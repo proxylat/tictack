@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>TicTackSv</AssemblyName>
+    <RootNamespace>TicTack</RootNamespace>
+    <NoWarn>$(NoWarn);NU1903</NoWarn>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
+    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
+    <!-- ponytail: winsqlite3 (Windows built-in) on net10.0, no bundle needed -->
+  </ItemGroup>
+  <!-- ponytail: .NET 10 SDK treats these as "type: platform" in deps.json but
+       doesn't ship them in the shared framework. Force copy from NuGet cache. -->
+  <Target Name="CopyWindowsRuntimePackages" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <Copy SourceFiles="$(NuGetPackageRoot)system.serviceprocess.servicecontroller\10.0.9\runtimes\win\lib\net10.0\System.ServiceProcess.ServiceController.dll"
+          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="Exists('$(NuGetPackageRoot)system.serviceprocess.servicecontroller\10.0.9\runtimes\win\lib\net10.0\System.ServiceProcess.ServiceController.dll')" />
+    <Copy SourceFiles="$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net10.0\System.Diagnostics.EventLog.dll"
+          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="Exists('$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net10.0\System.Diagnostics.EventLog.dll')" />
+    <!-- fallback: net9.0 TFM if the package didn't get a net10.0 folder -->
+    <Copy SourceFiles="$(NuGetPackageRoot)system.serviceprocess.servicecontroller\10.0.9\runtimes\win\lib\net9.0\System.ServiceProcess.ServiceController.dll"
+          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="!Exists('$(OutDir)System.ServiceProcess.ServiceController.dll') And Exists('$(NuGetPackageRoot)system.serviceprocess.servicecontroller\10.0.9\runtimes\win\lib\net9.0\System.ServiceProcess.ServiceController.dll')" />
+    <Copy SourceFiles="$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net9.0\System.Diagnostics.EventLog.dll"
+          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="!Exists('$(OutDir)System.Diagnostics.EventLog.dll') And Exists('$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net9.0\System.Diagnostics.EventLog.dll')" />
+    <!-- native e_sqlite3.dll: CopyLocalLocksFileAssemblies only handles managed DLLs -->
+    <Copy SourceFiles="$(NuGetPackageRoot)sqlitepclraw.lib.e_sqlite3\2.1.11\runtimes\win-x64\native\e_sqlite3.dll"
+          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="Exists('$(NuGetPackageRoot)sqlitepclraw.lib.e_sqlite3\2.1.11\runtimes\win-x64\native\e_sqlite3.dll')" />
+  </Target>
+</Project>

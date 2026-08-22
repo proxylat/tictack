@@ -1,0 +1,8 @@
+bin/
+obj/
+*.log
+service/TicTackSv.exe
+service/*.dll
+service/*.pdb
+service/*.deps.json
+service/*.runtimeconfig.json
