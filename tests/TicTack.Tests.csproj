@@ -1,0 +1,47 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);NU1903</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
+    <!-- ponytail: winsqlite3 (Windows built-in) on net10.0, no bundle needed -->
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="../src/Interfaces.cs" Link="src/Interfaces.cs" />
+    <Compile Include="../src/Config.cs" Link="src/Config.cs" />
+    <Compile Include="../src/Comparer.cs" Link="src/Comparer.cs" />
+    <Compile Include="../src/Validator.cs" Link="src/Validator.cs" />
+    <Compile Include="../src/Filter.cs" Link="src/Filter.cs" />
+    <Compile Include="../src/StateDb.cs" Link="src/StateDb.cs" />
+    <Compile Include="../src/SrcLock.cs" Link="src/SrcLock.cs" />
+    <Compile Include="../src/PowerGuard.cs" Link="src/PowerGuard.cs" />
+    <Compile Include="../src/Executor.cs" Link="src/Executor.cs" />
+    <Compile Include="../src/Deletion.cs" Link="src/Deletion.cs" />
+    <Compile Include="../src/Versioning.cs" Link="src/Versioning.cs" />
+    <Compile Include="../src/Logging.cs" Link="src/Logging.cs" />
+    <Compile Include="../src/DesktopAlert.cs" Link="src/DesktopAlert.cs" />
+
+    <Compile Include="../src/PathUtil.cs" Link="src/PathUtil.cs" />
+    <Compile Include="../src/Monitor.cs" Link="src/Monitor.cs" />
+    <Compile Include="../src/Pipeline.cs" Link="src/Pipeline.cs" />
+    <Compile Include="../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
+  </ItemGroup>
+
+</Project>
