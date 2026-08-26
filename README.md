@@ -251,14 +251,14 @@ TicTack runs natively on Linux with the same sync engine: `FileSystemWatcher`-ba
 Build + install as a systemd service:
 ```
 cd service/linux
-cp config_linux.yaml.example config.yaml   # edit paths, e.g. /home/user/Desktop -> /mnt/backup/Sync/Desktop
+cp config_linux.yaml.example config.yaml   # edit paths, e.g. ~/Desktop -> /mnt/backup/Sync/Desktop
 ./install-service.sh                 # publish + systemctl enable --now tictack
 ```
 
 Uninstall: `./uninstall-service.sh` (keeps config.yaml).
 
 Notes:
-- Config paths use Linux separators (`/home/user/Pictures`); `[VolumeLabel]` syntax is Windows-only.
+- Config paths use Linux separators (`~/Pictures`); `[VolumeLabel]` syntax is Windows-only.
 - The unit sends SIGINT on stop for a graceful shutdown.
 - Requires the .NET 10 runtime on the host (`dotnet --version`).
 

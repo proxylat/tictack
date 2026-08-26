@@ -18,3 +18,5 @@ service/linux/*.runtimeconfig.json
 service/linux/*.so
 service/linux/runtimes/
 service/linux/createdump
+service/linux/mount-pendrive.sh
+service/linux/99-tictack-pendrive.rules
