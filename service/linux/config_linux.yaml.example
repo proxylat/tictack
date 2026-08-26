@@ -1,10 +1,10 @@
 sources:
   - paths:
-      - '%HOME%/Desktop'
-      - '%HOME%/Pictures'
-      - '%HOME%/Videos'
-      - '%HOME%/Music'
-      - '%HOME%/Downloads'
+      - '/home/user/Desktop'
+      - '/home/user/Pictures'
+      - '/home/user/Videos'
+      - '/home/user/Music'
+      - '/home/user/Downloads'
     destination: '/srv/tictack/Sync'
     state_db_path: '/var/lib/tictack'
     debounce_seconds: 20
@@ -48,13 +48,13 @@ logging:
   max_size_mb: 10
   max_files: 5
   console: false
-  alert_path: '%HOME%/Desktop'
+  alert_path: '/home/user/Desktop'
 
 watchdog:
   enabled: true
   interval_minutes: 60
 
-restic_drives:
+external_drives:
   command: restic backup --compression auto "{source}" -r "{drive}/restic-repo"
   require_marker_file: true
-  marker_file_name: .restic-target
+  marker_file_name: .tictack-target

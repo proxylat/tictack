@@ -20,3 +20,4 @@ service/linux/runtimes/
 service/linux/createdump
 service/linux/mount-pendrive.sh
 service/linux/99-tictack-pendrive.rules
+AGENTS.md

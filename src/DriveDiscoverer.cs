@@ -6,7 +6,7 @@ namespace TicTack
 {
     public static class DriveDiscoverer
     {
-        public static List<string> GetEligibleDrives(ResticDrivesConfig cfg, HashSet<string> excludeDrives, ILogger log)
+        public static List<string> GetEligibleDrives(ExternalDrivesConfig cfg, HashSet<string> excludeDrives, ILogger log)
         {
             var results = new List<string>();
             var sysDrive = (Path.GetPathRoot(Environment.SystemDirectory) ?? "").TrimEnd('\\');
@@ -33,7 +33,7 @@ namespace TicTack
 
                 if (cfg.RequireMarkerFile)
                 {
-                    var marker = Path.Combine(root, cfg.MarkerFileName ?? ".restic-target");
+                    var marker = Path.Combine(root, cfg.MarkerFileName ?? ".tictack-target");
                     if (!File.Exists(marker))
                     {
                         log.Debug("Skipping " + root + ": no marker file (" + Path.GetFileName(marker) + ")");

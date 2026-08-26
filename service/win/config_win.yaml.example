@@ -1,12 +1,12 @@
 sources:
   - paths:
-      - '%USERPROFILE%\Desktop'
-      - '%USERPROFILE%\Pictures'
-      - '%USERPROFILE%\Videos'
-      - '%USERPROFILE%\Music'
-      - '%USERPROFILE%\Downloads'
+      - 'C:\Users\User\Desktop'
+      - 'C:\Users\User\Pictures'
+      - 'C:\Users\User\Videos'
+      - 'C:\Users\User\Music'
+      - 'C:\Users\User\Downloads'
     destination: '[TicTack]\Sync'
-    state_db_path: '%LOCALAPPDATA%\TicTack'
+    state_db_path: 'C:\ProgramData\TicTack'
     debounce_seconds: 20
     filter:
       max_file_size_mb: no-limit
@@ -48,16 +48,16 @@ logging:
   max_size_mb: 10
   max_files: 5
   console: false
-  alert_path: '%USERPROFILE%\Desktop'
+  alert_path: 'C:\Users\User\Desktop'
 
 watchdog:
   enabled: true
   interval_minutes: 30
 
-restic_drives:
+external_drives:
   command: restic.exe backup --compression auto "{source}" -r "{drive}\restic-repo"
   require_marker_file: true
-  marker_file_name: .restic-target
+  marker_file_name: .tictack-target
 
 jobs:
   - name: restic_archive

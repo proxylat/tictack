@@ -13,7 +13,7 @@ namespace TicTack
         public LoggingConfig Logging { get; set; }
         public List<JobConfig> Jobs { get; set; }
         public WatchdogConfig Watchdog { get; set; }
-        public ResticDrivesConfig ResticDrives { get; set; }
+        public ExternalDrivesConfig ExternalDrives { get; set; }
 
         public TicTackConfig()
         {
@@ -22,7 +22,7 @@ namespace TicTack
             Logging = new LoggingConfig();
             Jobs = new List<JobConfig>();
             Watchdog = new WatchdogConfig();
-            ResticDrives = new ResticDrivesConfig();
+            ExternalDrives = new ExternalDrivesConfig();
         }
     }
 
@@ -177,7 +177,7 @@ namespace TicTack
         }
     }
 
-    public class ResticDrivesConfig
+    public class ExternalDrivesConfig
     {
         public string? Command { get; set; }
         public string? WorkingDir { get; set; }
@@ -185,12 +185,12 @@ namespace TicTack
         public bool RequireMarkerFile { get; set; }
         public string? MarkerFileName { get; set; }
 
-        public ResticDrivesConfig()
+        public ExternalDrivesConfig()
         {
             Command = "restic.exe backup --compression auto \"{source}\" -r \"{drive}\\restic-repo\"";
             ExcludeDrives = new List<string>();
             RequireMarkerFile = true;
-            MarkerFileName = ".restic-target";
+            MarkerFileName = ".tictack-target";
         }
     }
 
