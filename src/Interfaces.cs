@@ -11,13 +11,13 @@ namespace TicTack
     {
         private readonly ChangeType _changeType;
         private readonly string _fullPath;
-        private readonly string _oldFullPath;
+        private readonly string? _oldFullPath;
 
         public ChangeType ChangeType { get { return _changeType; } }
         public string FullPath { get { return _fullPath; } }
-        public string OldFullPath { get { return _oldFullPath; } }
+        public string? OldFullPath { get { return _oldFullPath; } }
 
-        public FileChangedEventArgs(ChangeType type, string path, string oldPath = null)
+        public FileChangedEventArgs(ChangeType type, string path, string? oldPath = null)
         {
             _changeType = type; _fullPath = path; _oldFullPath = oldPath;
         }
@@ -38,13 +38,13 @@ namespace TicTack
         private readonly string _sourceBase;
         private readonly string _destBase;
         private readonly string _destPath;
-        private readonly string _oldDestPath;
+        private readonly string? _oldDestPath;
 
         public FileChangedEventArgs ChangeEvent { get { return _changeEvent; } }
         public string SourceBase { get { return _sourceBase; } }
         public string DestBase { get { return _destBase; } }
         public string DestPath { get { return _destPath; } }
-        public string OldDestPath { get { return _oldDestPath; } }
+        public string? OldDestPath { get { return _oldDestPath; } }
 
         public FileActionArgs(FileChangedEventArgs changeEvent, string sourceBase, string destBase)
         {
@@ -70,15 +70,15 @@ namespace TicTack
     public class ActionResult
     {
         public bool Success { get; set; }
-        public string ErrorMessage { get; set; }
+        public string? ErrorMessage { get; set; }
         public static ActionResult Ok() { return new ActionResult { Success = true }; }
         public static ActionResult Fail(string msg) { return new ActionResult { Success = false, ErrorMessage = msg }; }
     }
 
     public interface IFileMonitor : IDisposable
     {
-        event EventHandler<FileChangedEventArgs> Changed;
-        event EventHandler<MonitorErrorEventArgs> Error;
+        event EventHandler<FileChangedEventArgs>? Changed;
+        event EventHandler<MonitorErrorEventArgs>? Error;
         void Start();
         void Stop();
     }
@@ -122,7 +122,7 @@ namespace TicTack
 
     public interface IDeletionStrategy
     {
-        Task HandleDeletionAsync(string sourcePath, string destPath, CancellationToken ct);
+        Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct);
     }
 
     public interface ILogger
@@ -130,7 +130,7 @@ namespace TicTack
         void Debug(string msg);
         void Info(string msg);
         void Warn(string msg);
-        void Error(string msg, Exception ex = null);
+        void Error(string msg, Exception? ex = null);
     }
 
     public interface ISyncPipeline : IDisposable

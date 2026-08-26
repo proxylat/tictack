@@ -16,7 +16,7 @@
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
-    <!-- ponytail: winsqlite3 (Windows built-in) on net10.0, no bundle needed -->
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
   </ItemGroup>
 
   <ItemGroup>
@@ -37,11 +37,16 @@
     <Compile Include="../src/Versioning.cs" Link="src/Versioning.cs" />
     <Compile Include="../src/Logging.cs" Link="src/Logging.cs" />
     <Compile Include="../src/DesktopAlert.cs" Link="src/DesktopAlert.cs" />
+    <Compile Include="../src/Handler.cs" Link="src/Handler.cs" />
 
     <Compile Include="../src/PathUtil.cs" Link="src/PathUtil.cs" />
     <Compile Include="../src/Monitor.cs" Link="src/Monitor.cs" />
     <Compile Include="../src/Pipeline.cs" Link="src/Pipeline.cs" />
     <Compile Include="../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="MinimalService.cs" />
   </ItemGroup>
 
 </Project>

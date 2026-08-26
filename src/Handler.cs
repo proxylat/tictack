@@ -54,6 +54,9 @@ namespace TicTack
 
         public Stream OpenRead(string path)
         {
+            if (!OperatingSystem.IsWindows())
+                return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
             if (path.Length > 240 && !path.StartsWith(@"\\?\"))
                 path = @"\\?\" + path;
 

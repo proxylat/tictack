@@ -11,6 +11,5 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
-    <!-- ponytail: winsqlite3 (Windows built-in) on net10.0, no bundle needed -->
   </ItemGroup>
 </Project>

@@ -1,0 +1,60 @@
+sources:
+  - paths:
+      - '%HOME%/Desktop'
+      - '%HOME%/Pictures'
+      - '%HOME%/Videos'
+      - '%HOME%/Music'
+      - '%HOME%/Downloads'
+    destination: '/srv/tictack/Sync'
+    state_db_path: '/var/lib/tictack'
+    debounce_seconds: 20
+    filter:
+      max_file_size_mb: no-limit
+      exclude:
+        - "*.iso"
+        - "*.tmp"
+        - "*.vmdk"
+        - "*.crdownload"
+        - "*.part"
+    sync:
+      verification: date_and_size
+      retry:
+        max_attempts: 5
+        delay_ms: 1000
+        backoff: 2.0
+      lock_handling: retry
+      retry_lock_minutes: 10
+      delete_threshold_count: 1000
+      delete_threshold_size_gb: 50
+      delete_threshold_percent: 50
+      delete_hold_days: 7
+      rename_detection: true
+      versioning:
+        max_versions: 10
+        path: '/srv/tictack/Sync/.versions'
+      deletion:
+        mode: archive
+        path: '/srv/tictack/Sync/.archive'
+
+monitor:
+  type: composite
+  watcher_buffer_kb: 1024
+  polling_interval_seconds: 300
+  restart_delay_seconds: 10
+
+logging:
+  level: info
+  path: '/srv/tictack/Sync/tictack.log'
+  max_size_mb: 10
+  max_files: 5
+  console: false
+  alert_path: '%HOME%/Desktop'
+
+watchdog:
+  enabled: true
+  interval_minutes: 60
+
+restic_drives:
+  command: restic backup --compression auto "{source}" -r "{drive}/restic-repo"
+  require_marker_file: true
+  marker_file_name: .restic-target

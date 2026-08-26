@@ -7,7 +7,7 @@ namespace TicTack
 {
     public class MirrorDeletion : IDeletionStrategy
     {
-        public Task HandleDeletionAsync(string sourcePath, string destPath, CancellationToken ct)
+        public Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
         {
             try
             {
@@ -55,27 +55,30 @@ namespace TicTack
             }
         }
 
-        public Task HandleDeletionAsync(string sourcePath, string destPath, CancellationToken ct)
+        public Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
         {
             try
             {
+                var syncRoot = Path.GetDirectoryName(_archiveBase.TrimEnd('\\', '/'));
+                string RelFromSyncRoot(string p)
+                {
+                    if (syncRoot != null && p.StartsWith(syncRoot, StringComparison.OrdinalIgnoreCase))
+                        return p.Substring(syncRoot.Length).TrimStart('\\', '/');
+                    if (p.StartsWith(_destBase, StringComparison.OrdinalIgnoreCase))
+                        return p.Substring(_destBase.Length).TrimStart('\\', '/');
+                    return "";
+                }
+
                 if (File.Exists(destPath))
                 {
-                    var rel = "";
-                    var syncRoot = Path.GetDirectoryName(_archiveBase.TrimEnd('\\', '/'));
-                    if (syncRoot != null && !string.Equals(syncRoot, _destBase, StringComparison.OrdinalIgnoreCase)
-                        && destPath.StartsWith(syncRoot, StringComparison.OrdinalIgnoreCase))
-                        rel = destPath.Substring(syncRoot.Length).TrimStart('\\', '/');
-                    else if (destPath.StartsWith(_destBase, StringComparison.OrdinalIgnoreCase))
-                        rel = destPath.Substring(_destBase.Length).TrimStart('\\', '/');
-
-                    ArchiveFile(destPath, Path.Combine(_archiveBase, rel));
+                    ArchiveFile(destPath, Path.Combine(_archiveBase, RelFromSyncRoot(destPath)));
                 }
                 else if (Directory.Exists(destPath))
                 {
+                    var relDir = RelFromSyncRoot(destPath);
                     foreach (var f in Directory.EnumerateFiles(destPath, "*", SearchOption.AllDirectories))
                     {
-                        var rel = f.Substring(destPath.Length).TrimStart('\\', '/');
+                        var rel = Path.Combine(relDir, f.Substring(destPath.Length).TrimStart('\\', '/'));
                         ArchiveFile(f, Path.Combine(_archiveBase, rel));
                     }
                     Directory.Delete(destPath, true);
@@ -88,7 +91,7 @@ namespace TicTack
 
     public static class DeletionStrategyFactory
     {
-        public static IDeletionStrategy Create(DeletionConfig config, string destBase)
+        public static IDeletionStrategy Create(DeletionConfig? config, string destBase)
         {
             if (config == null) return new ArchiveDeletion(Path.Combine(destBase, ".archive"), destBase);
             var mode = config.Mode != null ? config.Mode.ToLowerInvariant() : null;

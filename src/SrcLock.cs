@@ -9,7 +9,7 @@ namespace TicTack
     {
         private readonly string _path;
         private readonly string _identity;
-        private readonly Timer _refreshTimer;
+        private readonly Timer? _refreshTimer;
         private bool _disposed;
 
         public bool IsHeld { get; private set; }
@@ -18,7 +18,7 @@ namespace TicTack
         {
             _path = path;
             _identity = Environment.MachineName + ":" + Process.GetCurrentProcess().Id;
-            var deadline = retryTimeout.HasValue ? DateTime.UtcNow + retryTimeout.Value : DateTime.MaxValue;
+            var deadline = retryTimeout.HasValue ? DateTime.UtcNow + retryTimeout.Value : DateTime.MinValue;
 
             try
             {

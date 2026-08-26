@@ -8,7 +8,7 @@ public class ConfigTests
     [Fact]
     public void Load_ReturnsNull_WhenFileMissing()
     {
-        var cfg = Config.Load("/nonexistent/path.yaml");
+        var cfg = Config.Load(@"C:\nonexistent\path.yaml");
         Assert.Null(cfg);
     }
 
@@ -114,7 +114,7 @@ watchdog:
         try
         {
             File.WriteAllText(path, yaml);
-            var cfg = Config.Load(path);
+            var cfg = Config.Load(path)!;
             Assert.NotNull(cfg);
             Assert.Single(cfg.Sources);
             Assert.Equal(@"C:\src", cfg.Sources[0].Path);
@@ -123,7 +123,7 @@ watchdog:
             Assert.Equal(3, cfg.Sources[0].Sync.Retry.MaxAttempts);
             Assert.Equal(100L, Config.ParseFileSizeLimit(cfg.Sources[0].Filter.MaxFileSizeMb));
             Assert.Contains("*.tmp", cfg.Sources[0].Filter.Exclude);
-            Assert.Equal("mirror", cfg.Sources[0].Sync.Deletion.Mode);
+            Assert.Equal("mirror", cfg.Sources[0].Sync.Deletion!.Mode);
             Assert.Equal("watcher", cfg.Monitor.Type);
             Assert.Equal("debug", cfg.Logging.Level);
             Assert.False(cfg.Watchdog.Enabled);
@@ -134,7 +134,7 @@ watchdog:
     [Fact]
     public void Load_ExpandsPathsListIntoMultipleSources()
     {
-        var userDir = Environment.GetEnvironmentVariable("USERPROFILE") ?? Environment.GetEnvironmentVariable("HOME") ?? "/tmp";
+        var userDir = Environment.GetEnvironmentVariable("USERPROFILE") ?? Environment.GetEnvironmentVariable("HOME") ?? @"C:\Users";
         var yaml = @"
 sources:
   - paths:
@@ -148,7 +148,7 @@ sources:
         try
         {
             File.WriteAllText(path, yaml);
-            var cfg = Config.Load(path);
+            var cfg = Config.Load(path)!;
             Assert.NotNull(cfg);
             Assert.Equal(2, cfg.Sources.Count);
             Assert.Contains("Desktop", cfg.Sources[0].Path);
@@ -179,12 +179,12 @@ logging:
         var path = Path.GetTempFileName();
         try
         {
-            Environment.SetEnvironmentVariable("TESTROOT", "/tmp/tictack_test");
+            Environment.SetEnvironmentVariable("TESTROOT", @"C:\TicTackTest");
             File.WriteAllText(path, yaml);
-            var cfg = Config.Load(path);
+            var cfg = Config.Load(path)!;
             Assert.NotNull(cfg);
-            Assert.Equal("/tmp/tictack_test" + @"\Desktop", cfg.Sources[0].Path);
-            Assert.Equal("/tmp/tictack_test" + @"\tictack.log", cfg.Logging.Path);
+            Assert.Equal(@"C:\TicTackTest" + @"\Desktop", cfg.Sources[0].Path);
+            Assert.Equal(@"C:\TicTackTest" + @"\tictack.log", cfg.Logging.Path);
         }
         finally
         {

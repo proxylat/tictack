@@ -35,14 +35,22 @@ namespace TicTack
                 var ts = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
                 var name = Path.GetFileNameWithoutExtension(destPath);
                 var ext = Path.GetExtension(destPath);
-                var relDir = Path.GetRelativePath(_destBase, Path.GetDirectoryName(destPath));
-                var verDir = relDir == "." ? _versionBase : Path.Combine(_versionBase, relDir);
+                var dir = Path.GetDirectoryName(destPath);
+                var syncRoot = Path.GetDirectoryName(_versionBase.TrimEnd('\\', '/'));
+                string relDir;
+                if (dir != null && syncRoot != null && dir.StartsWith(syncRoot, StringComparison.OrdinalIgnoreCase))
+                    relDir = dir.Substring(syncRoot.Length).TrimStart('\\', '/');
+                else if (dir != null && dir.StartsWith(_destBase, StringComparison.OrdinalIgnoreCase))
+                    relDir = dir.Substring(_destBase.Length).TrimStart('\\', '/');
+                else
+                    relDir = "";
+                var verDir = string.IsNullOrEmpty(relDir) ? _versionBase : Path.Combine(_versionBase, relDir);
                 var verFile = Path.Combine(verDir, name + "_" + ts + ext);
 
                 Directory.CreateDirectory(verDir);
                 File.Copy(PathUtil.EnsureExtended(destPath), verFile, overwrite: false);
 
-                // ponytail: limit versions by deleting oldest
+                // delete oldest versions beyond the cap
                 var files = Directory.GetFiles(verDir, name + "_*" + ext);
                 if (files.Length > _maxVersions)
                 {
@@ -58,7 +66,7 @@ namespace TicTack
 
     public static class VersioningFactory
     {
-        public static IVersioningStrategy Create(VersioningConfig config, string destBase)
+        public static IVersioningStrategy Create(VersioningConfig? config, string destBase)
         {
             if (config == null || string.IsNullOrEmpty(config.Path))
                 return new NoVersioning();

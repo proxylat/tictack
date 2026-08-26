@@ -14,7 +14,7 @@ namespace TicTack
     {
         static Program()
         {
-            // ponytail: .NET 10 SDK marks these as "type: platform" in deps.json
+            // .NET 10 SDK marks these as "type: platform" in deps.json
             // but the shared framework doesn't ship them yet. Use assembly-resolve
             // to load from app directory when the runtime can't find them.
             AssemblyLoadContext.Default.Resolving += (context, name) =>
@@ -75,7 +75,8 @@ namespace TicTack
             if (isCli || isOnce || isValidate || cfg.Logging.Console)
                 loggers.Add(new ConsoleLogger(level));
             loggers.Add(new DesktopAlertLogger(level > LogLevel.Debug ? LogLevel.Warn : LogLevel.Debug, cfg.Logging.AlertPath));
-            loggers.Add(new EventLogLogger());
+            if (OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive))
+                loggers.Add(new EventLogLogger());
             var log = new MultiLogger(loggers);
 
             PowerGuard.Cleanup(cfg, log);
@@ -111,9 +112,8 @@ namespace TicTack
                 return 0;
             }
 
-            if (isService || !Environment.UserInteractive)
+            if (OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive))
             {
-                try { File.AppendAllText(diag, DateTime.Now + " [2] Before RunService\n"); } catch { }
                 try { File.AppendAllText(diag, DateTime.Now + " [2a] dir dlls: " + string.Join(", ", Directory.GetFiles(AppDomain.CurrentDomain.BaseDirectory, "*.dll").Select(Path.GetFileName)) + "\n"); } catch { }
                 RunService(cfgPath);
                 try { File.AppendAllText(diag, DateTime.Now + " [3] After RunService (returning 0)\n"); } catch { }
@@ -195,17 +195,31 @@ namespace TicTack
 
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "cmd.exe",
-                    Arguments = "/c " + fullCmd,
                     WorkingDirectory = wd,
                     UseShellExecute = false,
                     CreateNoWindow = false
                 };
-
-                try
+                if (OperatingSystem.IsWindows())
                 {
+                    psi.FileName = "cmd.exe";
+                    psi.Arguments = "/c " + fullCmd;
+                }
+                else
+                {
+                    psi.FileName = "/bin/sh";
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(fullCmd);
+                }
+
+                    try
+                    {
                     using (var p = Process.Start(psi))
                     {
+                        if (p == null)
+                        {
+                            log.Error("Restic on " + drive + " failed to start");
+                            continue;
+                        }
                         if (!p.WaitForExit(600000))
                         {
                             try { p.Kill(); } catch { }
@@ -254,6 +268,20 @@ namespace TicTack
 
                 log.Info("Syncing: " + srcPath + " -> " + dstBase);
 
+                StateDb? stateDb = null;
+                Dictionary<string, (long size, long mtime)>? cache = null;
+                try
+                {
+                    var name = Path.GetFileName(srcPath.TrimEnd('\\', '/'));
+                    if (string.IsNullOrEmpty(name)) name = "default";
+                    var dbPath = !string.IsNullOrEmpty(src.StateDbPath)
+                        ? Path.Combine(src.StateDbPath, name + ".db")
+                        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TicTack", name + ".db");
+                    stateDb = new StateDb(dbPath);
+                    cache = stateDb.LoadAll();
+                }
+                catch (Exception ex) { log.Warn("StateDB init failed, continuing without: " + ex.Message); }
+
                 var sourceFiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 if (Directory.Exists(srcPath))
                 {
@@ -277,6 +305,17 @@ namespace TicTack
                     var dstFile = Path.Combine(dstBase, rel);
                     var e = new FileChangedEventArgs(ChangeType.Created, srcFile);
                     var actionArgs = new FileActionArgs(e, srcPath, dstBase);
+
+                    if (cache != null && cache.TryGetValue(rel, out var cached))
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(srcFile);
+                            if (fi.Length == cached.size && fi.LastWriteTimeUtc.Ticks == cached.mtime)
+                                continue;
+                        }
+                        catch { }
+                    }
 
                     if (comparer.AreEqual(srcFile, dstFile))
                         continue;
@@ -302,6 +341,16 @@ namespace TicTack
                         }
                     }
 
+                    if (stateDb != null)
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(srcFile);
+                            stateDb.Upsert(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+                        }
+                        catch { }
+                    }
+
                     log.Info("Synced: " + srcFile);
                 }
 
@@ -309,12 +358,47 @@ namespace TicTack
                 {
                     try
                     {
+                        var stale = new List<string>();
                         foreach (var dstFile in Directory.EnumerateFiles(dstBase, "*", SearchOption.AllDirectories))
                         {
                             var rel = dstFile.Substring(dstBase.Length).TrimStart('\\', '/');
+                            var name = Path.GetFileName(dstFile);
+                            if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
                             if (!sourceFiles.ContainsKey(rel))
+                                stale.Add(dstFile);
+                        }
+
+                        long stateCount = 0;
+                        if (stateDb != null) { try { stateCount = stateDb.Count(); } catch { } }
+                        long totalSize = 0;
+                        foreach (var sf in stale) { try { totalSize += new FileInfo(sf).Length; } catch { } }
+                        var sync = src.Sync;
+
+                        bool blocked =
+                            (sync != null && sync.DeleteThresholdCount > 0 && stale.Count >= sync.DeleteThresholdCount) ||
+                            (sync != null && sync.DeleteThresholdSizeGb.HasValue && sync.DeleteThresholdSizeGb.Value > 0 &&
+                             totalSize >= sync.DeleteThresholdSizeGb.Value * 1024L * 1024L * 1024L) ||
+                            (sync != null && sync.DeleteThresholdPercent > 0 && stateCount > 50 &&
+                             (double)stale.Count / stateCount * 100 >= sync.DeleteThresholdPercent);
+
+                        if (blocked)
+                        {
+                            log.Error("Delete guard: " + stale.Count + " stale files would be removed, skipping. Run --rebuild to force.");
+                        }
+                        else
+                        {
+                            foreach (var dstFile in stale)
                             {
                                 deletion.HandleDeletionAsync(null, dstFile, CancellationToken.None).GetAwaiter().GetResult();
+                                if (stateDb != null)
+                                {
+                                    try
+                                    {
+                                        var rel = dstFile.Substring(dstBase.Length).TrimStart('\\', '/');
+                                        stateDb.Delete(rel);
+                                    }
+                                    catch { }
+                                }
                                 log.Debug("Deleted: " + dstFile);
                             }
                         }
@@ -332,13 +416,11 @@ namespace TicTack
 
             foreach (var src in cfg.Sources)
             {
-                var dbPath = src.StateDbPath;
-                if (string.IsNullOrEmpty(dbPath))
-                {
-                    var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
-                    if (string.IsNullOrEmpty(name)) name = "default";
-                    dbPath = Path.Combine(localAppData, "TicTack", name + ".db");
-                }
+                var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
+                if (string.IsNullOrEmpty(name)) name = "default";
+                var dbPath = !string.IsNullOrEmpty(src.StateDbPath)
+                    ? Path.Combine(src.StateDbPath, name + ".db")
+                    : Path.Combine(localAppData, "TicTack", name + ".db");
                 try
                 {
                     if (Directory.Exists(dbPath))
@@ -355,13 +437,31 @@ namespace TicTack
                 catch (Exception ex) { log.Error("Failed to delete state DB: " + dbPath + ": " + ex.Message); }
             }
 
-            var deferredPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".tictack-deferred.json");
-            try
+            var rbBaseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+            var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
+                ? Path.Combine(rbBaseDir, "tictack.log")
+                : cfg.Logging.Path;
+            foreach (var src in cfg.Sources)
             {
-                File.Delete(deferredPath);
-                log.Info("Cleared deferred deletions: " + deferredPath);
+                var dname = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
+                if (string.IsNullOrEmpty(dname)) dname = "default";
+                var deferredFile = Path.Combine(Path.GetDirectoryName(logPath) ?? rbBaseDir, "tictack-deferred-" + dname.ToLowerInvariant() + ".json");
+                try
+                {
+                    if (File.Exists(deferredFile))
+                    {
+                        File.Delete(deferredFile);
+                        log.Info("Cleared deferred deletions: " + deferredFile);
+                    }
+                }
+                catch { }
+                try
+                {
+                    var legacyDeferred = Path.Combine(src.Destination, ".tictack-deferred.json");
+                    if (File.Exists(legacyDeferred)) File.Delete(legacyDeferred);
+                }
+                catch { }
             }
-            catch { }
 
             var accessor = new FileAccessor();
             foreach (var src in cfg.Sources)
@@ -431,6 +531,7 @@ namespace TicTack
                         var name = Path.GetFileName(dstFile);
                         if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
                         var rel = dstFile.Substring(dstBase.Length).TrimStart('\\', '/');
+                        if (UnderDir(rel, ".archive") || UnderDir(rel, ".versions")) continue;
                         if (!sourceFiles.Contains(rel))
                         {
                             deletion.HandleDeletionAsync(null, dstFile, CancellationToken.None).GetAwaiter().GetResult();
@@ -441,10 +542,10 @@ namespace TicTack
                         .OrderByDescending(d => d.Length))
                     {
                         var rel = dir.Substring(dstBase.Length).TrimStart('\\', '/');
-                        if (rel == ".archive" || rel.StartsWith(".archive\\", StringComparison.OrdinalIgnoreCase)) continue;
-                        if (rel == ".versions" || rel.StartsWith(".versions\\", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (rel == ".archive" || UnderDir(rel, ".archive")) continue;
+                        if (rel == ".versions" || UnderDir(rel, ".versions")) continue;
                         if (rel == ".tictack.lock" || rel == ".tictack-deferred.json") continue;
-                        if (sourceFiles.Any(f => f.StartsWith(rel + "\\", StringComparison.OrdinalIgnoreCase))) continue;
+                        if (sourceFiles.Any(f => UnderDir(f, rel))) continue;
                         deletion.HandleDeletionAsync(null, dir, CancellationToken.None).GetAwaiter().GetResult();
                         log.Info("Archived stale dir: " + dir);
                     }
@@ -454,6 +555,12 @@ namespace TicTack
             }
 
             log.Info("Full rebuild finished. All databases cleared, source re-scanned, parity enforced.");
+        }
+
+        static bool UnderDir(string path, string prefix)
+        {
+            return path.StartsWith(prefix + '/', StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith(prefix + '\\', StringComparison.OrdinalIgnoreCase);
         }
 
         static void RunCli(TicTackConfig cfg, ILogger log)
@@ -483,8 +590,11 @@ namespace TicTack
                     e.Cancel = true;
                     wait.Set();
                 };
-                var thread = new Thread(() => { Console.ReadLine(); wait.Set(); });
-                thread.Start();
+                if (!Console.IsInputRedirected)
+                {
+                    var thread = new Thread(() => { Console.ReadLine(); wait.Set(); });
+                    thread.Start();
+                }
                 wait.WaitOne();
             }
 
@@ -533,13 +643,14 @@ namespace TicTack
             var deleteAction = new DeleteAction();
             var renameAction = new RenameAction();
 
-            StateDb stateDb = null;
+            StateDb? stateDb = null;
             try
             {
-                var dbPath = src.StateDbPath ?? Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "TicTack",
-                    Path.GetFileName(src.Path.TrimEnd('\\', '/')) + ".db");
+                var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
+                if (string.IsNullOrEmpty(name)) name = "default";
+                var dbPath = !string.IsNullOrEmpty(src.StateDbPath)
+                    ? Path.Combine(src.StateDbPath, name + ".db")
+                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TicTack", name + ".db");
                 stateDb = new StateDb(dbPath);
             }
             catch (Exception ex)
@@ -548,37 +659,59 @@ namespace TicTack
             }
 
             IFileMonitor monitor;
-            switch (cfg.Monitor != null && cfg.Monitor.Type != null ? cfg.Monitor.Type.ToLowerInvariant() : "")
+            var monitorConfig = cfg.Monitor ?? new MonitorConfig();
+            IFileMonitor CreateWatcher() => OperatingSystem.IsWindows()
+                ? new FileWatcherMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds)
+                : new FsWatchMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds);
+            switch (monitorConfig.Type != null ? monitorConfig.Type.ToLowerInvariant() : "")
             {
                 case "watcher":
-                    monitor = new FileWatcherMonitor(src.Path, cfg.Monitor.WatcherBufferKb, cfg.Monitor.RestartDelaySeconds);
+                    monitor = CreateWatcher();
                     break;
                 case "polling":
-                    monitor = new PollingMonitor(src.Path, cfg.Monitor.PollingIntervalSeconds);
+                    monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
                     break;
                 default:
                     monitor = new CompositeMonitor(
-                        new FileWatcherMonitor(src.Path, cfg.Monitor.WatcherBufferKb, cfg.Monitor.RestartDelaySeconds),
-                        new PollingMonitor(src.Path, cfg.Monitor.PollingIntervalSeconds)
+                        CreateWatcher(),
+                        new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds)
                     );
                     break;
             }
 
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + '\\';
-            var srcDir = src.Path.TrimEnd('\\', '/') + '\\';
+            var sep = Path.DirectorySeparatorChar;
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + sep;
+            var srcDir = src.Path.TrimEnd('\\', '/') + sep;
             var excludes = new List<string>();
             if (baseDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase))
                 excludes.Add(baseDir);
             var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
                 ? Path.Combine(baseDir, "tictack.log")
                 : cfg.Logging.Path;
-            var logDir = Path.GetDirectoryName(logPath).TrimEnd('\\', '/') + '\\';
+            var logDir = (Path.GetDirectoryName(logPath) ?? baseDir).TrimEnd('\\', '/') + sep;
             if (logDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase) && !excludes.Contains(logDir))
                 excludes.Add(logDir);
 
+            var dname = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
+            if (string.IsNullOrEmpty(dname)) dname = "default";
+            var deferredPath = Path.Combine(Path.GetDirectoryName(logPath) ?? baseDir, "tictack-deferred-" + dname.ToLowerInvariant() + ".json");
+            var legacyDeferred = Path.Combine(src.Destination, ".tictack-deferred.json");
+            try
+            {
+                if (!File.Exists(deferredPath) && File.Exists(legacyDeferred))
+                {
+                    var dd = Path.GetDirectoryName(deferredPath);
+                    if (!string.IsNullOrEmpty(dd) && !Directory.Exists(dd))
+                        Directory.CreateDirectory(dd);
+                    File.Move(legacyDeferred, deferredPath);
+                }
+            }
+            catch { }
+
             return new SyncPipeline(src, monitor, comparer, copyAction, deleteAction, renameAction,
                 retry, validator, versioning, deletion, log, stateDb,
-                autoExcludePrefixes: excludes.ToArray());
+                autoExcludePrefixes: excludes.ToArray(),
+                deferredPath: deferredPath);
         }
     }
 }

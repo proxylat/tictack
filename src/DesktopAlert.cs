@@ -8,14 +8,14 @@ namespace TicTack
         private static readonly object Lock = new object();
         private static DateTime _lastAlert;
 
-        private static string _alertPath;
+        private static string? _alertPath;
 
-        public static void Configure(string path)
+        public static void Configure(string? path)
         {
             _alertPath = path;
         }
 
-        public static void Write(string level, string message, Exception ex = null)
+        public static void Write(string level, string message, Exception? ex = null)
         {
             var now = DateTime.Now;
             lock (Lock)

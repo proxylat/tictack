@@ -13,7 +13,7 @@ public class LoggingTests
     [InlineData(null, LogLevel.Info)]
     [InlineData("unknown", LogLevel.Info)]
     [InlineData("", LogLevel.Info)]
-    public void LogLevelParser_ParsesCorrectly(string input, LogLevel expected)
+    public void LogLevelParser_ParsesCorrectly(string? input, LogLevel expected)
     {
         Assert.Equal(expected, LogLevelParser.Parse(input));
     }

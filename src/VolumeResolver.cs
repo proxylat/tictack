@@ -18,8 +18,7 @@ namespace TicTack
             return VolumePattern.Replace(path, m =>
             {
                 var label = m.Groups[1].Value;
-                string root;
-                return map.TryGetValue(label, out root) ? root : m.Value;
+                return map.TryGetValue(label, out var root) ? root : m.Value;
             });
         }
 

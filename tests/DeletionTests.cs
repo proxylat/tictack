@@ -2,16 +2,17 @@ namespace TicTack;
 
 public class DeletionTests : IDisposable
 {
+    private readonly string _baseDir;
     private readonly string _srcDir;
     private readonly string _dstDir;
     private readonly string _archiveDir;
 
     public DeletionTests()
     {
-        var baseDir = Path.Combine(Path.GetTempPath(), "TicTackTest_del_" + Guid.NewGuid());
-        _srcDir = Path.Combine(baseDir, "src");
-        _dstDir = Path.Combine(baseDir, "dst");
-        _archiveDir = Path.Combine(baseDir, "archive");
+        _baseDir = Path.Combine(Path.GetTempPath(), "TicTackTest_del_" + Guid.NewGuid());
+        _srcDir = Path.Combine(_baseDir, "src");
+        _dstDir = Path.Combine(_baseDir, "sync", "Desktop");
+        _archiveDir = Path.Combine(_baseDir, "sync", ".archive");
         Directory.CreateDirectory(_srcDir);
         Directory.CreateDirectory(_dstDir);
         Directory.CreateDirectory(_archiveDir);
@@ -19,11 +20,11 @@ public class DeletionTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(Path.GetDirectoryName(_srcDir)!, true); } catch { }
+        try { Directory.Delete(_baseDir, true); } catch { }
     }
 
     string Dst(string name) => Path.Combine(_dstDir, name);
-    string Archive(string name) => Path.Combine(_archiveDir, name);
+    string Archive(params string[] parts) => Path.Combine(new[] { _archiveDir }.Concat(parts).ToArray());
 
     [Fact]
     public async Task MirrorDeletion_DeletesDestFile()
@@ -65,8 +66,8 @@ public class DeletionTests : IDisposable
         await deletion.HandleDeletionAsync(Path.Combine(_srcDir, "a.txt"), Dst("a.txt"), CancellationToken.None);
 
         Assert.False(File.Exists(Dst("a.txt")));
-        Assert.True(File.Exists(Archive("a.txt")));
-        Assert.Equal("archive me", File.ReadAllText(Archive("a.txt")));
+        Assert.True(File.Exists(Archive("Desktop", "a.txt")));
+        Assert.Equal("archive me", File.ReadAllText(Archive("Desktop", "a.txt")));
     }
 
     [Fact]
@@ -78,19 +79,20 @@ public class DeletionTests : IDisposable
         await deletion.HandleDeletionAsync("source/path/a.txt", Dst("a.txt"), CancellationToken.None);
 
         Assert.False(File.Exists(Dst("a.txt")));
-        Assert.True(File.Exists(Archive("a.txt")));
+        Assert.True(File.Exists(Archive("Desktop", "a.txt")));
     }
 
     [Fact]
     public async Task ArchiveDeletion_OverwritesExistingArchive()
     {
         File.WriteAllText(Dst("a.txt"), "newer version");
-        File.WriteAllText(Archive("a.txt"), "older version");
+        Directory.CreateDirectory(Path.Combine(_archiveDir, "Desktop"));
+        File.WriteAllText(Archive("Desktop", "a.txt"), "older version");
 
         var deletion = new ArchiveDeletion(_archiveDir, _dstDir);
         await deletion.HandleDeletionAsync(Path.Combine(_srcDir, "a.txt"), Dst("a.txt"), CancellationToken.None);
 
-        Assert.Equal("newer version", File.ReadAllText(Archive("a.txt")));
+        Assert.Equal("newer version", File.ReadAllText(Archive("Desktop", "a.txt")));
     }
 
     [Fact]
@@ -105,7 +107,21 @@ public class DeletionTests : IDisposable
             nested, CancellationToken.None);
 
         Assert.False(File.Exists(nested));
-        Assert.True(File.Exists(Path.Combine(_archiveDir, "sub", "dir", "nested.txt")));
+        Assert.True(File.Exists(Archive("Desktop", "sub", "dir", "nested.txt")));
+    }
+
+    [Fact]
+    public async Task ArchiveDeletion_MirrorsDirectoryFullPath()
+    {
+        var dir = Path.Combine(_dstDir, "Proj");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "nested.txt"), "dir archive");
+
+        var deletion = new ArchiveDeletion(_archiveDir, _dstDir);
+        await deletion.HandleDeletionAsync(Path.Combine(_srcDir, "Proj"), dir, CancellationToken.None);
+
+        Assert.False(Directory.Exists(dir));
+        Assert.True(File.Exists(Archive("Desktop", "Proj", "nested.txt")));
     }
 
     [Fact]

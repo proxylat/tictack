@@ -32,7 +32,7 @@ namespace TicTack
                 var dst = PathUtil.EnsureExtended(args.DestPath);
                 var tmp = dst + ".tictack.tmp";
 
-                var dir = PathUtil.EnsureExtended(Path.GetDirectoryName(dst));
+                var dir = PathUtil.EnsureExtended(Path.GetDirectoryName(dst) ?? "");
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
                 using (var probe = _accessor.OpenRead(src))
@@ -67,9 +67,12 @@ namespace TicTack
                     if (File.Exists(dst))
                     {
                         File.SetAttributes(dst, FileAttributes.Normal);
-                        File.Delete(dst);
+                        File.Replace(tmp, dst, null);
                     }
-                    File.Move(tmp, dst);
+                    else
+                    {
+                        File.Move(tmp, dst);
+                    }
                 }
                 catch (IOException)
                 {
@@ -144,9 +147,9 @@ namespace TicTack
     public class CommandAction : IFileAction
     {
         private readonly string _command;
-        private readonly string _workingDir;
+        private readonly string? _workingDir;
 
-        public CommandAction(string command, string workingDir = null)
+        public CommandAction(string command, string? workingDir = null)
         {
             _command = command;
             _workingDir = workingDir;
@@ -163,8 +166,17 @@ namespace TicTack
             try
             {
                 var psi = new ProcessStartInfo();
-                psi.FileName = "cmd.exe";
-                psi.Arguments = "/c " + cmd;
+                if (OperatingSystem.IsWindows())
+                {
+                    psi.FileName = "cmd.exe";
+                    psi.Arguments = "/c " + cmd;
+                }
+                else
+                {
+                    psi.FileName = "/bin/sh";
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(cmd);
+                }
                 psi.WorkingDirectory = _workingDir ?? AppDomain.CurrentDomain.BaseDirectory;
                 psi.UseShellExecute = false;
                 psi.RedirectStandardOutput = true;
@@ -173,6 +185,7 @@ namespace TicTack
 
                 using (var p = Process.Start(psi))
                 {
+                    if (p == null) return ActionResult.Fail("Failed to start process");
                     using (ct.Register(() => { try { p.Kill(); } catch { } }))
                     {
                         await Task.Run(() => p.WaitForExit(), ct);

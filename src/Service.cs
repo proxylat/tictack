@@ -10,10 +10,10 @@ namespace TicTack
     public class TicTackService : ServiceBase
     {
         private readonly string _configPath;
-        private ILogger _log;
-        private List<ISyncPipeline> _pipelines;
-        private IScheduler _scheduler;
-        private Timer _heartbeat;
+        private ILogger? _log;
+        private List<ISyncPipeline>? _pipelines;
+        private IScheduler? _scheduler;
+        private Timer? _heartbeat;
 
         public TicTackService(string configPath)
         {
@@ -39,7 +39,7 @@ namespace TicTack
 
                 var level = LogLevelParser.Parse(cfg.Logging.Level);
                 var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                    ? Path.Combine(Path.GetDirectoryName(_configPath), "tictack.log")
+                    ? Path.Combine(Path.GetDirectoryName(_configPath) ?? AppDomain.CurrentDomain.BaseDirectory, "tictack.log")
                     : cfg.Logging.Path;
                 var loggers = new List<ILogger>();
                 loggers.Add(new FileLogger(logPath, level, cfg.Logging.MaxSizeMb, cfg.Logging.MaxFiles));
@@ -70,7 +70,7 @@ namespace TicTack
                 if (cfg.Watchdog != null && cfg.Watchdog.Enabled)
                 {
                     var ms = Math.Max(60000, cfg.Watchdog.IntervalMinutes * 60000);
-                    _heartbeat = new Timer(_ => _log.Info("[HEARTBEAT] Service running"), null, ms, ms);
+                    _heartbeat = new Timer(_ => _log!.Info("[HEARTBEAT] Service running"), null, ms, ms);
                 }
 
                 _log.Info("TicTack Service started");

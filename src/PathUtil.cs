@@ -6,7 +6,9 @@ namespace TicTack
     {
         public static string EnsureExtended(string path)
         {
-            if (path != null && path.Length > 240 && !path.StartsWith(@"\\?\"))
+            if (!OperatingSystem.IsWindows())
+                return path;
+            if (path.Length > 240 && !path.StartsWith(@"\\?\"))
                 return @"\\?\" + path;
             return path;
         }

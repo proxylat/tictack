@@ -12,11 +12,11 @@ namespace TicTack
         private readonly int _holdDays;
         private readonly ILogger _log;
         private readonly object _lock = new object();
-        private DeferredState _state;
+        private DeferredState? _state;
 
-        public DeferredDeletion(string destination, int holdDays, ILogger log)
+        public DeferredDeletion(string dbPath, int holdDays, ILogger log)
         {
-            _dbPath = Path.Combine(destination, ".tictack-deferred.json");
+            _dbPath = dbPath;
             _holdDays = holdDays;
             _log = log;
             Load();
@@ -35,7 +35,7 @@ namespace TicTack
                 _state.LastWarningAt = DateTime.MinValue;
                 Save();
                 _log.Warn("Deferred deletion: " + files.Count + " files, hold for " + _holdDays + " days");
-                DesktopAlert.Write("WARN", "Deletion blocked: " + files.Count + " files (" + (totalSizeBytes / (1024L * 1024L)) + " MB) held for " + _holdDays + " days");
+                LogSample(files);
             }
         }
 
@@ -53,8 +53,7 @@ namespace TicTack
                     if ((DateTime.UtcNow - _state.LastWarningAt).TotalDays >= 1)
                     {
                         var remaining = _holdDays - (int)elapsed;
-                        _log.Warn("Deferred deletion: " + _state.PendingFiles.Count + " files pending, " + remaining + " day(s) remaining");
-                        DesktopAlert.Write("WARN", "Pending deletion: " + _state.PendingFiles.Count + " files will sync in " + remaining + " day(s)");
+                        _log.Warn("Deferred deletion: " + _state.PendingFiles.Count + " files pending, " + remaining + " day(s) remaining (full list: " + _dbPath + ")");
                         _state.LastWarningAt = DateTime.UtcNow;
                         Save();
                     }
@@ -78,12 +77,11 @@ namespace TicTack
                 if (filesStillDeleted.Count > 0)
                 {
                     _log.Warn("Deferred deletion: " + filesStillDeleted.Count + " files still deleted after hold, syncing");
-                    DesktopAlert.Write("WARN", "Deletion synced: " + filesStillDeleted.Count + " files after " + _holdDays + " day hold");
+                    LogSample(filesStillDeleted);
                 }
                 else
                 {
                     _log.Info("Deferred deletion: files reappeared, cancelling");
-                    DesktopAlert.Write("INFO", "Deletion cancelled: files reappeared during hold period");
                 }
 
                 _state = null;
@@ -95,6 +93,16 @@ namespace TicTack
         public bool HasPending
         {
             get { lock (_lock) { return _state != null && _state.PendingFiles != null && _state.PendingFiles.Count > 0; } }
+        }
+
+        private void LogSample(List<string> files)
+        {
+            var shown = files.Take(20).ToList();
+            var msg = string.Join(Environment.NewLine, shown.Select(f => "  " + f));
+            if (files.Count > shown.Count)
+                msg += Environment.NewLine + "  ... and " + (files.Count - shown.Count) + " more";
+            msg += Environment.NewLine + "Full list: " + _dbPath;
+            _log.Warn(msg);
         }
 
         private void Load()
@@ -127,7 +135,7 @@ namespace TicTack
         {
             public DateTime BlockedAt { get; set; }
             public DateTime LastWarningAt { get; set; }
-            public List<string> PendingFiles { get; set; }
+            public List<string>? PendingFiles { get; set; }
             public long TotalSizeBytes { get; set; }
         }
     }
@@ -135,7 +143,7 @@ namespace TicTack
     public class DeferredAction
     {
         public DeferredActionType Type { get; set; }
-        public List<string> Files { get; set; }
+        public List<string>? Files { get; set; }
         public long TotalSizeBytes { get; set; }
 
         public static DeferredAction None = new DeferredAction { Type = DeferredActionType.None };

@@ -9,7 +9,7 @@ namespace TicTack
         public static List<string> GetEligibleDrives(ResticDrivesConfig cfg, HashSet<string> excludeDrives, ILogger log)
         {
             var results = new List<string>();
-            var sysDrive = Path.GetPathRoot(Environment.SystemDirectory).TrimEnd('\\');
+            var sysDrive = (Path.GetPathRoot(Environment.SystemDirectory) ?? "").TrimEnd('\\');
             var exclude = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { sysDrive };
             if (cfg.ExcludeDrives != null)
                 foreach (var d in cfg.ExcludeDrives)

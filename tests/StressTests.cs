@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 
+#pragma warning disable CS0067
+
 namespace TicTack;
 
 public class MockEventMonitor : IFileMonitor
@@ -42,7 +44,7 @@ public class MockVersioning : IVersioningStrategy
 public class MockDeletion : IDeletionStrategy
 {
     public ConcurrentBag<string> Deleted { get; } = new();
-    public Task HandleDeletionAsync(string src, string dst, CancellationToken ct)
+    public Task HandleDeletionAsync(string? src, string dst, CancellationToken ct)
     {
         Deleted.Add(dst);
         return Task.CompletedTask;
