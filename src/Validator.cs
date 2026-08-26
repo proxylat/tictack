@@ -7,7 +7,7 @@ namespace TicTack
 {
     public static class ValidatorFactory
     {
-        public static IValidator Create(VerificationLevel level, IFileAccessor accessor = null)
+        public static IValidator Create(VerificationLevel level, IFileAccessor? accessor = null)
         {
             switch (level)
             {
@@ -35,8 +35,8 @@ namespace TicTack
 
     public class HashValidator : IValidator
     {
-        private readonly IFileAccessor _accessor;
-        public HashValidator(IFileAccessor accessor = null) { _accessor = accessor; }
+        private readonly IFileAccessor? _accessor;
+        public HashValidator(IFileAccessor? accessor = null) { _accessor = accessor; }
 
         public async Task<bool> ValidateAsync(string sourcePath, string destPath)
         {

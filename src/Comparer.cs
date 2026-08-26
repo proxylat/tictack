@@ -6,7 +6,7 @@ namespace TicTack
 {
     public static class ComparerFactory
     {
-        public static IFileComparer Create(VerificationLevel level, IFileAccessor accessor = null)
+        public static IFileComparer Create(VerificationLevel level, IFileAccessor? accessor = null)
         {
             switch (level)
             {
@@ -50,8 +50,8 @@ namespace TicTack
 
     public class HashComparer : IFileComparer
     {
-        private readonly IFileAccessor _accessor;
-        public HashComparer(IFileAccessor accessor = null) { _accessor = accessor; }
+        private readonly IFileAccessor? _accessor;
+        public HashComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
 
         public bool AreEqual(string sourcePath, string destPath)
         {
@@ -80,8 +80,8 @@ namespace TicTack
 
     public class FullComparer : IFileComparer
     {
-        private readonly IFileAccessor _accessor;
-        public FullComparer(IFileAccessor accessor = null) { _accessor = accessor; }
+        private readonly IFileAccessor? _accessor;
+        public FullComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
 
         public bool AreEqual(string sourcePath, string destPath)
         {

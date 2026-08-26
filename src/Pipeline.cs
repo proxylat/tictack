@@ -22,20 +22,20 @@ namespace TicTack
         private readonly IVersioningStrategy _versioning;
         private readonly IDeletionStrategy _deletion;
         private readonly ILogger _log;
-        private readonly IFileFilter _filter;
+        private readonly IFileFilter? _filter;
 
         private readonly ConcurrentQueue<FileChangedEventArgs> _queue = new ConcurrentQueue<FileChangedEventArgs>();
         private readonly ConcurrentDictionary<string, DateTime> _debounce = new ConcurrentDictionary<string, DateTime>();
         private readonly SemaphoreSlim _signal = new SemaphoreSlim(0);
-        private CancellationTokenSource _cts;
-        private Task _processor;
-        private Timer _startRetryTimer;
-        private Timer _deferredCheckTimer;
-        private SrcLock _lock;
-        private readonly StateDb _stateDb;
+        private CancellationTokenSource? _cts;
+        private Task? _processor;
+        private Timer? _startRetryTimer;
+        private Timer? _deferredCheckTimer;
+        private SrcLock? _lock;
+        private readonly StateDb? _stateDb;
         private readonly DeferredDeletion _deferred;
         private readonly List<PendingDeletion> _pendingDeletions = new List<PendingDeletion>();
-        private Timer _parityTimer;
+        private Timer? _parityTimer;
         private bool _disposed;
 
         public SyncPipeline(
@@ -50,8 +50,9 @@ namespace TicTack
             IVersioningStrategy versioning,
             IDeletionStrategy deletion,
             ILogger log,
-            StateDb stateDb = null,
-            string[] autoExcludePrefixes = null)
+            StateDb? stateDb = null,
+            string[]? autoExcludePrefixes = null,
+            string? deferredPath = null)
         {
             _config = config;
             _monitor = monitor;
@@ -67,7 +68,7 @@ namespace TicTack
             _stateDb = stateDb;
 
             var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : 7;
-            _deferred = new DeferredDeletion(_config.Destination, holdDays, _log);
+            _deferred = new DeferredDeletion(deferredPath ?? Path.Combine(_config.Destination, ".tictack-deferred.json"), holdDays, _log);
 
             var filters = new List<IFileFilter>();
             if (_config.Filter != null && _config.Filter.Exclude != null && _config.Filter.Exclude.Count > 0)
@@ -115,6 +116,7 @@ namespace TicTack
             var lockTimeout = _config.Sync != null && _config.Sync.LockHandling == "retry"
                 ? (TimeSpan?)TimeSpan.FromMinutes(_config.Sync.RetryLockMinutes > 0 ? _config.Sync.RetryLockMinutes : 10)
                 : null;
+            try { Directory.CreateDirectory(_config.Destination); } catch { }
             _lock = new SrcLock(Path.Combine(_config.Destination, ".tictack.lock"), _log, lockTimeout);
             _monitor.Changed += OnChanged;
             _monitor.Error += (s, e) => _log.Error("Monitor error", e.Exception);
@@ -128,7 +130,7 @@ namespace TicTack
 
         void RetryStart()
         {
-            if (_cts.IsCancellationRequested) return;
+            if (_cts!.IsCancellationRequested) return;
             if (!Directory.Exists(_config.Path)) return;
             if (!IsDriveReady(_config.Destination))
             {
@@ -143,7 +145,7 @@ namespace TicTack
             DoStart();
         }
 
-        private void OnChanged(object sender, FileChangedEventArgs e)
+        private void OnChanged(object? sender, FileChangedEventArgs e)
         {
             _debounce[e.FullPath] = DateTime.UtcNow.AddSeconds(_config.DebounceSeconds);
             _queue.Enqueue(e);
@@ -152,10 +154,10 @@ namespace TicTack
 
         private async Task ProcessLoop()
         {
-            var token = _cts.Token;
+            var token = _cts!.Token;
             while (!token.IsCancellationRequested)
             {
-                FileChangedEventArgs e;
+                FileChangedEventArgs? e;
                 if (_queue.TryDequeue(out e))
                 {
                     DateTime until;
@@ -173,6 +175,7 @@ namespace TicTack
                 else
                 {
                     SweepDebounced();
+                    await FlushPendingDeletions(token);
                     await WaitForSignal(token);
                 }
             }
@@ -209,7 +212,7 @@ namespace TicTack
             {
                 foreach (var f in Directory.EnumerateFiles(_config.Path, "*", SearchOption.AllDirectories))
                 {
-                    if (_cts.IsCancellationRequested) return;
+                    if (_cts!.IsCancellationRequested) return;
                     if (_filter != null && !_filter.ShouldProcess(f)) continue;
                     var rel = f.Substring(_config.Path.Length).TrimStart('\\', '/');
                     sourcePaths.Add(rel);
@@ -235,14 +238,14 @@ namespace TicTack
                     try
                     {
                         if (_versioning != null)
-                            _versioning.ArchivePreviousVersionAsync(dst, _cts.Token).GetAwaiter().GetResult();
+                            _versioning.ArchivePreviousVersionAsync(dst, _cts!.Token).GetAwaiter().GetResult();
                     }
                     catch { }
 
                     ActionResult result;
                     try
                     {
-                        result = _copyAction.ExecuteAsync(args, _cts.Token).GetAwaiter().GetResult();
+                        result = _copyAction.ExecuteAsync(args, _cts!.Token).GetAwaiter().GetResult();
                     }
                     catch (OperationCanceledException) { return; }
                     catch (Exception ex)
@@ -253,7 +256,6 @@ namespace TicTack
                     if (!result.Success)
                     {
                         _log.Error("Initial sync failed: " + f + ": " + result.ErrorMessage);
-                        DesktopAlert.Write("ERROR", "Initial sync failed: " + f + "\n" + result.ErrorMessage);
                         continue;
                     }
 
@@ -263,7 +265,6 @@ namespace TicTack
                         if (!valid)
                         {
                             _log.Error("Initial sync validation FAILED: " + f + " -> " + dst);
-                            DesktopAlert.Write("ERROR", "Initial sync validation FAILED: " + f + "\n-> " + dst);
                             continue;
                         }
                     }
@@ -309,16 +310,13 @@ namespace TicTack
                             _log.Warn("Source folder missing, deletion blocked: " + e.FullPath);
                             break;
                         }
-                        await _deletion.HandleDeletionAsync(e.FullPath, args.DestPath, ct);
+                        var delRel = e.FullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
+                        long size = 0;
                         if (_stateDb != null)
                         {
-                            try
-                            {
-                                var rel = e.FullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
-                                _stateDb.Delete(rel);
-                            }
-                            catch (Exception ex) { _log.Debug("StateDb delete failed: " + ex.Message); }
+                            try { size = _stateDb.GetSize(delRel) ?? 0; } catch { }
                         }
+                        _pendingDeletions.Add(new PendingDeletion { Path = e.FullPath, DestPath = args.DestPath, SizeBytes = size });
                         break;
 
                     case ChangeType.Renamed:
@@ -327,7 +325,7 @@ namespace TicTack
                             await _retry.ExecuteAsync(() => _renameAction.ExecuteAsync(args, ct), ct);
                         if (_stateDb != null)
                         {
-                            var oldRel = e.OldFullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
+                            var oldRel = e.OldFullPath!.Substring(_config.Path.Length).TrimStart('\\', '/');
                             var newRel = e.FullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
                             if (Directory.Exists(e.FullPath))
                             {
@@ -337,8 +335,16 @@ namespace TicTack
                             else
                             {
                                 _stateDb.Delete(oldRel);
-                                var fi = new FileInfo(e.FullPath);
-                                _stateDb.Upsert(newRel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+                                try
+                                {
+                                    if (File.Exists(e.FullPath))
+                                    {
+                                        var fi = new FileInfo(e.FullPath);
+                                        _stateDb.Upsert(newRel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+                                    }
+                                }
+                                catch (FileNotFoundException) { }
+                                catch (DirectoryNotFoundException) { }
                             }
                         }
                         _log.Debug("Renamed: " + e.OldFullPath + " -> " + e.FullPath);
@@ -366,7 +372,6 @@ namespace TicTack
                         if (!result.Success)
                         {
                             _log.Error("Copy failed: " + e.FullPath + ": " + result.ErrorMessage);
-                            DesktopAlert.Write("ERROR", "Copy failed: " + e.FullPath + "\n" + result.ErrorMessage);
                             return;
                         }
 
@@ -376,7 +381,6 @@ namespace TicTack
                             if (!valid)
                             {
                                 _log.Error("Validation FAILED: " + e.FullPath + " -> " + args.DestPath);
-                                DesktopAlert.Write("ERROR", "Validation FAILED: " + e.FullPath + "\n-> " + args.DestPath);
                                 return;
                             }
                         }
@@ -411,8 +415,8 @@ namespace TicTack
         public void Dispose()
         {
             if (_disposed) return;
-            _disposed = true;
             Stop();
+            _disposed = true;
             if (_startRetryTimer != null) _startRetryTimer.Dispose();
             if (_deferredCheckTimer != null) _deferredCheckTimer.Dispose();
             if (_parityTimer != null) _parityTimer.Dispose();
@@ -441,7 +445,7 @@ namespace TicTack
                 catch { _log.Debug("StateDb count failed"); }
             }
             bool blocked = false;
-            string reason = null;
+            string? reason = null;
 
             if (_config.Sync != null && _config.Sync.DeleteThresholdCount > 0 && totalCount >= _config.Sync.DeleteThresholdCount)
             {
@@ -502,7 +506,7 @@ namespace TicTack
                 {
                     foreach (var f in Directory.EnumerateFiles(_config.Path, "*", SearchOption.AllDirectories))
                     {
-                        if (_cts.IsCancellationRequested) return;
+                        if (_cts!.IsCancellationRequested) return;
                         if (_filter != null && !_filter.ShouldProcess(f)) continue;
                         var rel = f.Substring(_config.Path.Length).TrimStart('\\', '/');
                         sourcePaths.Add(rel);
@@ -511,6 +515,12 @@ namespace TicTack
                 catch (UnauthorizedAccessException) { _log.Warn("Access denied scanning " + _config.Path); }
             }
             EnforceParity(sourcePaths);
+        }
+
+        static bool UnderDir(string path, string prefix)
+        {
+            return path.StartsWith(prefix + '/', StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith(prefix + '\\', StringComparison.OrdinalIgnoreCase);
         }
 
         void EnforceParity(HashSet<string> sourcePaths)
@@ -522,10 +532,11 @@ namespace TicTack
             {
                 foreach (var f in Directory.EnumerateFiles(_config.Destination, "*", SearchOption.AllDirectories))
                 {
-                    if (_cts.IsCancellationRequested) return;
+                    if (_cts!.IsCancellationRequested) return;
                     var name = Path.GetFileName(f);
                     if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
                     var rel = f.Substring(_config.Destination.Length).TrimStart('\\', '/');
+                    if (UnderDir(rel, ".archive") || UnderDir(rel, ".versions")) continue;
                     if (sourcePaths.Contains(rel)) continue;
                     staleFiles.Add((f, rel));
                 }
@@ -549,12 +560,13 @@ namespace TicTack
             foreach (var dir in Directory.EnumerateDirectories(_config.Destination, "*", SearchOption.AllDirectories)
                 .OrderByDescending(d => d.Length))
             {
-                if (_cts.IsCancellationRequested) return;
+                if (_cts!.IsCancellationRequested) return;
                 var rel = dir.Substring(_config.Destination.Length).TrimStart('\\', '/');
-                if (rel == ".archive" || rel.StartsWith(".archive\\", StringComparison.OrdinalIgnoreCase)) continue;
-                if (rel == ".versions" || rel.StartsWith(".versions\\", StringComparison.OrdinalIgnoreCase)) continue;
+                if (rel == ".archive" || UnderDir(rel, ".archive")) continue;
+                if (rel == ".versions" || UnderDir(rel, ".versions")) continue;
                 if (rel == ".tictack.lock") continue;
-                if (sourcePaths.Any(f => f.StartsWith(rel + "\\", StringComparison.OrdinalIgnoreCase))) continue;
+                if (sourcePaths.Any(f => UnderDir(f, rel))) continue;
+                _log.Info("Cleanup: removing stale dir " + dir);
                 _deletion.HandleDeletionAsync(null, dir, CancellationToken.None).GetAwaiter().GetResult();
                 if (_stateDb != null)
                 {
@@ -571,10 +583,10 @@ namespace TicTack
             var action = _deferred.Check();
             if (action.Type == DeferredActionType.Proceed)
             {
-                _log.Warn("Deferred deletion: proceeding with " + action.Files.Count + " files");
+                _log.Warn("Deferred deletion: proceeding with " + (action.Files?.Count ?? 0) + " files");
                 Task.Run(async () =>
                 {
-                    foreach (var f in action.Files)
+                    foreach (var f in action.Files!)
                     {
                         var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Deleted, f), _config.Path, _config.Destination);
                         await _deletion.HandleDeletionAsync(f, args.DestPath, CancellationToken.None);
@@ -598,8 +610,8 @@ namespace TicTack
 
         private class PendingDeletion
         {
-            public string Path { get; set; }
-            public string DestPath { get; set; }
+            public string Path { get; set; } = string.Empty;
+            public string DestPath { get; set; } = string.Empty;
             public long SizeBytes { get; set; }
         }
     }

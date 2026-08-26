@@ -3,6 +3,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
     <AssemblyName>TicTackSv</AssemblyName>
     <RootNamespace>TicTack</RootNamespace>
     <NoWarn>$(NoWarn);NU1903</NoWarn>
@@ -14,9 +15,8 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
-    <!-- ponytail: winsqlite3 (Windows built-in) on net10.0, no bundle needed -->
   </ItemGroup>
-  <!-- ponytail: .NET 10 SDK treats these as "type: platform" in deps.json but
+  <!-- .NET 10 SDK treats these as "type: platform" in deps.json but
        doesn't ship them in the shared framework. Force copy from NuGet cache. -->
   <Target Name="CopyWindowsRuntimePackages" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <Copy SourceFiles="$(NuGetPackageRoot)system.serviceprocess.servicecontroller\10.0.9\runtimes\win\lib\net10.0\System.ServiceProcess.ServiceController.dll"

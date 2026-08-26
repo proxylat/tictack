@@ -1,3 +1,5 @@
+dotnet test tests/TicTack.Tests.csproj # dont remove this line
+
 # TicTack — Real-Time File Sync + Restic Drive Backup
 
 One-way file synchronisation service for Windows (.NET 10). Monitors source directories, copies changes to a destination, with optional versioning, deletion handling, validation, and crash recovery. Also includes an on-demand mode to auto-discover external drives and run Restic backups.
@@ -6,10 +8,10 @@ One-way file synchronisation service for Windows (.NET 10). Monitors source dire
 
 ## Quick Start
 
-1. Run `service/install-service.bat` as Administrator — compiles, registers, and starts `TicTackSv` service.
-2. Edit `service/config.yaml` to point to your source and destination paths.
+1. Run `service\win\install-service.bat` as Administrator — compiles, registers, and starts `TicTackSv` service.
+2. Edit `service\win\config.yaml` to point to your source and destination paths.
 3. `sc stop TicTackSv` / `sc start TicTackSv` to restart after config changes.
-4. Or run manually: `service\TicTackSv.exe --cli` (interactive) or `service\TicTackSv.exe --once` (single pass).
+4. Or run manually: `service\win\TicTackSv.exe --cli` (interactive) or `service\win\TicTackSv.exe --once` (single pass).
 
 ---
 
@@ -86,7 +88,7 @@ sources:
 | `sync.rename_detection` | `true` | Track renames (vs delete+re-create, saves bandwidth) |
 | `sync.versioning.max_versions` | `10` | Keep up to N old versions per file |
 | `sync.versioning.path` | — | Where archived versions go (timestamp suffix) |
-| `sync.deletion.mode` | `ignore` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive / `ignore` = leave dest alone |
+| `sync.deletion.mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |
 | `sync.deletion.path` | — | Target dir in `archive` mode |
 
 ### monitor
@@ -208,7 +210,7 @@ ReadDirectoryChangesW + PollingMonitor (composite mode)
    IValidator (size | hash) — post-copy integrity check
         │
         ▼
-   IDeletionStrategy — handle source deletions (mirror | archive | ignore)
+   IDeletionStrategy — handle source deletions (mirror | archive)
 ```
 
 ### Crash Recovery (PowerGuard)
@@ -228,12 +230,37 @@ FileAccessor uses `CreateFile` P/Invoke with `FILE_FLAG_BACKUP_SEMANTICS` + `Fil
 Requires: .NET 10 SDK.
 
 ```
-service\build.bat
+service\win\install-service.bat
 ```
 
-Output: `service\TicTackSv.exe` + DLLs
+Output: `service\win\TicTackSv.exe` + DLLs (framework-dependent publish)
+
+Tests:
+```
+dotnet test tests\TicTack.Tests.csproj
+```
 
 Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.9** (via NuGet; `dotnet restore` fetches automatically).
+
+---
+
+## Linux
+
+TicTack runs natively on Linux with the same sync engine: `FileSystemWatcher`-based monitoring (`FsWatchMonitor`), `/bin/sh -c` for jobs and commands, and standard file I/O.
+
+Build + install as a systemd service:
+```
+cd service/linux
+cp config_linux.yaml.example config.yaml   # edit paths, e.g. /home/user/Desktop -> /mnt/backup/Sync/Desktop
+./install-service.sh                 # publish + systemctl enable --now tictack
+```
+
+Uninstall: `./uninstall-service.sh` (keeps config.yaml).
+
+Notes:
+- Config paths use Linux separators (`/home/user/Pictures`); `[VolumeLabel]` syntax is Windows-only.
+- The unit sends SIGINT on stop for a graceful shutdown.
+- Requires the .NET 10 runtime on the host (`dotnet --version`).
 
 ---
 
@@ -243,15 +270,18 @@ Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.9** (via NuGet
 TicTack/
 ├── src/                  # C# source (24 files)
 ├── tests/                # Unit tests + MinimalService
-├── service/              # Service runtime + scripts
-│   ├── build.bat         # Compile → service/
-│   ├── install-service.bat
-│   ├── start-service.bat
-│   ├── stop-service.bat
-│   ├── uninstall-service.bat
-│   ├── restore-packages.ps1
-│   ├── setup.iss         # Inno Setup installer
-│   └── config.yaml       # Runtime config (copied to install dir)
+├── service/
+│   ├── win/              # Windows scripts + config example
+│   │   ├── config_win.yaml.example
+│   │   ├── install-service.bat
+│   │   ├── uninstall-service.bat
+│   │   ├── start-service.bat / stop-service.bat
+│   │   └── setup.iss     # Inno Setup installer
+│   └── linux/            # Linux scripts + systemd unit
+│       ├── config_linux.yaml.example
+│       ├── install-service.sh
+│       ├── uninstall-service.sh
+│       └── tictack.service
 ├── AGENTS.md
 └── README.md
 ```
@@ -262,9 +292,9 @@ TicTack/
 
 | Script | Action | Admin req. |
 |---|---|---|
-| `service\install-service.bat` | Build + register + start | Yes |
-| `service\start-service.bat` | Start | No |
-| `service\stop-service.bat` | Stop | No |
-| `service\uninstall-service.bat` | Stop + delete | Yes |
+| `service\win\install-service.bat` | Build + register + start | Yes |
+| `service\win\start-service.bat` | Start | No |
+| `service\win\stop-service.bat` | Stop | No |
+| `service\win\uninstall-service.bat` | Stop + delete | Yes |
 
 Service name: `TicTackSv` — runs as `LocalSystem`, auto-start.

@@ -87,7 +87,7 @@ public class StateDbTests : IDisposable
     }
 
     [Fact]
-    public void ConcurrentAccess_DoesNotCorrupt()
+    public async Task ConcurrentAccess_DoesNotCorrupt()
     {
         var tasks = new Task[10];
         for (int i = 0; i < tasks.Length; i++)
@@ -98,7 +98,7 @@ public class StateDbTests : IDisposable
                 _db.Upsert("file" + idx + ".txt", idx, idx);
             });
         }
-        Task.WaitAll(tasks);
+        await Task.WhenAll(tasks);
 
         var all = _db.LoadAll();
         Assert.Equal(10, all.Count);

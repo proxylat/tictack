@@ -13,10 +13,10 @@ namespace TicTack
 
     public class TimerScheduler : IScheduler
     {
-        private Timer _timer;
+        private Timer? _timer;
         private readonly List<JobEntry> _jobs;
         private readonly ILogger _log;
-        private readonly string _sourcePaths;
+        private readonly string? _sourcePaths;
 
         public TimerScheduler(TicTackConfig config, ILogger log)
         {
@@ -51,7 +51,7 @@ namespace TicTack
             _timer = new Timer(RunDueJobs, null, 0, 30000);
         }
 
-        private void RunDueJobs(object state)
+        private void RunDueJobs(object? state)
         {
             var now = DateTime.Now;
             var today = now.Date;
@@ -69,7 +69,7 @@ namespace TicTack
         {
             try
             {
-                var cmd = job.Config.Command;
+                var cmd = job.Config.Command!;
                 if (_sourcePaths != null)
                     cmd = cmd.Replace("{source}", _sourcePaths);
 
@@ -77,19 +77,29 @@ namespace TicTack
 
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "cmd.exe",
-                    Arguments = "/c " + cmd,
                     WorkingDirectory = wd,
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
                 };
+                if (OperatingSystem.IsWindows())
+                {
+                    psi.FileName = "cmd.exe";
+                    psi.Arguments = "/c " + cmd;
+                }
+                else
+                {
+                    psi.FileName = "/bin/sh";
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add(cmd);
+                }
 
                 _log.Info("Running job '" + job.Config.Name + "': " + cmd);
 
                 using (var p = Process.Start(psi))
                 {
+                    if (p == null) return;
                     if (!p.WaitForExit(600000))
                     {
                         try { p.Kill(); } catch { }
@@ -128,7 +138,7 @@ namespace TicTack
 
         private class JobEntry
         {
-            public JobConfig Config { get; set; }
+            public JobConfig Config { get; set; } = null!;
             public TimeSpan TimeOfDay { get; set; }
             public DateTime LastRunOn { get; set; }
         }

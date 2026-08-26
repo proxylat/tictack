@@ -1,0 +1,14 @@
+[Unit]
+Description=TicTack File Sync
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tictack
+ExecStart=/opt/tictack/TicTackSv --cli
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

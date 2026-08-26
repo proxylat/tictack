@@ -15,8 +15,8 @@ public class PipelineTests : IDisposable
     private readonly FakeValidator _validator = new();
     private readonly FakeDeletion _deletion = new();
     private readonly MockLogger _log = new();
-    private readonly StateDb _db;
-    private SyncPipeline _pipeline;
+    private StateDb _db = null!;
+    private SyncPipeline _pipeline = null!;
     private int _syncsSeen;
 
     public PipelineTests()
@@ -26,7 +26,6 @@ public class PipelineTests : IDisposable
         _dstDir = Path.Combine(_root, "dst");
         Directory.CreateDirectory(_srcDir);
         Directory.CreateDirectory(_dstDir);
-        _db = new StateDb(Path.Combine(_root, "state.db"));
         StartPipeline(null);
     }
 
@@ -34,6 +33,7 @@ public class PipelineTests : IDisposable
     {
         var cfg = new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 };
         tweak?.Invoke(cfg);
+        _db = new StateDb(Path.Combine(_root, "state.db"));
         _pipeline = new SyncPipeline(cfg, _monitor, _comparer, _copy, _delete, _rename,
             new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(),
             _deletion, _log, _db);
@@ -142,6 +142,41 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void Renamed_WhenTargetDisappears_SkipsStateMetadataWithoutError()
+    {
+        var oldSrc = Path.Combine(_srcDir, "old.txt");
+        var newSrc = Path.Combine(_srcDir, "new.txt");
+        _db.Upsert("old.txt", 1, 1);
+
+        _monitor.Fire(ChangeType.Renamed, newSrc, oldSrc);
+
+        WaitFor(() => _log.Messages.Any(m => m.Contains("Renamed: " + oldSrc)), "rename processing");
+
+        Assert.DoesNotContain(_log.Messages, m => m.StartsWith("ERR:Processing"));
+        Assert.False(_db.LoadAll().ContainsKey("old.txt"));
+        Assert.False(_db.LoadAll().ContainsKey("new.txt"));
+    }
+
+    [Fact]
+    public void StartupParity_KeepsNestedMirror_WhenSourceMatches()
+    {
+        _pipeline.Dispose();
+
+        Directory.CreateDirectory(Path.Combine(_srcDir, "Documents"));
+        Directory.CreateDirectory(Path.Combine(_dstDir, "Documents"));
+        Directory.CreateDirectory(Path.Combine(_dstDir, ".archive", "old"));
+        File.WriteAllText(Path.Combine(_srcDir, "Documents", "readme.txt"), "hello");
+        File.WriteAllText(Path.Combine(_dstDir, "Documents", "readme.txt"), "hello");
+        File.WriteAllText(Path.Combine(_dstDir, ".archive", "old", "x.txt"), "x");
+
+        StartPipeline(null);
+
+        Assert.True(File.Exists(Path.Combine(_dstDir, "Documents", "readme.txt")));
+        Assert.DoesNotContain(_deletion.Calls, c => c.dst.Contains("Documents") && c.dst.EndsWith("Documents"));
+        Assert.DoesNotContain(_deletion.Calls, c => c.dst.Contains(".archive"));
+    }
+
+    [Fact]
     public void Created_ExcludedPattern_IsNotCopied()
     {
         _pipeline.Dispose();
@@ -197,9 +232,9 @@ public class PipelineTests : IDisposable
     private sealed class FakeDeletion : IDeletionStrategy
     {
         public ConcurrentBag<(string src, string dst)> Calls { get; } = new();
-        public Task HandleDeletionAsync(string sourcePath, string destPath, CancellationToken ct)
+        public Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
         {
-            Calls.Add((sourcePath, destPath));
+            Calls.Add((sourcePath!, destPath));
             return Task.CompletedTask;
         }
     }

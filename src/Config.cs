@@ -38,6 +38,10 @@ namespace TicTack
 
         public SourceConfig()
         {
+            Path = string.Empty;
+            Paths = new List<string>();
+            Destination = string.Empty;
+            StateDbPath = string.Empty;
             DebounceSeconds = 10;
             Filter = new FilterConfig();
             Sync = new SyncConfig();
@@ -46,8 +50,8 @@ namespace TicTack
 
     public class FilterConfig
     {
-        public object MaxFileSizeMb { get; set; }
-        public List<string> Exclude { get; set; }
+        public object? MaxFileSizeMb { get; set; }
+        public List<string> Exclude { get; set; } = new List<string>();
 
         public FilterConfig()
         {
@@ -57,17 +61,17 @@ namespace TicTack
 
     public class SyncConfig
     {
-        public string Verification { get; set; }
+        public string? Verification { get; set; }
         public RetryConfig Retry { get; set; }
-        public string LockHandling { get; set; }
+        public string? LockHandling { get; set; }
         public int RetryLockMinutes { get; set; }
         public int DeleteThresholdCount { get; set; }
         public long? DeleteThresholdSizeGb { get; set; }
         public double DeleteThresholdPercent { get; set; }
         public int DeleteHoldDays { get; set; }
         public bool RenameDetection { get; set; }
-        public VersioningConfig Versioning { get; set; }
-        public DeletionConfig Deletion { get; set; }
+        public VersioningConfig? Versioning { get; set; }
+        public DeletionConfig? Deletion { get; set; }
 
         public SyncConfig()
         {
@@ -100,7 +104,7 @@ namespace TicTack
     public class VersioningConfig
     {
         public int MaxVersions { get; set; }
-        public string Path { get; set; }
+        public string? Path { get; set; }
 
         public VersioningConfig()
         {
@@ -110,8 +114,8 @@ namespace TicTack
 
     public class DeletionConfig
     {
-        public string Mode { get; set; }
-        public string Path { get; set; }
+        public string? Mode { get; set; }
+        public string? Path { get; set; }
 
         public DeletionConfig()
         {
@@ -137,9 +141,9 @@ namespace TicTack
 
     public class LoggingConfig
     {
-        public string Level { get; set; }
-        public string Path { get; set; }
-        public string AlertPath { get; set; }
+        public string? Level { get; set; }
+        public string? Path { get; set; }
+        public string? AlertPath { get; set; }
         public int MaxSizeMb { get; set; }
         public int MaxFiles { get; set; }
         public bool Console { get; set; }
@@ -155,10 +159,10 @@ namespace TicTack
 
     public class JobConfig
     {
-        public string Name { get; set; }
-        public string Time { get; set; }
-        public string Command { get; set; }
-        public string WorkingDir { get; set; }
+        public string? Name { get; set; }
+        public string? Time { get; set; }
+        public string? Command { get; set; }
+        public string? WorkingDir { get; set; }
     }
 
     public class WatchdogConfig
@@ -175,11 +179,11 @@ namespace TicTack
 
     public class ResticDrivesConfig
     {
-        public string Command { get; set; }
-        public string WorkingDir { get; set; }
+        public string? Command { get; set; }
+        public string? WorkingDir { get; set; }
         public List<string> ExcludeDrives { get; set; }
         public bool RequireMarkerFile { get; set; }
-        public string MarkerFileName { get; set; }
+        public string? MarkerFileName { get; set; }
 
         public ResticDrivesConfig()
         {
@@ -192,7 +196,7 @@ namespace TicTack
 
     public static class Config
     {
-        public static TicTackConfig Load(string path)
+        public static TicTackConfig? Load(string path)
         {
             if (!File.Exists(path)) return null;
 
@@ -233,12 +237,12 @@ namespace TicTack
             return valid;
         }
 
-        public static long? ParseFileSizeLimit(object val)
+        public static long? ParseFileSizeLimit(object? val)
         {
             if (val == null) return null;
             if (val is int) return (long)(int)val;
             if (val is long) return (long)val;
-            string s = val as string;
+            string? s = val as string;
             if (s != null)
             {
                 if (s == "no-limit" || s == "none") return null;
@@ -273,11 +277,11 @@ namespace TicTack
                         expanded.Add(new SourceConfig
                         {
                             Path = pExp,
-                            Destination = Path.Combine(src.Destination, folder),
+                            Destination = Path.Combine(src.Destination ?? "", folder),
                             DebounceSeconds = src.DebounceSeconds,
                             Filter = src.Filter,
-                            Sync = src.Sync,
-                            StateDbPath = src.StateDbPath
+                            Sync = src.Sync!,
+                            StateDbPath = src.StateDbPath!
                         });
                     }
                 }
@@ -299,7 +303,7 @@ namespace TicTack
             return Environment.ExpandEnvironmentVariables(s);
         }
 
-        public static VerificationLevel ParseVerification(string value)
+        public static VerificationLevel ParseVerification(string? value)
         {
             switch (value != null ? value.ToLowerInvariant().Replace("_", "").Replace("-", "") : null)
             {

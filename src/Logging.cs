@@ -16,7 +16,7 @@ namespace TicTack
         public void Debug(string msg) { if (_minLevel <= LogLevel.Debug) Write("DBG", msg, ConsoleColor.Gray); }
         public void Info(string msg) { if (_minLevel <= LogLevel.Info) Write("INF", msg, ConsoleColor.White); }
         public void Warn(string msg) { if (_minLevel <= LogLevel.Warn) Write("WRN", msg, ConsoleColor.Yellow); }
-        public void Error(string msg, Exception ex = null)
+        public void Error(string msg, Exception? ex = null)
         {
             if (_minLevel <= LogLevel.Error)
             {
@@ -49,14 +49,18 @@ namespace TicTack
             _maxSizeBytes = maxSizeMb * 1024 * 1024;
             _maxFiles = Math.Max(1, maxFiles);
             var dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
+            try
+            {
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+            }
+            catch { }
         }
 
         public void Debug(string msg) { if (_minLevel <= LogLevel.Debug) Write("DBG", msg); }
         public void Info(string msg) { if (_minLevel <= LogLevel.Info) Write("INF", msg); }
         public void Warn(string msg) { if (_minLevel <= LogLevel.Warn) Write("WRN", msg); }
-        public void Error(string msg, Exception ex = null)
+        public void Error(string msg, Exception? ex = null)
         {
             if (_minLevel <= LogLevel.Error)
             {
@@ -101,7 +105,7 @@ namespace TicTack
     public class DesktopAlertLogger : ILogger
     {
         private readonly LogLevel _minLevel;
-        public DesktopAlertLogger(LogLevel minLevel = LogLevel.Warn, string alertPath = null)
+        public DesktopAlertLogger(LogLevel minLevel = LogLevel.Warn, string? alertPath = null)
         {
             _minLevel = minLevel;
             if (!string.IsNullOrEmpty(alertPath))
@@ -110,7 +114,7 @@ namespace TicTack
         public void Debug(string msg) { }
         public void Info(string msg) { }
         public void Warn(string msg) { if (_minLevel <= LogLevel.Warn) DesktopAlert.Write("WARN", msg); }
-        public void Error(string msg, Exception ex = null) { if (_minLevel <= LogLevel.Error) DesktopAlert.Write("ERROR", msg, ex); }
+        public void Error(string msg, Exception? ex = null) { if (_minLevel <= LogLevel.Error) DesktopAlert.Write("ERROR", msg, ex); }
     }
 
     public class EventLogLogger : ILogger
@@ -120,7 +124,7 @@ namespace TicTack
         public void Debug(string msg) { }
         public void Info(string msg) { }
         public void Warn(string msg) { }
-        public void Error(string msg, Exception ex = null)
+        public void Error(string msg, Exception? ex = null)
         {
             if (_minLevel > LogLevel.Error) return;
             try { EventLog.WriteEntry("TicTackSv", msg + (ex != null ? "\n" + ex : ""), EventLogEntryType.Error); }
@@ -131,7 +135,7 @@ namespace TicTack
     public class MultiLogger : ILogger
     {
         private readonly ILogger[] _loggers;
-        public MultiLogger(IEnumerable<ILogger> loggers)
+        public MultiLogger(IEnumerable<ILogger>? loggers)
         {
             _loggers = loggers != null ? loggers.ToArray() : new ILogger[0];
         }
@@ -139,12 +143,12 @@ namespace TicTack
         public void Debug(string msg) { foreach (var l in _loggers) l.Debug(msg); }
         public void Info(string msg) { foreach (var l in _loggers) l.Info(msg); }
         public void Warn(string msg) { foreach (var l in _loggers) l.Warn(msg); }
-        public void Error(string msg, Exception ex = null) { foreach (var l in _loggers) l.Error(msg, ex); }
+        public void Error(string msg, Exception? ex = null) { foreach (var l in _loggers) l.Error(msg, ex); }
     }
 
     public static class LogLevelParser
     {
-        public static LogLevel Parse(string level, LogLevel defaultLevel = LogLevel.Info)
+        public static LogLevel Parse(string? level, LogLevel defaultLevel = LogLevel.Info)
         {
             switch (level != null ? level.ToLowerInvariant() : null)
             {

@@ -9,8 +9,8 @@ public class VersioningTests : IDisposable
     public VersioningTests()
     {
         _baseDir = Path.Combine(Path.GetTempPath(), "TicTackTest_ver_" + Guid.NewGuid());
-        _dstDir = Path.Combine(_baseDir, "dst");
-        _verDir = Path.Combine(_baseDir, "versions");
+        _dstDir = Path.Combine(_baseDir, "sync", "Desktop");
+        _verDir = Path.Combine(_baseDir, "sync", ".versions");
         Directory.CreateDirectory(_dstDir);
         Directory.CreateDirectory(_verDir);
     }
@@ -38,7 +38,7 @@ public class VersioningTests : IDisposable
         await versioning.ArchivePreviousVersionAsync(Dst("a.txt"), CancellationToken.None);
 
         Assert.True(File.Exists(Dst("a.txt")));
-        var files = Directory.GetFiles(_verDir, "a_*");
+        var files = Directory.GetFiles(Path.Combine(_verDir, "Desktop"), "a_*");
         Assert.NotEmpty(files);
     }
 
@@ -47,7 +47,8 @@ public class VersioningTests : IDisposable
     {
         var versioning = new TimestampVersioning(_verDir, _dstDir, 10);
         await versioning.ArchivePreviousVersionAsync(Dst("missing.txt"), CancellationToken.None);
-        Assert.Empty(Directory.GetFiles(_verDir, "missing_*"));
+        var dir = Path.Combine(_verDir, "Desktop");
+        Assert.Empty(Directory.Exists(dir) ? Directory.GetFiles(dir, "missing_*") : Array.Empty<string>());
     }
 
     [Fact]
@@ -60,7 +61,7 @@ public class VersioningTests : IDisposable
             await versioning.ArchivePreviousVersionAsync(Dst("a.txt"), CancellationToken.None);
         }
 
-        var versions = Directory.GetFiles(_verDir, "a_*");
+        var versions = Directory.GetFiles(Path.Combine(_verDir, "Desktop"), "a_*");
         Assert.True(versions.Length <= 6);
     }
 
@@ -74,7 +75,7 @@ public class VersioningTests : IDisposable
         await versioning.ArchivePreviousVersionAsync(Dst("a.txt"), CancellationToken.None);
         await versioning.ArchivePreviousVersionAsync(Dst("b.txt"), CancellationToken.None);
 
-        Assert.Equal(2, Directory.GetFiles(_verDir).Length);
+        Assert.Equal(2, Directory.GetFiles(Path.Combine(_verDir, "Desktop")).Length);
     }
 
     [Fact]

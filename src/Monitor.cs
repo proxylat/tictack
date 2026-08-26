@@ -41,15 +41,15 @@ namespace TicTack
         private const int ActionRenamedNew = 5;
 
         private IntPtr _dirHandle;
-        private Thread _worker;
+        private Thread? _worker;
         private volatile bool _stopping;
-        private string _pendingRename;
+        private string? _pendingRename;
         private readonly string _path;
         private readonly int _bufferSize;
         private readonly int _restartDelaySec;
 
-        public event EventHandler<FileChangedEventArgs> Changed;
-        public event EventHandler<MonitorErrorEventArgs> Error;
+        public event EventHandler<FileChangedEventArgs>? Changed;
+        public event EventHandler<MonitorErrorEventArgs>? Error;
 
         public FileWatcherMonitor(string path, int bufferKb = 256, int restartDelaySec = 10)
         {
@@ -156,7 +156,7 @@ namespace TicTack
             }
         }
 
-        private void FireChanged(ChangeType type, string path, string oldPath = null)
+        private void FireChanged(ChangeType type, string path, string? oldPath = null)
         {
             var h = Changed;
             if (h != null)
@@ -207,18 +207,18 @@ namespace TicTack
     {
         private readonly string _path;
         private readonly int _intervalSec;
-        private Timer _timer;
-        private Dictionary<string, FileSnapshot> _snapshot;
+        private Timer? _timer;
+        private Dictionary<string, FileSnapshot>? _snapshot;
         private string _prefix;
 
-        public event EventHandler<FileChangedEventArgs> Changed;
-        public event EventHandler<MonitorErrorEventArgs> Error;
+        public event EventHandler<FileChangedEventArgs>? Changed;
+        public event EventHandler<MonitorErrorEventArgs>? Error;
 
         public PollingMonitor(string path, int intervalSec = 300)
         {
             _path = path;
             _intervalSec = Math.Max(10, intervalSec);
-            _prefix = _path.EndsWith("\\") ? _path : _path + "\\";
+            _prefix = _path.EndsWith(Path.DirectorySeparatorChar) ? _path : _path + Path.DirectorySeparatorChar;
         }
 
         public void Start()
@@ -273,7 +273,7 @@ namespace TicTack
         {
             var result = new Dictionary<string, FileSnapshot>();
             if (!Directory.Exists(_path)) return result;
-            var prefix = _path.EndsWith("\\") ? _path : _path + "\\";
+            var prefix = _path.EndsWith(Path.DirectorySeparatorChar) ? _path : _path + Path.DirectorySeparatorChar;
             foreach (var f in Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories))
             {
                 try
@@ -318,8 +318,8 @@ namespace TicTack
             _monitors = monitors ?? Array.Empty<IFileMonitor>();
         }
 
-        public event EventHandler<FileChangedEventArgs> Changed;
-        public event EventHandler<MonitorErrorEventArgs> Error;
+        public event EventHandler<FileChangedEventArgs>? Changed;
+        public event EventHandler<MonitorErrorEventArgs>? Error;
 
         public void Start()
         {
@@ -349,6 +349,97 @@ namespace TicTack
         public void Dispose()
         {
             foreach (var m in _monitors) m.Dispose();
+        }
+    }
+
+    // Cross-platform watcher (System.IO.FileSystemWatcher) — used on non-Windows where
+    // FileWatcherMonitor's ReadDirectoryChangesW P/Invoke is unavailable.
+    public class FsWatchMonitor : IFileMonitor
+    {
+        private readonly string _path;
+        private readonly int _bufferSize;
+        private readonly int _restartDelaySec;
+        private FileSystemWatcher? _watcher;
+        private volatile bool _stopping;
+
+        public event EventHandler<FileChangedEventArgs>? Changed;
+        public event EventHandler<MonitorErrorEventArgs>? Error;
+
+        public FsWatchMonitor(string path, int bufferKb = 256, int restartDelaySec = 10)
+        {
+            _path = path;
+            _bufferSize = Math.Max(32, bufferKb) * 1024;
+            _restartDelaySec = Math.Max(1, restartDelaySec);
+        }
+
+        public void Start()
+        {
+            _stopping = false;
+            StartWatcher();
+        }
+
+        private void StartWatcher()
+        {
+            var watcher = new FileSystemWatcher(_path)
+            {
+                IncludeSubdirectories = true,
+                InternalBufferSize = _bufferSize,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime
+            };
+            watcher.Created += (s, e) => FireChanged(ChangeType.Created, e.FullPath);
+            watcher.Changed += (s, e) => FireChanged(ChangeType.Modified, e.FullPath);
+            watcher.Deleted += (s, e) => FireChanged(ChangeType.Deleted, e.FullPath);
+            watcher.Renamed += (s, e) => FireChanged(ChangeType.Renamed, e.FullPath, e.OldFullPath);
+            watcher.Error += (s, e) =>
+            {
+                var handler = Error;
+                if (handler != null)
+                    handler(this, new MonitorErrorEventArgs(e.GetException()));
+                if (!_stopping)
+                {
+                    var t = new Thread(() =>
+                    {
+                        try { watcher.Dispose(); } catch { }
+                        while (!_stopping)
+                        {
+                            Thread.Sleep(_restartDelaySec * 1000);
+                            if (_stopping) return;
+                            try { StartWatcher(); return; }
+                            catch (Exception ex)
+                            {
+                                var eh = Error;
+                                if (eh != null)
+                                    eh(this, new MonitorErrorEventArgs(ex));
+                            }
+                        }
+                    });
+                    t.IsBackground = true;
+                    t.Start();
+                }
+            };
+            _watcher = watcher;
+            watcher.EnableRaisingEvents = true;
+        }
+
+        private void FireChanged(ChangeType type, string path, string? oldPath = null)
+        {
+            if (_stopping) return;
+            var handler = Changed;
+            if (handler != null)
+                handler(this, new FileChangedEventArgs(type, path, oldPath));
+        }
+
+        public void Stop()
+        {
+            _stopping = true;
+            try { _watcher?.EnableRaisingEvents = false; } catch { }
+            try { _watcher?.Dispose(); } catch { }
+            _watcher = null;
+        }
+
+        public void Dispose()
+        {
+            Stop();
         }
     }
 }

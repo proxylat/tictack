@@ -9,7 +9,7 @@ namespace TicTack
 {
     public sealed class StateDb : IDisposable
     {
-        private SqliteConnection _conn;
+        private SqliteConnection _conn = null!;
         private readonly string _dbPath;
         private readonly object _lock = new object();
         private bool _disposed;
@@ -157,6 +157,21 @@ namespace TicTack
             }
         }
 
+        public long? GetSize(string path)
+        {
+            lock (_lock)
+            {
+                EnsureConnected();
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT size FROM state WHERE path = @p";
+                    cmd.Parameters.AddWithValue("@p", path);
+                    var r = cmd.ExecuteScalar();
+                    return r == null || r is DBNull ? (long?)null : (long)r;
+                }
+            }
+        }
+
         public long Count()
         {
             lock (_lock)
@@ -165,7 +180,7 @@ namespace TicTack
                 using (var cmd = _conn.CreateCommand())
                 {
                     cmd.CommandText = "SELECT COUNT(*) FROM state";
-                    return (long)cmd.ExecuteScalar();
+                    return (long)(cmd.ExecuteScalar() ?? 0L);
                 }
             }
         }

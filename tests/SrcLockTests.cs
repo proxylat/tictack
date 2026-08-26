@@ -57,7 +57,7 @@ public class SrcLockTests : IDisposable
         sw.Stop();
 
         Assert.False(lockObj.IsHeld);
-        // ponytail: advisory lock, doesn't wait — returns < 500ms
+        // advisory lock, doesn't wait — returns < 500ms
         Assert.True(sw.ElapsedMilliseconds < 500);
     }
 
