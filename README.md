@@ -1,195 +1,56 @@
-dotnet test tests/TicTack.Tests.csproj # dont remove this line
+# TicTack — Real-Time File Sync + Automations
 
-# TicTack — Real-Time File Sync + Restic Drive Backup
-
-One-way file synchronisation service for Windows (.NET 10). Monitors source directories, copies changes to a destination, with optional versioning, deletion handling, validation, and crash recovery. Also includes an on-demand mode to auto-discover external drives and run Restic backups.
+One-way file synchronisation service for Windows and Linux. Monitors source directories, copies changes to a destination, with optional versioning, deletion handling, validation, and crash recovery. Also runs scheduled tasks and external-drive jobs — any shell command.
 
 ---
 
-## Quick Start
+## Design Principles
 
-1. Run `service\win\install-service.bat` as Administrator — compiles, registers, and starts `TicTackSv` service.
-2. Edit `service\win\config.yaml` to point to your source and destination paths.
-3. `sc stop TicTackSv` / `sc start TicTackSv` to restart after config changes.
-4. Or run manually: `service\win\TicTackSv.exe --cli` (interactive) or `service\win\TicTackSv.exe --once` (single pass).
+- **Never lose data** — fsync before rename ensures data is on disk before the final path is updated. Post-copy validation (size, hash, or both) verifies every file. Three layers of integrity: pre-read probe catches permissions early, temp+rename prevents partial overwrites, validation catches corruption.
+- **Detect early, fail fast** — a 1-byte read from the source catches ~90% of lock/permission/access issues before the full copy starts. Delete-threshold guard blocks accidental mass deletions. Source-disappearance guard prevents syncing from an unmounted or empty directory.
+- **Zero CPU idle** — `SemaphoreSlim` blocks the processing thread with no CPU usage when no events are queued. No polling timers. SQLite state DB uses incremental writes (no periodic full rewrites). The only wake-ups are file-change events from the OS.
+- **Crash-proof by construction** — every write follows the temp-then-rename pattern: no partial file ever lands at the final path. Startup recovery (`PowerGuard.Cleanup()`) collects orphaned `.tictack.tmp` files. SQLite WAL journal survives power loss without corruption. Lock files have stale-detection and auto-release.
+- **No secrets** — zero external network calls, no accounts, no cloud. Local diagnostic logs (`tictack-diag.log`, EventLog) stay on the machine.
+- **Dependency-light** — four runtime dependencies (Microsoft.Data.Sqlite, YamlDotNet, System.ServiceProcess.ServiceController, System.Diagnostics.EventLog). No npm, pip, cargo, or gem trees.
 
 ---
 
-## CLI Flags
+## Features
 
-| Flag | Description |
+| Feature | Implementation |
 |---|---|
-| `--cli` | Interactive console mode — live monitoring with per-event logging |
-| `--once` | Single sync pass over all sources, then exit |
-| `--validate` | Load and validate config, exit with code 0/1 |
-| `--restic-drives` | Auto-discover external drives with marker file, run restic on each |
-| `--service` | Run as Windows Service (auto-detected when non-interactive) |
-| `--config <path>` | Path to config file (default: `config.yaml` in exe dir) |
-
----
-
-## Configuration
-
-All paths support `[VolumeLabel]` syntax (e.g., `[Backup-Disk]\Sync`) — resolves to the actual drive letter at startup. Use absolute paths for source folders (e.g., `C:\Users\YourName\Desktop`).
-
-### sources
-
-```yaml
-sources:
-  - paths:
-      - 'C:\Users\YourName\Desktop'
-      - 'C:\Users\YourName\Pictures'
-      - 'C:\Users\YourName\Downloads'
-    destination: '[TicTack]\Sync'
-    debounce_seconds: 10
-    filter:
-      max_file_size_mb: no-limit
-      exclude:
-        - "*.iso"
-        - "*.tmp"
-    sync:
-      verification: date_and_size
-      retry:
-        max_attempts: 5
-        delay_ms: 1000
-        backoff: 2.0
-      lock_handling: retry
-      retry_lock_minutes: 10
-      delete_threshold_count: 1000
-      delete_threshold_size_gb: 50
-      delete_threshold_percent: 50
-      delete_hold_days: 7
-      rename_detection: true
-      versioning:
-        max_versions: 10
-        path: '[TicTack]\Sync\.versions'
-      deletion:
-        mode: archive
-        path: '[TicTack]\Sync\.archive'
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `paths` | — | List of source folders to monitor **(required)**. Each entry becomes its own source at `destination + foldername` |
-| `destination` | — | Drive+folder to sync into, supports `[VolumeLabel]` **(required)** |
-| `debounce_seconds` | `10` | Wait time (s) after last change before triggering sync |
-| `filter.max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files |
-| `filter.exclude` | `[]` | Case-insensitive glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) |
-| `sync.verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |
-| `sync.retry.max_attempts` | `5` | Max retries on failed copy |
-| `sync.retry.delay_ms` | `1000` | Initial retry delay (ms) |
-| `sync.retry.backoff` | `2.0` | Delay multiplier per retry (1s → 2s → 4s) |
-| `sync.lock_handling` | `retry` | `retry` = wait and retry when lock is held / `ignore` = proceed without lock |
-| `sync.retry_lock_minutes` | `10` | Minutes to retry when lock is held before giving up (only when `lock_handling: retry`) |
-| `sync.delete_threshold_count` | `1000` | Block deletion if one burst contains >= N files |
-| `sync.delete_threshold_size_gb` | `50` | Block deletion if one burst total size >= N GB |
-| `sync.delete_threshold_percent` | `50` | Block deletion if one burst >= N% of known files |
-| `sync.delete_hold_days` | `7` | Days to hold blocked deletions before syncing; daily warnings sent |
-| `sync.rename_detection` | `true` | Track renames (vs delete+re-create, saves bandwidth) |
-| `sync.versioning.max_versions` | `10` | Keep up to N old versions per file |
-| `sync.versioning.path` | — | Where archived versions go (timestamp suffix) |
-| `sync.deletion.mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |
-| `sync.deletion.path` | — | Target dir in `archive` mode |
-
-### monitor
-
-```yaml
-monitor:
-  type: composite
-  watcher_buffer_kb: 512
-  polling_interval_seconds: 300
-  restart_delay_seconds: 10
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `type` | `composite` | `watcher` = P/Invoke ReadDirectoryChangesW (instant, zero CPU). `polling` = periodic dir scan (no missed events). `composite` = both (watcher for speed, polling as safety net) |
-| `watcher_buffer_kb` | `64` | Raw NTFS notify buffer in KB. **Larger = survives bursts (git clone, npm install, unzip) without event loss.** Use 512+ for heavy churn |
-| `polling_interval_seconds` | `3600` | Full directory scan interval (s) for polling fallback. Min 10 |
-| `restart_delay_seconds` | `10` | Wait before restarting watcher after error |
-
-### logging
-
-```yaml
-logging:
-  level: info
-  path: '[TicTack]\Sync\tictack.log'
-  max_size_mb: 10
-  max_files: 5
-  console: false
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `level` | `info` | `debug` / `info` / `warn` / `error` / `silent` |
-| `path` | `tictack.log` | Log file path, dir created automatically |
-| `max_size_mb` | `10` | Rotate log after N MB |
-| `max_files` | `5` | Keep N rotated logs (`tictack.log`, `.1`, `.2`...) |
-| `console` | `false` | Also write to stdout (auto-enabled in `--cli`/`--once`) |
-
-### watchdog
-
-```yaml
-watchdog:
-  enabled: true
-  interval_minutes: 30
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `enabled` | `true` | Periodic heartbeat log entry to prove the service is alive |
-| `interval_minutes` | `30` | Minutes between heartbeats |
-
-### restic_drives
-
-```yaml
-restic_drives:
-  command: restic.exe backup --compression auto "{source}" -r "{drive}\restic-repo"
-  require_marker_file: true
-  marker_file_name: .restic-target
-```
-
-Template for `--restic-drives` CLI mode. Discovers external drives with a marker file and runs the command on each. Drives containing sync destinations are automatically excluded.
-
-| Field | Default | Description |
-|---|---|---|
-| `command` | `restic.exe backup ...` | Template with `{source}` (all source paths) and `{drive}` (each discovered drive) |
-| `working_dir` | exe dir | Working directory for the command |
-| `require_marker_file` | `true` | Only run on drives with a marker file (safety gate) |
-| `marker_file_name` | `.restic-target` | Marker file name to look for at drive root |
-| `exclude_drives` | `[]` | Drive letters to always skip (system drive + sync destination drives excluded automatically) |
-
-### jobs
-
-```yaml
-jobs:
-  - name: restic_archive
-    time: "14:00"
-    command: restic.exe backup --compression auto "{source}" -r D:\ResticRepo
-    working_dir: C:\ProgramData\TicTack
-  - name: restic_archive_evening
-    time: "21:00"
-    command: restic.exe backup --compression auto "{source}" -r D:\ResticRepo
-    working_dir: C:\ProgramData\TicTack
-```
-
-Scheduled commands run once per day via `cmd.exe /c`. Unaffected by `--restic-drives`. Define multiple entries to run the same command at different times.
-
-| Field | Default | Description |
-|---|---|---|
-| `name` | — | Job label for logs **(required)** |
-| `time` | — | Daily trigger time, `HH:mm` 24h format **(required)** |
-| `command` | — | `cmd.exe /c` command. `{source}` = all source paths quoted **(required)** |
-| `working_dir` | exe dir | Working directory for the command |
-
-If the machine is off during a scheduled time, the job runs on next startup (catch-up within 30 seconds).
+| Change monitoring | `FileWatcherMonitor`, `PollingMonitor`, `CompositeMonitor` — pluggable via `IFileMonitor` |
+| Comparison (date/size/hash) | `IFileComparer` — `SizeComparer`, `DateSizeComparer`, `HashComparer`, `FullComparer` |
+| Locked file handling | `FileAccessor` opens with `FileShare.ReadWrite|Delete` + `FILE_FLAG_BACKUP_SEMANTICS` (SYSTEM bypass); retry backoff |
+| VSS support | Designed via `IFileAccessor` — swap in VSS-based accessor without pipeline changes |
+| Retry logic | `ExponentialBackoffRetry` — configurable attempts, delay, backoff multiplier |
+| Logging | `FileLogger` (rotating), `ConsoleLogger` (color), `DesktopAlertLogger`, `EventLogLogger`, `MultiLogger` |
+| Rename detection | `RenameAction` + `FileChangedEventArgs.OldFullPath` |
+| Deletion handling | `MirrorDeletion`, `ArchiveDeletion` — factory-selected |
+| Versioning | `TimestampVersioning` (max-versions limit), `NoVersioning` — factory-selected |
+| Post-copy validation | `SizeValidator`, `HashValidator` — mirrors comparison level |
+| Max file size | `SizeFilter` — `max_file_size_mb: <number>` or `no-limit` |
+| Crash Recovery | `CopyAction` writes to `.tictack.tmp` then atomic rename; `PowerGuard.Cleanup()` recovers orphaned temps on startup |
+| Desktop alerts | `DesktopAlert.Write()` creates `TicTack-{LEVEL}-{timestamp}.txt` in `alert_path` (30s cooldown per level) |
+| Zero-CPU idle | `SemaphoreSlim` in `SyncPipeline` — thread sleeps with zero CPU when idle, wakes instantly on file events |
+| Volume label paths | `[VolumeLabel]\path` syntax resolved to drive letters via `DriveInfo.GetDrives()` |
+| Scheduled jobs | `TimerScheduler` — daily shell commands (`cmd.exe /c` Windows, `/bin/sh -c` Linux) with `{source}` substitution |
+| External drive tasks | `DriveDiscoverer` — runs a shell command on each discovered external drive |
+| State DB (skip-known) | `StateDb` — SQLite WAL, per-source, `size+mtime` cache to skip unchanged files on startup |
+| Pre-read fail-fast | `CopyAction` probes 1 byte before full copy — catches permission/lock issues instantly |
+| Deferred deletion | `DeferredDeletion` — holds blocked deletions for `delete_hold_days`, daily warnings with first 20 paths, recheck before sync |
+| Delete-threshold guard | Blocks deletions when >50% of known files would be removed in one batch, or when count/size exceeds configured limits |
+| Source-disappearance guard | Refuses to process Deleted events when source folder is missing |
+| Exclusive lock | `.tictack.lock` — Restic-style 2-phase check, 200ms settle, 5min stale timeout, 30s refresh, configurable retry timeout |
+| Sparse file support | Detects `FILE_ATTRIBUTE_SPARSE_FILE`, uses `FSCTL_SET_SPARSE` via `DeviceIoControl` |
+| EventLog propagation | `EventLogLogger` writes errors to Windows Application log under `TicTackSv` source |
 
 ---
 
 ## Architecture
 
 ```
-ReadDirectoryChangesW + PollingMonitor (composite mode)
+FileWatcherMonitor (Windows) / FsWatchMonitor (Linux) + PollingMonitor (composite mode)
         │
         ▼
    Debounce Queue (per-file timer, configurable debounce_seconds)
@@ -213,88 +74,151 @@ ReadDirectoryChangesW + PollingMonitor (composite mode)
    IDeletionStrategy — handle source deletions (mirror | archive)
 ```
 
-### Crash Recovery (PowerGuard)
-- CopyAction writes to `{dest}.tictack.tmp` first, then fsync + atomic rename.
-- On startup, PowerGuard scans for orphaned `.tictack.tmp` files and recovers or removes them.
-
-### Desktop Alerts
-Warnings and errors create `TicTack-WARN-*.txt` / `TicTack-ERROR-*.txt` on the user's Desktop (30s cooldown between same-level alerts).
-
-### Locked File Handling
-FileAccessor uses `CreateFile` P/Invoke with `FILE_FLAG_BACKUP_SEMANTICS` + `FileShare.ReadWrite|Delete`, bypassing most locks for the SYSTEM account. When the destination is locked by another process, TicTack retries for `retry_lock_minutes` (default 10) before proceeding without the lock.
-
 ---
 
-## Building from Source
+## Quick Start
 
-Requires: .NET 10 SDK.
+Requires: .NET 10 SDK. Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.9** (via NuGet; `dotnet restore` fetches automatically).
 
-```
-service\win\install-service.bat
-```
+### Windows
 
-Output: `service\win\TicTackSv.exe` + DLLs (framework-dependent publish)
+1. Copy `service\win\config_win.yaml.example` to `service\win\config.yaml` and edit your source/destination paths.
+2. Run `service\win\install-service.bat` as Administrator — compiles (`dotnet publish`), registers the `TicTackSv` Windows service, and starts it.
+3. `sc stop TicTackSv` / `sc start TicTackSv` to restart after config changes.
 
-Tests:
+Or run manually: `service\win\TicTackSv.exe --cli` (interactive) or `service\win\TicTackSv.exe --once` (single pass).
+
+### Linux
+
+1. Copy `service/linux/config_linux.yaml.example` to `service/linux/config.yaml` and edit your paths.
+2. Run `cd service/linux && ./install-service.sh` — publishes, installs to `/opt/tictack`, and enables the `tictack` systemd service.
+3. `sudo systemctl restart tictack` to restart after config changes.
+
+### Tests
+
 ```
 dotnet test tests\TicTack.Tests.csproj
 ```
 
-Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.9** (via NuGet; `dotnet restore` fetches automatically).
+---
+
+## CLI Flags
+
+| Flag | Description |
+|---|---|
+| `--cli` | Interactive console mode — live monitoring with per-event logging |
+| `--once` | Single sync pass over all sources, then exit |
+| `--validate` | Load and validate config, exit with code 0/1 |
+| `--rebuild` | Clear state DBs and re-sync everything from scratch (archives stale dest files). Stop the service first — it locks the state DBs |
+| `--external-drives` | Auto-discover external drives with marker file, run command on each (Restic, Rclone, rsync, etc.) |
+| `--service` | Run as Windows Service (auto-detected when non-interactive; Windows-only) |
+| `--config <path>` | Path to config file (default: `config.yaml` in exe dir) |
 
 ---
 
-## Linux
+## Configuration
 
-TicTack runs natively on Linux with the same sync engine: `FileSystemWatcher`-based monitoring (`FsWatchMonitor`), `/bin/sh -c` for jobs and commands, and standard file I/O.
+All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`) — resolves to the actual drive letter at startup.
 
-Build + install as a systemd service:
-```
-cd service/linux
-cp config_linux.yaml.example config.yaml   # edit paths, e.g. ~/Desktop -> /mnt/backup/Sync/Desktop
-./install-service.sh                 # publish + systemctl enable --now tictack
-```
+**Do not use environment variables like `%USERPROFILE%` or `%HOME%`.** The Windows service runs as `LocalSystem`, so `%USERPROFILE%` resolves to `C:\WINDOWS\system32\config\systemprofile`, not your profile — same for `%HOME%` under systemd (root). Always write the full path (`C:\Users\User\Desktop`).
 
-Uninstall: `./uninstall-service.sh` (keeps config.yaml).
+### sources
 
-Notes:
-- Config paths use Linux separators (`~/Pictures`); `[VolumeLabel]` syntax is Windows-only.
-- The unit sends SIGINT on stop for a graceful shutdown.
-- Requires the .NET 10 runtime on the host (`dotnet --version`).
+| Field | Default | Description |
+|---|---|---|
+| `paths` | — | List of source folders to monitor. Each entry becomes its own source at `destination + foldername` |
+| `destination` | — | Drive+folder to sync into, supports `[VolumeLabel]` |
+| `state_db_path` | `C:\ProgramData\TicTack` / `/var/lib/tictack` | **Directory** for per-source state DBs (`<folder>.db`, SQLite WAL) used to skip unchanged files on startup |
+| `debounce_seconds` | `10` | Wait time (s) after last change before triggering sync |
+| `max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files |
+| `exclude` | `[]` | Case-insensitive glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) |
+| `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |
+| `max_attempts` | `5` | Max retries on failed copy |
+| `delay_ms` | `1000` | Initial retry delay (ms) |
+| `backoff` | `2.0` | Delay multiplier per retry (1s → 2s → 4s) |
+| `lock_handling` | `retry` | `retry` = wait and retry when lock is held / `ignore` = proceed without lock |
+| `retry_lock_minutes` | `10` | Minutes to retry when lock is held before giving up (only when `lock_handling: retry`) |
+| `delete_threshold_count` | `1000` | Block deletion if one burst contains >= N files |
+| `delete_threshold_size_gb` | `50` | Block deletion if one burst total size >= N GB |
+| `delete_threshold_percent` | `50` | Block deletion if one burst >= N% of known files |
+| `delete_hold_days` | `7` | Days to hold blocked deletions before syncing; daily warnings sent |
+| `rename_detection` | `true` | Track renames (vs delete+re-create, saves bandwidth) |
+| `max_versions` | `10` | Keep up to N old versions per file |
+| `path` | — | Where archived versions go (timestamp suffix) |
+| `deletion_mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |
+| `path` | — | Target dir in `archive` mode |
 
----
+**Path mirroring:** archived and versioned files keep their real folder structure. With a shared `.archive` / `.versions` next to the sync root, deleting `Desktop\foo.txt` lands in `.archive\Desktop\foo_ts.txt` — not in the archive root.
 
-## Project Layout
+**Delete-threshold guard:** if one deletion burst exceeds `delete_threshold_count`, `delete_threshold_size_gb`, or `delete_threshold_percent` of known files, it is deferred to `tictack-deferred-<folder>.json` (next to the log file). After `delete_hold_days`, remaining files are synced; warnings are logged daily with the first 20 paths + full list location.
 
-```
-TicTack/
-├── src/                  # C# source (24 files)
-├── tests/                # Unit tests + MinimalService
-├── service/
-│   ├── win/              # Windows scripts + config example
-│   │   ├── config_win.yaml.example
-│   │   ├── install-service.bat
-│   │   ├── uninstall-service.bat
-│   │   ├── start-service.bat / stop-service.bat
-│   │   └── setup.iss     # Inno Setup installer
-│   └── linux/            # Linux scripts + systemd unit
-│       ├── config_linux.yaml.example
-│       ├── install-service.sh
-│       ├── uninstall-service.sh
-│       └── tictack.service
-├── AGENTS.md
-└── README.md
-```
+### monitor
+
+| Field | Default | Description |
+|---|---|---|
+| `type` | `composite` | `watcher` = instant OS events, zero CPU idle (`ReadDirectoryChangesW` P/Invoke on Windows, `FileSystemWatcher` on Linux). `polling` = periodic dir scan (no missed events). `composite` = both (watcher for speed, polling as safety net) |
+| `watcher_buffer_kb` | `64` | Watcher buffer in KB (NTFS on Windows, inotify on Linux). **Larger = survives bursts (git clone, npm install, unzip) without event loss.** Use 512+ for heavy churn |
+| `polling_interval_seconds` | `3600` | Full directory scan interval (s) for polling fallback. Min 10 |
+| `restart_delay_seconds` | `10` | Wait before restarting watcher after error |
+
+### logging
+
+| Field | Default | Description |
+|---|---|---|
+| `level` | `info` | `debug` / `info` / `warn` / `error` / `silent` |
+| `path` | `tictack.log` | Log file path, dir created automatically |
+| `max_size_mb` | `10` | Rotate log after N MB |
+| `max_files` | `5` | Keep N rotated logs (`tictack.log`, `.1`, `.2`...) |
+| `console` | `false` | Also write to stdout (auto-enabled in `--cli`/`--once`) |
+| `alert_path` | exe dir | Where `TicTack-WARN/ERROR-*.txt` alert files are written. On Windows, Desktop is `C:\Users\User\Desktop`; on Linux, `~/Desktop` |
+
+### watchdog
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Periodic heartbeat log entry to prove the service is alive |
+| `interval_minutes` | `30` | Minutes between heartbeats |
+
+### external_drives
+
+Run any command on each discovered external drive (Restic, Rclone, rsync, etc.). Discovers drives via a marker file and executes the configured command, passing `{source}` and `{drive}` placeholders. Drives containing sync destinations are automatically excluded.
+
+| Field | Default | Description |
+|---|---|---|
+| `command` | `restic.exe backup ...` | Shell command with `{source}` (all source paths) and `{drive}` (each discovered drive). Works with any tool — Restic, Rclone, rsync, etc. Default uses `restic.exe`; override for Linux (`restic backup ...`) |
+| `working_dir` | exe dir | Working directory for the command |
+| `require_marker_file` | `true` | Only run on drives with a marker file (safety gate) |
+| `marker_file_name` | `.tictack-target` | Marker file name to look for at drive root |
+| `exclude_drives` | `[]` | Drive letters to always skip (system drive + sync destination drives excluded automatically) |
+
+### jobs
+
+Scheduled commands run once per day (`cmd.exe /c` Windows, `/bin/sh -c` Linux). If the machine was off at the scheduled time, the job runs on next startup (catch-up within 30 seconds).
+
+| Field | Default | Description |
+|---|---|---|
+| `name` | — | Job label for logs **(required)** |
+| `time` | — | Daily trigger time, `HH:mm` 24h format **(required)** |
+| `command` | — | Shell command (`cmd.exe /c` on Windows, `/bin/sh -c` on Linux). `{source}` = all source paths quoted **(required)** |
+| `working_dir` | exe dir | Working directory for the command |
 
 ---
 
 ## Service Management
 
-| Script | Action | Admin req. |
-|---|---|---|
-| `service\win\install-service.bat` | Build + register + start | Yes |
-| `service\win\start-service.bat` | Start | No |
-| `service\win\stop-service.bat` | Stop | No |
-| `service\win\uninstall-service.bat` | Stop + delete | Yes |
+### Linux (systemd)
 
-Service name: `TicTackSv` — runs as `LocalSystem`, auto-start.
+| Command | Action |
+|---|---|
+| `sudo systemctl status tictack` | Show status |
+| `sudo systemctl restart tictack` | Restart after config changes (`/opt/tictack/config.yaml`) |
+| `journalctl -u tictack -f` | Follow logs |
+| `./uninstall-service.sh` | Stop + remove (keeps `/opt/tictack/config.yaml`) |
+
+Unit name: `tictack`, runs `TicTackSv --cli` under systemd with SIGINT shutdown.
+
+Notes:
+- Config paths use Linux separators (`~/Pictures`); `[VolumeLabel]` syntax is Windows-only.
+- The unit sends SIGINT on stop for a graceful shutdown; deploy dir is `/opt/tictack`.
+- `install-service.sh` auto-detects `dotnet`: with a system runtime it publishes framework-dependent, without one it publishes self-contained (~80 MB, no host runtime required).
+- Jobs and commands run via `/bin/sh -c`; use Linux syntax and paths in `jobs:` / `external_drives.command`.

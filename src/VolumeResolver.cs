@@ -45,8 +45,8 @@ namespace TicTack
                     job.WorkingDir = Resolve(job.WorkingDir);
             }
 
-            if (cfg.ResticDrives != null && cfg.ResticDrives.WorkingDir != null)
-                cfg.ResticDrives.WorkingDir = Resolve(cfg.ResticDrives.WorkingDir);
+            if (cfg.ExternalDrives != null && cfg.ExternalDrives.WorkingDir != null)
+                cfg.ExternalDrives.WorkingDir = Resolve(cfg.ExternalDrives.WorkingDir);
         }
 
         private static Dictionary<string, string> BuildVolumeMap()

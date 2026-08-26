@@ -39,7 +39,7 @@ namespace TicTack
             {
                 var baseDir = AppDomain.CurrentDomain.BaseDirectory;
             var cfgPath = Path.Combine(baseDir, "config.yaml");
-            bool isService = false, isCli = false, isOnce = false, isValidate = false, isResticDrives = false, isRebuild = false;
+            bool isService = false, isCli = false, isOnce = false, isValidate = false, isExternalDrives = false, isRebuild = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -52,7 +52,7 @@ namespace TicTack
                     case "--cli": isCli = true; break;
                     case "--once": isOnce = true; break;
                     case "--validate": isValidate = true; break;
-                    case "--restic-drives": isResticDrives = true; break;
+                    case "--external-drives": isExternalDrives = true; break;
                     case "--rebuild": isRebuild = true; break;
                 }
             }
@@ -81,9 +81,9 @@ namespace TicTack
 
             PowerGuard.Cleanup(cfg, log);
 
-            if (isResticDrives)
+            if (isExternalDrives)
             {
-                RunResticDrives(cfg, log);
+                RunExternalDrives(cfg, log);
                 return 0;
             }
 
@@ -120,7 +120,7 @@ namespace TicTack
                 return 0;
             }
 
-            log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --restic-drives | --service | --config <path>");
+            log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --external-drives | --service | --config <path>");
             return 0;
             }
             catch (Exception ex)
@@ -133,15 +133,15 @@ namespace TicTack
             }
         }
 
-        static void RunResticDrives(TicTackConfig cfg, ILogger log)
+        static void RunExternalDrives(TicTackConfig cfg, ILogger log)
         {
-            if (cfg.ResticDrives == null || string.IsNullOrEmpty(cfg.ResticDrives.Command))
+            if (cfg.ExternalDrives == null || string.IsNullOrEmpty(cfg.ExternalDrives.Command))
             {
-                log.Error("No restic_drives configuration found in config.yaml");
+                log.Error("No external_drives configuration found in config.yaml");
                 return;
             }
 
-            var cmd = cfg.ResticDrives.Command;
+            var cmd = cfg.ExternalDrives.Command;
             var sourcePaths = cfg.Sources != null && cfg.Sources.Count > 0
                 ? string.Join(" ", cfg.Sources.ConvertAll(s => "\"" + s.Path + "\""))
                 : null;
@@ -158,7 +158,7 @@ namespace TicTack
                 }
             }
 
-            var drives = DriveDiscoverer.GetEligibleDrives(cfg.ResticDrives, destinationDrives, log);
+            var drives = DriveDiscoverer.GetEligibleDrives(cfg.ExternalDrives, destinationDrives, log);
 
             if (drives.Count == 0)
             {
@@ -179,11 +179,11 @@ namespace TicTack
             var input = Console.ReadLine();
             if (string.IsNullOrEmpty(input) || !input.TrimStart().StartsWith("y", StringComparison.OrdinalIgnoreCase))
             {
-                log.Info("Restic drives cancelled by user");
+                log.Info("External drive backups cancelled by user");
                 return;
             }
 
-            var wd = cfg.ResticDrives.WorkingDir ?? AppDomain.CurrentDomain.BaseDirectory;
+            var wd = cfg.ExternalDrives.WorkingDir ?? AppDomain.CurrentDomain.BaseDirectory;
 
             foreach (var drive in drives)
             {
@@ -191,7 +191,7 @@ namespace TicTack
                 if (sourcePaths != null)
                     fullCmd = fullCmd.Replace("{source}", sourcePaths);
 
-                log.Info("Running restic for " + drive + ": " + fullCmd);
+                log.Info("Running backup for " + drive + ": " + fullCmd);
 
                 var psi = new ProcessStartInfo
                 {
@@ -217,27 +217,27 @@ namespace TicTack
                     {
                         if (p == null)
                         {
-                            log.Error("Restic on " + drive + " failed to start");
+                            log.Error("Backup on " + drive + " failed to start");
                             continue;
                         }
                         if (!p.WaitForExit(600000))
                         {
                             try { p.Kill(); } catch { }
-                            log.Error("Restic on " + drive + " timed out after 10 minutes, killed");
+                            log.Error("Backup on " + drive + " timed out after 10 minutes, killed");
                         }
                         else if (p.ExitCode != 0)
-                            log.Error("Restic on " + drive + " exited " + p.ExitCode);
+                            log.Error("Backup on " + drive + " exited " + p.ExitCode);
                         else
-                            log.Info("Restic on " + drive + " completed");
+                            log.Info("Backup on " + drive + " completed");
                     }
                 }
                 catch (Exception ex)
                 {
-                    log.Error("Restic on " + drive + " failed", ex);
+                    log.Error("Backup on " + drive + " failed", ex);
                 }
             }
 
-            log.Info("All restic drive backups complete");
+            log.Info("All external drive backups complete");
         }
 
         static void RunOnce(TicTackConfig cfg, ILogger log)
@@ -428,13 +428,19 @@ namespace TicTack
                         log.Warn("State DB path is a directory, expected a .db file: " + dbPath);
                         continue;
                     }
-                    if (File.Exists(dbPath))
-                    {
-                        File.Delete(dbPath);
-                        log.Info("Cleared state DB: " + dbPath);
-                    }
+                    if (!File.Exists(dbPath) && !File.Exists(dbPath + "-wal") && !File.Exists(dbPath + "-shm"))
+                        continue;
+                    DeleteWithRetry(dbPath);
+                    DeleteWithRetry(dbPath + "-wal");
+                    DeleteWithRetry(dbPath + "-shm");
+                    log.Info("Cleared state DB: " + dbPath);
                 }
-                catch (Exception ex) { log.Error("Failed to delete state DB: " + dbPath + ": " + ex.Message); }
+                catch (Exception ex)
+                {
+                    log.Error("Failed to delete state DB: " + dbPath + ": " + ex.Message);
+                    log.Error("Another process (likely the running TicTackSv service) holds this file. Stop the service first ('sc stop TicTackSv' on Windows, 'sudo systemctl stop tictack' on Linux), then re-run --rebuild. Nothing was modified.");
+                    Environment.Exit(1);
+                }
             }
 
             var rbBaseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
@@ -555,6 +561,26 @@ namespace TicTack
             }
 
             log.Info("Full rebuild finished. All databases cleared, source re-scanned, parity enforced.");
+        }
+
+        static void DeleteWithRetry(string path)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path)) File.Delete(path);
+                    return;
+                }
+                catch (IOException) when (attempt < 3)
+                {
+                    Thread.Sleep(500);
+                }
+                catch (UnauthorizedAccessException) when (attempt < 3)
+                {
+                    Thread.Sleep(500);
+                }
+            }
         }
 
         static bool UnderDir(string path, string prefix)
