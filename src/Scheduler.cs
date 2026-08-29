@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 
 namespace TicTack
@@ -17,6 +18,7 @@ namespace TicTack
         private readonly List<JobEntry> _jobs;
         private readonly ILogger _log;
         private readonly string? _sourcePaths;
+        private readonly JobRunStore? _store;
 
         public TimerScheduler(TicTackConfig config, ILogger log)
         {
@@ -24,24 +26,53 @@ namespace TicTack
             _jobs = new List<JobEntry>();
 
             if (config.Jobs == null || config.Jobs.Count == 0)
+            {
+                _store = null;
                 return;
+            }
 
             if (config.Sources != null && config.Sources.Count > 0)
                 _sourcePaths = string.Join(" ", config.Sources.ConvertAll(s => "\"" + s.Path + "\""));
 
+            _store = CreateStore(config);
+
             foreach (var job in config.Jobs)
             {
-                if (string.IsNullOrEmpty(job.Time) || string.IsNullOrEmpty(job.Command))
+                if (string.IsNullOrEmpty(job.Name) || string.IsNullOrEmpty(job.Time) || string.IsNullOrEmpty(job.Command))
                 {
-                    log.Warn("Skipping incomplete job '" + job.Name + "'");
+                    log.Warn("Skipping incomplete job '" + (job.Name ?? "<unnamed>") + "'");
                     continue;
                 }
-                TimeSpan ts;
-                if (TimeSpan.TryParse(job.Time, out ts))
-                    _jobs.Add(new JobEntry { Config = job, TimeOfDay = ts });
-                else
+                if (!TimeSpan.TryParse(job.Time, out var ts))
+                {
                     log.Warn("Invalid time '" + job.Time + "' for job '" + job.Name + "'");
+                    continue;
+                }
+                var entry = new JobEntry { Config = job, TimeOfDay = ts };
+                var last = _store.GetLastRun(job.Name!);
+                entry.LastRunOn = last ?? DateTime.MinValue;
+                _jobs.Add(entry);
             }
+        }
+
+        private static JobRunStore CreateStore(TicTackConfig config)
+        {
+            string dir;
+            if (config.Sources != null && config.Sources.Count > 0 && !string.IsNullOrEmpty(config.Sources[0].StateDbPath))
+                dir = Path.GetDirectoryName(config.Sources[0].StateDbPath) ?? AppContext.BaseDirectory;
+            else
+                dir = AppContext.BaseDirectory;
+            return new JobRunStore(Path.Combine(dir, "jobs.db"));
+        }
+
+        // Run if not already run today AND (time reached today OR at least one full day was missed).
+        public static bool IsDue(DateTime now, DateTime lastRun, TimeSpan timeOfDay)
+        {
+            var today = now.Date;
+            if (lastRun >= today) return false;
+            if (now.TimeOfDay >= timeOfDay) return true;
+            if (lastRun < today.AddDays(-1)) return true;
+            return false;
         }
 
         public void Start()
@@ -54,12 +85,11 @@ namespace TicTack
         private void RunDueJobs(object? state)
         {
             var now = DateTime.Now;
-            var today = now.Date;
             foreach (var job in _jobs)
             {
-                if (job.LastRunOn < today && job.TimeOfDay <= now.TimeOfDay)
+                if (IsDue(now, job.LastRunOn, job.TimeOfDay))
                 {
-                    job.LastRunOn = today;
+                    job.LastRunOn = now.Date; // in-memory guard against same-day re-trigger
                     System.Threading.Tasks.Task.Run(() => RunJob(job));
                 }
             }
@@ -113,6 +143,8 @@ namespace TicTack
                     else
                     {
                         _log.Info("Job '" + job.Config.Name + "' completed");
+                        try { _store?.SetLastRun(job.Config.Name!, DateTime.Today); }
+                        catch (Exception ex) { _log.Error("Failed to persist run state for job '" + job.Config.Name + "'", ex); }
                     }
                 }
             }
@@ -134,6 +166,7 @@ namespace TicTack
         public void Dispose()
         {
             Stop();
+            _store?.Dispose();
         }
 
         private class JobEntry
