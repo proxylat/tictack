@@ -279,7 +279,7 @@ namespace TicTack
                 try
                 {
                     var info = new FileInfo(f);
-                    result[f.Substring(prefix.Length)] = new FileSnapshot(info.Length, info.LastWriteTimeUtc);
+                    result[f.Substring(prefix.Length)] = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks);
                 }
                 catch { }
             }
@@ -300,13 +300,6 @@ namespace TicTack
             Stop();
         }
 
-        private struct FileSnapshot
-        {
-            public readonly long Size;
-            public readonly DateTime LastWrite;
-            public FileSnapshot(long size, DateTime lastWrite) { Size = size; LastWrite = lastWrite; }
-            public bool Equals(FileSnapshot other) { return Size == other.Size && LastWrite == other.LastWrite; }
-        }
     }
 
     public class CompositeMonitor : IFileMonitor

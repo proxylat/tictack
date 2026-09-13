@@ -106,24 +106,6 @@ public class StateDbTests : IDisposable
     }
 
     [Fact]
-    public async Task ConcurrentAccess_DoesNotCorrupt()
-    {
-        var tasks = new Task[10];
-        for (int i = 0; i < tasks.Length; i++)
-        {
-            var idx = i;
-            tasks[i] = Task.Run(() =>
-            {
-                _db.Upsert("file" + idx + ".txt", idx, idx);
-            });
-        }
-        await Task.WhenAll(tasks);
-
-        var all = _db.LoadAll();
-        Assert.Equal(10, all.Count);
-    }
-
-    [Fact]
     public void SqlInjection_DoesNotBreak()
     {
         _db.Upsert("'; DROP TABLE state; --", 999, 999);

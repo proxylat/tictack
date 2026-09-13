@@ -11,8 +11,8 @@ namespace TicTack
     {
         private readonly string _configPath;
         private ILogger? _log;
-        private List<ISyncPipeline>? _pipelines;
-        private IScheduler? _scheduler;
+        private List<SyncPipeline>? _pipelines;
+        private TimerScheduler? _scheduler;
         private Timer? _heartbeat;
 
         public TicTackService(string configPath)
@@ -26,11 +26,8 @@ namespace TicTack
 
         protected override void OnStart(string[] args)
         {
-            var diag = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tictack-diag.log");
-            try { File.AppendAllText(diag, DateTime.Now + " [OS1] OnStart entered\n"); } catch { }
             try
             {
-                try { File.AppendAllText(diag, DateTime.Now + " [OS2] OnStart try block\n"); } catch { }
                 var cfg = Config.Load(_configPath);
                 if (cfg == null)
                     throw new InvalidOperationException("Config not found: " + _configPath);
@@ -56,7 +53,7 @@ namespace TicTack
 
                 _log.Info("TicTack Service starting");
 
-                _pipelines = new List<ISyncPipeline>();
+                _pipelines = new List<SyncPipeline>();
                 foreach (var src in cfg.Sources)
                 {
                     var pipeline = Program.BuildPipeline(src, cfg, _log);
@@ -77,14 +74,12 @@ namespace TicTack
             }
             catch (Exception ex)
             {
-                try { File.AppendAllText(diag, DateTime.Now + " [OS3] OnStart caught: " + ex.GetType().Name + ": " + ex.Message + "\n"); } catch { }
                 try
                 {
-                    try { File.AppendAllText(diag, DateTime.Now + " [OS4] Before EventLog.WriteEntry\n"); } catch { }
                     EventLog.WriteEntry("TicTackSv", "OnStart failed: " + ex.ToString(),
                         EventLogEntryType.Error);
                 }
-                catch (Exception evtEx) { try { File.AppendAllText(diag, DateTime.Now + " [OS5] EventLog failed: " + evtEx.GetType().Name + ": " + evtEx.Message + "\n"); } catch { } }
+                catch { }
                 try
                 {
                     var crashLog = Path.Combine(Path.GetTempPath(), "TicTackSv-crash.log");

@@ -8,7 +8,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace TicTack
 {
-    public class ExponentialBackoffRetry : IRetryPolicy
+    public class ExponentialBackoffRetry
     {
         private readonly int _maxAttempts;
         private readonly int _initialDelayMs;
@@ -41,9 +41,13 @@ namespace TicTack
 
     public class FileAccessor : IFileAccessor
     {
+        [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+        static extern int OpenFile(string path, int flags);
+
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
+        const int O_RDONLY = 0;
         const uint GENERIC_READ = 0x80000000;
         const uint FILE_SHARE_READ = 0x00000001;
         const uint FILE_SHARE_WRITE = 0x00000002;
@@ -55,7 +59,12 @@ namespace TicTack
         public Stream OpenRead(string path)
         {
             if (!OperatingSystem.IsWindows())
-                return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            {
+                // Bypass managed Unix sharing locks so active files remain readable.
+                var fd = OpenFile(path, O_RDONLY);
+                if (fd < 0) throw new IOException("Failed to open source file: " + path);
+                return new FileStream(new SafeFileHandle((IntPtr)fd, true), FileAccess.Read);
+            }
 
             if (path.Length > 240 && !path.StartsWith(@"\\?\"))
                 path = @"\\?\" + path;

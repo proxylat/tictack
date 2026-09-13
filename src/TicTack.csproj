@@ -25,13 +25,6 @@
     <Copy SourceFiles="$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net10.0\System.Diagnostics.EventLog.dll"
           DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
           Condition="Exists('$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net10.0\System.Diagnostics.EventLog.dll')" />
-    <!-- fallback: net9.0 TFM if the package didn't get a net10.0 folder -->
-    <Copy SourceFiles="$(NuGetPackageRoot)system.serviceprocess.servicecontroller\10.0.9\runtimes\win\lib\net9.0\System.ServiceProcess.ServiceController.dll"
-          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
-          Condition="!Exists('$(OutDir)System.ServiceProcess.ServiceController.dll') And Exists('$(NuGetPackageRoot)system.serviceprocess.servicecontroller\10.0.9\runtimes\win\lib\net9.0\System.ServiceProcess.ServiceController.dll')" />
-    <Copy SourceFiles="$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net9.0\System.Diagnostics.EventLog.dll"
-          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
-          Condition="!Exists('$(OutDir)System.Diagnostics.EventLog.dll') And Exists('$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net9.0\System.Diagnostics.EventLog.dll')" />
     <!-- native e_sqlite3.dll: CopyLocalLocksFileAssemblies only handles managed DLLs -->
     <Copy SourceFiles="$(NuGetPackageRoot)sqlitepclraw.lib.e_sqlite3\2.1.11\runtimes\win-x64\native\e_sqlite3.dll"
           DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"

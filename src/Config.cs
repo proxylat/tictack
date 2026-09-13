@@ -71,7 +71,6 @@ namespace TicTack
         public long? DeleteThresholdSizeGb { get; set; }
         public double DeleteThresholdPercent { get; set; }
         public int DeleteHoldDays { get; set; }
-        public bool RenameDetection { get; set; }
         public VersioningConfig? Versioning { get; set; }
         public DeletionConfig? Deletion { get; set; }
 
@@ -87,7 +86,6 @@ namespace TicTack
             DeleteThresholdSizeGb = 50;
             DeleteThresholdPercent = 50;
             DeleteHoldDays = 7;
-            RenameDetection = true;
         }
     }
 
@@ -212,7 +210,7 @@ namespace TicTack
             using (var reader = new StreamReader(path))
             {
                 var cfg = deserializer.Deserialize<TicTackConfig>(reader);
-                ExpandEnvVars(cfg);
+                ExpandPathsList(cfg);
                 return cfg;
             }
         }
@@ -262,31 +260,19 @@ namespace TicTack
             return null;
         }
 
-        static void ExpandEnvVars(TicTackConfig cfg)
+        static void ExpandPathsList(TicTackConfig cfg)
         {
             var expanded = new List<SourceConfig>();
             foreach (var src in cfg.Sources)
             {
-                if (src.Path != null) src.Path = Expand(src.Path);
-                if (src.Destination != null) src.Destination = Expand(src.Destination);
-                if (src.StateDbPath != null) src.StateDbPath = Expand(src.StateDbPath);
-                if (src.Sync != null)
-                {
-                    if (src.Sync.Versioning != null && src.Sync.Versioning.Path != null)
-                        src.Sync.Versioning.Path = Expand(src.Sync.Versioning.Path);
-                    if (src.Sync.Deletion != null && src.Sync.Deletion.Path != null)
-                        src.Sync.Deletion.Path = Expand(src.Sync.Deletion.Path);
-                }
-
                 if (src.Paths != null && src.Paths.Count > 0)
                 {
                     foreach (var p in src.Paths)
                     {
-                        var pExp = Expand(p);
-                        var folder = Path.GetFileName(pExp.TrimEnd('\\', '/'));
+                        var folder = Path.GetFileName(p.TrimEnd('\\', '/'));
                         expanded.Add(new SourceConfig
                         {
-                            Path = pExp,
+                            Path = p,
                             Destination = Path.Combine(src.Destination ?? "", folder),
                             DebounceSeconds = src.DebounceSeconds,
                             Filter = src.Filter,
@@ -301,16 +287,6 @@ namespace TicTack
                 }
             }
             cfg.Sources = expanded;
-
-            if (cfg.Logging != null && cfg.Logging.Path != null)
-                cfg.Logging.Path = Expand(cfg.Logging.Path);
-            if (cfg.Logging != null && cfg.Logging.AlertPath != null)
-                cfg.Logging.AlertPath = Expand(cfg.Logging.AlertPath);
-        }
-
-        static string Expand(string s)
-        {
-            return Environment.ExpandEnvironmentVariables(s);
         }
 
         public static VerificationLevel ParseVerification(string? value)
@@ -318,7 +294,7 @@ namespace TicTack
             switch (value != null ? value.ToLowerInvariant().Replace("_", "").Replace("-", "") : null)
             {
                 case "size": return VerificationLevel.Size;
-                case "dateandsize": case "date_size": case "date-and-size": return VerificationLevel.DateAndSize;
+                case "dateandsize": return VerificationLevel.DateAndSize;
                 case "hash": return VerificationLevel.Hash;
                 case "full": return VerificationLevel.Full;
                 default: return VerificationLevel.DateAndSize;

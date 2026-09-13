@@ -6,13 +6,7 @@ using System.Threading;
 
 namespace TicTack
 {
-    public interface IScheduler : IDisposable
-    {
-        void Start();
-        void Stop();
-    }
-
-    public class TimerScheduler : IScheduler
+    public class TimerScheduler
     {
         private Timer? _timer;
         private readonly List<JobEntry> _jobs;

@@ -10,7 +10,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 - **Detect early, fail fast** — a 1-byte read from the source catches ~90% of lock/permission/access issues before the full copy starts. Delete-threshold guard blocks accidental mass deletions. Source-disappearance guard prevents syncing from an unmounted or empty directory.
 - **Zero CPU idle** — `SemaphoreSlim` blocks the processing thread with no CPU usage when no events are queued. No polling timers. SQLite state DB uses incremental writes (no periodic full rewrites). The only wake-ups are file-change events from the OS.
 - **Crash-proof by construction** — every write follows the temp-then-rename pattern: no partial file ever lands at the final path. Startup recovery (`PowerGuard.Cleanup()`) collects orphaned `.tictack.tmp` files. SQLite WAL journal survives power loss without corruption. Lock files have stale-detection and auto-release.
-- **No secrets** — zero external network calls, no accounts, no cloud. Local diagnostic logs (`tictack-diag.log`, EventLog) stay on the machine.
+- **No secrets** — zero external network calls, no accounts, no cloud. EventLog entries stay on the machine.
 - **Dependency-light** — four runtime dependencies (Microsoft.Data.Sqlite, YamlDotNet, System.ServiceProcess.ServiceController, System.Diagnostics.EventLog). No npm, pip, cargo, or gem trees.
 
 ---
@@ -65,7 +65,7 @@ FileWatcherMonitor (Windows) / FsWatchMonitor (Linux) + PollingMonitor (composit
    IVersioningStrategy — archive previous version to .versions (optional)
         │
         ▼
-   IRetryPolicy + CopyAction (.tictack.tmp → fsync → atomic rename)
+   ExponentialBackoffRetry + CopyAction (.tictack.tmp → fsync → atomic rename)
         │
         ▼
    IValidator (size | hash) — post-copy integrity check
@@ -144,7 +144,6 @@ All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`)
 | `delete_threshold_size_gb` | `50` | Block deletion if one burst total size >= N GB |
 | `delete_threshold_percent` | `50` | Block deletion if one burst >= N% of known files |
 | `delete_hold_days` | `7` | Days to hold blocked deletions before syncing; daily warnings sent |
-| `rename_detection` | `true` | Track renames (vs delete+re-create, saves bandwidth) |
 | `max_versions` | `10` | Keep up to N old versions per file |
 | `path` | — | Where archived versions go (timestamp suffix) |
 | `deletion_mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |

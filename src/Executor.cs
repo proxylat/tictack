@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -129,26 +128,6 @@ namespace TicTack
 
     }
 
-    public class DeleteAction : IFileAction
-    {
-        public Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
-        {
-            try
-            {
-                if (File.Exists(args.DestPath) || Directory.Exists(args.DestPath))
-                {
-                    File.SetAttributes(args.DestPath, FileAttributes.Normal);
-                    File.Delete(args.DestPath);
-                }
-            }
-            catch (Exception ex)
-            {
-                return Task.FromResult(ActionResult.Fail(ex.Message));
-            }
-            return Task.FromResult(ActionResult.Ok());
-        }
-    }
-
     public class RenameAction : IFileAction
     {
         public Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
@@ -181,65 +160,4 @@ namespace TicTack
         }
     }
 
-    public class CommandAction : IFileAction
-    {
-        private readonly string _command;
-        private readonly string? _workingDir;
-
-        public CommandAction(string command, string? workingDir = null)
-        {
-            _command = command;
-            _workingDir = workingDir;
-        }
-
-        public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
-        {
-            var cmd = _command
-                .Replace("{source}", args.ChangeEvent.FullPath)
-                .Replace("{dest}", args.DestPath)
-                .Replace("{file}", Path.GetFileName(args.ChangeEvent.FullPath))
-                .Replace("{source_base}", args.SourceBase);
-
-            try
-            {
-                var psi = new ProcessStartInfo();
-                if (OperatingSystem.IsWindows())
-                {
-                    psi.FileName = "cmd.exe";
-                    psi.Arguments = "/c " + cmd;
-                }
-                else
-                {
-                    psi.FileName = "/bin/sh";
-                    psi.ArgumentList.Add("-c");
-                    psi.ArgumentList.Add(cmd);
-                }
-                psi.WorkingDirectory = _workingDir ?? AppDomain.CurrentDomain.BaseDirectory;
-                psi.UseShellExecute = false;
-                psi.RedirectStandardOutput = true;
-                psi.RedirectStandardError = true;
-                psi.CreateNoWindow = true;
-
-                using (var p = Process.Start(psi))
-                {
-                    if (p == null) return ActionResult.Fail("Failed to start process");
-                    using (ct.Register(() => { try { p.Kill(); } catch { } }))
-                    {
-                        await Task.Run(() => p.WaitForExit(), ct);
-                    }
-                    if (p.ExitCode != 0)
-                    {
-                        var err = p.StandardError.ReadToEnd();
-                        return ActionResult.Fail("exit=" + p.ExitCode + ": " + err);
-                    }
-                }
-                return ActionResult.Ok();
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                return ActionResult.Fail(ex.Message);
-            }
-        }
-    }
 }
