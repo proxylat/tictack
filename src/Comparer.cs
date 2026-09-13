@@ -20,13 +20,18 @@ namespace TicTack
 
     public class SizeComparer : IFileComparer
     {
-        public bool AreEqual(string sourcePath, string destPath)
+        public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
             {
-                var sInfo = new FileInfo(PathUtil.EnsureExtended(sourcePath));
+                var source = sourceSnapshot;
+                if (!source.HasValue)
+                {
+                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    source = current;
+                }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                return sInfo.Exists && dInfo.Exists && sInfo.Length == dInfo.Length;
+                return dInfo.Exists && source.Value.Length == dInfo.Length;
             }
             catch { return false; }
         }
@@ -34,15 +39,20 @@ namespace TicTack
 
     public class DateSizeComparer : IFileComparer
     {
-        public bool AreEqual(string sourcePath, string destPath)
+        public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
             {
-                var sInfo = new FileInfo(PathUtil.EnsureExtended(sourcePath));
+                var source = sourceSnapshot;
+                if (!source.HasValue)
+                {
+                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    source = current;
+                }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                return sInfo.Exists && dInfo.Exists
-                    && sInfo.Length == dInfo.Length
-                    && sInfo.LastWriteTimeUtc == dInfo.LastWriteTimeUtc;
+                return dInfo.Exists
+                    && source.Value.Length == dInfo.Length
+                    && source.Value.LastWriteTimeUtcTicks == dInfo.LastWriteTimeUtc.Ticks;
             }
             catch { return false; }
         }
@@ -53,14 +63,19 @@ namespace TicTack
         private readonly IFileAccessor? _accessor;
         public HashComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
 
-        public bool AreEqual(string sourcePath, string destPath)
+        public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
             {
-                var sInfo = new FileInfo(PathUtil.EnsureExtended(sourcePath));
+                var source = sourceSnapshot;
+                if (!source.HasValue)
+                {
+                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    source = current;
+                }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                if (!sInfo.Exists || !dInfo.Exists) return false;
-                if (sInfo.Length != dInfo.Length) return false;
+                if (!dInfo.Exists) return false;
+                if (source.Value.Length != dInfo.Length) return false;
                 return ComputeHash(sourcePath) == ComputeHash(destPath);
             }
             catch { return false; }
@@ -83,16 +98,21 @@ namespace TicTack
         private readonly IFileAccessor? _accessor;
         public FullComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
 
-        public bool AreEqual(string sourcePath, string destPath)
+        public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
             {
-                var sInfo = new FileInfo(PathUtil.EnsureExtended(sourcePath));
+                var source = sourceSnapshot;
+                if (!source.HasValue)
+                {
+                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    source = current;
+                }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                if (!sInfo.Exists || !dInfo.Exists) return false;
-                if (sInfo.Length != dInfo.Length) return false;
-                if (sInfo.LastWriteTimeUtc != dInfo.LastWriteTimeUtc) return false;
-                return new HashComparer(_accessor).AreEqual(sourcePath, destPath);
+                if (!dInfo.Exists) return false;
+                if (source.Value.Length != dInfo.Length) return false;
+                if (source.Value.LastWriteTimeUtcTicks != dInfo.LastWriteTimeUtc.Ticks) return false;
+                return new HashComparer(_accessor).AreEqual(sourcePath, destPath, source);
             }
             catch { return false; }
         }

@@ -206,84 +206,102 @@ namespace TicTack
         {
             if (!Directory.Exists(_config.Path)) return;
             var cache = _stateDb?.LoadAll();
-            var sourcePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sourcePaths = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            var pendingState = new List<(string path, long size, long mtime)>();
+            var stateLock = new object();
+
+            void FlushState()
+            {
+                if (_stateDb == null || pendingState.Count == 0) return;
+                lock (stateLock)
+                {
+                    try
+                    {
+                        _stateDb.UpsertBatch(pendingState);
+                        pendingState.Clear();
+                    }
+                    catch (Exception ex) { _log.Debug("StateDb batch upsert failed: " + ex.Message); }
+                }
+            }
 
             try
             {
-                foreach (var f in Directory.EnumerateFiles(_config.Path, "*", SearchOption.AllDirectories))
+                var files = Directory.EnumerateFiles(_config.Path, "*", SearchOption.AllDirectories)
+                    .Where(f => _filter == null || _filter.ShouldProcess(f))
+                    .ToList();
+                var options = new ParallelOptions
                 {
-                    if (_cts!.IsCancellationRequested) return;
-                    if (_filter != null && !_filter.ShouldProcess(f)) continue;
-                    var rel = f.Substring(_config.Path.Length).TrimStart('\\', '/');
-                    sourcePaths.Add(rel);
-                    var dst = Path.Combine(_config.Destination, rel);
-
-                    if (cache != null)
+                    CancellationToken = _cts!.Token,
+                    MaxDegreeOfParallelism = Math.Max(1, _config.Sync != null ? _config.Sync.InitialSyncWorkers : 2)
+                };
+                Parallel.ForEach(files, options, f =>
+                {
+                    try
                     {
-                        long srcSize = 0, srcTicks = 0;
+                        if (!FileSnapshot.TryRead(f, out var sourceSnapshot)) return;
+                        var rel = f.Substring(_config.Path.Length).TrimStart('\\', '/');
+                        sourcePaths.TryAdd(rel, 0);
+                        var dst = Path.Combine(_config.Destination, rel);
+
+                        if (cache != null && cache.TryGetValue(rel, out var s)
+                            && s.size == sourceSnapshot.Length && s.mtime == sourceSnapshot.LastWriteTimeUtcTicks)
+                            return;
+
+                        if (_comparer.AreEqual(f, dst, sourceSnapshot)) return;
+                        var e = new FileChangedEventArgs(ChangeType.Created, f);
+                        var args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                         try
                         {
-                            var fi = new FileInfo(f);
-                            srcSize = fi.Length;
-                            srcTicks = fi.LastWriteTimeUtc.Ticks;
+                            if (_versioning != null)
+                                _versioning.ArchivePreviousVersionAsync(dst, _cts!.Token).GetAwaiter().GetResult();
                         }
                         catch { }
-                        if (cache.TryGetValue(rel, out var s) && s.size == srcSize && s.mtime == srcTicks)
-                            continue;
-                    }
 
-                    if (_comparer.AreEqual(f, dst)) continue;
-                    var e = new FileChangedEventArgs(ChangeType.Created, f);
-                    var args = new FileActionArgs(e, _config.Path, _config.Destination);
-                    try
-                    {
-                        if (_versioning != null)
-                            _versioning.ArchivePreviousVersionAsync(dst, _cts!.Token).GetAwaiter().GetResult();
-                    }
-                    catch { }
-
-                    ActionResult result;
-                    try
-                    {
+                        ActionResult result;
                         result = _copyAction.ExecuteAsync(args, _cts!.Token).GetAwaiter().GetResult();
+                        if (!result.Success)
+                        {
+                            _log.Error("Initial sync failed: " + f + ": " + result.ErrorMessage);
+                            return;
+                        }
+
+                        if (!FileSnapshot.TryRead(f, out var freshSnapshot))
+                        {
+                            _log.Error("Initial sync validation FAILED: source disappeared: " + f);
+                            return;
+                        }
+                        if (_validator != null)
+                        {
+                            var valid = _validator.ValidateAsync(f, dst, freshSnapshot).GetAwaiter().GetResult();
+                            if (!valid)
+                            {
+                                _log.Error("Initial sync validation FAILED: " + f + " -> " + dst);
+                                return;
+                            }
+                        }
+
+                        if (_stateDb != null)
+                        {
+                            lock (stateLock)
+                            {
+                                pendingState.Add((rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks));
+                                if (pendingState.Count >= 500) FlushState();
+                            }
+                        }
                     }
-                    catch (OperationCanceledException) { return; }
+                    catch (OperationCanceledException) { }
                     catch (Exception ex)
                     {
                         _log.Error("Initial sync failed: " + f, ex);
-                        continue;
                     }
-                    if (!result.Success)
-                    {
-                        _log.Error("Initial sync failed: " + f + ": " + result.ErrorMessage);
-                        continue;
-                    }
+                });
 
-                    if (_validator != null)
-                    {
-                        var valid = _validator.ValidateAsync(f, dst).GetAwaiter().GetResult();
-                        if (!valid)
-                        {
-                            _log.Error("Initial sync validation FAILED: " + f + " -> " + dst);
-                            continue;
-                        }
-                    }
-
-                    if (_stateDb != null)
-                    {
-                        try
-                        {
-                            var fi = new FileInfo(f);
-                            _stateDb.Upsert(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
-                        }
-                        catch (Exception ex) { _log.Debug("StateDb upsert failed: " + ex.Message); }
-                    }
-                }
-
-                EnforceParity(sourcePaths);
+                FlushState();
+                EnforceParity(new HashSet<string>(sourcePaths.Keys, StringComparer.OrdinalIgnoreCase));
             }
             catch (UnauthorizedAccessException) { _log.Warn("Access denied scanning " + _config.Path); }
             catch (PathTooLongException) { _log.Warn("Path too long scanning " + _config.Path); }
+            catch (OperationCanceledException) { return; }
             _log.Info("Sync complete: " + _config.Path);
         }
 
@@ -361,7 +379,9 @@ namespace TicTack
                                 await _deletion.HandleDeletionAsync(e.FullPath, args.DestPath, ct);
                             return;
                         }
-                        if (_comparer.AreEqual(e.FullPath, args.DestPath)) return;
+                        if (!FileSnapshot.TryRead(e.FullPath, out var sourceSnapshot)) return;
+                        args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
+                        if (_comparer.AreEqual(e.FullPath, args.DestPath, sourceSnapshot)) return;
 
                         if (_versioning != null)
                             await _versioning.ArchivePreviousVersionAsync(args.DestPath, ct);
@@ -375,9 +395,14 @@ namespace TicTack
                             return;
                         }
 
+                        if (!FileSnapshot.TryRead(e.FullPath, out var freshSnapshot))
+                        {
+                            _log.Error("Validation FAILED: source disappeared: " + e.FullPath);
+                            return;
+                        }
                         if (_validator != null)
                         {
-                            var valid = await _validator.ValidateAsync(e.FullPath, args.DestPath);
+                            var valid = await _validator.ValidateAsync(e.FullPath, args.DestPath, freshSnapshot);
                             if (!valid)
                             {
                                 _log.Error("Validation FAILED: " + e.FullPath + " -> " + args.DestPath);
@@ -389,8 +414,7 @@ namespace TicTack
                             try
                             {
                                 var rel = e.FullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
-                                var fi = new FileInfo(e.FullPath);
-                                _stateDb.Upsert(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+                                _stateDb.Upsert(rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks);
                             }
                             catch (Exception ex) { _log.Debug("StateDb update skipped: " + ex.Message); }
                         }

@@ -43,6 +43,25 @@ public class StateDbTests : IDisposable
     }
 
     [Fact]
+    public void UpsertBatch_RoundTripsAndOverwrites()
+    {
+        _db.UpsertBatch(new[]
+        {
+            (path: "file1.txt", size: 100L, mtime: 1000L),
+            (path: "file2.txt", size: 200L, mtime: 2000L)
+        });
+        _db.UpsertBatch(new[]
+        {
+            (path: "file1.txt", size: 300L, mtime: 3000L)
+        });
+
+        var all = _db.LoadAll();
+        Assert.Equal(2, all.Count);
+        Assert.Equal((300L, 3000L), all["file1.txt"]);
+        Assert.Equal((200L, 2000L), all["file2.txt"]);
+    }
+
+    [Fact]
     public void Delete_RemovesEntry()
     {
         _db.Upsert("file.txt", 100, 1000);

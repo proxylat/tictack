@@ -1,6 +1,8 @@
 bin/
 obj/
 .dotnet/
+.opencode/
+.code-review-graph/
 *.log
 service/win/TicTackSv.exe
 service/win/config.yaml
@@ -18,6 +20,4 @@ service/linux/*.runtimeconfig.json
 service/linux/*.so
 service/linux/runtimes/
 service/linux/createdump
-service/linux/mount-pendrive.sh
-service/linux/99-tictack-pendrive.rules
 AGENTS.md

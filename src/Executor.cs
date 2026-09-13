@@ -10,6 +10,19 @@ namespace TicTack
     public class CopyAction : IFileAction
     {
         private readonly IFileAccessor _accessor;
+        private readonly bool _fullDurability;
+
+        [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+        static extern int OpenDirectory(string path, int flags);
+
+        [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
+        static extern int Fsync(int fd);
+
+        [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+        static extern int Close(int fd);
+
+        const int O_RDONLY = 0;
+        const int O_DIRECTORY = 0x10000;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool DeviceIoControl(IntPtr hDevice, uint dwIoControlCode,
@@ -19,9 +32,10 @@ namespace TicTack
 
         const uint FSCTL_SET_SPARSE = 0x000900C4;
 
-        public CopyAction(IFileAccessor accessor)
+        public CopyAction(IFileAccessor accessor, bool fullDurability = true)
         {
             _accessor = accessor;
+            _fullDurability = fullDurability;
         }
 
         public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
@@ -57,10 +71,21 @@ namespace TicTack
                         dstStream.SetLength(srcStream.Length);
                     }
                     await srcStream.CopyToAsync(dstStream, 81920, ct);
-                    dstStream.Flush(true);
+                    if (_fullDurability)
+                        dstStream.Flush(true);
+                    else
+                        dstStream.Flush();
                 }
 
-                try { File.SetLastWriteTimeUtc(tmp, new FileInfo(src).LastWriteTimeUtc); } catch { }
+                try
+                {
+                    var sourceSnapshot = args.SourceSnapshot;
+                    if (!sourceSnapshot.HasValue && FileSnapshot.TryRead(src, out var current))
+                        sourceSnapshot = current;
+                    if (sourceSnapshot.HasValue)
+                        File.SetLastWriteTimeUtc(tmp, sourceSnapshot.Value.LastWriteTimeUtc);
+                }
+                catch { }
 
                 try
                 {
@@ -81,6 +106,9 @@ namespace TicTack
                     try { File.Delete(tmp); } catch { }
                 }
 
+                if (!_fullDurability)
+                    FlushDirectory(Path.GetDirectoryName(dst));
+
                 return ActionResult.Ok();
             }
             catch (UnauthorizedAccessException ex) { return ActionResult.Fail(ex.Message); }
@@ -88,6 +116,15 @@ namespace TicTack
             catch (PathTooLongException ex) { return ActionResult.Fail(ex.Message); }
             catch (NotSupportedException ex) { return ActionResult.Fail(ex.Message); }
             catch (IOException ex) { return ActionResult.Fail(ex.Message); }
+        }
+
+        static void FlushDirectory(string? path)
+        {
+            if (!OperatingSystem.IsLinux() || string.IsNullOrEmpty(path)) return;
+            var fd = OpenDirectory(path, O_RDONLY | O_DIRECTORY);
+            if (fd < 0) return;
+            try { Fsync(fd); }
+            finally { Close(fd); }
         }
 
     }

@@ -133,6 +133,8 @@ All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`)
 | `max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files |
 | `exclude` | `[]` | Case-insensitive glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) |
 | `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |
+| `durability` | `full` | `full` fsyncs each temporary file before rename; `rename-only` skips per-file disk flush and fsyncs the destination directory instead, trading a power-loss window for speed |
+| `initial_sync_workers` | `2` | Bounded parallel workers for initial sync only; copying remains complete before parity/deletion cleanup |
 | `max_attempts` | `5` | Max retries on failed copy |
 | `delay_ms` | `1000` | Initial retry delay (ms) |
 | `backoff` | `2.0` | Delay multiplier per retry (1s → 2s → 4s) |
@@ -149,6 +151,8 @@ All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`)
 | `path` | — | Target dir in `archive` mode |
 
 **Path mirroring:** archived and versioned files keep their real folder structure. With a shared `.archive` / `.versions` next to the sync root, deleting `Desktop\foo.txt` lands in `.archive\Desktop\foo_ts.txt` — not in the archive root.
+
+**Durability warning:** `rename-only` preserves atomic temp+rename behavior but does not force each file's data to stable storage before the rename. Use the default `full` setting when power-loss durability matters more than initial-sync speed.
 
 **Delete-threshold guard:** if one deletion burst exceeds `delete_threshold_count`, `delete_threshold_size_gb`, or `delete_threshold_percent` of known files, it is deferred to `tictack-deferred-<folder>.json` (next to the log file). After `delete_hold_days`, remaining files are synced; warnings are logged daily with the first 20 paths + full list location.
 

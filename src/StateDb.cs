@@ -125,6 +125,31 @@ namespace TicTack
             }
         }
 
+        public void UpsertBatch(IEnumerable<(string path, long size, long mtime)> entries)
+        {
+            lock (_lock)
+            {
+                EnsureConnected();
+                using (var tx = _conn.BeginTransaction())
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "INSERT OR REPLACE INTO state (path, size, mtime) VALUES (@p, @s, @m)";
+                    var path = cmd.Parameters.Add("@p", SqliteType.Text);
+                    var size = cmd.Parameters.Add("@s", SqliteType.Integer);
+                    var mtime = cmd.Parameters.Add("@m", SqliteType.Integer);
+                    foreach (var entry in entries)
+                    {
+                        path.Value = entry.path;
+                        size.Value = entry.size;
+                        mtime.Value = entry.mtime;
+                        cmd.ExecuteNonQuery();
+                    }
+                    tx.Commit();
+                }
+            }
+        }
+
         public void Delete(string path)
         {
             lock (_lock)

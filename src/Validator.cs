@@ -21,13 +21,18 @@ namespace TicTack
 
     public class SizeValidator : IValidator
     {
-        public Task<bool> ValidateAsync(string sourcePath, string destPath)
+        public Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
             {
-                var sInfo = new FileInfo(PathUtil.EnsureExtended(sourcePath));
+                var source = sourceSnapshot;
+                if (!source.HasValue)
+                {
+                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return Task.FromResult(false);
+                    source = current;
+                }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                return Task.FromResult(dInfo.Exists && sInfo.Length == dInfo.Length);
+                return Task.FromResult(dInfo.Exists && source.Value.Length == dInfo.Length);
             }
             catch { return Task.FromResult(false); }
         }
@@ -38,14 +43,18 @@ namespace TicTack
         private readonly IFileAccessor? _accessor;
         public HashValidator(IFileAccessor? accessor = null) { _accessor = accessor; }
 
-        public async Task<bool> ValidateAsync(string sourcePath, string destPath)
+        public async Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
             {
-                if (!File.Exists(PathUtil.EnsureExtended(sourcePath)) || !File.Exists(PathUtil.EnsureExtended(destPath))) return false;
-                var sInfo = new FileInfo(PathUtil.EnsureExtended(sourcePath));
+                var source = sourceSnapshot;
+                if (!source.HasValue)
+                {
+                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    source = current;
+                }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                if (sInfo.Length != dInfo.Length) return false;
+                if (!dInfo.Exists || source.Value.Length != dInfo.Length) return false;
                 var srcHash = await ComputeHashAsync(sourcePath);
                 var dstHash = await ComputeHashAsync(destPath);
                 return srcHash == dstHash;
