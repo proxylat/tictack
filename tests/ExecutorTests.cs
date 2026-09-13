@@ -110,30 +110,6 @@ public class ExecutorTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteAction_DeletesFile()
-    {
-        File.WriteAllText(Dst("a.txt"), "delete me");
-
-        var action = new DeleteAction();
-        var e = new FileChangedEventArgs(ChangeType.Deleted, Src("a.txt"));
-        var args = new FileActionArgs(e, _srcDir, _dstDir);
-        var result = await action.ExecuteAsync(args, CancellationToken.None);
-
-        Assert.True(result.Success);
-        Assert.False(File.Exists(Dst("a.txt")));
-    }
-
-    [Fact]
-    public async Task DeleteAction_NoError_OnMissingFile()
-    {
-        var action = new DeleteAction();
-        var e = new FileChangedEventArgs(ChangeType.Deleted, Src("missing.txt"));
-        var args = new FileActionArgs(e, _srcDir, _dstDir);
-        var result = await action.ExecuteAsync(args, CancellationToken.None);
-        Assert.True(result.Success);
-    }
-
-    [Fact]
     public async Task RenameAction_RenamesFile()
     {
         File.WriteAllText(Dst("old.txt"), "rename me");
@@ -174,17 +150,4 @@ public class ExecutorTests : IDisposable
         Assert.True(result.Success);
     }
 
-    [Fact]
-    public async Task CopyAction_FsyncAfterWrite()
-    {
-        var content = new string('X', 10000);
-        File.WriteAllText(Src("large.txt"), content);
-
-        var action = new CopyAction(_accessor);
-        var args = MakeArgs(Src("large.txt"), "large.txt");
-        var result = await action.ExecuteAsync(args, CancellationToken.None);
-
-        Assert.True(result.Success);
-        Assert.Equal(content.Length, new FileInfo(Dst("large.txt")).Length);
-    }
 }

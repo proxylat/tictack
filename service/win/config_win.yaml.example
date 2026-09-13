@@ -30,7 +30,6 @@ sources:
       delete_threshold_size_gb: 50
       delete_threshold_percent: 50
       delete_hold_days: 7
-      rename_detection: true
       versioning:
         max_versions: 10
         path: '[TicTack]\Sync\.versions'

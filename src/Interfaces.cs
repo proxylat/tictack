@@ -9,54 +9,41 @@ namespace TicTack
 
     public class FileChangedEventArgs : EventArgs
     {
-        private readonly ChangeType _changeType;
-        private readonly string _fullPath;
-        private readonly string? _oldFullPath;
-
-        public ChangeType ChangeType { get { return _changeType; } }
-        public string FullPath { get { return _fullPath; } }
-        public string? OldFullPath { get { return _oldFullPath; } }
+        public ChangeType ChangeType { get; }
+        public string FullPath { get; }
+        public string? OldFullPath { get; }
 
         public FileChangedEventArgs(ChangeType type, string path, string? oldPath = null)
         {
-            _changeType = type; _fullPath = path; _oldFullPath = oldPath;
+            ChangeType = type; FullPath = path; OldFullPath = oldPath;
         }
     }
 
     public class MonitorErrorEventArgs : EventArgs
     {
-        private readonly Exception _exception;
+        public Exception Exception { get; }
 
-        public Exception Exception { get { return _exception; } }
-
-        public MonitorErrorEventArgs(Exception ex) { _exception = ex; }
+        public MonitorErrorEventArgs(Exception ex) { Exception = ex; }
     }
 
     public class FileActionArgs
     {
-        private readonly FileChangedEventArgs _changeEvent;
-        private readonly string _sourceBase;
-        private readonly string _destBase;
-        private readonly string _destPath;
-        private readonly string? _oldDestPath;
-        private readonly FileSnapshot? _sourceSnapshot;
-
-        public FileChangedEventArgs ChangeEvent { get { return _changeEvent; } }
-        public string SourceBase { get { return _sourceBase; } }
-        public string DestBase { get { return _destBase; } }
-        public string DestPath { get { return _destPath; } }
-        public string? OldDestPath { get { return _oldDestPath; } }
-        public FileSnapshot? SourceSnapshot { get { return _sourceSnapshot; } }
+        public FileChangedEventArgs ChangeEvent { get; }
+        public string SourceBase { get; }
+        public string DestBase { get; }
+        public string DestPath { get; }
+        public string? OldDestPath { get; }
+        public FileSnapshot? SourceSnapshot { get; }
 
         public FileActionArgs(FileChangedEventArgs changeEvent, string sourceBase, string destBase, FileSnapshot? sourceSnapshot = null)
         {
-            _changeEvent = changeEvent;
-            _sourceBase = sourceBase;
-            _destBase = destBase;
-            _destPath = MapPath(sourceBase, destBase, changeEvent.FullPath);
-            _sourceSnapshot = sourceSnapshot;
+            ChangeEvent = changeEvent;
+            SourceBase = sourceBase;
+            DestBase = destBase;
+            DestPath = MapPath(sourceBase, destBase, changeEvent.FullPath);
+            SourceSnapshot = sourceSnapshot;
             if (changeEvent.ChangeType == ChangeType.Renamed && changeEvent.OldFullPath != null)
-                _oldDestPath = MapPath(sourceBase, destBase, changeEvent.OldFullPath);
+                OldDestPath = MapPath(sourceBase, destBase, changeEvent.OldFullPath);
         }
 
         private static string MapPath(string fromBase, string toBase, string path)
@@ -137,11 +124,6 @@ namespace TicTack
         Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct);
     }
 
-    public interface IRetryPolicy
-    {
-        Task<T> ExecuteAsync<T>(Func<Task<T>> action, CancellationToken ct);
-    }
-
     public interface IFileAccessor
     {
         Stream OpenRead(string path);
@@ -170,9 +152,4 @@ namespace TicTack
         void Error(string msg, Exception? ex = null);
     }
 
-    public interface ISyncPipeline : IDisposable
-    {
-        void Start();
-        void Stop();
-    }
 }

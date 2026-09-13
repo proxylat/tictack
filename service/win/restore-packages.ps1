@@ -1,5 +1,3 @@
-param([switch]$Force)
-
 Write-Host "Restoring NuGet packages..."
 dotnet restore "$PSScriptRoot\..\src\TicTack.csproj"
 if ($LASTEXITCODE -ne 0) {

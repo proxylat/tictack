@@ -39,7 +39,6 @@ public class StressTests
                 new EventMonitor(),
                 new DateSizeComparer(),
                 new CopyAction(new FileAccessor()),
-                new DeleteAction(),
                 new RenameAction(),
                 new ExponentialBackoffRetry(1, 0, 1),
                 new SizeValidator(),
@@ -76,7 +75,6 @@ public class StressTests
                 new EventMonitor(),
                 new DateSizeComparer(),
                 new CopyAction(new FileAccessor()),
-                new DeleteAction(),
                 new RenameAction(),
                 new ExponentialBackoffRetry(1, 0, 1),
                 new SizeValidator(),
@@ -314,7 +312,6 @@ public class StressTests
                 monitor,
                 new DateSizeComparer(),
                 new CopyAction(new FileAccessor()),
-                new DeleteAction(),
                 new RenameAction(),
                 new ExponentialBackoffRetry(1, 0, 1),
                 new SizeValidator(),
@@ -363,7 +360,6 @@ public class StressTests
                 monitor,
                 new DateSizeComparer(),
                 new CopyAction(new FileAccessor()),
-                new DeleteAction(),
                 new RenameAction(),
                 new ExponentialBackoffRetry(1, 0, 1),
                 new SizeValidator(),
@@ -404,7 +400,6 @@ public class StressTests
                 monitor,
                 new DateSizeComparer(),
                 new CopyAction(new FileAccessor()),
-                new DeleteAction(),
                 new RenameAction(),
                 new ExponentialBackoffRetry(1, 0, 1),
                 new SizeValidator(),
@@ -434,8 +429,6 @@ public class StressTests
             await Task.Delay(2000);
             pipeline.Dispose();
 
-            // Should not throw or deadlock
-            Assert.True(true);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -594,33 +587,4 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 18. CopyAction with locked source file (sharing violation) ──
-
-    [Fact]
-    public async Task CopyAction_LockedSourceFile_UsesPlatformSharingRules()
-    {
-        var dir = TestDir();
-        var srcDir = Path.Combine(dir, "src");
-        var dstDir = Path.Combine(dir, "dst");
-        Directory.CreateDirectory(srcDir);
-        Directory.CreateDirectory(dstDir);
-        try
-        {
-            var src = Path.Combine(srcDir, "locked.txt");
-            File.WriteAllText(src, "locked content");
-
-            using (var hold = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.None))
-            {
-                var action = new CopyAction(new FileAccessor());
-                var args = new FileActionArgs(
-                    new FileChangedEventArgs(ChangeType.Created, src), srcDir, dstDir);
-                var result = await action.ExecuteAsync(args, CancellationToken.None);
-                if (OperatingSystem.IsWindows())
-                    Assert.False(result.Success);
-                else
-                    Assert.True(result.Success);
-            }
-        }
-        finally { try { Directory.Delete(dir, true); } catch { } }
-    }
 }

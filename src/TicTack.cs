@@ -34,8 +34,6 @@ namespace TicTack
 
         static int Main(string[] args)
         {
-            var diag = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tictack-diag.log");
-            try { File.AppendAllText(diag, DateTime.Now + " [1] Main started, baseDir=" + AppDomain.CurrentDomain.BaseDirectory + "\n"); } catch { }
             try
             {
                 var baseDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -115,9 +113,7 @@ namespace TicTack
 
             if (OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive))
             {
-                try { File.AppendAllText(diag, DateTime.Now + " [2a] dir dlls: " + string.Join(", ", Directory.GetFiles(AppDomain.CurrentDomain.BaseDirectory, "*.dll").Select(Path.GetFileName)) + "\n"); } catch { }
                 RunService(cfgPath);
-                try { File.AppendAllText(diag, DateTime.Now + " [3] After RunService (returning 0)\n"); } catch { }
                 return 0;
             }
 
@@ -126,7 +122,6 @@ namespace TicTack
             }
             catch (Exception ex)
             {
-                try { File.AppendAllText(diag, DateTime.Now + " [E] Main catch: " + ex.GetType().Name + ": " + ex.Message + "\n" + ex.StackTrace + "\n"); } catch { }
                 var crashLog = Path.Combine(Path.GetTempPath(), "TicTackSv-crash.log");
                 try { File.WriteAllText(crashLog, DateTime.Now + " Main failed:\r\n" + ex); } catch { }
                 LogCrash(ex);
@@ -273,11 +268,7 @@ namespace TicTack
                 Dictionary<string, (long size, long mtime)>? cache = null;
                 try
                 {
-                    var name = Path.GetFileName(srcPath.TrimEnd('\\', '/'));
-                    if (string.IsNullOrEmpty(name)) name = "default";
-                    var dbPath = !string.IsNullOrEmpty(src.StateDbPath)
-                        ? Path.Combine(src.StateDbPath, name + ".db")
-                        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TicTack", name + ".db");
+                    var dbPath = GetStateDbPath(src);
                     stateDb = new StateDb(dbPath);
                     cache = stateDb.LoadAll();
                 }
@@ -435,15 +426,9 @@ namespace TicTack
 
         static void RunRebuild(TicTackConfig cfg, ILogger log)
         {
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-
             foreach (var src in cfg.Sources)
             {
-                var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
-                if (string.IsNullOrEmpty(name)) name = "default";
-                var dbPath = !string.IsNullOrEmpty(src.StateDbPath)
-                    ? Path.Combine(src.StateDbPath, name + ".db")
-                    : Path.Combine(localAppData, "TicTack", name + ".db");
+                var dbPath = GetStateDbPath(src);
                 try
                 {
                     if (Directory.Exists(dbPath))
@@ -627,7 +612,7 @@ namespace TicTack
                 return;
             }
 
-            var pipelines = new List<ISyncPipeline>();
+            var pipelines = new List<SyncPipeline>();
 
             foreach (var src in cfg.Sources)
             {
@@ -660,21 +645,7 @@ namespace TicTack
 
         static void RunService(string cfgPath)
         {
-            var diag = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tictack-diag.log");
-            try { File.AppendAllText(diag, DateTime.Now + " [4] RunService: creating TicTackService\n"); } catch { }
-            try
-            {
-                var svc = new TicTackService(cfgPath);
-                try { File.AppendAllText(diag, DateTime.Now + " [5] RunService: calling ServiceBase.Run\n"); } catch { }
-                ServiceBase.Run(svc);
-                try { File.AppendAllText(diag, DateTime.Now + " [6] RunService: ServiceBase.Run returned\n"); } catch { }
-            }
-            catch (Exception ex)
-            {
-                try { File.AppendAllText(diag, DateTime.Now + " [E] RunService failed: " + ex.GetType().Name + ": " + ex.Message + "\n" + ex.StackTrace + "\n"); } catch { }
-                try { File.AppendAllText(diag, DateTime.Now + " [E2] dir dlls: " + string.Join(", ", Directory.GetFiles(AppDomain.CurrentDomain.BaseDirectory, "*.dll").Select(Path.GetFileName)) + "\n"); } catch { }
-                throw;
-            }
+            ServiceBase.Run(new TicTackService(cfgPath));
         }
 
         static void LogCrash(Exception ex)
@@ -682,7 +653,19 @@ namespace TicTack
             try { EventLog.WriteEntry("TicTackSv", "Main failed: " + ex, EventLogEntryType.Error); } catch { }
         }
 
-        internal static ISyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log)
+        static string GetStateDbPath(SourceConfig src)
+        {
+            var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
+            if (string.IsNullOrEmpty(name)) name = "default";
+            var root = !string.IsNullOrEmpty(src.StateDbPath)
+                ? src.StateDbPath
+                : OperatingSystem.IsWindows()
+                    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TicTack")
+                    : "/var/lib/tictack";
+            return Path.Combine(root, name + ".db");
+        }
+
+        internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log)
         {
             var accessor = new FileAccessor();
             var level = Config.ParseVerification(src.Sync != null ? src.Sync.Verification : null);
@@ -695,17 +678,12 @@ namespace TicTack
             var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, src.Destination);
 
             var copyAction = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
-            var deleteAction = new DeleteAction();
             var renameAction = new RenameAction();
 
             StateDb? stateDb = null;
             try
             {
-                var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
-                if (string.IsNullOrEmpty(name)) name = "default";
-                var dbPath = !string.IsNullOrEmpty(src.StateDbPath)
-                    ? Path.Combine(src.StateDbPath, name + ".db")
-                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TicTack", name + ".db");
+                var dbPath = GetStateDbPath(src);
                 stateDb = new StateDb(dbPath);
             }
             catch (Exception ex)
@@ -763,7 +741,7 @@ namespace TicTack
             }
             catch { }
 
-            return new SyncPipeline(src, monitor, comparer, copyAction, deleteAction, renameAction,
+            return new SyncPipeline(src, monitor, comparer, copyAction, renameAction,
                 retry, validator, versioning, deletion, log, stateDb,
                 autoExcludePrefixes: excludes.ToArray(),
                 deferredPath: deferredPath);

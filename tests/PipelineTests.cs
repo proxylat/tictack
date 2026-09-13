@@ -7,7 +7,6 @@ public class PipelineTests : IDisposable
     private readonly string _dstDir;
     private readonly EventMonitor _monitor = new();
     private readonly RecordingAction _copy = new(new CopyAction(new FileAccessor()));
-    private readonly RecordingAction _delete = new(new DeleteAction());
     private readonly RecordingAction _rename = new(new RenameAction());
     private readonly RecordingValidator _validator = new(new SizeValidator());
     private readonly RecordingDeletion _deletion = new(new MirrorDeletion());
@@ -31,7 +30,7 @@ public class PipelineTests : IDisposable
         var cfg = new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 };
         tweak?.Invoke(cfg);
         _db = new StateDb(Path.Combine(_root, "state.db"));
-        _pipeline = new SyncPipeline(cfg, _monitor, new SizeComparer(), _copy, _delete, _rename,
+        _pipeline = new SyncPipeline(cfg, _monitor, new SizeComparer(), _copy, _rename,
             new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(),
             _deletion, _log, _db);
         _pipeline.Start();
@@ -72,8 +71,15 @@ public class PipelineTests : IDisposable
     [Fact]
     public void Created_UsesFreshSnapshotAfterCopy()
     {
-        _copy.AfterExecute = args => File.AppendAllText(args.ChangeEvent.FullPath, "y");
         var file = Path.Combine(_srcDir, "fresh.txt");
+        var changed = false;
+        _copy.AfterExecute = args =>
+        {
+            if (changed) return;
+            changed = true;
+            File.AppendAllText(args.ChangeEvent.FullPath, "y");
+            _monitor.Fire(ChangeType.Modified, file);
+        };
         File.WriteAllText(file, "x");
         _monitor.Fire(ChangeType.Created, file);
 
@@ -101,7 +107,7 @@ public class PipelineTests : IDisposable
     {
         using var failingPipeline = new SyncPipeline(
             new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
-            _monitor, new SizeComparer(), new FaultingAction("boom"), _delete, _rename,
+            _monitor, new SizeComparer(), new FaultingAction("boom"), _rename,
             new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(), _deletion, _log,
             _db = new StateDb(Path.Combine(_root, "failure-state.db")));
         _pipeline.Dispose();

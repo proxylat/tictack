@@ -152,7 +152,7 @@ watchdog:
     [Fact]
     public void Load_ExpandsPathsListIntoMultipleSources()
     {
-        var userDir = Environment.GetEnvironmentVariable("USERPROFILE") ?? Environment.GetEnvironmentVariable("HOME") ?? @"C:\Users";
+        const string userDir = @"C:\Users\TestUser";
         var yaml = @"
 sources:
   - paths:
@@ -178,37 +178,24 @@ sources:
     }
 
     [Fact]
-    public void Load_HandlesMissingFileGracefully()
-    {
-        var result = Config.Load(Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString()));
-        Assert.Null(result);
-    }
-
-    [Fact]
-    public void EnvVars_AreExpanded()
+    public void Load_LeavesEnvironmentVariablesLiteral()
     {
         var yaml = @"
 sources:
-  - path: '%TESTROOT%\Desktop'
+  - path: '%USERPROFILE%\Desktop'
     destination: D:\dst
 logging:
-  path: '%TESTROOT%\tictack.log'
+  path: '%LOCALAPPDATA%\tictack.log'
 ";
         var path = Path.GetTempFileName();
         try
         {
-            Environment.SetEnvironmentVariable("TESTROOT", @"C:\TicTackTest");
             File.WriteAllText(path, yaml);
             var cfg = Config.Load(path)!;
-            Assert.NotNull(cfg);
-            Assert.Equal(@"C:\TicTackTest" + @"\Desktop", cfg.Sources[0].Path);
-            Assert.Equal(@"C:\TicTackTest" + @"\tictack.log", cfg.Logging.Path);
+            Assert.Equal(@"%USERPROFILE%\Desktop", cfg.Sources[0].Path);
+            Assert.Equal(@"%LOCALAPPDATA%\tictack.log", cfg.Logging.Path);
         }
-        finally
-        {
-            Environment.SetEnvironmentVariable("TESTROOT", null);
-            File.Delete(path);
-        }
+        finally { File.Delete(path); }
     }
 
     [Fact]

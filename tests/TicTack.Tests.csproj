@@ -16,7 +16,6 @@
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
-    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
   </ItemGroup>
 
   <ItemGroup>
@@ -45,10 +44,6 @@
     <Compile Include="../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
     <Compile Include="../src/Scheduler.cs" Link="src/Scheduler.cs" />
     <Compile Include="../src/JobState.cs" Link="src/JobState.cs" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Remove="MinimalService.cs" />
   </ItemGroup>
 
 </Project>

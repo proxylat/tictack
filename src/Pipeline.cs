@@ -9,15 +9,14 @@ using System.Threading.Tasks;
 
 namespace TicTack
 {
-    public class SyncPipeline : ISyncPipeline
+    public class SyncPipeline : IDisposable
     {
         private readonly SourceConfig _config;
         private readonly IFileMonitor _monitor;
         private readonly IFileComparer _comparer;
         private readonly IFileAction _copyAction;
-        private readonly IFileAction _deleteAction;
         private readonly IFileAction _renameAction;
-        private readonly IRetryPolicy _retry;
+        private readonly ExponentialBackoffRetry _retry;
         private readonly IValidator _validator;
         private readonly IVersioningStrategy _versioning;
         private readonly IDeletionStrategy _deletion;
@@ -43,9 +42,8 @@ namespace TicTack
             IFileMonitor monitor,
             IFileComparer comparer,
             IFileAction copyAction,
-            IFileAction deleteAction,
             IFileAction renameAction,
-            IRetryPolicy retry,
+            ExponentialBackoffRetry retry,
             IValidator validator,
             IVersioningStrategy versioning,
             IDeletionStrategy deletion,
@@ -58,7 +56,6 @@ namespace TicTack
             _monitor = monitor;
             _comparer = comparer;
             _copyAction = copyAction;
-            _deleteAction = deleteAction;
             _renameAction = renameAction;
             _retry = retry;
             _validator = validator;
@@ -252,8 +249,7 @@ namespace TicTack
                         var args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                         try
                         {
-                            if (_versioning != null)
-                                _versioning.ArchivePreviousVersionAsync(dst, _cts!.Token).GetAwaiter().GetResult();
+                            _versioning.ArchivePreviousVersionAsync(dst, _cts!.Token).GetAwaiter().GetResult();
                         }
                         catch { }
 
@@ -270,14 +266,11 @@ namespace TicTack
                             _log.Error("Initial sync validation FAILED: source disappeared: " + f);
                             return;
                         }
-                        if (_validator != null)
+                        var valid = _validator.ValidateAsync(f, dst, freshSnapshot).GetAwaiter().GetResult();
+                        if (!valid)
                         {
-                            var valid = _validator.ValidateAsync(f, dst, freshSnapshot).GetAwaiter().GetResult();
-                            if (!valid)
-                            {
-                                _log.Error("Initial sync validation FAILED: " + f + " -> " + dst);
-                                return;
-                            }
+                            _log.Error("Initial sync validation FAILED: " + f + " -> " + dst);
+                            return;
                         }
 
                         if (_stateDb != null)
@@ -383,8 +376,7 @@ namespace TicTack
                         args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                         if (_comparer.AreEqual(e.FullPath, args.DestPath, sourceSnapshot)) return;
 
-                        if (_versioning != null)
-                            await _versioning.ArchivePreviousVersionAsync(args.DestPath, ct);
+                        await _versioning.ArchivePreviousVersionAsync(args.DestPath, ct);
 
                         var result = await _retry.ExecuteAsync(
                             () => _copyAction.ExecuteAsync(args, ct), ct);
@@ -400,14 +392,11 @@ namespace TicTack
                             _log.Error("Validation FAILED: source disappeared: " + e.FullPath);
                             return;
                         }
-                        if (_validator != null)
+                        var valid = await _validator.ValidateAsync(e.FullPath, args.DestPath, freshSnapshot);
+                        if (!valid)
                         {
-                            var valid = await _validator.ValidateAsync(e.FullPath, args.DestPath, freshSnapshot);
-                            if (!valid)
-                            {
-                                _log.Error("Validation FAILED: " + e.FullPath + " -> " + args.DestPath);
-                                return;
-                            }
+                            _log.Error("Validation FAILED: " + e.FullPath + " -> " + args.DestPath);
+                            return;
                         }
                         if (_stateDb != null)
                         {
@@ -505,7 +494,6 @@ namespace TicTack
 
             foreach (var d in batch)
             {
-                var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Deleted, d.Path), _config.Path, _config.Destination);
                 await _deletion.HandleDeletionAsync(d.Path, d.DestPath, ct);
                 if (_stateDb != null)
                 {
@@ -612,8 +600,8 @@ namespace TicTack
                 {
                     foreach (var f in action.Files!)
                     {
-                        var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Deleted, f), _config.Path, _config.Destination);
-                        await _deletion.HandleDeletionAsync(f, args.DestPath, CancellationToken.None);
+                        var destPath = Path.Combine(_config.Destination, f.Substring(_config.Path.Length).TrimStart('\\', '/'));
+                        await _deletion.HandleDeletionAsync(f, destPath, CancellationToken.None);
                         if (_stateDb != null)
                         {
                             try
