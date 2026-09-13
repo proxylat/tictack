@@ -136,12 +136,12 @@ namespace TicTack
 
     public interface IVersioningStrategy
     {
-        Task ArchivePreviousVersionAsync(string destPath, CancellationToken ct);
+        Task<ActionResult> ArchivePreviousVersionAsync(string destPath, CancellationToken ct);
     }
 
     public interface IDeletionStrategy
     {
-        Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct);
+        Task<ActionResult> HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct);
     }
 
     public interface ILogger

@@ -58,6 +58,18 @@ public sealed class FaultingAction : IFileAction
         Task.FromResult(ActionResult.Fail(_message));
 }
 
+public sealed class BlockingAction : IFileAction
+{
+    public TaskCompletionSource<bool> Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
+    {
+        Started.TrySetResult(true);
+        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        return ActionResult.Ok();
+    }
+}
+
 public sealed class RecordingValidator : IValidator
 {
     private readonly IValidator _inner;
@@ -83,9 +95,9 @@ public sealed class RecordingDeletion : IDeletionStrategy
 
     public RecordingDeletion(IDeletionStrategy inner) => _inner = inner;
 
-    public async Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
+    public async Task<ActionResult> HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
     {
         Calls.Add((sourcePath, destPath));
-        await _inner.HandleDeletionAsync(sourcePath, destPath, ct);
+        return await _inner.HandleDeletionAsync(sourcePath, destPath, ct);
     }
 }

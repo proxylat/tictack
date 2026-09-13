@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../../src/Interfaces.cs" Link="src/Interfaces.cs" />
+    <Compile Include="../../src/PathUtil.cs" Link="src/PathUtil.cs" />
+    <Compile Include="../../src/Handler.cs" Link="src/Handler.cs" />
+    <Compile Include="../../src/Executor.cs" Link="src/Executor.cs" />
+    <Compile Include="../../src/SrcLock.cs" Link="src/SrcLock.cs" />
+  </ItemGroup>
+</Project>

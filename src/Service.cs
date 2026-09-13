@@ -39,7 +39,7 @@ namespace TicTack
                     ? Path.Combine(Path.GetDirectoryName(_configPath) ?? AppDomain.CurrentDomain.BaseDirectory, "tictack.log")
                     : cfg.Logging.Path;
                 var loggers = new List<ILogger>();
-                loggers.Add(new FileLogger(logPath, level, cfg.Logging.MaxSizeMb, cfg.Logging.MaxFiles));
+                loggers.Add(new BufferedLogger(new FileLogger(logPath, level, cfg.Logging.MaxSizeMb, cfg.Logging.MaxFiles)));
                 if (cfg.Logging.Console)
                     loggers.Add(new ConsoleLogger(level));
                 loggers.Add(new DesktopAlertLogger(LogLevel.Warn, cfg.Logging.AlertPath));
@@ -86,7 +86,13 @@ namespace TicTack
                     File.WriteAllText(crashLog, DateTime.Now + " OnStart failed:\r\n" + ex);
                 }
                 catch { }
-                try { Stop(); } catch { }
+                try
+                {
+                    if (_pipelines != null) foreach (var pipeline in _pipelines) pipeline.Dispose();
+                }
+                catch { }
+                if (_log is IDisposable disposable) disposable.Dispose();
+                throw;
             }
         }
 
@@ -97,6 +103,7 @@ namespace TicTack
             if (_scheduler != null) _scheduler.Dispose();
             if (_pipelines != null) foreach (var p in _pipelines) p.Dispose();
             if (_log != null) _log.Info("TicTack Service stopped");
+            if (_log is IDisposable disposable) disposable.Dispose();
         }
 
         protected override void OnShutdown()

@@ -6,10 +6,19 @@ using System.Threading.Tasks;
 
 namespace TicTack
 {
+    internal enum CopyCheckpoint
+    {
+        TempCreated,
+        DataFlushed,
+        BeforeCommit,
+        AfterCommit
+    }
+
     public class CopyAction : IFileAction
     {
         private readonly IFileAccessor _accessor;
         private readonly bool _fullDurability;
+        private readonly Action<CopyCheckpoint>? _checkpoint;
 
         [DllImport("libc", EntryPoint = "open", SetLastError = true)]
         static extern int OpenDirectory(string path, int flags);
@@ -32,9 +41,15 @@ namespace TicTack
         const uint FSCTL_SET_SPARSE = 0x000900C4;
 
         public CopyAction(IFileAccessor accessor, bool fullDurability = true)
+            : this(accessor, fullDurability, null)
+        {
+        }
+
+        internal CopyAction(IFileAccessor accessor, bool fullDurability, Action<CopyCheckpoint>? checkpoint)
         {
             _accessor = accessor;
             _fullDurability = fullDurability;
+            _checkpoint = checkpoint;
         }
 
         public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
@@ -59,6 +74,7 @@ namespace TicTack
                 using (var srcStream = _accessor.OpenRead(src))
                 using (var dstStream = File.Create(tmp))
                 {
+                    _checkpoint?.Invoke(CopyCheckpoint.TempCreated);
                     if (isSparse)
                     {
                         uint dummy;
@@ -74,6 +90,7 @@ namespace TicTack
                         dstStream.Flush(true);
                     else
                         dstStream.Flush();
+                    _checkpoint?.Invoke(CopyCheckpoint.DataFlushed);
                 }
 
                 try
@@ -86,27 +103,20 @@ namespace TicTack
                 }
                 catch { }
 
-                try
+                _checkpoint?.Invoke(CopyCheckpoint.BeforeCommit);
+                if (File.Exists(dst))
                 {
-                    if (File.Exists(dst))
-                    {
-                        File.SetAttributes(dst, FileAttributes.Normal);
-                        File.Replace(tmp, dst, null);
-                    }
-                    else
-                    {
-                        File.Move(tmp, dst);
-                    }
+                    File.SetAttributes(dst, FileAttributes.Normal);
+                    File.Replace(tmp, dst, null);
                 }
-                catch (IOException)
+                else
                 {
-                    if (string.IsNullOrEmpty(dst)) throw;
-                    File.Copy(tmp, dst, overwrite: true);
-                    try { File.Delete(tmp); } catch { }
+                    File.Move(tmp, dst);
                 }
+                _checkpoint?.Invoke(CopyCheckpoint.AfterCommit);
 
-                if (!_fullDurability)
-                    FlushDirectory(Path.GetDirectoryName(dst));
+                if (!FlushDirectory(Path.GetDirectoryName(dst)))
+                    return ActionResult.Fail("Could not fsync destination directory");
 
                 return ActionResult.Ok();
             }
@@ -117,12 +127,12 @@ namespace TicTack
             catch (IOException ex) { return ActionResult.Fail(ex.Message); }
         }
 
-        static void FlushDirectory(string? path)
+        static bool FlushDirectory(string? path)
         {
-            if (!OperatingSystem.IsLinux() || string.IsNullOrEmpty(path)) return;
+            if (!OperatingSystem.IsLinux() || string.IsNullOrEmpty(path)) return true;
             var fd = OpenDirectory(path, O_RDONLY | O_DIRECTORY);
-            if (fd < 0) return;
-            try { Fsync(fd); }
+            if (fd < 0) return false;
+            try { return Fsync(fd) == 0; }
             finally { Close(fd); }
         }
 

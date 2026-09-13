@@ -26,8 +26,14 @@ if not exist "%EXE%" (
 sc query "%SERVICE_NAME%" >nul 2>&1 && (
     sc stop "%SERVICE_NAME%" >nul 2>&1
     sc delete "%SERVICE_NAME%" >nul 2>&1
-    timeout /t 3 /nobreak >nul
+    for /l %%i in (1,1,30) do (
+        sc query "%SERVICE_NAME%" >nul 2>&1 || goto :service_stopped
+        timeout /t 1 /nobreak >nul
+    )
+    echo ERROR: Existing service did not stop in time.
+    exit /b 1
 )
+:service_stopped
 
 :: Install and start
 sc create "%SERVICE_NAME%" binPath= "\"%EXE%\"" start= auto obj= LocalSystem DisplayName= "TicTack File Sync"

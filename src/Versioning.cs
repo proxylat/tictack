@@ -7,9 +7,9 @@ namespace TicTack
 {
     public class NoVersioning : IVersioningStrategy
     {
-        public Task ArchivePreviousVersionAsync(string destPath, CancellationToken ct)
+        public Task<ActionResult> ArchivePreviousVersionAsync(string destPath, CancellationToken ct)
         {
-            return Task.CompletedTask;
+            return Task.FromResult(ActionResult.Ok());
         }
     }
 
@@ -26,12 +26,13 @@ namespace TicTack
             _maxVersions = Math.Max(1, maxVersions);
         }
 
-        public Task ArchivePreviousVersionAsync(string destPath, CancellationToken ct)
+        public Task<ActionResult> ArchivePreviousVersionAsync(string destPath, CancellationToken ct)
         {
-            if (!File.Exists(PathUtil.EnsureExtended(destPath))) return Task.CompletedTask;
+            if (!File.Exists(PathUtil.EnsureExtended(destPath))) return Task.FromResult(ActionResult.Ok());
 
             try
             {
+                ct.ThrowIfCancellationRequested();
                 var ts = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
                 var name = Path.GetFileNameWithoutExtension(destPath);
                 var ext = Path.GetExtension(destPath);
@@ -45,10 +46,17 @@ namespace TicTack
                 else
                     relDir = "";
                 var verDir = string.IsNullOrEmpty(relDir) ? _versionBase : Path.Combine(_versionBase, relDir);
-                var verFile = Path.Combine(verDir, name + "_" + ts + ext);
+                var verFile = Path.Combine(verDir, name + "_" + ts + "_" + Guid.NewGuid().ToString("N") + ext);
+                var temp = verFile + ".tictack.tmp";
 
                 Directory.CreateDirectory(verDir);
-                File.Copy(PathUtil.EnsureExtended(destPath), verFile, overwrite: false);
+                using (var input = File.OpenRead(PathUtil.EnsureExtended(destPath)))
+                using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    input.CopyTo(output);
+                    output.Flush(true);
+                }
+                File.Move(temp, verFile);
 
                 // delete oldest versions beyond the cap
                 var files = Directory.GetFiles(verDir, name + "_*" + ext);
@@ -58,9 +66,10 @@ namespace TicTack
                     for (int i = 0; i < files.Length - _maxVersions; i++)
                         File.Delete(files[i]);
                 }
+                return Task.FromResult(ActionResult.Ok());
             }
-            catch { }
-            return Task.CompletedTask;
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { return Task.FromResult(ActionResult.Fail(ex.Message)); }
         }
     }
 

@@ -71,4 +71,14 @@ public class FsWatchMonitorTests : IDisposable
         var renamed = WaitEvent(ChangeType.Renamed, e => e.FullPath == newPath);
         Assert.Equal(oldPath, renamed.OldFullPath);
     }
+
+    [Fact]
+    public void RescanEmitsModifiedForExistingFiles()
+    {
+        var file = Path.Combine(_dir, "rescan.txt");
+        File.WriteAllText(file, "x");
+        _monitor.RescanNow();
+
+        WaitEvent(ChangeType.Modified, e => e.FullPath == file);
+    }
 }

@@ -22,7 +22,7 @@ namespace TicTack
             Load();
         }
 
-        public void RecordPending(List<string> files, long totalSizeBytes)
+        public void RecordPending(List<string> files, long totalSizeBytes, string? sourceRoot = null)
         {
             lock (_lock)
             {
@@ -31,6 +31,7 @@ namespace TicTack
 
                 _state.PendingFiles = files;
                 _state.TotalSizeBytes = totalSizeBytes;
+                _state.SourceRoot = sourceRoot;
                 _state.BlockedAt = DateTime.UtcNow;
                 _state.LastWarningAt = DateTime.MinValue;
                 Save();
@@ -61,6 +62,11 @@ namespace TicTack
                 }
 
                 var filesStillDeleted = new List<string>();
+                if (!string.IsNullOrEmpty(_state.SourceRoot) && !Directory.Exists(_state.SourceRoot))
+                {
+                    _log.Warn("Deferred deletion: source unavailable, holding pending deletions");
+                    return DeferredAction.Waiting;
+                }
                 foreach (var f in _state.PendingFiles)
                 {
                     if (!File.Exists(f))
@@ -115,7 +121,7 @@ namespace TicTack
                     _state = JsonSerializer.Deserialize<DeferredState>(json);
                 }
             }
-            catch { _state = null; }
+            catch { _log.Warn("Deferred deletion state could not be loaded; preserving it for recovery: " + _dbPath); }
         }
 
         private void Save()
@@ -126,7 +132,15 @@ namespace TicTack
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
                 var json = JsonSerializer.Serialize(_state ?? new DeferredState(), new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(_dbPath, json);
+                var temp = _dbPath + ".tictack.tmp";
+                using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(stream))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                    stream.Flush(true);
+                }
+                File.Move(temp, _dbPath, true);
             }
             catch { }
         }
@@ -137,6 +151,7 @@ namespace TicTack
             public DateTime LastWarningAt { get; set; }
             public List<string>? PendingFiles { get; set; }
             public long TotalSizeBytes { get; set; }
+            public string? SourceRoot { get; set; }
         }
     }
 

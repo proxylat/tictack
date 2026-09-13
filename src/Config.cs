@@ -134,7 +134,7 @@ namespace TicTack
 
         public MonitorConfig()
         {
-            Type = "composite";
+            Type = "watcher";
             WatcherBufferKb = 64;
             PollingIntervalSeconds = 3600;
             RestartDelaySeconds = 10;
@@ -204,7 +204,7 @@ namespace TicTack
 
             var deserializer = new DeserializerBuilder()
                 .WithNamingConvention(UnderscoredNamingConvention.Instance)
-                .IgnoreUnmatchedProperties()
+                .WithDuplicateKeyChecking()
                 .Build();
 
             using (var reader = new StreamReader(path))
@@ -234,6 +234,26 @@ namespace TicTack
                 {
                     log.Error("Destination is required for source: " + src.Path);
                     valid = false;
+                }
+                if (!string.IsNullOrEmpty(src.Path) && !string.IsNullOrEmpty(src.Destination))
+                {
+                    try
+                    {
+                        var source = Path.GetFullPath(src.Path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                        var destination = Path.GetFullPath(src.Destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                        if (source.Equals(destination, StringComparison.OrdinalIgnoreCase)
+                            || destination.StartsWith(source + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                            || source.StartsWith(destination + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                        {
+                            log.Error("Source and destination overlap: " + src.Path + " -> " + src.Destination);
+                            valid = false;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error("Invalid source or destination path: " + ex.Message);
+                        valid = false;
+                    }
                 }
                 if (src.Sync != null && !string.Equals(src.Sync.Durability, "full", StringComparison.OrdinalIgnoreCase)
                     && !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase))

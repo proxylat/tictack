@@ -326,7 +326,9 @@ public class StressTests
             File.WriteAllText(f, "hello");
 
             monitor.Fire(ChangeType.Created, f);
-            await Task.Delay(500);
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (!File.Exists(Path.Combine(dst, "debounced.txt")) && DateTime.UtcNow < deadline)
+                await Task.Delay(25);
             pipeline.Dispose();
 
             Assert.True(File.Exists(Path.Combine(dst, "debounced.txt")));

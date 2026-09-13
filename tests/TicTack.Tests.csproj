@@ -2,11 +2,20 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
-    <NoWarn>$(NoWarn);NU1903</NoWarn>
+    <NoWarn>$(NoWarn);NU1903;CS8892</NoWarn>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="CrashWorker/**/*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="CrashWorker/CrashWorker.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.2" />
@@ -16,6 +25,7 @@
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
   </ItemGroup>
 
   <ItemGroup>
@@ -39,6 +49,10 @@
     <Compile Include="../src/Handler.cs" Link="src/Handler.cs" />
 
     <Compile Include="../src/PathUtil.cs" Link="src/PathUtil.cs" />
+    <Compile Include="../src/VolumeResolver.cs" Link="src/VolumeResolver.cs" />
+    <Compile Include="../src/DriveDiscoverer.cs" Link="src/DriveDiscoverer.cs" />
+    <Compile Include="../src/Service.cs" Link="src/Service.cs" />
+    <Compile Include="../src/TicTack.cs" Link="src/TicTack.cs" />
     <Compile Include="../src/Monitor.cs" Link="src/Monitor.cs" />
     <Compile Include="../src/Pipeline.cs" Link="src/Pipeline.cs" />
     <Compile Include="../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />

@@ -26,7 +26,9 @@ public class PowerGuardTests : IDisposable
     public void Cleanup_RecoversOrphanedTemp()
     {
         var tmpFile = Path.Combine(_dstDir, "recovered.txt.tictack.tmp");
-        File.WriteAllText(tmpFile, "recoverable data");
+        var sourceFile = Path.Combine(_srcDir, "recovered.txt");
+        File.WriteAllText(sourceFile, "recoverable data");
+        File.Copy(sourceFile, tmpFile);
 
         var cfg = new TicTackConfig();
         cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
@@ -37,6 +39,22 @@ public class PowerGuardTests : IDisposable
         Assert.True(File.Exists(recovered));
         Assert.False(File.Exists(tmpFile));
         Assert.Equal("recoverable data", File.ReadAllText(recovered));
+    }
+
+    [Fact]
+    public void Cleanup_DeletesUnvalidatedTemp()
+    {
+        var tmpFile = Path.Combine(_dstDir, "partial.txt.tictack.tmp");
+        File.WriteAllText(Path.Combine(_srcDir, "partial.txt"), "complete data");
+        File.WriteAllText(tmpFile, "partial");
+
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
+
+        PowerGuard.Cleanup(cfg, _log);
+
+        Assert.False(File.Exists(Path.Combine(_dstDir, "partial.txt")));
+        Assert.False(File.Exists(tmpFile));
     }
 
     [Fact]
@@ -61,16 +79,19 @@ public class PowerGuardTests : IDisposable
     public void Cleanup_ProcessesAllSources()
     {
         var dst2 = Path.Combine(Path.GetDirectoryName(_dstDir)!, "dst2");
+        var src2 = Path.Combine(Path.GetDirectoryName(_srcDir)!, "src2");
         Directory.CreateDirectory(dst2);
+        Directory.CreateDirectory(src2);
 
         var tmp1 = Path.Combine(_dstDir, "f1.txt.tictack.tmp");
         var tmp2 = Path.Combine(dst2, "f2.txt.tictack.tmp");
-        File.WriteAllText(tmp1, "data1");
-        File.WriteAllText(tmp2, "data2");
+        File.WriteAllText(Path.Combine(_srcDir, "f1.txt"), "data1");
+        File.WriteAllText(Path.Combine(src2, "f2.txt"), "data2");
+        File.Copy(Path.Combine(_srcDir, "f1.txt"), tmp1);
+        File.Copy(Path.Combine(src2, "f2.txt"), tmp2);
 
         var cfg = new TicTackConfig();
         cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
-        var src2 = Path.Combine(Path.GetDirectoryName(_srcDir)!, "src2");
         cfg.Sources.Add(new SourceConfig { Path = src2, Destination = dst2 });
 
         PowerGuard.Cleanup(cfg, _log);
@@ -116,7 +137,7 @@ public class PowerGuardTests : IDisposable
 
         PowerGuard.Cleanup(cfg, _log);
 
-        Assert.True(File.Exists(Path.Combine(versionDir, "v1.txt")));
+        Assert.False(File.Exists(Path.Combine(versionDir, "v1.txt")));
         Assert.False(File.Exists(tmp));
     }
 }

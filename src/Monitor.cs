@@ -96,6 +96,12 @@ namespace TicTack
                             FireError(new IOException("ReadDirectoryChangesW error " + err));
                             break;
                         }
+                        if (ret == 0)
+                        {
+                            FireError(new IOException("ReadDirectoryChangesW buffer overflow; rescanning"));
+                            Rescan();
+                            break;
+                        }
                         ParseEvents(buf, ret);
                     }
                 }
@@ -119,11 +125,16 @@ namespace TicTack
         private void ParseEvents(byte[] buf, uint len)
         {
             var offset = 0;
-            while (offset < len)
+            while (offset + 12 <= len)
             {
                 var next = BitConverter.ToInt32(buf, offset);
                 var action = BitConverter.ToInt32(buf, offset + 4);
                 var nameLen = BitConverter.ToInt32(buf, offset + 8);
+                if (nameLen < 0 || offset + 12 + nameLen > len)
+                {
+                    FireError(new IOException("Malformed ReadDirectoryChangesW event"));
+                    break;
+                }
                 var name = Encoding.Unicode.GetString(buf, offset + 12, nameLen);
                 var full = Path.Combine(_path, name);
 
@@ -143,8 +154,25 @@ namespace TicTack
                         break;
                 }
                 if (next == 0) break;
+                if (next < 12 || offset + next > len)
+                {
+                    FireError(new IOException("Malformed ReadDirectoryChangesW event chain"));
+                    break;
+                }
                 offset += next;
             }
+        }
+
+        internal void RescanNow() => Rescan();
+
+        private void Rescan()
+        {
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories))
+                    FireChanged(ChangeType.Modified, file);
+            }
+            catch (Exception ex) { FireError(ex); }
         }
 
         private void FlushRename()
@@ -393,6 +421,7 @@ namespace TicTack
                     var t = new Thread(() =>
                     {
                         try { watcher.Dispose(); } catch { }
+                        Rescan();
                         while (!_stopping)
                         {
                             Thread.Sleep(_restartDelaySec * 1000);
@@ -412,6 +441,23 @@ namespace TicTack
             };
             _watcher = watcher;
             watcher.EnableRaisingEvents = true;
+        }
+
+        internal void RescanNow() => Rescan();
+
+        private void Rescan()
+        {
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories))
+                    FireChanged(ChangeType.Modified, file);
+            }
+            catch (Exception ex)
+            {
+                var handler = Error;
+                if (handler != null)
+                    handler(this, new MonitorErrorEventArgs(ex));
+            }
         }
 
         private void FireChanged(ChangeType type, string path, string? oldPath = null)
