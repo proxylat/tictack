@@ -98,7 +98,13 @@ Or run manually: `service\win\TicTackSv.exe --cli` (interactive) or `service\win
 
 ```
 dotnet test tests\TicTack.Tests.csproj
+# Windows native watcher/access tests (run on Windows)
+dotnet test tests\TicTack.Tests.csproj --filter "Category=Windows"
 ```
+
+Crash-recovery and lock-contention tests launch the real copy/lock code in a
+separate worker process and terminate it at controlled durability checkpoints.
+Physical power-cut tests require dedicated hardware or VM infrastructure.
 
 ---
 
@@ -119,6 +125,7 @@ dotnet test tests\TicTack.Tests.csproj
 ## Configuration
 
 All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`) — resolves to the actual drive letter at startup.
+Unknown or duplicate YAML properties are rejected at startup instead of being ignored.
 
 **Do not use environment variables like `%USERPROFILE%` or `%HOME%`.** The Windows service runs as `LocalSystem`, so `%USERPROFILE%` resolves to `C:\WINDOWS\system32\config\systemprofile`, not your profile — same for `%HOME%` under systemd (root). Always write the full path (`C:\Users\User\Desktop`).
 
@@ -159,7 +166,7 @@ All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`)
 
 | Field | Default | Description |
 |---|---|---|
-| `type` | `composite` | `watcher` = instant OS events, zero CPU idle (`ReadDirectoryChangesW` P/Invoke on Windows, `FileSystemWatcher` on Linux). `polling` = periodic dir scan (no missed events). `composite` = both (watcher for speed, polling as safety net) |
+| `type` | `watcher` | `watcher` = instant OS events, zero CPU idle (`ReadDirectoryChangesW` P/Invoke on Windows, `FileSystemWatcher` on Linux). `polling` = periodic dir scan (no missed events). `composite` = both (watcher for speed, polling as safety net) |
 | `watcher_buffer_kb` | `64` | Watcher buffer in KB (NTFS on Windows, inotify on Linux). **Larger = survives bursts (git clone, npm install, unzip) without event loss.** Use 512+ for heavy churn |
 | `polling_interval_seconds` | `3600` | Full directory scan interval (s) for polling fallback. Min 10 |
 | `restart_delay_seconds` | `10` | Wait before restarting watcher after error |
