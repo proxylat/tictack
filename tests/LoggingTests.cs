@@ -137,8 +137,8 @@ public class LoggingTests
     [Fact]
     public void MultiLogger_DelegatesToAll()
     {
-        var log1 = new MockLogger();
-        var log2 = new MockLogger();
+        var log1 = new RecordingLogger();
+        var log2 = new RecordingLogger();
         var multi = new MultiLogger(new[] { log1, log2 });
 
         multi.Info("broadcast");

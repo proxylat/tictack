@@ -5,7 +5,7 @@ public class PowerGuardTests : IDisposable
     private readonly string _srcDir;
     private readonly string _dstDir;
     private readonly string _verDir;
-    private readonly MockLogger _log = new();
+    private readonly RecordingLogger _log = new();
 
     public PowerGuardTests()
     {

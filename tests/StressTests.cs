@@ -1,55 +1,6 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
-
-#pragma warning disable CS0067
 
 namespace TicTack;
-
-public class MockEventMonitor : IFileMonitor
-{
-    public event EventHandler<FileChangedEventArgs>? Changed;
-    public event EventHandler<MonitorErrorEventArgs>? Error;
-    public bool Started { get; private set; }
-
-    public void Fire(ChangeType type, string path, string? oldPath = null) =>
-        Changed?.Invoke(this, new FileChangedEventArgs(type, path, oldPath));
-
-    public void Start() => Started = true;
-    public void Stop() => Started = false;
-    public void Dispose() { }
-}
-
-public class MockComparer : IFileComparer
-{
-    public bool Equal { get; set; }
-    public bool AreEqual(string a, string b) => Equal;
-}
-
-public class MockValidator : IValidator
-{
-    public bool Valid { get; set; } = true;
-    public Task<bool> ValidateAsync(string src, string dst) => Task.FromResult(Valid);
-}
-
-public class MockRetry : IRetryPolicy
-{
-    public async Task<T> ExecuteAsync<T>(Func<Task<T>> action, CancellationToken ct) => await action();
-}
-
-public class MockVersioning : IVersioningStrategy
-{
-    public Task ArchivePreviousVersionAsync(string path, CancellationToken ct) => Task.CompletedTask;
-}
-
-public class MockDeletion : IDeletionStrategy
-{
-    public ConcurrentBag<string> Deleted { get; } = new();
-    public Task HandleDeletionAsync(string? src, string dst, CancellationToken ct)
-    {
-        Deleted.Add(dst);
-        return Task.CompletedTask;
-    }
-}
 
 public class StressTests
 {
@@ -83,19 +34,18 @@ public class StressTests
             for (int i = 0; i < n; i++)
                 File.WriteAllText(Path.Combine(src, $"f{i}.txt"), $"content{i}");
 
-            var accessor = new MockFileAccessor();
-            var pipeline = new SyncPipeline(
+            using var pipeline = new SyncPipeline(
                 MakeConfig(src, dst),
-                new MockEventMonitor(),
+                new EventMonitor(),
                 new DateSizeComparer(),
-                new CopyAction(accessor),
+                new CopyAction(new FileAccessor()),
                 new DeleteAction(),
                 new RenameAction(),
-                new MockRetry(),
-                new MockValidator(),
-                new MockVersioning(),
-                new MockDeletion(),
-                new MockLogger()
+                new ExponentialBackoffRetry(1, 0, 1),
+                new SizeValidator(),
+                new NoVersioning(),
+                new MirrorDeletion(),
+                new RecordingLogger()
             );
             pipeline.Start();
             await Task.Delay(5000); // let InitialSync finish for 500 files
@@ -121,19 +71,18 @@ public class StressTests
         {
             File.WriteAllText(Path.Combine(src, "empty.txt"), "");
 
-            var accessor = new MockFileAccessor();
-            var pipeline = new SyncPipeline(
+            using var pipeline = new SyncPipeline(
                 MakeConfig(src, dst),
-                new MockEventMonitor(),
+                new EventMonitor(),
                 new DateSizeComparer(),
-                new CopyAction(accessor),
+                new CopyAction(new FileAccessor()),
                 new DeleteAction(),
                 new RenameAction(),
-                new MockRetry(),
-                new MockValidator(),
-                new MockVersioning(),
-                new MockDeletion(),
-                new MockLogger()
+                new ExponentialBackoffRetry(1, 0, 1),
+                new SizeValidator(),
+                new NoVersioning(),
+                new MirrorDeletion(),
+                new RecordingLogger()
             );
             pipeline.Start();
             await Task.Delay(500);
@@ -159,7 +108,7 @@ public class StressTests
         {
             var file = Path.Combine(src, "goner.txt");
             File.WriteAllText(file, "bye");
-            var action = new CopyAction(new MockFileAccessor());
+            var action = new CopyAction(new FileAccessor());
 
             // Delete source just before copy (race condition sim)
             var args = new FileActionArgs(
@@ -207,7 +156,7 @@ public class StressTests
     // ── 5. Source file locked by another process ──
 
     [Fact]
-    public async Task CopyAction_LockedSource_ReturnsFail()
+    public async Task CopyAction_LockedSource_UsesPlatformSharingRules()
     {
         var dir = TestDir();
         var src = Path.Combine(dir, "src");
@@ -222,11 +171,14 @@ public class StressTests
             // Hold exclusive lock on source
             using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.None))
             {
-                var action = new CopyAction(new MockFileAccessor());
+                var action = new CopyAction(new FileAccessor());
                 var args = new FileActionArgs(
                     new FileChangedEventArgs(ChangeType.Modified, file), src, dst);
                 var result = await action.ExecuteAsync(args, CancellationToken.None);
-                Assert.False(result.Success);
+                if (OperatingSystem.IsWindows())
+                    Assert.False(result.Success);
+                else
+                    Assert.True(result.Success);
             }
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
@@ -353,21 +305,20 @@ public class StressTests
         Directory.CreateDirectory(dst);
         try
         {
-            var monitor = new MockEventMonitor();
-            var log = new MockLogger();
-            var deletion = new MockDeletion();
-            var accessor = new MockFileAccessor();
+            var monitor = new EventMonitor();
+            var log = new RecordingLogger();
+            var deletion = new RecordingDeletion(new MirrorDeletion());
 
             using var pipeline = new SyncPipeline(
                 MakeConfig(src, dst),
                 monitor,
                 new DateSizeComparer(),
-                new CopyAction(accessor),
+                new CopyAction(new FileAccessor()),
                 new DeleteAction(),
                 new RenameAction(),
-                new MockRetry(),
-                new MockValidator(),
-                new MockVersioning(),
+                new ExponentialBackoffRetry(1, 0, 1),
+                new SizeValidator(),
+                new NoVersioning(),
                 deletion,
                 log
             );
@@ -403,21 +354,20 @@ public class StressTests
             var d = Path.Combine(dst, "todelete.txt");
             File.WriteAllText(d, "bye");
 
-            var monitor = new MockEventMonitor();
-            var log = new MockLogger();
-            var deletion = new MockDeletion();
-            var accessor = new MockFileAccessor();
+            var monitor = new EventMonitor();
+            var log = new RecordingLogger();
+            var deletion = new RecordingDeletion(new MirrorDeletion());
 
             using var pipeline = new SyncPipeline(
                 MakeConfig(src, dst),
                 monitor,
                 new DateSizeComparer(),
-                new CopyAction(accessor),
+                new CopyAction(new FileAccessor()),
                 new DeleteAction(),
                 new RenameAction(),
-                new MockRetry(),
-                new MockValidator(),
-                new MockVersioning(),
+                new ExponentialBackoffRetry(1, 0, 1),
+                new SizeValidator(),
+                new NoVersioning(),
                 deletion,
                 log
             );
@@ -429,12 +379,12 @@ public class StressTests
             await Task.Delay(500);
             pipeline.Dispose();
 
-            Assert.Contains(d, deletion.Deleted);
+            Assert.Contains(deletion.Calls, call => call.dst == d);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 12. Pipeline handles rapid bursts via mock events ──
+    // ── 12. Pipeline handles rapid bursts via emitted events ──
 
     [Fact]
     public async Task Pipeline_BurstEvents_NoCrash()
@@ -446,21 +396,20 @@ public class StressTests
         Directory.CreateDirectory(dst);
         try
         {
-            var monitor = new MockEventMonitor();
-            var log = new MockLogger();
-            var accessor = new MockFileAccessor();
+            var monitor = new EventMonitor();
+            var log = new RecordingLogger();
 
             using var pipeline = new SyncPipeline(
                 MakeConfig(src, dst, 0.01),
                 monitor,
                 new DateSizeComparer(),
-                new CopyAction(accessor),
+                new CopyAction(new FileAccessor()),
                 new DeleteAction(),
                 new RenameAction(),
-                new MockRetry(),
-                new MockValidator(),
-                new MockVersioning(),
-                new MockDeletion(),
+                new ExponentialBackoffRetry(1, 0, 1),
+                new SizeValidator(),
+                new NoVersioning(),
+                new MirrorDeletion(),
                 log
             );
             pipeline.Start();
@@ -502,7 +451,7 @@ public class StressTests
         try
         {
             var locks = new ConcurrentBag<SrcLock>();
-            Parallel.For(0, 10, _ => locks.Add(new SrcLock(lockPath, new MockLogger())));
+            Parallel.For(0, 10, _ => locks.Add(new SrcLock(lockPath, new RecordingLogger())));
             Assert.True(File.Exists(lockPath));
             foreach (var l in locks) l.Dispose();
         }
@@ -529,7 +478,7 @@ public class StressTests
                 fs.Write(data, 0, data.Length);
             }
 
-            var action = new CopyAction(new MockFileAccessor());
+            var action = new CopyAction(new FileAccessor());
             var args = new FileActionArgs(
                 new FileChangedEventArgs(ChangeType.Created, f), src, dst);
             var result = await action.ExecuteAsync(args, CancellationToken.None);
@@ -559,7 +508,7 @@ public class StressTests
             var dst = Path.Combine(dstDir, "file.txt");
             File.WriteAllText(dst + ".tictack.tmp", "partial garbage");
 
-            var action = new CopyAction(new MockFileAccessor());
+            var action = new CopyAction(new FileAccessor());
             var args = new FileActionArgs(
                 new FileChangedEventArgs(ChangeType.Created, src), srcDir, dstDir);
             var result = await action.ExecuteAsync(args, CancellationToken.None);
@@ -648,7 +597,7 @@ public class StressTests
     // ── 18. CopyAction with locked source file (sharing violation) ──
 
     [Fact]
-    public async Task CopyAction_LockedSourceFile_ReturnsFail()
+    public async Task CopyAction_LockedSourceFile_UsesPlatformSharingRules()
     {
         var dir = TestDir();
         var srcDir = Path.Combine(dir, "src");
@@ -662,11 +611,14 @@ public class StressTests
 
             using (var hold = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.None))
             {
-                var action = new CopyAction(new MockFileAccessor());
+                var action = new CopyAction(new FileAccessor());
                 var args = new FileActionArgs(
                     new FileChangedEventArgs(ChangeType.Created, src), srcDir, dstDir);
                 var result = await action.ExecuteAsync(args, CancellationToken.None);
-                Assert.False(result.Success);
+                if (OperatingSystem.IsWindows())
+                    Assert.False(result.Success);
+                else
+                    Assert.True(result.Success);
             }
         }
         finally { try { Directory.Delete(dir, true); } catch { } }

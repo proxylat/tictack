@@ -42,15 +42,33 @@ public class ConfigTests
     {
         var cfg = new TicTackConfig();
         cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst" });
-        var log = new MockLogger();
+        var log = new RecordingLogger();
         Assert.True(Config.Validate(cfg, log));
+    }
+
+    [Fact]
+    public void Validate_AllowsRenameOnlyDurability()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { Durability = "rename-only" } });
+        Assert.True(Config.Validate(cfg, new RecordingLogger()));
+    }
+
+    [Fact]
+    public void Validate_RejectsUnknownDurability()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { Durability = "unsafe" } });
+        var log = new RecordingLogger();
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("Durability"));
     }
 
     [Fact]
     public void Validate_ReturnsFalse_WhenNoSources()
     {
         var cfg = new TicTackConfig();
-        var log = new MockLogger();
+        var log = new RecordingLogger();
         Assert.False(Config.Validate(cfg, log));
         Assert.Contains(log.Messages, m => m.Contains("No sources"));
     }
@@ -60,7 +78,7 @@ public class ConfigTests
     {
         var cfg = new TicTackConfig();
         cfg.Sources.Add(new SourceConfig { Destination = @"D:\dst" });
-        var log = new MockLogger();
+        var log = new RecordingLogger();
         Assert.False(Config.Validate(cfg, log));
         Assert.Contains(log.Messages, m => m.Contains("Source path"));
     }
@@ -70,7 +88,7 @@ public class ConfigTests
     {
         var cfg = new TicTackConfig();
         cfg.Sources.Add(new SourceConfig { Path = @"C:\src" });
-        var log = new MockLogger();
+        var log = new RecordingLogger();
         Assert.False(Config.Validate(cfg, log));
         Assert.Contains(log.Messages, m => m.Contains("Destination is required"));
     }

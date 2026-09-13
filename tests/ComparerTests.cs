@@ -4,7 +4,7 @@ public class ComparerTests : IDisposable
 {
     private readonly string _srcDir;
     private readonly string _dstDir;
-    private readonly MockFileAccessor _accessor = new();
+    private readonly FileAccessor _accessor = new();
 
     public ComparerTests()
     {
@@ -60,6 +60,18 @@ public class ComparerTests : IDisposable
         File.WriteAllText(Src("a.txt"), "hello");
         File.WriteAllText(Dst("a.txt"), "hello");
         File.SetLastWriteTimeUtc(Dst("a.txt"), DateTime.UtcNow.AddHours(-1));
+        Assert.False(new DateSizeComparer().AreEqual(Src("a.txt"), Dst("a.txt")));
+    }
+
+    [Fact]
+    public void DateSizeComparer_UsesSuppliedSourceSnapshot()
+    {
+        File.WriteAllText(Src("a.txt"), "hello");
+        File.Copy(Src("a.txt"), Dst("a.txt"), overwrite: true);
+        Assert.True(FileSnapshot.TryRead(Src("a.txt"), out var snapshot));
+        File.SetLastWriteTimeUtc(Src("a.txt"), snapshot.LastWriteTimeUtc.AddHours(1));
+
+        Assert.True(new DateSizeComparer().AreEqual(Src("a.txt"), Dst("a.txt"), snapshot));
         Assert.False(new DateSizeComparer().AreEqual(Src("a.txt"), Dst("a.txt")));
     }
 
