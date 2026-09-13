@@ -62,6 +62,8 @@ namespace TicTack
     public class SyncConfig
     {
         public string? Verification { get; set; }
+        public string Durability { get; set; }
+        public int InitialSyncWorkers { get; set; }
         public RetryConfig Retry { get; set; }
         public string? LockHandling { get; set; }
         public int RetryLockMinutes { get; set; }
@@ -76,6 +78,8 @@ namespace TicTack
         public SyncConfig()
         {
             Verification = "date_and_size";
+            Durability = "full";
+            InitialSyncWorkers = 2;
             Retry = new RetryConfig();
             LockHandling = "retry";
             RetryLockMinutes = 10;
@@ -231,6 +235,12 @@ namespace TicTack
                 if (string.IsNullOrEmpty(src.Destination))
                 {
                     log.Error("Destination is required for source: " + src.Path);
+                    valid = false;
+                }
+                if (src.Sync != null && !string.Equals(src.Sync.Durability, "full", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase))
+                {
+                    log.Error("Durability must be 'full' or 'rename-only' for source: " + src.Path);
                     valid = false;
                 }
             }

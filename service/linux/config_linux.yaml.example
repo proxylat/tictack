@@ -18,6 +18,8 @@ sources:
         - "*.part"
     sync:
       verification: date_and_size
+      durability: full
+      initial_sync_workers: 2
       retry:
         max_attempts: 5
         delay_ms: 1000

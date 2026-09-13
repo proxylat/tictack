@@ -39,19 +39,22 @@ namespace TicTack
         private readonly string _destBase;
         private readonly string _destPath;
         private readonly string? _oldDestPath;
+        private readonly FileSnapshot? _sourceSnapshot;
 
         public FileChangedEventArgs ChangeEvent { get { return _changeEvent; } }
         public string SourceBase { get { return _sourceBase; } }
         public string DestBase { get { return _destBase; } }
         public string DestPath { get { return _destPath; } }
         public string? OldDestPath { get { return _oldDestPath; } }
+        public FileSnapshot? SourceSnapshot { get { return _sourceSnapshot; } }
 
-        public FileActionArgs(FileChangedEventArgs changeEvent, string sourceBase, string destBase)
+        public FileActionArgs(FileChangedEventArgs changeEvent, string sourceBase, string destBase, FileSnapshot? sourceSnapshot = null)
         {
             _changeEvent = changeEvent;
             _sourceBase = sourceBase;
             _destBase = destBase;
             _destPath = MapPath(sourceBase, destBase, changeEvent.FullPath);
+            _sourceSnapshot = sourceSnapshot;
             if (changeEvent.ChangeType == ChangeType.Renamed && changeEvent.OldFullPath != null)
                 _oldDestPath = MapPath(sourceBase, destBase, changeEvent.OldFullPath);
         }
@@ -64,6 +67,40 @@ namespace TicTack
                 return string.IsNullOrEmpty(rel) ? toBase : Path.Combine(toBase, rel);
             }
             return path;
+        }
+    }
+
+    public readonly struct FileSnapshot
+    {
+        public long Length { get; }
+        public long LastWriteTimeUtcTicks { get; }
+        public DateTime LastWriteTimeUtc => new DateTime(LastWriteTimeUtcTicks, DateTimeKind.Utc);
+
+        public FileSnapshot(long length, long lastWriteTimeUtcTicks)
+        {
+            Length = length;
+            LastWriteTimeUtcTicks = lastWriteTimeUtcTicks;
+        }
+
+        public static bool TryRead(string path, out FileSnapshot snapshot)
+        {
+            try
+            {
+                var info = new FileInfo(PathUtil.EnsureExtended(path));
+                if (!info.Exists)
+                {
+                    snapshot = default;
+                    return false;
+                }
+
+                snapshot = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks);
+                return true;
+            }
+            catch
+            {
+                snapshot = default;
+                return false;
+            }
         }
     }
 
@@ -87,7 +124,7 @@ namespace TicTack
 
     public interface IFileComparer
     {
-        bool AreEqual(string sourcePath, string destPath);
+        bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null);
     }
 
     public interface IFileFilter
@@ -112,7 +149,7 @@ namespace TicTack
 
     public interface IValidator
     {
-        Task<bool> ValidateAsync(string sourcePath, string destPath);
+        Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null);
     }
 
     public interface IVersioningStrategy

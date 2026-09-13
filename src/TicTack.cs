@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.Loader;
 using System.ServiceProcess;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace TicTack
 {
@@ -256,7 +257,7 @@ namespace TicTack
                     : new ExponentialBackoffRetry();
             var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, src.Destination);
                 var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, dstBase);
-                var copy = new CopyAction(accessor);
+                var copy = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
 
                 var filters = new List<IFileFilter>();
                 if (src.Filter != null && src.Filter.Exclude != null && src.Filter.Exclude.Count > 0)
@@ -298,61 +299,83 @@ namespace TicTack
                     catch (UnauthorizedAccessException) { log.Warn("Access denied scanning " + srcPath); }
                 }
 
-                foreach (var kv in sourceFiles)
+                var pendingState = new List<(string path, long size, long mtime)>();
+                var stateLock = new object();
+                void FlushState()
                 {
-                    var rel = kv.Key;
-                    var srcFile = kv.Value;
-                    var dstFile = Path.Combine(dstBase, rel);
-                    var e = new FileChangedEventArgs(ChangeType.Created, srcFile);
-                    var actionArgs = new FileActionArgs(e, srcPath, dstBase);
-
-                    if (cache != null && cache.TryGetValue(rel, out var cached))
+                    if (stateDb == null || pendingState.Count == 0) return;
+                    lock (stateLock)
                     {
                         try
                         {
-                            var fi = new FileInfo(srcFile);
-                            if (fi.Length == cached.size && fi.LastWriteTimeUtc.Ticks == cached.mtime)
-                                continue;
+                            stateDb.UpsertBatch(pendingState);
+                            pendingState.Clear();
                         }
-                        catch { }
+                        catch (Exception ex) { log.Debug("StateDb batch upsert failed: " + ex.Message); }
                     }
-
-                    if (comparer.AreEqual(srcFile, dstFile))
-                        continue;
-
-                    if (versioning != null)
-                        versioning.ArchivePreviousVersionAsync(dstFile, CancellationToken.None).GetAwaiter().GetResult();
-
-                    var result = retry.ExecuteAsync(() => copy.ExecuteAsync(actionArgs, CancellationToken.None), CancellationToken.None).GetAwaiter().GetResult();
-
-                    if (!result.Success)
-                    {
-                        log.Error("Copy failed: " + srcFile + ": " + result.ErrorMessage);
-                        continue;
-                    }
-
-                    if (validator != null)
-                    {
-                        var valid = validator.ValidateAsync(srcFile, dstFile).GetAwaiter().GetResult();
-                        if (!valid)
-                        {
-                            log.Error("Validation FAILED: " + srcFile + " -> " + dstFile);
-                            continue;
-                        }
-                    }
-
-                    if (stateDb != null)
-                    {
-                        try
-                        {
-                            var fi = new FileInfo(srcFile);
-                            stateDb.Upsert(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
-                        }
-                        catch { }
-                    }
-
-                    log.Info("Synced: " + srcFile);
                 }
+
+                var options = new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = Math.Max(1, src.Sync != null ? src.Sync.InitialSyncWorkers : 2)
+                };
+                Parallel.ForEach(sourceFiles, options, kv =>
+                {
+                    try
+                    {
+                        var rel = kv.Key;
+                        var srcFile = kv.Value;
+                        var dstFile = Path.Combine(dstBase, rel);
+                        if (!FileSnapshot.TryRead(srcFile, out var sourceSnapshot)) return;
+                        var e = new FileChangedEventArgs(ChangeType.Created, srcFile);
+                        var actionArgs = new FileActionArgs(e, srcPath, dstBase, sourceSnapshot);
+
+                        if (cache != null && cache.TryGetValue(rel, out var cached)
+                            && sourceSnapshot.Length == cached.size && sourceSnapshot.LastWriteTimeUtcTicks == cached.mtime)
+                            return;
+
+                        if (comparer.AreEqual(srcFile, dstFile, sourceSnapshot)) return;
+
+                        if (versioning != null)
+                            versioning.ArchivePreviousVersionAsync(dstFile, CancellationToken.None).GetAwaiter().GetResult();
+
+                        var result = retry.ExecuteAsync(() => copy.ExecuteAsync(actionArgs, CancellationToken.None), CancellationToken.None).GetAwaiter().GetResult();
+                        if (!result.Success)
+                        {
+                            log.Error("Copy failed: " + srcFile + ": " + result.ErrorMessage);
+                            return;
+                        }
+
+                        if (!FileSnapshot.TryRead(srcFile, out var freshSnapshot))
+                        {
+                            log.Error("Validation FAILED: source disappeared: " + srcFile);
+                            return;
+                        }
+                        if (validator != null)
+                        {
+                            var valid = validator.ValidateAsync(srcFile, dstFile, freshSnapshot).GetAwaiter().GetResult();
+                            if (!valid)
+                            {
+                                log.Error("Validation FAILED: " + srcFile + " -> " + dstFile);
+                                return;
+                            }
+                        }
+
+                        if (stateDb != null)
+                        {
+                            lock (stateLock)
+                            {
+                                pendingState.Add((rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks));
+                                if (pendingState.Count >= 500) FlushState();
+                            }
+                        }
+
+                        log.Info("Synced: " + srcFile);
+                    }
+                    catch (Exception ex) { log.Error("Initial sync failed: " + kv.Value, ex); }
+                });
+
+                FlushState();
 
                 if (Directory.Exists(dstBase))
                 {
@@ -482,7 +505,7 @@ namespace TicTack
                     : new ExponentialBackoffRetry();
                 var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, dstBase);
                 var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, dstBase);
-                var copy = new CopyAction(accessor);
+                var copy = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
 
                 var filters = new List<IFileFilter>();
                 if (src.Filter != null && src.Filter.Exclude != null && src.Filter.Exclude.Count > 0)
@@ -501,13 +524,14 @@ namespace TicTack
                     {
                         if (filter != null && !filter.ShouldProcess(f)) continue;
                         var rel = f.Substring(srcPath.Length).TrimStart('\\', '/');
-                        sourceFiles.Add(rel);
+                         sourceFiles.Add(rel);
 
-                        var dstFile = Path.Combine(dstBase, rel);
-                        var e = new FileChangedEventArgs(ChangeType.Created, f);
-                        var actionArgs = new FileActionArgs(e, srcPath, dstBase);
+                         var dstFile = Path.Combine(dstBase, rel);
+                         if (!FileSnapshot.TryRead(f, out var sourceSnapshot)) continue;
+                         var e = new FileChangedEventArgs(ChangeType.Created, f);
+                         var actionArgs = new FileActionArgs(e, srcPath, dstBase, sourceSnapshot);
 
-                        if (comparer.AreEqual(f, dstFile)) continue;
+                         if (comparer.AreEqual(f, dstFile, sourceSnapshot)) continue;
 
                         if (versioning != null)
                             versioning.ArchivePreviousVersionAsync(dstFile, CancellationToken.None).GetAwaiter().GetResult();
@@ -520,9 +544,14 @@ namespace TicTack
                             continue;
                         }
 
-                        if (validator != null)
-                        {
-                            var valid = validator.ValidateAsync(f, dstFile).GetAwaiter().GetResult();
+                         if (validator != null)
+                         {
+                             if (!FileSnapshot.TryRead(f, out var freshSnapshot))
+                             {
+                                 log.Error("Validation FAILED: source disappeared: " + f);
+                                 continue;
+                             }
+                             var valid = validator.ValidateAsync(f, dstFile, freshSnapshot).GetAwaiter().GetResult();
                             if (!valid)
                                 log.Error("Validation FAILED: " + f + " -> " + dstFile);
                         }
@@ -665,7 +694,7 @@ namespace TicTack
             var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, src.Destination);
             var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, src.Destination);
 
-            var copyAction = new CopyAction(accessor);
+            var copyAction = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
             var deleteAction = new DeleteAction();
             var renameAction = new RenameAction();
 
