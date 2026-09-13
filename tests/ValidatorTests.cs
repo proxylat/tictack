@@ -4,7 +4,7 @@ public class ValidatorTests : IDisposable
 {
     private readonly string _srcDir;
     private readonly string _dstDir;
-    private readonly MockFileAccessor _accessor = new();
+    private readonly FileAccessor _accessor = new();
 
     public ValidatorTests()
     {

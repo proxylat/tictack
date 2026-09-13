@@ -1,5 +1,3 @@
-using System.Collections.Concurrent;
-
 namespace TicTack;
 
 public class PipelineTests : IDisposable
@@ -7,14 +5,13 @@ public class PipelineTests : IDisposable
     private readonly string _root;
     private readonly string _srcDir;
     private readonly string _dstDir;
-    private readonly FakeMonitor _monitor = new();
-    private readonly FakeComparer _comparer = new();
-    private readonly RecordingAction _copy = new();
-    private readonly RecordingAction _delete = new();
-    private readonly RecordingAction _rename = new();
-    private readonly FakeValidator _validator = new();
-    private readonly FakeDeletion _deletion = new();
-    private readonly MockLogger _log = new();
+    private readonly EventMonitor _monitor = new();
+    private readonly RecordingAction _copy = new(new CopyAction(new FileAccessor()));
+    private readonly RecordingAction _delete = new(new DeleteAction());
+    private readonly RecordingAction _rename = new(new RenameAction());
+    private readonly RecordingValidator _validator = new(new SizeValidator());
+    private readonly RecordingDeletion _deletion = new(new MirrorDeletion());
+    private readonly RecordingLogger _log = new();
     private StateDb _db = null!;
     private SyncPipeline _pipeline = null!;
     private int _syncsSeen;
@@ -34,7 +31,7 @@ public class PipelineTests : IDisposable
         var cfg = new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 };
         tweak?.Invoke(cfg);
         _db = new StateDb(Path.Combine(_root, "state.db"));
-        _pipeline = new SyncPipeline(cfg, _monitor, _comparer, _copy, _delete, _rename,
+        _pipeline = new SyncPipeline(cfg, _monitor, new SizeComparer(), _copy, _delete, _rename,
             new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(),
             _deletion, _log, _db);
         _pipeline.Start();
@@ -73,11 +70,25 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void Created_UsesFreshSnapshotAfterCopy()
+    {
+        _copy.AfterExecute = args => File.AppendAllText(args.ChangeEvent.FullPath, "y");
+        var file = Path.Combine(_srcDir, "fresh.txt");
+        File.WriteAllText(file, "x");
+        _monitor.Fire(ChangeType.Created, file);
+
+        WaitFor(() => _db.LoadAll().ContainsKey("fresh.txt"), "fresh state update");
+
+        Assert.Equal(2, _validator.LastSnapshot?.Length);
+        Assert.Equal(2, _db.LoadAll()["fresh.txt"].size);
+    }
+
+    [Fact]
     public void Created_WhenComparerEqual_SkipsCopy()
     {
-        _comparer.Equal = true;
         var file = Path.Combine(_srcDir, "same.txt");
         File.WriteAllText(file, "x");
+        File.WriteAllText(Path.Combine(_dstDir, "same.txt"), "x");
         _monitor.Fire(ChangeType.Created, file);
 
         Thread.Sleep(400);
@@ -88,7 +99,13 @@ public class PipelineTests : IDisposable
     [Fact]
     public void CopyFailure_LogsError_AndDoesNotUpdateState()
     {
-        _copy.Result = ActionResult.Fail("boom");
+        using var failingPipeline = new SyncPipeline(
+            new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
+            _monitor, new SizeComparer(), new FaultingAction("boom"), _delete, _rename,
+            new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(), _deletion, _log,
+            _db = new StateDb(Path.Combine(_root, "failure-state.db")));
+        _pipeline.Dispose();
+        failingPipeline.Start();
         var file = Path.Combine(_srcDir, "bad.txt");
         File.WriteAllText(file, "x");
         _monitor.Fire(ChangeType.Created, file);
@@ -190,52 +207,4 @@ public class PipelineTests : IDisposable
         Assert.Empty(_copy.Calls);
     }
 
-    private sealed class FakeMonitor : IFileMonitor
-    {
-        public event EventHandler<FileChangedEventArgs>? Changed;
-        public event EventHandler<MonitorErrorEventArgs>? Error;
-        public void Start() { }
-        public void Stop() { }
-        public void Fire(ChangeType type, string path, string? oldPath = null)
-            => Changed?.Invoke(this, new FileChangedEventArgs(type, path, oldPath));
-        public void FireError(Exception ex) => Error?.Invoke(this, new MonitorErrorEventArgs(ex));
-        public void Dispose() { }
-    }
-
-    private sealed class FakeComparer : IFileComparer
-    {
-        public bool Equal;
-        public bool AreEqual(string sourcePath, string destPath) => Equal;
-    }
-
-    private sealed class RecordingAction : IFileAction
-    {
-        public ConcurrentBag<FileActionArgs> Calls { get; } = new();
-        public ActionResult Result = ActionResult.Ok();
-        public Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
-        {
-            Calls.Add(args);
-            return Task.FromResult(Result);
-        }
-    }
-
-    private sealed class FakeValidator : IValidator
-    {
-        public int Calls;
-        public Task<bool> ValidateAsync(string sourcePath, string destPath)
-        {
-            Calls++;
-            return Task.FromResult(true);
-        }
-    }
-
-    private sealed class FakeDeletion : IDeletionStrategy
-    {
-        public ConcurrentBag<(string src, string dst)> Calls { get; } = new();
-        public Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
-        {
-            Calls.Add((sourcePath!, destPath));
-            return Task.CompletedTask;
-        }
-    }
 }

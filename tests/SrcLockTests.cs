@@ -6,7 +6,7 @@ public class SrcLockTests : IDisposable
 {
     private readonly string _dir;
     private readonly string _lockPath;
-    private readonly MockLogger _log = new();
+    private readonly RecordingLogger _log = new();
 
     public SrcLockTests()
     {
