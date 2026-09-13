@@ -213,4 +213,86 @@ public class PipelineTests : IDisposable
         Assert.Empty(_copy.Calls);
     }
 
+    [Fact]
+    public async Task RunOnceAsync_UsesPipelineEngineAndReleasesLock()
+    {
+        _pipeline.Dispose();
+        var file = Path.Combine(_srcDir, "once.txt");
+        File.WriteAllText(file, "once");
+        using var once = new SyncPipeline(
+            new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
+            new EventMonitor(), new SizeComparer(), new CopyAction(new FileAccessor()),
+            new RenameAction(), new ExponentialBackoffRetry(1, 0, 1), new SizeValidator(),
+            new NoVersioning(), new MirrorDeletion(), _log,
+            new StateDb(Path.Combine(_root, "once-state.db")));
+
+        Assert.True(await once.RunOnceAsync());
+        Assert.True(File.Exists(Path.Combine(_dstDir, "once.txt")));
+        once.Dispose();
+        Assert.False(File.Exists(Path.Combine(_dstDir, ".tictack.lock")));
+    }
+
+    [Fact]
+    public async Task Dispose_CancelsInitialSyncAndReleasesLock()
+    {
+        _pipeline.Dispose();
+        var monitor = new EventMonitor();
+        var blocking = new BlockingAction();
+        var cfg = new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 };
+        using var pipeline = new SyncPipeline(cfg, monitor, new SizeComparer(), blocking, _rename,
+            new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(), _deletion, _log);
+
+        File.WriteAllText(Path.Combine(_srcDir, "blocking.txt"), "x");
+        pipeline.Start();
+        await blocking.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        pipeline.Dispose();
+
+        Assert.False(File.Exists(Path.Combine(_dstDir, ".tictack.lock")));
+    }
+
+    [Fact]
+    public async Task RunOnce_FailsClosedWhenSourceEnumerationFails()
+    {
+        _pipeline.Dispose();
+        var stale = Path.Combine(_dstDir, "stale.txt");
+        File.WriteAllText(stale, "keep");
+        var monitor = new EventMonitor();
+        var deletion = new RecordingDeletion(new MirrorDeletion());
+        using var pipeline = new SyncPipeline(
+            new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
+            monitor, new SizeComparer(), new CopyAction(new FileAccessor()), new RenameAction(),
+            new ExponentialBackoffRetry(1, 0, 1), new SizeValidator(), new NoVersioning(), deletion, _log,
+            enumerateFiles: (_, _) => throw new IOException("injected scan failure"));
+
+        Assert.False(await pipeline.RunOnceAsync());
+        Assert.Equal("keep", File.ReadAllText(stale));
+        Assert.Empty(deletion.Calls);
+    }
+
+    [Fact]
+    public async Task DestinationLoss_BlocksLiveEvent()
+    {
+        _pipeline.Dispose();
+        var ready = true;
+        var monitor = new EventMonitor();
+        var copy = new RecordingAction(new CopyAction(new FileAccessor()));
+        var log = new RecordingLogger();
+        using var pipeline = new SyncPipeline(
+            new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
+            monitor, new SizeComparer(), copy, new RenameAction(),
+            new ExponentialBackoffRetry(1, 0, 1), new SizeValidator(), new NoVersioning(), new MirrorDeletion(), log,
+            driveReady: _ => ready);
+
+        pipeline.Start();
+        WaitFor(() => log.Messages.Any(m => m.Contains("Sync complete")), "initial sync");
+        ready = false;
+        var file = Path.Combine(_srcDir, "mount-loss.txt");
+        File.WriteAllText(file, "must not copy");
+        monitor.Fire(ChangeType.Created, file);
+        Thread.Sleep(400);
+
+        Assert.Empty(copy.Calls);
+        Assert.False(File.Exists(Path.Combine(_dstDir, "mount-loss.txt")));
+    }
+
 }

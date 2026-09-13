@@ -38,7 +38,7 @@ sources:
         path: '[TicTack]\Sync\.archive'
 
 monitor:
-  type: composite
+  type: watcher
   watcher_buffer_kb: 1024
   polling_interval_seconds: 300
   restart_delay_seconds: 10

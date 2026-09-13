@@ -1,12 +1,15 @@
 [Unit]
 Description=TicTack File Sync
 After=local-fs.target
+RequiresMountsFor=/srv/tictack
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/tictack
 ExecStart=/opt/tictack/TicTackSv --cli
 KillSignal=SIGINT
+TimeoutStopSec=60
+UMask=0077
 Restart=on-failure
 RestartSec=10
 

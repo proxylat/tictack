@@ -8,27 +8,36 @@ namespace TicTack
     {
         public static List<string> GetEligibleDrives(ExternalDrivesConfig cfg, HashSet<string> excludeDrives, ILogger log)
         {
+            var drives = new List<DriveCandidate>();
+            foreach (var di in DriveInfo.GetDrives())
+                drives.Add(new DriveCandidate(di.RootDirectory.FullName, di.DriveType, di.IsReady));
+            return GetEligibleDrives(cfg, excludeDrives, log, drives);
+        }
+
+        internal static List<string> GetEligibleDrives(ExternalDrivesConfig cfg, HashSet<string> excludeDrives,
+            ILogger log, IEnumerable<DriveCandidate> drives)
+        {
             var results = new List<string>();
-            var sysDrive = (Path.GetPathRoot(Environment.SystemDirectory) ?? "").TrimEnd('\\');
+            var sysDrive = NormalizeRoot(Path.GetPathRoot(Environment.SystemDirectory) ?? "");
             var exclude = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { sysDrive };
             if (cfg.ExcludeDrives != null)
                 foreach (var d in cfg.ExcludeDrives)
-                    exclude.Add(d.TrimEnd('\\'));
+                    exclude.Add(NormalizeRoot(d));
             if (excludeDrives != null)
                 foreach (var d in excludeDrives)
-                    exclude.Add(d.TrimEnd('\\'));
+                    exclude.Add(NormalizeRoot(d));
 
-            foreach (var di in DriveInfo.GetDrives())
+            foreach (var di in drives)
             {
-                if (di.DriveType == DriveType.NoRootDirectory ||
-                    di.DriveType == DriveType.Ram ||
-                    di.DriveType == DriveType.CDRom ||
-                    di.DriveType == DriveType.Network)
+                if (di.Type == DriveType.NoRootDirectory ||
+                    di.Type == DriveType.Ram ||
+                    di.Type == DriveType.CDRom ||
+                    di.Type == DriveType.Network)
                     continue;
 
                 if (!di.IsReady) continue;
 
-                var root = di.RootDirectory.FullName.TrimEnd('\\');
+                var root = NormalizeRoot(di.Root);
                 if (exclude.Contains(root)) continue;
 
                 if (cfg.RequireMarkerFile)
@@ -41,11 +50,19 @@ namespace TicTack
                     }
                 }
 
-                results.Add(root + "\\");
+                results.Add(root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar);
                 log.Info("Discovered eligible drive: " + root);
             }
 
             return results;
         }
+
+        private static string NormalizeRoot(string root)
+        {
+            var trimmed = root.TrimEnd('\\', '/');
+            return trimmed.Length == 0 ? Path.DirectorySeparatorChar.ToString() : trimmed;
+        }
+
+        internal readonly record struct DriveCandidate(string Root, DriveType Type, bool IsReady);
     }
 }

@@ -43,6 +43,20 @@ public class StateDbTests : IDisposable
     }
 
     [Fact]
+    public async Task AsyncUpsertLoadDelete_RoundTrip()
+    {
+        await _db.UpsertAsync("file.txt", 100, 1000);
+
+        var all = await _db.LoadAllAsync();
+        Assert.Equal((100L, 1000L), all["file.txt"]);
+        Assert.Equal(100L, await _db.GetSizeAsync("file.txt"));
+
+        await _db.DeleteAsync("file.txt");
+
+        Assert.Empty(await _db.LoadAllAsync());
+    }
+
+    [Fact]
     public void UpsertBatch_RoundTripsAndOverwrites()
     {
         _db.UpsertBatch(new[]
@@ -87,6 +101,17 @@ public class StateDbTests : IDisposable
         Assert.Equal(2, _db.Count());
         _db.Delete("a.txt");
         Assert.Equal(1, _db.Count());
+    }
+
+    [Fact]
+    public void Clear_RemovesAllEntries()
+    {
+        _db.Upsert("a.txt", 1, 10);
+        _db.Upsert("b.txt", 2, 20);
+
+        _db.Clear();
+
+        Assert.Empty(_db.LoadAll());
     }
 
     [Fact]

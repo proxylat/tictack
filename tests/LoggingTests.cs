@@ -173,4 +173,18 @@ public class LoggingTests
         }
         finally { File.Delete(path); }
     }
+
+    [Fact]
+    public void BufferedLogger_FlushesOnDispose()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var logger = new BufferedLogger(new FileLogger(path, LogLevel.Debug)))
+                logger.Info("buffered message");
+
+            Assert.Contains("buffered message", File.ReadAllText(path));
+        }
+        finally { File.Delete(path); }
+    }
 }

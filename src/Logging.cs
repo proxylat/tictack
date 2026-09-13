@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 
 namespace TicTack
 {
@@ -102,6 +104,61 @@ namespace TicTack
         }
     }
 
+    public sealed class BufferedLogger : ILogger, IDisposable
+    {
+        private readonly ILogger _inner;
+        private readonly Channel<Entry> _queue = Channel.CreateBounded<Entry>(new BoundedChannelOptions(4096)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true
+        });
+        private readonly Task _writer;
+
+        public BufferedLogger(ILogger inner)
+        {
+            _inner = inner;
+            _writer = Task.Run(WriteLoopAsync);
+        }
+
+        public void Debug(string msg) => Enqueue(LogLevel.Debug, msg, null);
+        public void Info(string msg) => Enqueue(LogLevel.Info, msg, null);
+        public void Warn(string msg) => Enqueue(LogLevel.Warn, msg, null);
+        public void Error(string msg, Exception? ex = null) => Enqueue(LogLevel.Error, msg, ex);
+
+        private void Enqueue(LogLevel level, string msg, Exception? ex)
+        {
+            if (_queue.Writer.TryWrite(new Entry(level, msg, ex))) return;
+            if (level >= LogLevel.Warn)
+                Write(new Entry(level, msg, ex));
+        }
+
+        private async Task WriteLoopAsync()
+        {
+            await foreach (var entry in _queue.Reader.ReadAllAsync())
+                Write(entry);
+        }
+
+        private void Write(Entry entry)
+        {
+            switch (entry.Level)
+            {
+                case LogLevel.Debug: _inner.Debug(entry.Message); break;
+                case LogLevel.Info: _inner.Info(entry.Message); break;
+                case LogLevel.Warn: _inner.Warn(entry.Message); break;
+                default: _inner.Error(entry.Message, entry.Exception); break;
+            }
+        }
+
+        public void Dispose()
+        {
+            _queue.Writer.TryComplete();
+            try { _writer.GetAwaiter().GetResult(); } catch { }
+            if (_inner is IDisposable disposable) disposable.Dispose();
+        }
+
+        private readonly record struct Entry(LogLevel Level, string Message, Exception? Exception);
+    }
+
     public class DesktopAlertLogger : ILogger
     {
         private readonly LogLevel _minLevel;
@@ -132,7 +189,7 @@ namespace TicTack
         }
     }
 
-    public class MultiLogger : ILogger
+    public class MultiLogger : ILogger, IDisposable
     {
         private readonly ILogger[] _loggers;
         public MultiLogger(IEnumerable<ILogger>? loggers)
@@ -144,6 +201,11 @@ namespace TicTack
         public void Info(string msg) { foreach (var l in _loggers) l.Info(msg); }
         public void Warn(string msg) { foreach (var l in _loggers) l.Warn(msg); }
         public void Error(string msg, Exception? ex = null) { foreach (var l in _loggers) l.Error(msg, ex); }
+        public void Dispose()
+        {
+            foreach (var logger in _loggers)
+                if (logger is IDisposable disposable) disposable.Dispose();
+        }
     }
 
     public static class LogLevelParser

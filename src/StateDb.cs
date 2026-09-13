@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 
 namespace TicTack
@@ -11,7 +12,7 @@ namespace TicTack
     {
         private SqliteConnection _conn = null!;
         private readonly string _dbPath;
-        private readonly object _lock = new object();
+        private readonly SemaphoreSlim _gate = new SemaphoreSlim(1, 1);
         private bool _disposed;
 
         public StateDb(string dbPath)
@@ -57,7 +58,7 @@ namespace TicTack
 
         void EnsureConnected()
         {
-            if (_disposed) return;
+            if (_disposed) throw new ObjectDisposedException(nameof(StateDb));
             try
             {
                 using (var cmd = _conn.CreateCommand())
@@ -85,10 +86,92 @@ namespace TicTack
             }
         }
 
+        async Task EnsureConnectedAsync()
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(StateDb));
+            try
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT 1";
+                    await cmd.ExecuteScalarAsync().ConfigureAwait(false);
+                }
+            }
+            catch
+            {
+                var root = Path.GetPathRoot(_dbPath);
+                if (!string.IsNullOrEmpty(root) &&
+                    !DriveInfo.GetDrives().Any(d => d.Name.StartsWith(root, StringComparison.OrdinalIgnoreCase) && d.IsReady))
+                    return;
+
+                for (int i = 0; i < 5; i++)
+                {
+                    try { await ReconnectAsync().ConfigureAwait(false); return; }
+                    catch
+                    {
+                        if (i < 4)
+                            await Task.Delay((int)Math.Pow(2, i) * 1000).ConfigureAwait(false);
+                    }
+                }
+            }
+        }
+
+        void Enter()
+        {
+            _gate.Wait();
+            if (_disposed)
+            {
+                _gate.Release();
+                throw new ObjectDisposedException(nameof(StateDb));
+            }
+        }
+
+        async Task EnterAsync()
+        {
+            await _gate.WaitAsync().ConfigureAwait(false);
+            if (_disposed)
+            {
+                _gate.Release();
+                throw new ObjectDisposedException(nameof(StateDb));
+            }
+        }
+
+        async Task ReconnectAsync()
+        {
+            if (_conn != null)
+            {
+                try { _conn.Close(); } catch { }
+                _conn.Dispose();
+            }
+            _conn = new SqliteConnection("Data Source=" + _dbPath);
+            await _conn.OpenAsync().ConfigureAwait(false);
+
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "PRAGMA journal_mode=WAL";
+                await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+            }
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "PRAGMA cache_size = -500";
+                await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+            }
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = @"CREATE TABLE IF NOT EXISTS state (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime INTEGER NOT NULL
+                )";
+                await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+            }
+        }
+
         public Dictionary<string, (long size, long mtime)> LoadAll()
         {
             var result = new Dictionary<string, (long, long)>(StringComparer.OrdinalIgnoreCase);
-            lock (_lock)
+            Enter();
+            try
             {
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
@@ -106,12 +189,37 @@ namespace TicTack
                     }
                 }
             }
+            finally { _gate.Release(); }
+            return result;
+        }
+
+        public async Task<Dictionary<string, (long size, long mtime)>> LoadAllAsync()
+        {
+            var result = new Dictionary<string, (long, long)>(StringComparer.OrdinalIgnoreCase);
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT path, size, mtime FROM state";
+                    using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
+                    {
+                        while (await reader.ReadAsync().ConfigureAwait(false))
+                        {
+                            result[reader.GetString(0)] = (reader.GetInt64(1), reader.GetInt64(2));
+                        }
+                    }
+                }
+            }
+            finally { _gate.Release(); }
             return result;
         }
 
         public void Upsert(string path, long size, long mtime)
         {
-            lock (_lock)
+            Enter();
+            try
             {
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
@@ -123,11 +231,31 @@ namespace TicTack
                     cmd.ExecuteNonQuery();
                 }
             }
+            finally { _gate.Release(); }
+        }
+
+        public async Task UpsertAsync(string path, long size, long mtime)
+        {
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "INSERT OR REPLACE INTO state (path, size, mtime) VALUES (@p, @s, @m)";
+                    cmd.Parameters.AddWithValue("@p", path);
+                    cmd.Parameters.AddWithValue("@s", size);
+                    cmd.Parameters.AddWithValue("@m", mtime);
+                    await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                }
+            }
+            finally { _gate.Release(); }
         }
 
         public void UpsertBatch(IEnumerable<(string path, long size, long mtime)> entries)
         {
-            lock (_lock)
+            Enter();
+            try
             {
                 EnsureConnected();
                 using (var tx = _conn.BeginTransaction())
@@ -148,11 +276,13 @@ namespace TicTack
                     tx.Commit();
                 }
             }
+            finally { _gate.Release(); }
         }
 
         public void Delete(string path)
         {
-            lock (_lock)
+            Enter();
+            try
             {
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
@@ -162,13 +292,31 @@ namespace TicTack
                     cmd.ExecuteNonQuery();
                 }
             }
+            finally { _gate.Release(); }
+        }
+
+        public async Task DeleteAsync(string path)
+        {
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "DELETE FROM state WHERE path = @p";
+                    cmd.Parameters.AddWithValue("@p", path);
+                    await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                }
+            }
+            finally { _gate.Release(); }
         }
 
         public void UpdatePrefix(string oldPrefix, string newPrefix)
         {
             if (string.IsNullOrEmpty(oldPrefix)) return;
             var sep = Path.DirectorySeparatorChar;
-            lock (_lock)
+            Enter();
+            try
             {
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
@@ -180,11 +328,33 @@ namespace TicTack
                     cmd.ExecuteNonQuery();
                 }
             }
+            finally { _gate.Release(); }
+        }
+
+        public async Task UpdatePrefixAsync(string oldPrefix, string newPrefix)
+        {
+            if (string.IsNullOrEmpty(oldPrefix)) return;
+            var sep = Path.DirectorySeparatorChar;
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "UPDATE state SET path = @new || SUBSTR(path, LENGTH(@old) + 1) WHERE path LIKE @old || @sep || '%'";
+                    cmd.Parameters.AddWithValue("@old", oldPrefix);
+                    cmd.Parameters.AddWithValue("@new", newPrefix);
+                    cmd.Parameters.AddWithValue("@sep", sep.ToString());
+                    await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                }
+            }
+            finally { _gate.Release(); }
         }
 
         public long? GetSize(string path)
         {
-            lock (_lock)
+            Enter();
+            try
             {
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
@@ -195,11 +365,30 @@ namespace TicTack
                     return r == null || r is DBNull ? (long?)null : (long)r;
                 }
             }
+            finally { _gate.Release(); }
+        }
+
+        public async Task<long?> GetSizeAsync(string path)
+        {
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT size FROM state WHERE path = @p";
+                    cmd.Parameters.AddWithValue("@p", path);
+                    var r = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
+                    return r == null || r is DBNull ? (long?)null : (long)r;
+                }
+            }
+            finally { _gate.Release(); }
         }
 
         public long Count()
         {
-            lock (_lock)
+            Enter();
+            try
             {
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
@@ -208,19 +397,53 @@ namespace TicTack
                     return (long)(cmd.ExecuteScalar() ?? 0L);
                 }
             }
+            finally { _gate.Release(); }
+        }
+
+        public async Task<long> CountAsync()
+        {
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT COUNT(*) FROM state";
+                    return (long)(await cmd.ExecuteScalarAsync().ConfigureAwait(false) ?? 0L);
+                }
+            }
+            finally { _gate.Release(); }
+        }
+
+        public void Clear()
+        {
+            Enter();
+            try
+            {
+                EnsureConnected();
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "DELETE FROM state";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            finally { _gate.Release(); }
         }
 
         public void Dispose()
         {
-            if (!_disposed)
+            _gate.Wait();
+            try
             {
+                if (_disposed) return;
+                _disposed = true;
                 if (_conn != null)
                 {
                     _conn.Close();
                     _conn.Dispose();
                 }
-                _disposed = true;
             }
+            finally { _gate.Release(); }
         }
     }
 }

@@ -1,5 +1,6 @@
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
+using YamlDotNet.Core;
 
 namespace TicTack;
 
@@ -199,10 +200,34 @@ logging:
     }
 
     [Fact]
+    public void Load_RejectsUnknownProperty()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, "sources: []\nunexpected: true\n");
+            Assert.Throws<YamlException>(() => Config.Load(path));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void Load_RejectsDuplicateProperty()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, "sources: []\nmonitor:\n  type: watcher\n  type: polling\n");
+            Assert.Throws<YamlException>(() => Config.Load(path));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
     public void DefaultValues_AreSet()
     {
         Assert.Equal(10.0, new SourceConfig().DebounceSeconds);
-        Assert.Equal("composite", new MonitorConfig().Type);
+        Assert.Equal("watcher", new MonitorConfig().Type);
         Assert.Equal(LogLevel.Info, LogLevelParser.Parse(new LoggingConfig().Level));
         Assert.True(new WatchdogConfig().Enabled);
     }

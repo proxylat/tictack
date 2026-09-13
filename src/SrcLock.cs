@@ -10,6 +10,7 @@ namespace TicTack
         private readonly string _path;
         private readonly string _identity;
         private readonly Timer? _refreshTimer;
+        private FileStream? _handle;
         private bool _disposed;
 
         public bool IsHeld { get; private set; }
@@ -24,43 +25,37 @@ namespace TicTack
             {
                 while (true)
                 {
-                    if (File.Exists(path))
+                    try
                     {
-                        var content = File.ReadAllText(path);
-                        var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(path);
-                        if (age.TotalMinutes < 5)
-                        {
-                            if (DateTime.UtcNow >= deadline)
-                            {
-                                log.Warn("Lock held by " + content + " — retry timeout, continuing without it");
-                                return;
-                            }
-                            log.Debug("Lock held by " + content + " — retrying...");
-                            Thread.Sleep(5000);
-                            continue;
-                        }
-                        File.Delete(path);
+                        _handle = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1, FileOptions.WriteThrough);
+                        using (var writer = new StreamWriter(_handle, leaveOpen: true))
+                            writer.Write(_identity);
+                        _handle.Flush(true);
+                        IsHeld = true;
+                        break;
                     }
-
-                    File.WriteAllText(path, _identity);
-                    Thread.Sleep(200);
-                    if (File.ReadAllText(path) != _identity)
+                    catch (IOException)
                     {
+                        _handle?.Dispose();
+                        _handle = null;
+                        if (!File.Exists(path)) throw;
+                        var content = "unknown";
+                        try { content = File.ReadAllText(path); } catch { }
+                        var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(path);
+                        if (age.TotalMinutes >= 5)
+                        {
+                            try { File.Delete(path); continue; } catch { }
+                        }
                         if (DateTime.UtcNow >= deadline)
                         {
-                            File.Delete(path);
-                            log.Warn("Lock stolen — retry timeout, continuing without it");
+                            log.Warn("Lock held by " + content + " — lock acquisition failed");
                             return;
                         }
-                        log.Debug("Lock stolen — retrying...");
+                        log.Debug("Lock held by " + content + " — retrying...");
                         Thread.Sleep(5000);
-                        continue;
                     }
-
-                    break;
                 }
 
-                IsHeld = true;
                 _refreshTimer = new Timer(_ =>
                 {
                     try { File.SetLastWriteTimeUtc(_path, DateTime.UtcNow); }
@@ -69,6 +64,8 @@ namespace TicTack
             }
             catch (Exception ex)
             {
+                _handle?.Dispose();
+                _handle = null;
                 log.Warn("Lock init failed: " + ex.Message);
             }
         }
@@ -82,8 +79,9 @@ namespace TicTack
             {
                 try
                 {
-                    if (File.Exists(_path) && File.ReadAllText(_path) == _identity)
-                        File.Delete(_path);
+                    _handle?.Dispose();
+                    _handle = null;
+                    if (File.Exists(_path)) File.Delete(_path);
                 }
                 catch { }
             }

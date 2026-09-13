@@ -2,7 +2,13 @@
 set "DIR=%~dp0"
 
 sc stop TicTackSv >nul 2>&1
-taskkill /F /IM TicTackSv.exe
+for /l %%i in (1,1,30) do (
+    sc query TicTackSv >nul 2>&1 || goto :service_stopped
+    timeout /t 1 /nobreak >nul
+)
+echo ERROR: TicTackSv did not stop in time. Aborting without deleting live files.
+exit /b 1
+:service_stopped
 sc delete TicTackSv
 
 :: Remove publish artifacts, keep config.yaml (user data)

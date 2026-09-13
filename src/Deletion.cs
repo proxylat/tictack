@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -7,10 +8,11 @@ namespace TicTack
 {
     public class MirrorDeletion : IDeletionStrategy
     {
-        public Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
+        public Task<ActionResult> HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
         {
             try
             {
+                ct.ThrowIfCancellationRequested();
                 if (File.Exists(destPath))
                 {
                     File.SetAttributes(destPath, FileAttributes.Normal);
@@ -20,9 +22,9 @@ namespace TicTack
                 {
                     Directory.Delete(destPath, true);
                 }
+                return Task.FromResult(ActionResult.Ok());
             }
-            catch { }
-            return Task.CompletedTask;
+            catch (Exception ex) { return Task.FromResult(ActionResult.Fail(ex.Message)); }
         }
     }
 
@@ -41,24 +43,39 @@ namespace TicTack
         {
             var dir = Path.GetDirectoryName(archivePath);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
-            if (File.Exists(archivePath))
+            var temp = archivePath + ".tictack.tmp";
+            try
             {
-                File.SetAttributes(archivePath, FileAttributes.Normal);
-                File.Delete(archivePath);
-            }
-            try { File.Move(src, archivePath); }
-            catch
-            {
-                File.Copy(src, archivePath, overwrite: true);
+                using (var input = File.OpenRead(src))
+                using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    input.CopyTo(output);
+                    output.Flush(true);
+                }
+                if (!FilesMatch(src, temp))
+                    throw new IOException("Archive validation failed: " + src);
+                File.Move(temp, archivePath, true);
                 File.Delete(src);
             }
+            finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
         }
 
-        public Task HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
+        static bool FilesMatch(string left, string right)
+        {
+            var leftInfo = new FileInfo(left);
+            var rightInfo = new FileInfo(right);
+            if (leftInfo.Length != rightInfo.Length) return false;
+            using var leftStream = File.OpenRead(left);
+            using var rightStream = File.OpenRead(right);
+            return Convert.ToHexString(SHA256.HashData(leftStream)) ==
+                Convert.ToHexString(SHA256.HashData(rightStream));
+        }
+
+        public Task<ActionResult> HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
         {
             try
             {
+                ct.ThrowIfCancellationRequested();
                 var syncRoot = Path.GetDirectoryName(_archiveBase.TrimEnd('\\', '/'));
                 string RelFromSyncRoot(string p)
                 {
@@ -83,9 +100,9 @@ namespace TicTack
                     }
                     Directory.Delete(destPath, true);
                 }
+                return Task.FromResult(ActionResult.Ok());
             }
-            catch { }
-            return Task.CompletedTask;
+            catch (Exception ex) { return Task.FromResult(ActionResult.Fail(ex.Message)); }
         }
     }
 

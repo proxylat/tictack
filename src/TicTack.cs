@@ -32,8 +32,9 @@ namespace TicTack
             };
         }
 
-        static int Main(string[] args)
+        static async Task<int> Main(string[] args)
         {
+            MultiLogger? rootLogger = null;
             try
             {
                 var baseDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -70,13 +71,17 @@ namespace TicTack
             var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
                 ? Path.Combine(baseDir, "tictack.log")
                 : cfg.Logging.Path;
-            loggers.Add(new FileLogger(logPath, level, cfg.Logging.MaxSizeMb, cfg.Logging.MaxFiles));
+            loggers.Add(new BufferedLogger(new FileLogger(logPath, level, cfg.Logging.MaxSizeMb, cfg.Logging.MaxFiles)));
             if (isCli || isOnce || isValidate || cfg.Logging.Console)
                 loggers.Add(new ConsoleLogger(level));
             loggers.Add(new DesktopAlertLogger(level > LogLevel.Debug ? LogLevel.Warn : LogLevel.Debug, cfg.Logging.AlertPath));
             if (OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive))
                 loggers.Add(new EventLogLogger());
             var log = new MultiLogger(loggers);
+            rootLogger = log;
+
+            if (!Config.Validate(cfg, log))
+                return 1;
 
             PowerGuard.Cleanup(cfg, log);
 
@@ -88,7 +93,7 @@ namespace TicTack
 
             if (isRebuild)
             {
-                RunRebuild(cfg, log);
+                await RunRebuildAsync(cfg, log);
                 return 0;
             }
 
@@ -101,7 +106,7 @@ namespace TicTack
 
             if (isOnce)
             {
-                RunOnce(cfg, log);
+                await RunOnceAsync(cfg, log);
                 return 0;
             }
 
@@ -126,6 +131,10 @@ namespace TicTack
                 try { File.WriteAllText(crashLog, DateTime.Now + " Main failed:\r\n" + ex); } catch { }
                 LogCrash(ex);
                 return 1;
+            }
+            finally
+            {
+                rootLogger?.Dispose();
             }
         }
 
@@ -236,342 +245,89 @@ namespace TicTack
             log.Info("All external drive backups complete");
         }
 
-        static void RunOnce(TicTackConfig cfg, ILogger log)
+        internal static async Task<bool> RunOnceAsync(TicTackConfig cfg, ILogger log)
         {
             log.Info("Once-off sync starting");
-
+            var ran = false;
             foreach (var src in cfg.Sources)
             {
-                var srcPath = src.Path;
-                var dstBase = src.Destination;
-                var accessor = new FileAccessor();
-                var comparer = ComparerFactory.Create(Config.ParseVerification(src.Sync != null ? src.Sync.Verification : null), accessor);
-                var validator = ValidatorFactory.Create(Config.ParseVerification(src.Sync != null ? src.Sync.Verification : null), accessor);
-                var retry = src.Sync != null && src.Sync.Retry != null
-                    ? new ExponentialBackoffRetry(src.Sync.Retry.MaxAttempts, src.Sync.Retry.DelayMs, src.Sync.Retry.Backoff)
-                    : new ExponentialBackoffRetry();
-            var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, src.Destination);
-                var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, dstBase);
-                var copy = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
+                if (!Directory.Exists(src.Path))
+                {
+                    log.Warn("Source folder missing, skipping once-off sync: " + src.Path);
+                    continue;
+                }
+                if (!SyncPipeline.IsDriveReady(src.Destination))
+                {
+                    log.Error("Destination drive is not ready: " + src.Destination);
+                    continue;
+                }
 
-                var filters = new List<IFileFilter>();
-                if (src.Filter != null && src.Filter.Exclude != null && src.Filter.Exclude.Count > 0)
-                    filters.Add(new PatternFilter(src.Filter.Exclude.ToArray()));
-                long? maxSize = src.Filter != null ? Config.ParseFileSizeLimit(src.Filter.MaxFileSizeMb) : null;
-                if (maxSize.HasValue && maxSize.Value > 0)
-                    filters.Add(new SizeFilter(maxSize.Value));
-                var filter = filters.Count > 0 ? new CompositeFilter(filters) : null;
-
-                log.Info("Syncing: " + srcPath + " -> " + dstBase);
-
-                StateDb? stateDb = null;
-                Dictionary<string, (long size, long mtime)>? cache = null;
+                SyncPipeline? pipeline = null;
                 try
                 {
-                    var dbPath = GetStateDbPath(src);
-                    stateDb = new StateDb(dbPath);
-                    cache = stateDb.LoadAll();
-                }
-                catch (Exception ex) { log.Warn("StateDB init failed, continuing without: " + ex.Message); }
-
-                var sourceFiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                if (Directory.Exists(srcPath))
-                {
-                    try
-                    {
-                        foreach (var f in Directory.EnumerateFiles(srcPath, "*", SearchOption.AllDirectories))
-                        {
-                            if (filter != null && !filter.ShouldProcess(f))
-                                continue;
-                            var rel = f.Substring(srcPath.Length).TrimStart('\\', '/');
-                            sourceFiles[rel] = f;
-                        }
-                    }
-                    catch (UnauthorizedAccessException) { log.Warn("Access denied scanning " + srcPath); }
-                }
-
-                var pendingState = new List<(string path, long size, long mtime)>();
-                var stateLock = new object();
-                void FlushState()
-                {
-                    if (stateDb == null || pendingState.Count == 0) return;
-                    lock (stateLock)
-                    {
-                        try
-                        {
-                            stateDb.UpsertBatch(pendingState);
-                            pendingState.Clear();
-                        }
-                        catch (Exception ex) { log.Debug("StateDb batch upsert failed: " + ex.Message); }
-                    }
-                }
-
-                var options = new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = Math.Max(1, src.Sync != null ? src.Sync.InitialSyncWorkers : 2)
-                };
-                Parallel.ForEach(sourceFiles, options, kv =>
-                {
-                    try
-                    {
-                        var rel = kv.Key;
-                        var srcFile = kv.Value;
-                        var dstFile = Path.Combine(dstBase, rel);
-                        if (!FileSnapshot.TryRead(srcFile, out var sourceSnapshot)) return;
-                        var e = new FileChangedEventArgs(ChangeType.Created, srcFile);
-                        var actionArgs = new FileActionArgs(e, srcPath, dstBase, sourceSnapshot);
-
-                        if (cache != null && cache.TryGetValue(rel, out var cached)
-                            && sourceSnapshot.Length == cached.size && sourceSnapshot.LastWriteTimeUtcTicks == cached.mtime)
-                            return;
-
-                        if (comparer.AreEqual(srcFile, dstFile, sourceSnapshot)) return;
-
-                        if (versioning != null)
-                            versioning.ArchivePreviousVersionAsync(dstFile, CancellationToken.None).GetAwaiter().GetResult();
-
-                        var result = retry.ExecuteAsync(() => copy.ExecuteAsync(actionArgs, CancellationToken.None), CancellationToken.None).GetAwaiter().GetResult();
-                        if (!result.Success)
-                        {
-                            log.Error("Copy failed: " + srcFile + ": " + result.ErrorMessage);
-                            return;
-                        }
-
-                        if (!FileSnapshot.TryRead(srcFile, out var freshSnapshot))
-                        {
-                            log.Error("Validation FAILED: source disappeared: " + srcFile);
-                            return;
-                        }
-                        if (validator != null)
-                        {
-                            var valid = validator.ValidateAsync(srcFile, dstFile, freshSnapshot).GetAwaiter().GetResult();
-                            if (!valid)
-                            {
-                                log.Error("Validation FAILED: " + srcFile + " -> " + dstFile);
-                                return;
-                            }
-                        }
-
-                        if (stateDb != null)
-                        {
-                            lock (stateLock)
-                            {
-                                pendingState.Add((rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks));
-                                if (pendingState.Count >= 500) FlushState();
-                            }
-                        }
-
-                        log.Info("Synced: " + srcFile);
-                    }
-                    catch (Exception ex) { log.Error("Initial sync failed: " + kv.Value, ex); }
-                });
-
-                FlushState();
-
-                if (Directory.Exists(dstBase))
-                {
-                    try
-                    {
-                        var stale = new List<string>();
-                        foreach (var dstFile in Directory.EnumerateFiles(dstBase, "*", SearchOption.AllDirectories))
-                        {
-                            var rel = dstFile.Substring(dstBase.Length).TrimStart('\\', '/');
-                            var name = Path.GetFileName(dstFile);
-                            if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
-                            if (!sourceFiles.ContainsKey(rel))
-                                stale.Add(dstFile);
-                        }
-
-                        long stateCount = 0;
-                        if (stateDb != null) { try { stateCount = stateDb.Count(); } catch { } }
-                        long totalSize = 0;
-                        foreach (var sf in stale) { try { totalSize += new FileInfo(sf).Length; } catch { } }
-                        var sync = src.Sync;
-
-                        bool blocked =
-                            (sync != null && sync.DeleteThresholdCount > 0 && stale.Count >= sync.DeleteThresholdCount) ||
-                            (sync != null && sync.DeleteThresholdSizeGb.HasValue && sync.DeleteThresholdSizeGb.Value > 0 &&
-                             totalSize >= sync.DeleteThresholdSizeGb.Value * 1024L * 1024L * 1024L) ||
-                            (sync != null && sync.DeleteThresholdPercent > 0 && stateCount > 50 &&
-                             (double)stale.Count / stateCount * 100 >= sync.DeleteThresholdPercent);
-
-                        if (blocked)
-                        {
-                            log.Error("Delete guard: " + stale.Count + " stale files would be removed, skipping. Run --rebuild to force.");
-                        }
-                        else
-                        {
-                            foreach (var dstFile in stale)
-                            {
-                                deletion.HandleDeletionAsync(null, dstFile, CancellationToken.None).GetAwaiter().GetResult();
-                                if (stateDb != null)
-                                {
-                                    try
-                                    {
-                                        var rel = dstFile.Substring(dstBase.Length).TrimStart('\\', '/');
-                                        stateDb.Delete(rel);
-                                    }
-                                    catch { }
-                                }
-                                log.Debug("Deleted: " + dstFile);
-                            }
-                        }
-                    }
-                    catch (UnauthorizedAccessException) { }
-                }
-            }
-
-            log.Info("Once-off sync complete");
-        }
-
-        static void RunRebuild(TicTackConfig cfg, ILogger log)
-        {
-            foreach (var src in cfg.Sources)
-            {
-                var dbPath = GetStateDbPath(src);
-                try
-                {
-                    if (Directory.Exists(dbPath))
-                    {
-                        log.Warn("State DB path is a directory, expected a .db file: " + dbPath);
-                        continue;
-                    }
-                    if (!File.Exists(dbPath) && !File.Exists(dbPath + "-wal") && !File.Exists(dbPath + "-shm"))
-                        continue;
-                    DeleteWithRetry(dbPath);
-                    DeleteWithRetry(dbPath + "-wal");
-                    DeleteWithRetry(dbPath + "-shm");
-                    log.Info("Cleared state DB: " + dbPath);
+                    pipeline = BuildPipeline(src, cfg, log);
+                    if (!await pipeline.RunOnceAsync())
+                        log.Warn("Once-off sync skipped: " + src.Path);
+                    else
+                        ran = true;
                 }
                 catch (Exception ex)
                 {
-                    log.Error("Failed to delete state DB: " + dbPath + ": " + ex.Message);
-                    log.Error("Another process (likely the running TicTackSv service) holds this file. Stop the service first ('sc stop TicTackSv' on Windows, 'sudo systemctl stop tictack' on Linux), then re-run --rebuild. Nothing was modified.");
-                    Environment.Exit(1);
+                    log.Error("Once-off sync failed: " + src.Path, ex);
+                }
+                finally
+                {
+                    pipeline?.Dispose();
                 }
             }
+            log.Info("Once-off sync complete");
+            return ran;
+        }
 
-            var rbBaseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+        internal static async Task RunRebuildAsync(TicTackConfig cfg, ILogger log)
+        {
+            log.Info("Full rebuild starting");
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
             var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                ? Path.Combine(rbBaseDir, "tictack.log")
+                ? Path.Combine(baseDir, "tictack.log")
                 : cfg.Logging.Path;
+            var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
+
             foreach (var src in cfg.Sources)
             {
-                var dname = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
-                if (string.IsNullOrEmpty(dname)) dname = "default";
-                var deferredFile = Path.Combine(Path.GetDirectoryName(logPath) ?? rbBaseDir, "tictack-deferred-" + dname.ToLowerInvariant() + ".json");
+                if (!Directory.Exists(src.Path))
+                {
+                    log.Error("Source folder missing, rebuild skipped: " + src.Path);
+                    continue;
+                }
+                if (!SyncPipeline.IsDriveReady(src.Destination))
+                {
+                    log.Error("Destination drive is not ready: " + src.Destination);
+                    return;
+                }
+
                 try
                 {
-                    if (File.Exists(deferredFile))
+                    using var pipeline = BuildPipeline(src, cfg, log);
+                    var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
+                    if (string.IsNullOrEmpty(name)) name = "default";
+                    var deferredFile = Path.Combine(deferredDir, "tictack-deferred-" + name.ToLowerInvariant() + ".json");
+                    var rebuilt = await pipeline.RunOnceAsync(() =>
                     {
-                        File.Delete(deferredFile);
-                        log.Info("Cleared deferred deletions: " + deferredFile);
-                    }
+                        pipeline.ResetState();
+                        DeleteWithRetry(deferredFile);
+                        DeleteWithRetry(Path.Combine(src.Destination, ".tictack-deferred.json"));
+                        return Task.CompletedTask;
+                    });
+                    if (rebuilt)
+                        log.Info("Rebuild complete: " + src.Path);
+                    else
+                        log.Warn("Rebuild skipped: " + src.Path);
                 }
-                catch { }
-                try
+                catch (Exception ex)
                 {
-                    var legacyDeferred = Path.Combine(src.Destination, ".tictack-deferred.json");
-                    if (File.Exists(legacyDeferred)) File.Delete(legacyDeferred);
+                    log.Error("Rebuild failed: " + src.Path, ex);
                 }
-                catch { }
-            }
-
-            var accessor = new FileAccessor();
-            foreach (var src in cfg.Sources)
-            {
-                var srcPath = src.Path;
-                var dstBase = src.Destination;
-                var level = Config.ParseVerification(src.Sync != null ? src.Sync.Verification : null);
-                var comparer = ComparerFactory.Create(level, accessor);
-                var validator = ValidatorFactory.Create(level, accessor);
-                var retry = src.Sync != null && src.Sync.Retry != null
-                    ? new ExponentialBackoffRetry(src.Sync.Retry.MaxAttempts, src.Sync.Retry.DelayMs, src.Sync.Retry.Backoff)
-                    : new ExponentialBackoffRetry();
-                var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, dstBase);
-                var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, dstBase);
-                var copy = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
-
-                var filters = new List<IFileFilter>();
-                if (src.Filter != null && src.Filter.Exclude != null && src.Filter.Exclude.Count > 0)
-                    filters.Add(new PatternFilter(src.Filter.Exclude.ToArray()));
-                long? maxSize = src.Filter != null ? Config.ParseFileSizeLimit(src.Filter.MaxFileSizeMb) : null;
-                if (maxSize.HasValue && maxSize.Value > 0)
-                    filters.Add(new SizeFilter(maxSize.Value));
-                var filter = filters.Count > 0 ? new CompositeFilter(filters) : null;
-
-                log.Info("Rebuilding: " + srcPath + " -> " + dstBase);
-
-                var sourceFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                if (Directory.Exists(srcPath))
-                {
-                    foreach (var f in Directory.EnumerateFiles(srcPath, "*", SearchOption.AllDirectories))
-                    {
-                        if (filter != null && !filter.ShouldProcess(f)) continue;
-                        var rel = f.Substring(srcPath.Length).TrimStart('\\', '/');
-                         sourceFiles.Add(rel);
-
-                         var dstFile = Path.Combine(dstBase, rel);
-                         if (!FileSnapshot.TryRead(f, out var sourceSnapshot)) continue;
-                         var e = new FileChangedEventArgs(ChangeType.Created, f);
-                         var actionArgs = new FileActionArgs(e, srcPath, dstBase, sourceSnapshot);
-
-                         if (comparer.AreEqual(f, dstFile, sourceSnapshot)) continue;
-
-                        if (versioning != null)
-                            versioning.ArchivePreviousVersionAsync(dstFile, CancellationToken.None).GetAwaiter().GetResult();
-
-                        var result = retry.ExecuteAsync(() => copy.ExecuteAsync(actionArgs, CancellationToken.None), CancellationToken.None).GetAwaiter().GetResult();
-
-                        if (!result.Success)
-                        {
-                            log.Error("Copy failed: " + f + ": " + result.ErrorMessage);
-                            continue;
-                        }
-
-                         if (validator != null)
-                         {
-                             if (!FileSnapshot.TryRead(f, out var freshSnapshot))
-                             {
-                                 log.Error("Validation FAILED: source disappeared: " + f);
-                                 continue;
-                             }
-                             var valid = validator.ValidateAsync(f, dstFile, freshSnapshot).GetAwaiter().GetResult();
-                            if (!valid)
-                                log.Error("Validation FAILED: " + f + " -> " + dstFile);
-                        }
-                        log.Info("Synced: " + f);
-                    }
-                }
-
-                if (Directory.Exists(dstBase))
-                {
-                    foreach (var dstFile in Directory.EnumerateFiles(dstBase, "*", SearchOption.AllDirectories))
-                    {
-                        var name = Path.GetFileName(dstFile);
-                        if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
-                        var rel = dstFile.Substring(dstBase.Length).TrimStart('\\', '/');
-                        if (UnderDir(rel, ".archive") || UnderDir(rel, ".versions")) continue;
-                        if (!sourceFiles.Contains(rel))
-                        {
-                            deletion.HandleDeletionAsync(null, dstFile, CancellationToken.None).GetAwaiter().GetResult();
-                            log.Info("Archived stale: " + dstFile);
-                        }
-                    }
-                    foreach (var dir in Directory.EnumerateDirectories(dstBase, "*", SearchOption.AllDirectories)
-                        .OrderByDescending(d => d.Length))
-                    {
-                        var rel = dir.Substring(dstBase.Length).TrimStart('\\', '/');
-                        if (rel == ".archive" || UnderDir(rel, ".archive")) continue;
-                        if (rel == ".versions" || UnderDir(rel, ".versions")) continue;
-                        if (rel == ".tictack.lock" || rel == ".tictack-deferred.json") continue;
-                        if (sourceFiles.Any(f => UnderDir(f, rel))) continue;
-                        deletion.HandleDeletionAsync(null, dir, CancellationToken.None).GetAwaiter().GetResult();
-                        log.Info("Archived stale dir: " + dir);
-                    }
-                }
-
-                log.Info("Rebuild complete: " + srcPath);
             }
 
             log.Info("Full rebuild finished. All databases cleared, source re-scanned, parity enforced.");
