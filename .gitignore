@@ -1,8 +1,5 @@
 bin/
 obj/
-.dotnet/
-.opencode/
-.code-review-graph/
 *.log
 service/win/TicTackSv.exe
 service/win/config.yaml

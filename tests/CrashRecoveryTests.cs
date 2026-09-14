@@ -17,12 +17,15 @@ public class CrashRecoveryTests
         {
             var sourceFile = Path.Combine(source, "file.txt");
             var destinationFile = Path.Combine(destination, "file.txt");
+            var sentinel = Path.Combine(root, "checkpoint.reached");
             File.WriteAllText(sourceFile, new string('x', 4096));
 
-            using var process = StartWorker("copy", sourceFile, destinationFile, "DataFlushed");
+            using var process = StartWorker("copy", sourceFile, destinationFile, "DataFlushed", sentinel);
+            await WaitForFileAsync(sentinel, TimeSpan.FromSeconds(10));
+            process.Kill();
             await WaitForExitAsync(process, TimeSpan.FromSeconds(10));
 
-            Assert.NotEqual(0, process.ExitCode);
+            Assert.True(process.HasExited);
             Assert.False(File.Exists(destinationFile));
             Assert.True(File.Exists(destinationFile + ".tictack.tmp"));
 
@@ -75,7 +78,6 @@ public class CrashRecoveryTests
         foreach (var arg in args) startInfo.ArgumentList.Add(arg);
         var process = Process.Start(startInfo);
         Assert.NotNull(process);
-        foreach (var arg in args) process!.StartInfo.ArgumentList.Add(arg);
         return process!;
     }
 

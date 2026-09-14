@@ -40,7 +40,7 @@ namespace TicTack
                         _handle = null;
                         if (!File.Exists(path)) throw;
                         var content = "unknown";
-                        try { content = File.ReadAllText(path); } catch { }
+                        try { content = ReadIdentity(path); } catch { }
                         var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(path);
                         if (age.TotalMinutes >= 5)
                         {
@@ -68,6 +68,15 @@ namespace TicTack
                 _handle = null;
                 log.Warn("Lock init failed: " + ex.Message);
             }
+        }
+
+        internal static string ReadIdentity(string path)
+        {
+            // The holder keeps Write access, so readers must share Write
+            // (default FileShare.Read readers get a sharing violation on Windows).
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
         }
 
         public void Dispose()

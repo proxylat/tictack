@@ -65,7 +65,7 @@ public class SrcLockTests : IDisposable
     public void LockFile_IdentityWritten()
     {
         using var lockObj = new SrcLock(_lockPath, _log);
-        var content = File.ReadAllText(_lockPath);
+        var content = SrcLock.ReadIdentity(_lockPath);
         Assert.Contains(Environment.MachineName, content);
         Assert.Contains(Environment.ProcessId.ToString(), content);
     }
