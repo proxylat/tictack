@@ -7,10 +7,25 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Include="../../src/Interfaces.cs" Link="src/Interfaces.cs" />
     <Compile Include="../../src/PathUtil.cs" Link="src/PathUtil.cs" />
     <Compile Include="../../src/Handler.cs" Link="src/Handler.cs" />
     <Compile Include="../../src/Executor.cs" Link="src/Executor.cs" />
     <Compile Include="../../src/SrcLock.cs" Link="src/SrcLock.cs" />
+    <Compile Include="../../src/Config.cs" Link="src/Config.cs" />
+    <Compile Include="../../src/Comparer.cs" Link="src/Comparer.cs" />
+    <Compile Include="../../src/Validator.cs" Link="src/Validator.cs" />
+    <Compile Include="../../src/Filter.cs" Link="src/Filter.cs" />
+    <Compile Include="../../src/StateDb.cs" Link="src/StateDb.cs" />
+    <Compile Include="../../src/Deletion.cs" Link="src/Deletion.cs" />
+    <Compile Include="../../src/Versioning.cs" Link="src/Versioning.cs" />
+    <Compile Include="../../src/Monitor.cs" Link="src/Monitor.cs" />
+    <Compile Include="../../src/Pipeline.cs" Link="src/Pipeline.cs" />
+    <Compile Include="../../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
   </ItemGroup>
 </Project>

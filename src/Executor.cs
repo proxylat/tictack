@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -125,6 +126,7 @@ namespace TicTack
             catch (PathTooLongException ex) { return ActionResult.Fail(ex.Message); }
             catch (NotSupportedException ex) { return ActionResult.Fail(ex.Message); }
             catch (IOException ex) { return ActionResult.Fail(ex.Message); }
+            catch (Win32Exception ex) { return ActionResult.Fail(ex.Message); }
         }
 
         static bool FlushDirectory(string? path)
