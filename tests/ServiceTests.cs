@@ -1,5 +1,6 @@
 namespace TicTack;
 
+[Collection("SerialWatcher")]
 public class ServiceTests
 {
     [Fact]

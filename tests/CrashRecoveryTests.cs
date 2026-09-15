@@ -2,6 +2,7 @@ using System.Diagnostics;
 
 namespace TicTack;
 
+[Collection("SerialWatcher")]
 public class CrashRecoveryTests
 {
     [Fact]

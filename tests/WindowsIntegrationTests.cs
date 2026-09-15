@@ -1,5 +1,11 @@
 namespace TicTack;
 
+// Native-watcher and child-process tests share kernel/process resources and
+// contend badly on small CI runners: run them serially, never in parallel.
+[CollectionDefinition("SerialWatcher", DisableParallelization = true)]
+public class SerialWatcherCollection { }
+
+[Collection("SerialWatcher")]
 public class WindowsIntegrationTests
 {
     [Fact]

@@ -47,7 +47,19 @@ public class StressTests
                 new RecordingLogger()
             );
             pipeline.Start();
-            await Task.Delay(5000); // let InitialSync finish for 500 files
+            // Poll for completion: a fixed sleep flakes on loaded runners
+            // (500 fsync'd copies + AV scanning can exceed any constant).
+            var deadline = DateTime.UtcNow.AddSeconds(60);
+            bool synced;
+            do
+            {
+                synced = true;
+                for (int i = 0; i < n; i++)
+                {
+                    if (!File.Exists(Path.Combine(dst, $"f{i}.txt"))) { synced = false; break; }
+                }
+                if (!synced) await Task.Delay(250);
+            } while (!synced && DateTime.UtcNow < deadline);
             // pipeline.Dispose via using
 
             for (int i = 0; i < n; i++)
