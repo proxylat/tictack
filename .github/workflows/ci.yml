@@ -13,8 +13,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
       - name: Restore
@@ -24,10 +24,10 @@ jobs:
       - name: Build application
         run: dotnet build src/TicTack.csproj --configuration Release --no-restore
       - name: Run tests
-        run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --logger "trx;LogFileName=test-results.trx" --collect:"XPlat Code Coverage"
+        run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --logger "trx;LogFileName=test-results.trx" --collect:"XPlat Code Coverage" --blame-hang --blame-hang-timeout 180000 --blame-hang-dump-type mini
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results-${{ matrix.os }}
           path: tests/TestResults/
@@ -38,11 +38,18 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
       - name: Restore
         run: dotnet restore tests/TicTack.Tests.csproj
       - name: Run Windows integration tests
-        run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --filter "Category=Windows"
+        run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --filter "Category=Windows" --blame-hang --blame-hang-timeout 180000 --blame-hang-dump-type mini
+      - name: Upload hang diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: hang-dumps-windows
+          path: tests/TestResults/
+          if-no-files-found: ignore
