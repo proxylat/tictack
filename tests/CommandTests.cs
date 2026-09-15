@@ -1,5 +1,6 @@
 namespace TicTack;
 
+[Collection("SerialWatcher")]
 public class CommandTests
 {
     [Fact]

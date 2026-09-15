@@ -111,11 +111,12 @@ namespace TicTack
                 }
                 finally
                 {
-                    if (_dirHandle != IntPtr.Zero && _dirHandle != new IntPtr(-1))
-                    {
-                        CloseHandle(_dirHandle);
-                        _dirHandle = IntPtr.Zero;
-                    }
+                    // Exactly-once close: Stop() may race us here; whoever wins
+                    // the exchange owns the handle, preventing double-close or
+                    // closing a recycled handle value owned by someone else.
+                    var h = Interlocked.Exchange(ref _dirHandle, IntPtr.Zero);
+                    if (h != IntPtr.Zero && h != new IntPtr(-1))
+                        CloseHandle(h);
                     FlushRename();
                 }
                 SleepOrStop(_restartDelaySec * 1000);
@@ -214,11 +215,10 @@ namespace TicTack
         public void Stop()
         {
             _stopping = true;
-            var h = _dirHandle;
+            var h = Interlocked.Exchange(ref _dirHandle, IntPtr.Zero);
             if (h != IntPtr.Zero && h != new IntPtr(-1))
             {
                 CloseHandle(h);
-                _dirHandle = IntPtr.Zero;
             }
             if (_worker != null && _worker.IsAlive)
             {
