@@ -10,6 +10,11 @@
     <NoWarn>$(NoWarn);NU1903</NoWarn>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <TieredCompilation>false</TieredCompilation>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <PublishReadyToRunShowWarnings>true</PublishReadyToRunShowWarnings>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
@@ -27,8 +32,8 @@
           DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
           Condition="Exists('$(NuGetPackageRoot)system.diagnostics.eventlog\10.0.9\runtimes\win\lib\net10.0\System.Diagnostics.EventLog.dll')" />
     <!-- native e_sqlite3.dll: CopyLocalLocksFileAssemblies only handles managed DLLs -->
-    <Copy SourceFiles="$(NuGetPackageRoot)sqlitepclraw.lib.e_sqlite3\2.1.11\runtimes\win-x64\native\e_sqlite3.dll"
+    <Copy SourceFiles="$(NuGetPackageRoot)sqlitepclraw.lib.e_sqlite3\2.1.12\runtimes\win-x64\native\e_sqlite3.dll"
           DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
-          Condition="Exists('$(NuGetPackageRoot)sqlitepclraw.lib.e_sqlite3\2.1.11\runtimes\win-x64\native\e_sqlite3.dll')" />
+          Condition="Exists('$(NuGetPackageRoot)sqlitepclraw.lib.e_sqlite3\2.1.12\runtimes\win-x64\native\e_sqlite3.dll')" />
   </Target>
 </Project>
