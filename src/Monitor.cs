@@ -24,6 +24,12 @@ namespace TicTack
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
 
+        // Cancels a blocked synchronous ReadDirectoryChangesW issued from the worker
+        // thread. Best-effort: CloseHandle can stall while a filter driver holds the
+        // pending IRP, so the read must be cancelled before the handle is closed.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
+
         private const uint FileListDirectory = 0x0001;
         private const uint FileShareRead = 0x00000001;
         private const uint FileShareWrite = 0x00000002;
@@ -82,6 +88,12 @@ namespace TicTack
                         SleepOrStop(5000);
                         continue;
                     }
+
+                    // Stop() may already have run before the handle existed (it then
+                    // closed nothing). Exit now instead of blocking in the read below
+                    // with a handle nobody will close; finally releases it.
+                    if (_stopping)
+                        break;
 
                     var buf = new byte[_bufferSize];
                     while (!_stopping)
@@ -218,6 +230,9 @@ namespace TicTack
             var h = Interlocked.Exchange(ref _dirHandle, IntPtr.Zero);
             if (h != IntPtr.Zero && h != new IntPtr(-1))
             {
+                // Cancel the worker's blocked read first: CloseHandle alone can stall
+                // while a filter driver holds the pending directory-change IRP.
+                try { CancelIoEx(h, IntPtr.Zero); } catch { }
                 CloseHandle(h);
             }
             if (_worker != null && _worker.IsAlive)
