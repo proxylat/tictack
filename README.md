@@ -8,7 +8,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 
 - **Never lose data** — fsync before rename ensures data is on disk before the final path is updated. Post-copy validation (size, hash, or both) verifies every file. Three layers of integrity: pre-read probe catches permissions early, temp+rename prevents partial overwrites, validation catches corruption.
 - **Detect early, fail fast** — a 1-byte read from the source catches ~90% of lock/permission/access issues before the full copy starts. Delete-threshold guard blocks accidental mass deletions. Source-disappearance guard prevents syncing from an unmounted or empty directory.
-- **Zero CPU idle** — `SemaphoreSlim` blocks the processing thread with no CPU usage when no events are queued. No polling timers. SQLite state DB uses incremental writes (no periodic full rewrites). The only wake-ups are file-change events from the OS.
+- **Zero CPU idle** — `SemaphoreSlim` blocks the processing thread with no CPU usage when no events are queued. Default `watcher` monitor blocks inside OS file-change notifications. SQLite state DB uses incremental writes (no periodic full rewrites). Periodic wake-ups still exist: lock refresh (30s), deferred-deletion check (1h, only when armed), parity rescan (6h); `polling`/`composite` monitor modes add their scan interval on top.
 - **Crash-proof by construction** — every write follows the temp-then-rename pattern: no partial file ever lands at the final path. Startup recovery (`PowerGuard.Cleanup()`) collects orphaned `.tictack.tmp` files. SQLite WAL journal survives power loss without corruption. Lock files have stale-detection and auto-release.
 - **No secrets** — zero external network calls, no accounts, no cloud. EventLog entries stay on the machine.
 - **Dependency-light** — four runtime dependencies (Microsoft.Data.Sqlite, YamlDotNet, System.ServiceProcess.ServiceController, System.Diagnostics.EventLog). No npm, pip, cargo, or gem trees.
@@ -24,14 +24,14 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | Locked file handling | `FileAccessor` opens with `FileShare.ReadWrite|Delete` + `FILE_FLAG_BACKUP_SEMANTICS` (SYSTEM bypass); retry backoff |
 | VSS support | Designed via `IFileAccessor` — swap in VSS-based accessor without pipeline changes |
 | Retry logic | `ExponentialBackoffRetry` — configurable attempts, delay, backoff multiplier |
-| Logging | `FileLogger` (rotating), `ConsoleLogger` (color), `DesktopAlertLogger`, `EventLogLogger`, `MultiLogger` |
+| Logging | `FileLogger` (rotating), `BufferedLogger` (async channel, flushes on shutdown), `ConsoleLogger` (color), `DesktopAlertLogger`, `EventLogLogger`, `MultiLogger` |
 | Rename detection | `RenameAction` + `FileChangedEventArgs.OldFullPath` |
 | Deletion handling | `MirrorDeletion`, `ArchiveDeletion` — factory-selected |
 | Versioning | `TimestampVersioning` (max-versions limit), `NoVersioning` — factory-selected |
 | Post-copy validation | `SizeValidator`, `HashValidator` — mirrors comparison level |
 | Max file size | `SizeFilter` — `max_file_size_mb: <number>` or `no-limit` |
 | Crash Recovery | `CopyAction` writes to `.tictack.tmp` then atomic rename; `PowerGuard.Cleanup()` recovers orphaned temps on startup |
-| Desktop alerts | `DesktopAlert.Write()` creates `TicTack-{LEVEL}-{timestamp}.txt` in `alert_path` (30s cooldown per level) |
+| Desktop alerts | `DesktopAlert.Write()` creates `TicTack-{LEVEL}-{timestamp}.txt` in `alert_path` (global 30s cooldown shared across levels) |
 | Zero-CPU idle | `SemaphoreSlim` in `SyncPipeline` — thread sleeps with zero CPU when idle, wakes instantly on file events |
 | Volume label paths | `[VolumeLabel]\path` syntax resolved to drive letters via `DriveInfo.GetDrives()` |
 | Scheduled jobs | `TimerScheduler` — daily shell commands (`cmd.exe /c` Windows, `/bin/sh -c` Linux) with `{source}` substitution |
@@ -41,7 +41,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | Deferred deletion | `DeferredDeletion` — holds blocked deletions for `delete_hold_days`, daily warnings with first 20 paths, recheck before sync |
 | Delete-threshold guard | Blocks deletions when >50% of known files would be removed in one batch, or when count/size exceeds configured limits |
 | Source-disappearance guard | Refuses to process Deleted events when source folder is missing |
-| Exclusive lock | `.tictack.lock` — Restic-style 2-phase check, 200ms settle, 5min stale timeout, 30s refresh, configurable retry timeout |
+| Exclusive lock | `.tictack.lock` — exclusive `FileMode.CreateNew` handle held open, identity write + flush, 5min stale timeout, 30s refresh, configurable retry timeout (`retry_lock_minutes`) |
 | Sparse file support | Detects `FILE_ATTRIBUTE_SPARSE_FILE`, uses `FSCTL_SET_SPARSE` via `DeviceIoControl` |
 | EventLog propagation | `EventLogLogger` writes errors to Windows Application log under `TicTackSv` source |
 
@@ -78,7 +78,7 @@ FileWatcherMonitor (Windows) / FsWatchMonitor (Linux) + PollingMonitor (composit
 
 ## Quick Start
 
-Requires: .NET 10 SDK. Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.9** (via NuGet; `dotnet restore` fetches automatically).
+Requires: .NET 10 SDK. Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.12** (via NuGet; `dotnet restore` fetches automatically).
 
 ### Windows
 
@@ -180,7 +180,7 @@ Unknown or duplicate YAML properties are rejected at startup instead of being ig
 | `max_size_mb` | `10` | Rotate log after N MB |
 | `max_files` | `5` | Keep N rotated logs (`tictack.log`, `.1`, `.2`...) |
 | `console` | `false` | Also write to stdout (auto-enabled in `--cli`/`--once`) |
-| `alert_path` | exe dir | Where `TicTack-WARN/ERROR-*.txt` alert files are written. On Windows, Desktop is `C:\Users\User\Desktop`; on Linux, `~/Desktop` |
+| `alert_path` | unset (alerts off) | Where `TicTack-WARN/ERROR-*.txt` alert files are written — no code default, so leave it set (the examples use the Desktop). On Windows, Desktop is `C:\Users\User\Desktop`; on Linux, `~/Desktop` |
 
 ### watchdog
 

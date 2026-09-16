@@ -32,8 +32,13 @@ public class ServiceTests
         {
             var service = new TestService(config);
             service.StartForTest();
+            // Initial sync runs in the background; wait for the copy before stopping.
+            var deadline = DateTime.UtcNow.AddSeconds(60);
+            var copied = Path.Combine(destination, "service.txt");
+            while (!File.Exists(copied) && DateTime.UtcNow < deadline)
+                Thread.Sleep(50);
             service.StopForTest();
-            Assert.True(File.Exists(Path.Combine(destination, "service.txt")));
+            Assert.True(File.Exists(copied));
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }

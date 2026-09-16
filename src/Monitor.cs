@@ -252,6 +252,10 @@ namespace TicTack
         private readonly int _intervalSec;
         private Timer? _timer;
         private Dictionary<string, FileSnapshot>? _snapshot;
+        // Scratch dictionary reused across scans so periodic polling does not
+        // allocate (and later discard) two full per-file dictionaries per tick.
+        // Both dictionaries keep their capacity; detection logic is unchanged.
+        private Dictionary<string, FileSnapshot>? _scratch;
         private string _prefix;
 
         public event EventHandler<FileChangedEventArgs>? Changed;
@@ -273,8 +277,11 @@ namespace TicTack
         {
             try
             {
-                if (_snapshot == null) { _snapshot = Scan(); return; }
-                var current = Scan();
+                if (_snapshot == null) { _snapshot = new Dictionary<string, FileSnapshot>(); ScanInto(_snapshot); return; }
+                _scratch ??= new Dictionary<string, FileSnapshot>(_snapshot.Count);
+                _scratch.Clear();
+                ScanInto(_scratch);
+                var current = _scratch;
                 var prev = _snapshot;
 
                 foreach (var kv in current)
@@ -303,6 +310,7 @@ namespace TicTack
                 }
 
                 _snapshot = current;
+                _scratch = prev;
             }
             catch (Exception ex)
             {
@@ -312,10 +320,9 @@ namespace TicTack
             }
         }
 
-        private Dictionary<string, FileSnapshot> Scan()
+        private void ScanInto(Dictionary<string, FileSnapshot> result)
         {
-            var result = new Dictionary<string, FileSnapshot>();
-            if (!Directory.Exists(_path)) return result;
+            if (!Directory.Exists(_path)) return;
             var prefix = _path.EndsWith(Path.DirectorySeparatorChar) ? _path : _path + Path.DirectorySeparatorChar;
             foreach (var f in Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories))
             {
@@ -326,7 +333,6 @@ namespace TicTack
                 }
                 catch { }
             }
-            return result;
         }
 
         public void Stop()

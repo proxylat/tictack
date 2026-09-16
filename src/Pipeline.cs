@@ -164,7 +164,11 @@ namespace TicTack
         {
             _initialSync = Task.Run(() => InitialSyncAsync());
             _processor = Task.Run(() => ProcessLoop());
-            _deferredCheckTimer = new Timer(_ => CheckDeferredDeletions(), null, TimeSpan.FromHours(1), TimeSpan.FromHours(1));
+            // Arm the hourly deferred-deletion recheck only when something is
+            // actually pending (e.g. persisted from a previous run). Recording
+            // new pending deletions arms it too; the check itself still runs
+            // hourly and still early-returns once nothing is pending.
+            if (_deferred.HasPending) ArmDeferredCheckTimer();
             _parityTimer = new Timer(_ => QueueParityCheck(), null, TimeSpan.FromHours(6), TimeSpan.FromHours(6));
         }
 
@@ -647,6 +651,7 @@ namespace TicTack
                 _log.Error("Delete guard: " + reason + ". Deferring.");
                 var files = batch.ConvertAll(d => d.Path);
                 _deferred.RecordPending(files, totalSize, _config.Path);
+                ArmDeferredCheckTimer();
                 return;
             }
 
@@ -809,6 +814,14 @@ namespace TicTack
                     try { await _stateDb.DeleteAsync(rel); }
                     catch (Exception ex) { _log.Debug("StateDb parity dir delete failed: " + ex.Message); }
                 }
+            }
+        }
+
+        private void ArmDeferredCheckTimer()
+        {
+            lock (_taskLock)
+            {
+                _deferredCheckTimer ??= new Timer(_ => CheckDeferredDeletions(), null, TimeSpan.FromHours(1), TimeSpan.FromHours(1));
             }
         }
 
