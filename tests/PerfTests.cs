@@ -91,6 +91,27 @@ public sealed class PerfTests
     }
 
     [Fact]
+    public async Task InitialSync_LogsProgressAndSummaryCounts()
+    {
+        var dir = TestDir();
+        var src = Path.Combine(dir, "src");
+        var dst = Path.Combine(dir, "dst");
+        try
+        {
+            WriteFiles(src, 1000, 64, ".txt");
+            var log = new RecordingLogger();
+            using var pipeline = MakePipeline(MakeConfig(src, dst), new EventMonitor(),
+                new DateSizeComparer(), new SizeValidator(), new CopyAction(new FileAccessor()), log);
+
+            Assert.True(await pipeline.RunOnceAsync());
+
+            Assert.Contains(log.Messages, m => m.Contains("Initial sync progress: 1000 scanned"));
+            Assert.Contains(log.Messages, m => m.Contains("Sync complete") && m.Contains("(1000 scanned, 1000 copied"));
+        }
+        finally { TryDelete(dir); }
+    }
+
+    [Fact]
     public async Task InitialSync_ManySmallFiles_AllocationPerFileBounded()
     {
         var dir = TestDir();

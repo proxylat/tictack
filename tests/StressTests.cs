@@ -16,6 +16,14 @@ public class StressTests
         return Convert.ToHexStringLower(SHA256.HashData(fs));
     }
 
+    static async Task WaitForAsync(Func<bool> condition, string what, int timeoutSeconds = 60)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        while (DateTime.UtcNow < deadline && !condition())
+            await Task.Delay(100);
+        Assert.True(condition(), "Timed out waiting for " + what);
+    }
+
     static SourceConfig MakeConfig(string src, string dst, double debounce = 0.1) => new()
     {
         Path = src,
@@ -428,7 +436,9 @@ public class StressTests
                 log
             );
             pipeline.Start();
-            await Task.Delay(50);
+            // The initial sync must finish before the burst so the counts
+            // below are the burst's alone.
+            await WaitForAsync(() => log.Messages.Any(m => m.Contains("Sync complete")), "initial sync");
 
             var n = 200;
             for (int i = 0; i < n; i++)
@@ -437,18 +447,18 @@ public class StressTests
                 File.WriteAllText(f, $"burst{i}");
                 monitor.Fire(ChangeType.Created, f);
             }
-            await Task.Delay(1000);
+            await WaitForAsync(() => Directory.GetFiles(dst, "burst*.txt").Length == n, "burst creates");
+            Assert.Equal(n, Directory.GetFiles(dst, "burst*.txt").Length);
 
-            // Fire deletes for all
             for (int i = 0; i < n; i++)
             {
                 var f = Path.Combine(src, $"burst{i}.txt");
                 File.Delete(f);
                 monitor.Fire(ChangeType.Deleted, f);
             }
-            await Task.Delay(2000);
-            pipeline.Dispose();
-
+            await WaitForAsync(() => Directory.GetFiles(dst, "burst*.txt").Length == 0, "burst deletes");
+            Assert.Empty(Directory.GetFiles(dst, "burst*.txt"));
+            Assert.DoesNotContain(log.Messages, m => m.StartsWith("ERR:"));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

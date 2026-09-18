@@ -25,8 +25,12 @@ public class VersioningTests : IDisposable
     [Fact]
     public async Task NoVersioning_DoesNothing()
     {
+        File.WriteAllText(Dst("a.txt"), "keep");
+
         var versioning = new NoVersioning();
         await versioning.ArchivePreviousVersionAsync(Dst("a.txt"), CancellationToken.None);
+
+        Assert.Equal("keep", File.ReadAllText(Dst("a.txt")));
     }
 
     [Fact]
@@ -65,7 +69,8 @@ public class VersioningTests : IDisposable
         }
 
         var versions = Directory.GetFiles(Path.Combine(_verDir, "Desktop"), "a_*");
-        Assert.True(versions.Length <= 6);
+        // Production prunes to exactly the cap after every archive.
+        Assert.Equal(5, versions.Length);
     }
 
     [Fact]

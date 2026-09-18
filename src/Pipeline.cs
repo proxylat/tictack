@@ -81,7 +81,11 @@ namespace TicTack
             _enumerateFiles = enumerateFiles ?? ((path, option) => Directory.EnumerateFiles(path, "*", option));
             _enumerateDirectories = enumerateDirectories ?? ((path, option) => Directory.EnumerateDirectories(path, "*", option));
             _driveReady = driveReady ?? (path => IsDriveReady(path));
-            _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(() => _pendingEvents.Count);
+            // Capture the queue itself, not `this`: a constructor that throws
+            // after this point would otherwise leak the whole pipeline through
+            // the static EventSource's counter callback.
+            var pendingEvents = _pendingEvents;
+            _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(_config.Path, () => pendingEvents.Count);
 
             var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : 7;
             _deferred = new DeferredDeletion(deferredPath ?? Path.Combine(_config.Destination, ".tictack-deferred.json"), holdDays, _log);

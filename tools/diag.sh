@@ -14,6 +14,11 @@
 # problem and no .NET tool will help — the script says so and stops escalating.
 set -uo pipefail
 
+# Perf regression threshold, shared contract with diag.ps1 and documented in
+# docs/linux-debug-perf.md (perf section): a scenario slower than its
+# benchmarks/baseline.json entry by more than this percent is reported.
+REGRESSION_PCT=20
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 if [ -x "$repo_root/.dotnet/dotnet" ]; then DOTNET="$repo_root/.dotnet/dotnet"; else DOTNET=$(command -v dotnet || true); fi
@@ -435,9 +440,9 @@ EOF
         base=$(jq -r --arg s "$name" '.[]? | select(.scenario == $s) | .seconds' \
             "$repo_root/benchmarks/baseline.json" 2>/dev/null | head -1)
         if [ -n "$base" ] && [ "$base" != "null" ]; then
-            awk -v n="$secs" -v b="$base" -v nm="$name" 'BEGIN{
+            awk -v n="$secs" -v b="$base" -v nm="$name" -v t="$REGRESSION_PCT" 'BEGIN{
                 d = (b > 0 ? (n-b)/b*100 : 0);
-                if (d > 20) printf "REGRESSION: %s is %.0f%% slower than baseline (%.3fs -> %.3fs)\n", nm, d, b, n;
+                if (d > t) printf "REGRESSION: %s is %.0f%% slower than baseline (%.3fs -> %.3fs)\n", nm, d, b, n;
             }' | while read -r l; do note "$l"; done
         fi
     fi

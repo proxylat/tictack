@@ -138,9 +138,9 @@ public class GcSoakTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 2. Bulk medium files (LOH-sized) must not force gen2 churn ──
+    // ── 2. Bulk medium files must not allocate per-file LOH buffers ──
     [Fact]
-    public async Task CopyAction_BulkMediumFiles_BoundedGen2Collections()
+    public async Task CopyAction_BulkMediumFiles_BoundedAllocations()
     {
         var dir = TestDir();
         var src = Path.Combine(dir, "src");
@@ -150,7 +150,8 @@ public class GcSoakTests
         try
         {
             // 40 x 256 KB files: each is LOH-sized as file DATA, but the
-            // copy loop must stream through sub-LOH buffers (no AllocLarge).
+            // copy loop must stream through sub-LOH buffers (no per-file
+            // 256 KB array).
             const int n = 40;
             var rnd = new Random(7);
             for (int i = 0; i < n; i++)
@@ -160,7 +161,7 @@ public class GcSoakTests
                 File.WriteAllBytes(Path.Combine(src, $"m{i}.bin"), data);
             }
 
-            var gen2Before = GC.CollectionCount(2);
+            var allocBefore = GC.GetTotalAllocatedBytes(true);
             var action = new CopyAction(new FileAccessor());
             for (int i = 0; i < n; i++)
             {
@@ -169,12 +170,11 @@ public class GcSoakTests
                     new FileChangedEventArgs(ChangeType.Created, f), src, dst), CancellationToken.None);
                 Assert.True(result.Success);
             }
-            var gen2Delta = GC.CollectionCount(2) - gen2Before;
+            var allocDelta = GC.GetTotalAllocatedBytes(true) - allocBefore;
 
-            // Streaming 10 MB through 80 KB buffers should cost ~zero gen2s.
-            // Bound is deliberately loose (10) — per-file LOH buffers would
-            // force ~40 AllocLarge gen2s and fail loudly.
-            Assert.True(gen2Delta <= 10, $"Bulk copy forced {gen2Delta} gen2 collections");
+            // Streaming 10 MB through 80 KB pooled buffers should allocate
+            // far less than the payload; a per-file LOH buffer adds >= 10 MB.
+            Assert.True(allocDelta < 8 * 1024 * 1024, $"Bulk copy allocated {allocDelta} bytes");
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

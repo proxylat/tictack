@@ -20,6 +20,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Perf regression threshold, shared contract with diag.sh and documented in
+# docs/linux-debug-perf.md (perf section): a scenario slower than its
+# benchmarks/baseline.json entry by more than this percent is reported.
+$RegressionPct = 20
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $dotnet = if (Test-Path (Join-Path $repoRoot '.dotnet\dotnet.exe')) { Join-Path $repoRoot '.dotnet\dotnet.exe' } else { 'dotnet' }
 $toolsDir = Join-Path $env:USERPROFILE '.dotnet\tools'
@@ -407,7 +411,7 @@ function Run-Perf([string[]]$Args) {
             $b = $baseline | Where-Object { $_.scenario -eq $r.scenario } | Select-Object -First 1
             if ($b -and $b.seconds -gt 0) {
                 $d = ($r.seconds - $b.seconds) / $b.seconds * 100
-                if ($d -gt 20) { Note ("REGRESSION: {0} is {1:N0}% slower than baseline ({2:N3}s -> {3:N3}s)" -f $r.scenario, $d, $b.seconds, $r.seconds) }
+                if ($d -gt $RegressionPct) { Note ("REGRESSION: {0} is {1:N0}% slower than baseline ({2:N3}s -> {3:N3}s)" -f $r.scenario, $d, $b.seconds, $r.seconds) }
             }
         }
     }
