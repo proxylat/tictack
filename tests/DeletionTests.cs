@@ -71,7 +71,7 @@ public class DeletionTests : IDisposable
     }
 
     [Fact]
-    public async Task ArchiveDeletion_HandlesEmptyRelPath()
+    public async Task ArchiveDeletion_IgnoresSourcePathForm_ArchivesByDestName()
     {
         File.WriteAllText(Dst("a.txt"), "archive no rel");
 
@@ -80,6 +80,27 @@ public class DeletionTests : IDisposable
 
         Assert.False(File.Exists(Dst("a.txt")));
         Assert.True(File.Exists(Archive("Desktop", "a.txt")));
+    }
+
+    [Fact]
+    public async Task ArchiveDeletion_OutsideSyncRoot_FailsWithoutDeleting()
+    {
+        // Empty relative path: the destination is under neither the sync root
+        // nor the dest base, so archiving must fail closed, never delete.
+        var outside = Path.Combine(Path.GetTempPath(), "TicTackTest_del_out_" + Guid.NewGuid());
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var victim = Path.Combine(outside, "a.txt");
+            File.WriteAllText(victim, "do not lose me");
+
+            var deletion = new ArchiveDeletion(_archiveDir, _dstDir);
+            var result = await deletion.HandleDeletionAsync(Path.Combine(_srcDir, "a.txt"), victim, CancellationToken.None);
+
+            Assert.False(result.Success);
+            Assert.Equal("do not lose me", File.ReadAllText(victim));
+        }
+        finally { try { Directory.Delete(outside, true); } catch { } }
     }
 
     [Fact]

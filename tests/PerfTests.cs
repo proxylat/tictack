@@ -184,11 +184,15 @@ public sealed class PerfTests
             WriteFiles(src, 5, 512, ".txt");
             var monitor = new EventMonitor();
             var copy = new RecordingAction(new CopyAction(new FileAccessor()));
+            var log = new RecordingLogger();
             using var pipeline = MakePipeline(MakeConfig(src, dst), monitor,
-                new DateSizeComparer(), new SizeValidator(), copy, new RecordingLogger());
+                new DateSizeComparer(), new SizeValidator(), copy, log);
 
             pipeline.Start();
             await WaitForAsync(() => copy.Calls.Count >= 5, "initial copies");
+            // The scan must be fully done before mutating: a straggler scan
+            // copy would otherwise inflate the exactly-once count below.
+            await WaitForAsync(() => log.Messages.Any(m => m.Contains("Sync complete")), "initial sync complete");
             var before = copy.Calls.Count;
 
             var target = Path.Combine(src, "file00002.txt");
@@ -196,7 +200,19 @@ public sealed class PerfTests
             monitor.Fire(ChangeType.Modified, target);
 
             await WaitForAsync(() => copy.Calls.Count > before, "the changed file");
-            Assert.Equal(before + 1, copy.Calls.Count);
+
+            // A duplicate arriving after the first copy must also be seen:
+            // require the count to settle before asserting exactly-once.
+            var settled = copy.Calls.Count;
+            var stable = 0;
+            for (int i = 0; i < 30 && stable < 3; i++)
+            {
+                await Task.Delay(200);
+                if (copy.Calls.Count != settled) { settled = copy.Calls.Count; stable = 0; }
+                else stable++;
+            }
+            Assert.Equal(3, stable);
+            Assert.Equal(before + 1, settled);
         }
         finally { TryDelete(dir); }
     }

@@ -106,11 +106,16 @@ public class PipelineTests : IDisposable
         var file = Path.Combine(_srcDir, "same.txt");
         File.WriteAllText(file, "x");
         File.WriteAllText(Path.Combine(_dstDir, "same.txt"), "x");
+        var control = Path.Combine(_srcDir, "control.txt");
+        File.WriteAllText(control, "control");
         _monitor.Fire(ChangeType.Created, file);
+        _monitor.Fire(ChangeType.Created, control);
 
-        Thread.Sleep(400);
-        Assert.Empty(_copy.Calls);
-        Assert.Empty(_db.LoadAll());
+        // The control file must copy: proves the pipeline processed events promptly.
+        WaitFor(() => _db.LoadAll().ContainsKey("control.txt"), "control copy");
+
+        Assert.DoesNotContain(_copy.Calls, c => c.DestPath.EndsWith("same.txt"));
+        Assert.False(_db.LoadAll().ContainsKey("same.txt"));
     }
 
     [Fact]
@@ -218,10 +223,15 @@ public class PipelineTests : IDisposable
 
         var file = Path.Combine(_srcDir, "skip.tmp");
         File.WriteAllText(file, "x");
+        var control = Path.Combine(_srcDir, "ok.txt");
+        File.WriteAllText(control, "control");
         _monitor.Fire(ChangeType.Created, file);
+        _monitor.Fire(ChangeType.Created, control);
 
-        Thread.Sleep(400);
-        Assert.Empty(_copy.Calls);
+        // The control file must copy: proves the pipeline processed events promptly.
+        WaitFor(() => _db.LoadAll().ContainsKey("ok.txt"), "control copy");
+
+        Assert.DoesNotContain(_copy.Calls, c => c.DestPath.EndsWith("skip.tmp"));
     }
 
     [Fact]
@@ -300,9 +310,18 @@ public class PipelineTests : IDisposable
         var file = Path.Combine(_srcDir, "mount-loss.txt");
         File.WriteAllText(file, "must not copy");
         monitor.Fire(ChangeType.Created, file);
-        Thread.Sleep(400);
 
-        Assert.Empty(copy.Calls);
+        // The block warning proves the mount-loss event was processed while down.
+        WaitFor(() => log.Messages.Any(m => m.Contains("event blocked") && m.Contains("mount-loss.txt")), "drive-loss block");
+
+        // Re-enable and prove the pipeline is still alive and prompt.
+        ready = true;
+        var control = Path.Combine(_srcDir, "control.txt");
+        File.WriteAllText(control, "control");
+        monitor.Fire(ChangeType.Created, control);
+        WaitFor(() => copy.Calls.Any(c => c.DestPath.EndsWith("control.txt")), "control copy");
+
+        Assert.DoesNotContain(copy.Calls, c => c.DestPath.EndsWith("mount-loss.txt"));
         Assert.False(File.Exists(Path.Combine(_dstDir, "mount-loss.txt")));
     }
 
