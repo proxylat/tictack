@@ -59,6 +59,7 @@
     <Compile Include="../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
     <Compile Include="../src/Scheduler.cs" Link="src/Scheduler.cs" />
     <Compile Include="../src/JobState.cs" Link="src/JobState.cs" />
+    <Compile Include="../src/Metrics.cs" Link="src/Metrics.cs" />
   </ItemGroup>
 
 </Project>

@@ -62,7 +62,7 @@ namespace TicTack
                 var files = Directory.GetFiles(verDir, name + "_*" + ext);
                 if (files.Length > _maxVersions)
                 {
-                    Array.Sort(files);
+                    Array.Sort(files, StringComparer.Ordinal);
                     for (int i = 0; i < files.Length - _maxVersions; i++)
                         File.Delete(files[i]);
                 }

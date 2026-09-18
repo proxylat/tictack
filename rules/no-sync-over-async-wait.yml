@@ -1,0 +1,24 @@
+# No sync-over-async via .Wait() in product code: it blocks a threadpool
+# thread. Await the task instead — blocked await chains are triaged via
+# pstacks/syncblk (see docs/linux-debug-perf.md §4).
+# Heuristic, not type-directed: ast-grep cannot resolve types, so the rule
+# only matches receivers NAMED like a task (task, myTask, ...). Deliberately
+# excludes SemaphoreSlim.Wait() in StateDb.cs Enter()/Dispose() — those are
+# intentional blocking primitives in sync methods (the async path already uses
+# WaitAsync). A single-letter receiver (t.Wait()) slips through; the .Result
+# rule and code review cover the rest.
+
+id: no-sync-over-async-wait
+language: csharp
+severity: error
+message: >-
+  Sync-over-async (.Wait() blocks a threadpool thread). Await the task
+  instead — blocked await chains are triaged via pstacks/syncblk (see
+  docs/linux-debug-perf.md §4).
+files:
+  - src/**
+rule:
+  pattern: $TASK.Wait()
+constraints:
+  TASK:
+    regex: '[Tt]ask'

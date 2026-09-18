@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -57,7 +58,12 @@ namespace TicTack
         }
     }
 
-    public readonly struct FileSnapshot
+    // Compared once per file per poll scan. IEquatable gives the JIT a
+    // direct field compare instead of routing through ValueType.Equals.
+    // Sequential is the CLR default for structs; explicit to satisfy
+    // MA0008 without changing the marshalling contract.
+    [StructLayout(LayoutKind.Sequential)]
+    public readonly struct FileSnapshot : IEquatable<FileSnapshot>
     {
         public long Length { get; }
         public long LastWriteTimeUtcTicks { get; }
@@ -68,6 +74,13 @@ namespace TicTack
             Length = length;
             LastWriteTimeUtcTicks = lastWriteTimeUtcTicks;
         }
+
+        public bool Equals(FileSnapshot other) =>
+            Length == other.Length && LastWriteTimeUtcTicks == other.LastWriteTimeUtcTicks;
+
+        public override bool Equals(object? obj) => obj is FileSnapshot other && Equals(other);
+
+        public override int GetHashCode() => HashCode.Combine(Length, LastWriteTimeUtcTicks);
 
         public static bool TryRead(string path, out FileSnapshot snapshot)
         {

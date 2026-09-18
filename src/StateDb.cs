@@ -169,11 +169,11 @@ namespace TicTack
 
         public Dictionary<string, (long size, long mtime)> LoadAll()
         {
-            var result = new Dictionary<string, (long, long)>(StringComparer.OrdinalIgnoreCase);
             Enter();
             try
             {
                 EnsureConnected();
+                var result = new Dictionary<string, (long, long)>(CountInternal(), StringComparer.OrdinalIgnoreCase);
                 using (var cmd = _conn.CreateCommand())
                 {
                     cmd.CommandText = "SELECT path, size, mtime FROM state";
@@ -188,18 +188,18 @@ namespace TicTack
                         }
                     }
                 }
+                return result;
             }
             finally { _gate.Release(); }
-            return result;
         }
 
         public async Task<Dictionary<string, (long size, long mtime)>> LoadAllAsync()
         {
-            var result = new Dictionary<string, (long, long)>(StringComparer.OrdinalIgnoreCase);
             await EnterAsync().ConfigureAwait(false);
             try
             {
                 await EnsureConnectedAsync().ConfigureAwait(false);
+                var result = new Dictionary<string, (long, long)>(CountInternal(), StringComparer.OrdinalIgnoreCase);
                 using (var cmd = _conn.CreateCommand())
                 {
                     cmd.CommandText = "SELECT path, size, mtime FROM state";
@@ -211,9 +211,9 @@ namespace TicTack
                         }
                     }
                 }
+                return result;
             }
             finally { _gate.Release(); }
-            return result;
         }
 
         public void Upsert(string path, long size, long mtime)
@@ -413,6 +413,18 @@ namespace TicTack
                 }
             }
             finally { _gate.Release(); }
+        }
+
+        // Capacity seed only; cap it so an absurdly large state table cannot
+        // overflow the int conversion or over-allocate the dictionary up front.
+        private int CountInternal()
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT COUNT(*) FROM state";
+                var count = (long)(cmd.ExecuteScalar() ?? 0L);
+                return count > 1_000_000 ? 1_000_000 : (int)count;
+            }
         }
 
         public void Clear()

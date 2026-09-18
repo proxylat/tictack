@@ -8,7 +8,7 @@ namespace TicTack
         {
             if (!OperatingSystem.IsWindows())
                 return path;
-            if (path.Length > 240 && !path.StartsWith(@"\\?\"))
+            if (path.Length > 240 && !path.StartsWith(@"\\?\", StringComparison.Ordinal))
                 return @"\\?\" + path;
             return path;
         }

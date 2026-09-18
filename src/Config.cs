@@ -261,6 +261,11 @@ namespace TicTack
                     log.Error("Durability must be 'full' or 'rename-only' for source: " + src.Path);
                     valid = false;
                 }
+                if (src.Sync != null && !IsValidVerification(src.Sync.Verification))
+                {
+                    log.Error("Verification must be 'size', 'date_and_size', 'hash', or 'full' for source: " + src.Path);
+                    valid = false;
+                }
             }
             return valid;
         }
@@ -311,7 +316,7 @@ namespace TicTack
 
         public static VerificationLevel ParseVerification(string? value)
         {
-            switch (value != null ? value.ToLowerInvariant().Replace("_", "").Replace("-", "") : null)
+            switch (NormalizeVerification(value))
             {
                 case "size": return VerificationLevel.Size;
                 case "dateandsize": return VerificationLevel.DateAndSize;
@@ -320,5 +325,22 @@ namespace TicTack
                 default: return VerificationLevel.DateAndSize;
             }
         }
+
+        public static bool IsValidVerification(string? value)
+        {
+            switch (NormalizeVerification(value))
+            {
+                case "size":
+                case "dateandsize":
+                case "hash":
+                case "full":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        static string? NormalizeVerification(string? value) =>
+            value != null ? value.ToLowerInvariant().Replace("_", "").Replace("-", "") : null;
     }
 }

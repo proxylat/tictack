@@ -10,7 +10,7 @@ namespace TicTack
         private readonly IFileFilter[] _filters;
         public CompositeFilter(IEnumerable<IFileFilter> filters)
         {
-            _filters = filters != null ? filters.ToArray() : new IFileFilter[0];
+            _filters = filters != null ? filters.ToArray() : Array.Empty<IFileFilter>();
         }
         public bool ShouldProcess(string fullPath)
         {
@@ -22,24 +22,51 @@ namespace TicTack
 
     public class PatternFilter : IFileFilter
     {
-        private readonly string[] _patterns;
+        private readonly Pattern[] _patterns;
+        private readonly bool _anyPathPattern;
+
+        private readonly struct Pattern
+        {
+            public readonly string Value;
+            public readonly string SlashSuffix;
+            public readonly bool HasSlash;
+
+            public Pattern(string value, bool hasSlash)
+            {
+                Value = value;
+                HasSlash = hasSlash;
+                SlashSuffix = hasSlash ? "*/" + value : value;
+            }
+        }
 
         public PatternFilter(string[] patterns)
         {
-            _patterns = patterns ?? Array.Empty<string>();
+            if (patterns == null || patterns.Length == 0)
+            {
+                _patterns = Array.Empty<Pattern>();
+                _anyPathPattern = false;
+                return;
+            }
+            _patterns = new Pattern[patterns.Length];
+            for (int i = 0; i < patterns.Length; i++)
+            {
+                var pat = patterns[i].Replace('\\', '/');
+                var hasSlash = pat.IndexOf('/') >= 0;
+                _patterns[i] = new Pattern(pat, hasSlash);
+                if (hasSlash) _anyPathPattern = true;
+            }
         }
 
         public bool ShouldProcess(string fullPath)
         {
             if (_patterns.Length == 0) return true;
             var fileName = Path.GetFileName(fullPath);
-            var normPath = fullPath.Replace('\\', '/');
+            var normPath = _anyPathPattern ? fullPath.Replace('\\', '/') : null;
             foreach (var p in _patterns)
             {
-                var pat = p.Replace('\\', '/');
-                if (MatchWildcard(pat, fileName)) return false;
-                if (pat.IndexOf('/') >= 0 &&
-                    (MatchWildcard(pat, normPath) || MatchWildcard("*/" + pat, normPath)))
+                if (MatchWildcard(p.Value, fileName)) return false;
+                if (p.HasSlash &&
+                    (MatchWildcard(p.Value, normPath!) || MatchWildcard(p.SlashSuffix, normPath!)))
                     return false;
             }
             return true;

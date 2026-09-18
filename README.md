@@ -78,7 +78,7 @@ FileWatcherMonitor (Windows) / FsWatchMonitor (Linux) + PollingMonitor (composit
 
 ## Quick Start
 
-Requires: .NET 10 SDK. Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.12** (via NuGet; `dotnet restore` fetches automatically).
+Requires: .NET 10 SDK. Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sqlite 10.0.12** (via NuGet; `dotnet restore` fetches automatically). **Meziantou.Analyzer** (compile-time Roslyn rules, `PrivateAssets=all` — never ships) and **BenchmarkDotNet** (`benchmarks/` project only) are dev-only.
 
 ### Windows
 
@@ -105,6 +105,74 @@ dotnet test tests\TicTack.Tests.csproj --filter "Category=Windows"
 Crash-recovery and lock-contention tests launch the real copy/lock code in a
 separate worker process and terminate it at controlled durability checkpoints.
 Physical power-cut tests require dedicated hardware or VM infrastructure.
+
+### Diagnostics & performance
+
+One workflow per OS wraps the `dotnet-*` diagnostic tools and the fixtured copy
+benchmark. Every run writes `diag-out/<timestamp>-<mode>/` with a `SUMMARY.md`
+recording each command and the file it produced.
+
+```
+tools\diag.ps1 debug [-Full] [-Dump] [PID|NAME]     # Windows
+tools\diag.ps1 test  [-Filter EXPR]
+tools\diag.ps1 perf  [-Root DIR]
+tools\diag.ps1 static                             # semgrep + ast-grep
+
+tools/diag.sh debug [--full] [--dump] [--io] [--kuni] [PID|NAME]  # Linux
+tools/diag.sh test  [--filter EXPR]
+tools/diag.sh perf  [FIXTURE_ROOT]
+tools/diag.sh static                                # semgrep + ast-grep
+```
+
+`debug` escalates cheap to expensive: process identity, thread states and a
+CPU-delta read (stuck vs. slow), then `dotnet-counters` (System.Runtime plus
+the in-app `TicTack` provider: files/bytes copied, copy+fsync latency,
+pending events). `-Full` adds `dotnet-gcstats`, `dotnet-pstacks`, two
+`dotnet-gcdump` samples (auto-diffed), `dotnet-dstrings`, `dotnet-trace`
+(plus a Speedscope flame-graph conversion of the `.nettrace`),
+`dotnet-stack`, `dotnet-fullgc` and the
+Windows event log. On Linux the thread snapshot also includes `pidstat`
+per-thread I/O, `debug --io` adds bounded BPF/fs tracing (bpftrace fsync
+hist, syncsnoop, fs-specific `*slower`, funclatency, offcputime — needs root plus
+`bcc-tools`/`bpftrace` installed), and `debug --kuni` captures a unified
+managed+kernel+native trace (`dotnet-trace collect-linux`; needs root,
+kernel ≥ 6.4, tracefs). `static` runs `semgrep --config r/csharp` (`ast-grep scan` over the banked
+`rules/`) — mirrored by the `static` CI job. `-Dump` on Windows falls back
+to `procdump -ma` when `dotnet-dump` is not installed. `-Dump` is the only step that
+freezes the target and it asks first — it writes the dump to `/tmp`, analyzes
+it offline (`dotnet-pstacks` / `dotnet-dstrings` / `dotnet-dump analyze` plus
+an automated leak-triage chain, so
+no root is needed even when ptrace is blocked), then deletes it. Threads stuck
+in `D`-state are a kernel/filesystem problem, so the script reports that
+instead of escalating.
+
+`perf` regenerates the fixture (`benchmarks/create-fixture.sh` /
+`.ps1`), builds Release, warms the page cache, takes an `fio` fsync-latency
+baseline of the fixture filesystem when `fio` is installed, then runs named
+scenarios — `cold-initial`, `warm-noop`, `hash-verify` and `workers=1|2|4` —
+writing one row per scenario (seconds, MB/s, files/s, load average, diff
+verdict) plus a machine-readable `results.json`, with `hyperfine` means when
+`hyperfine` is installed. It diffs those numbers against the checked-in
+`benchmarks/baseline.json` and flags anything >20 % slower. Pass scenario names
+to run a subset. Override with the `DURABILITY` (`rename-only`) environment
+variable. Microbenchmarks (`BenchmarkDotNet`, `benchmarks/TicTack.Benchmarks.csproj`)
+cover the hot paths: filter matching, arg construction, hex formatting,
+`FileSnapshot` equality, StateDb batch ops.
+
+Record the load average with every number. A saturated host swamps the
+pipeline: on a 4-core box at 41 % iowait and 7 blocked processes the same
+2 GB fixture took 356 s, while a `cp -a` of it took 46 s. `durability: full`
+costs only ~1.4× more than `rename-only` — it is not the dominant term. The
+`perf` subcommand hands the sync off to a detached child, so give the whole
+run its own wall-clock budget rather than the default agent/CI step timeout.
+
+Install the tools once with `dotnet tool install -g dotnet-counters dotnet-gcdump
+dotnet-dump dotnet-trace dotnet-stack dotnet-pstacks dotnet-dstrings dotnet-gcstats
+dotnet-fullgc` — or skip the install and run them one-shot with `dnx`
+(`dnx dotnet-counters …`, ships with the .NET 10 SDK). Tool selection by symptom and the PerfView GC recipes live in
+[`docs/linux-debug-perf.md`](docs/linux-debug-perf.md),
+[`docs/windows-debug-perf.md`](docs/windows-debug-perf.md) and
+[`docs/windows-perf.md`](docs/windows-perf.md).
 
 ---
 

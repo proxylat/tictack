@@ -277,8 +277,8 @@ namespace TicTack
         {
             try
             {
-                if (_snapshot == null) { _snapshot = new Dictionary<string, FileSnapshot>(); ScanInto(_snapshot); return; }
-                _scratch ??= new Dictionary<string, FileSnapshot>(_snapshot.Count);
+                if (_snapshot == null) { _snapshot = new Dictionary<string, FileSnapshot>(StringComparer.Ordinal); ScanInto(_snapshot); return; }
+                _scratch ??= new Dictionary<string, FileSnapshot>(_snapshot.Count, StringComparer.Ordinal);
                 _scratch.Clear();
                 ScanInto(_scratch);
                 var current = _scratch;

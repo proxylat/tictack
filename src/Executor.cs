@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -69,13 +70,20 @@ namespace TicTack
                     probe.ReadByte();
                 }
 
+                long bytesCopied = 0;
+                double copyMs = -1;
+
                 var isSparse = false;
-                try { isSparse = (File.GetAttributes(src) & FileAttributes.SparseFile) != 0; } catch { }
+                try { isSparse = (File.GetAttributes(src) & FileAttributes.SparseFile) == FileAttributes.SparseFile; } catch { }
 
                 using (var srcStream = _accessor.OpenRead(src))
                 using (var dstStream = File.Create(tmp))
                 {
                     _checkpoint?.Invoke(CopyCheckpoint.TempCreated);
+                    // Timed only while a counters listener is attached — otherwise
+                    // this path stays allocation-free apart from the copy itself.
+                    var timed = TicTackEventSource.Log.IsEnabled();
+                    var sw = timed ? Stopwatch.StartNew() : null;
                     if (isSparse)
                     {
                         uint dummy;
@@ -86,12 +94,16 @@ namespace TicTack
                     {
                         dstStream.SetLength(srcStream.Length);
                     }
+                    bytesCopied = srcStream.Length;
                     await srcStream.CopyToAsync(dstStream, 81920, ct);
+                    Stopwatch? fsw = timed ? Stopwatch.StartNew() : null;
                     if (_fullDurability)
                         dstStream.Flush(true);
                     else
                         dstStream.Flush();
+                    if (fsw != null) TicTackEventSource.Log.FsyncCompleted(fsw.Elapsed.TotalMilliseconds);
                     _checkpoint?.Invoke(CopyCheckpoint.DataFlushed);
+                    if (sw != null) copyMs = sw.Elapsed.TotalMilliseconds;
                 }
 
                 try
@@ -119,6 +131,9 @@ namespace TicTack
                 if (!FlushDirectory(Path.GetDirectoryName(dst)))
                     return ActionResult.Fail("Could not fsync destination directory");
 
+                // Count only fully committed copies.
+                if (copyMs >= 0) TicTackEventSource.Log.CopyCompleted(copyMs);
+                TicTackEventSource.Log.FileCopied(bytesCopied);
                 return ActionResult.Ok();
             }
             catch (UnauthorizedAccessException ex) { return ActionResult.Fail(ex.Message); }

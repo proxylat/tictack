@@ -8,7 +8,13 @@ namespace TicTack
 {
     public static class VolumeResolver
     {
+        // MA0009/MA0023 false positives, kept explicit: the pattern is a
+        // negated character class (linear time, no ReDoS shape) and group 1
+        // is load-bearing (m.Groups[1].Value below), which ExplicitCapture
+        // would stop capturing.
+#pragma warning disable MA0009, MA0023
         private static readonly Regex VolumePattern = new Regex(@"\[([^\]]+)\]", RegexOptions.Compiled);
+#pragma warning restore MA0009, MA0023
 
         public static string Resolve(string path)
         {
@@ -88,7 +94,7 @@ namespace TicTack
                         v => v.root,
                         StringComparer.OrdinalIgnoreCase);
             }
-            catch { return new Dictionary<string, string>(); }
+            catch { return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); }
         }
     }
 }

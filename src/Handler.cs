@@ -66,7 +66,7 @@ namespace TicTack
                 return new FileStream(new SafeFileHandle((IntPtr)fd, true), FileAccess.Read);
             }
 
-            if (path.Length > 240 && !path.StartsWith(@"\\?\"))
+            if (path.Length > 240 && !path.StartsWith(@"\\?\", StringComparison.Ordinal))
                 path = @"\\?\" + path;
 
             var rawHandle = CreateFile(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
