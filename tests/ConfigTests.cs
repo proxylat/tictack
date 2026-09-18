@@ -316,6 +316,23 @@ logging:
     }
 
     [Fact]
+    public void Validate_ReportsNullSyncOnExpandedPaths()
+    {
+        var yaml = "sources:\n  - paths:\n      - '/tmp/tt-src'\n    destination: '/tmp/tt-dst'\n    sync:\n";
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, yaml);
+            var cfg = Config.Load(path)!;
+            var log = new RecordingLogger();
+
+            Assert.False(Config.Validate(cfg, log));
+            Assert.Contains(log.Messages, m => m.Contains("missing 'sync' or 'state_db_path'"));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
     public void DefaultValues_AreSet()
     {
         Assert.Equal(10.0, new SourceConfig().DebounceSeconds);

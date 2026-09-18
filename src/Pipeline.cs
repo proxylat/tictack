@@ -90,7 +90,7 @@ namespace TicTack
             var pendingEvents = _pendingEvents;
             _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(_config.Path, () => pendingEvents.Count);
 
-            var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : 7;
+            var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : SyncConfig.DefaultDeleteHoldDays;
             _deferred = new DeferredDeletion(deferredPath ?? Path.Combine(_config.Destination, ".tictack-deferred.json"), holdDays, _log);
 
             var filters = new List<IFileFilter>();
