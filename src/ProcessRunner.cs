@@ -37,7 +37,7 @@ namespace TicTack
         }
 
         public static async Task<(int ExitCode, string Stdout, string Stderr, bool TimedOut)> RunAsync(
-            string command, string workingDir, bool redirect, CancellationToken ct = default)
+            string command, string workingDir, bool redirect, CancellationToken ct = default, int timeoutMs = TimeoutMs)
         {
             using var p = Process.Start(CreateStartInfo(command, workingDir, redirect));
             if (p == null) return (-1, string.Empty, string.Empty, false);
@@ -50,7 +50,7 @@ namespace TicTack
             }
 
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeout.CancelAfter(TimeoutMs);
+            timeout.CancelAfter(timeoutMs);
             try
             {
                 await p.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
