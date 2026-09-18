@@ -50,6 +50,7 @@ namespace TicTack
         private Thread? _worker;
         private volatile bool _stopping;
         private string? _pendingRename;
+        private readonly ManualResetEventSlim _armed = new(false);
         private readonly string _path;
         private readonly int _bufferSize;
         private readonly int _restartDelaySec;
@@ -68,8 +69,14 @@ namespace TicTack
         {
             Stop();
             _stopping = false;
+            _armed.Reset();
             _worker = new Thread(WorkerLoop) { IsBackground = true };
             _worker.Start();
+            // Do not return until the first ReadDirectoryChangesW is armed:
+            // a change written before then is not buffered and is lost. The
+            // worker also signals on the open-failure and retry paths, so this
+            // is bounded even when the directory cannot be opened.
+            _armed.Wait(TimeSpan.FromSeconds(10));
         }
 
         private void WorkerLoop()
@@ -84,6 +91,7 @@ namespace TicTack
 
                     if (_dirHandle == new IntPtr(-1))
                     {
+                        _armed.Set();
                         FireError(new IOException("Failed to open directory: " + _path));
                         SleepOrStop(5000);
                         continue;
@@ -95,6 +103,9 @@ namespace TicTack
                     if (_stopping)
                         break;
 
+                    // Signal immediately before the first read: the kernel starts
+                    // buffering directory changes only once this call is issued.
+                    _armed.Set();
                     var buf = new byte[_bufferSize];
                     while (!_stopping)
                     {
@@ -119,6 +130,7 @@ namespace TicTack
                 }
                 catch (Exception ex) when (!_stopping)
                 {
+                    _armed.Set();
                     FireError(ex);
                 }
                 finally
@@ -238,6 +250,9 @@ namespace TicTack
             }
         }
 
+        // Intentionally does not dispose _armed: the worker can still signal it
+        // on a retry path after Stop()'s bounded join, and Set() on a disposed
+        // event would fault the background thread.
         public void Dispose() => Stop();
     }
 
