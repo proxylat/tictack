@@ -260,4 +260,31 @@ public class StateDbTests : IDisposable
         Assert.Equal((5L, 50L), all["keep.txt"]);
         Assert.Equal((6L, 60L), all["after.txt"]);
     }
+
+    [Fact]
+    public void Dispose_Twice_IsIdempotent()
+    {
+        _db.Dispose();
+        _db.Dispose();
+    }
+
+    [Fact]
+    public void AfterDispose_OperationsThrowObjectDisposed()
+    {
+        _db.Dispose();
+
+        var loadEx = Assert.Throws<ObjectDisposedException>(() => _db.LoadAll());
+        Assert.Equal(nameof(StateDb), loadEx.ObjectName);
+        var countEx = Assert.Throws<ObjectDisposedException>(() => _db.Count());
+        Assert.Equal(nameof(StateDb), countEx.ObjectName);
+    }
+
+    [Fact]
+    public async Task AfterDispose_AsyncOperationThrowsObjectDisposed()
+    {
+        _db.Dispose();
+
+        var ex = await Assert.ThrowsAsync<ObjectDisposedException>(() => _db.LoadAllAsync());
+        Assert.Equal(nameof(StateDb), ex.ObjectName);
+    }
 }

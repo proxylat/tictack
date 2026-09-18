@@ -24,8 +24,11 @@ namespace TicTack
         private readonly IFileFilter? _filter;
         private readonly IDisposable? _queueCounter;
 
-        private readonly ConcurrentDictionary<string, FileChangedEventArgs> _pendingEvents = new ConcurrentDictionary<string, FileChangedEventArgs>(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, DateTime> _debounce = new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private static readonly StringComparer PathComparer =
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
+        private readonly ConcurrentDictionary<string, FileChangedEventArgs> _pendingEvents = new ConcurrentDictionary<string, FileChangedEventArgs>(PathComparer);
+        private readonly ConcurrentDictionary<string, DateTime> _debounce = new ConcurrentDictionary<string, DateTime>(PathComparer);
         private readonly SemaphoreSlim _signal = new SemaphoreSlim(0);
         private CancellationTokenSource? _cts;
         private bool _started;

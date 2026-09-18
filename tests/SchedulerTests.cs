@@ -85,4 +85,13 @@ public class SchedulerTests
             try { Directory.Delete(dir, true); } catch { }
         }
     }
+
+    [Fact]
+    public void TimeoutMessage_DerivesTheMinutesFromProcessRunner()
+    {
+        var message = TimerScheduler.TimeoutMessage("backup");
+
+        Assert.Equal("Job 'backup' timed out after " + (ProcessRunner.TimeoutMs / 60000) + " minutes, killed", message);
+        Assert.Contains("10 minutes", message);
+    }
 }

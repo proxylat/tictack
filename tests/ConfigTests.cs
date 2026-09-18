@@ -340,4 +340,11 @@ logging:
         Assert.Equal(LogLevel.Info, LogLevelParser.Parse(new LoggingConfig().Level));
         Assert.True(new WatchdogConfig().Enabled);
     }
+
+    [Fact]
+    public void DeleteHoldDays_DefaultsToTheSharedConstant()
+    {
+        Assert.Equal(7, SyncConfig.DefaultDeleteHoldDays);
+        Assert.Equal(SyncConfig.DefaultDeleteHoldDays, new SyncConfig().DeleteHoldDays);
+    }
 }

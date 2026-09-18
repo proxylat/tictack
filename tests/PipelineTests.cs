@@ -442,4 +442,27 @@ public class PipelineTests : IDisposable
         Assert.Empty(_deletion.Calls);
     }
 
+    [Fact]
+    public void Created_CaseDistinctNames_BothCopied()
+    {
+        if (OperatingSystem.IsWindows()) return; // Windows paths are case-insensitive
+
+        _pipeline.Dispose();
+        StartPipeline(c => c.DebounceSeconds = 2);
+
+        var upper = Path.Combine(_srcDir, "Case.txt");
+        var lower = Path.Combine(_srcDir, "case.txt");
+        File.WriteAllText(upper, "upper");
+        File.WriteAllText(lower, "lower");
+        // Same debounce window: a case-folding event map would coalesce these.
+        _monitor.Fire(ChangeType.Created, upper);
+        _monitor.Fire(ChangeType.Created, lower);
+
+        WaitFor(() => File.Exists(Path.Combine(_dstDir, "Case.txt")) && File.Exists(Path.Combine(_dstDir, "case.txt")),
+            "both case-distinct copies");
+
+        Assert.Equal("upper", File.ReadAllText(Path.Combine(_dstDir, "Case.txt")));
+        Assert.Equal("lower", File.ReadAllText(Path.Combine(_dstDir, "case.txt")));
+    }
+
 }

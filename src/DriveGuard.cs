@@ -44,20 +44,27 @@ namespace TicTack
             try
             {
                 var fullPath = Path.GetFullPath(path);
-                var mounts = GetCachedDrives(getDrives)
-                    .Where(d => d.Ready && fullPath.StartsWith(d.Root, StringComparison.OrdinalIgnoreCase))
-                    .OrderByDescending(d => d.Root.Length)
-                    .ToList();
-                if (mounts.Count == 0) return false;
-                if (OperatingSystem.IsLinux() && mounts[0].Root == "/"
-                    && (fullPath == "/srv" || fullPath.StartsWith("/srv/", StringComparison.Ordinal)
-                        || fullPath == "/mnt" || fullPath.StartsWith("/mnt/", StringComparison.Ordinal)
-                        || fullPath == "/media" || fullPath.StartsWith("/media/", StringComparison.Ordinal)
-                        || fullPath.StartsWith("/run/media/", StringComparison.Ordinal)))
-                    return false;
-                return true;
+                return SelectReady(fullPath, GetCachedDrives(getDrives));
             }
             catch { return false; }
+        }
+
+        // Pure reachability selection over a mount list, split out so the
+        // benchmark measures the selection without the probe or cache.
+        internal static bool SelectReady(string fullPath, IReadOnlyList<(string Root, bool Ready)> drives)
+        {
+            var mounts = drives
+                .Where(d => d.Ready && fullPath.StartsWith(d.Root, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(d => d.Root.Length)
+                .ToList();
+            if (mounts.Count == 0) return false;
+            if (OperatingSystem.IsLinux() && mounts[0].Root == "/"
+                && (fullPath == "/srv" || fullPath.StartsWith("/srv/", StringComparison.Ordinal)
+                    || fullPath == "/mnt" || fullPath.StartsWith("/mnt/", StringComparison.Ordinal)
+                    || fullPath == "/media" || fullPath.StartsWith("/media/", StringComparison.Ordinal)
+                    || fullPath.StartsWith("/run/media/", StringComparison.Ordinal)))
+                return false;
+            return true;
         }
     }
 }
