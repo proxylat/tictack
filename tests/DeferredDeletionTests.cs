@@ -15,8 +15,8 @@ public class DeferredDeletionTests
         try
         {
             var dd = new DeferredDeletion(Path.Combine(dir, "deferred.json"), 0, new RecordingLogger());
-            dd.RecordPending(new List<string> { a, b }, 100, dir);
-            dd.RecordPending(new List<string> { b, c }, 50, dir);
+            dd.RecordPending(new List<string> { a, b }, dir);
+            dd.RecordPending(new List<string> { b, c }, dir);
 
             var action = dd.Check();
 
@@ -41,7 +41,7 @@ public class DeferredDeletionTests
         {
             var log = new RecordingLogger();
             var dd = new DeferredDeletion(Path.Combine(blocker, "deferred.json"), 1, log);
-            dd.RecordPending(new List<string> { Path.Combine(dir, "gone.txt") }, 1);
+            dd.RecordPending(new List<string> { Path.Combine(dir, "gone.txt") });
 
             Assert.Contains(log.Messages, m => m.Contains("could not be saved"));
         }
@@ -58,7 +58,7 @@ public class DeferredDeletionTests
             var dd = new DeferredDeletion(Path.Combine(dir, "deferred.json"), 0, new RecordingLogger());
             var a = Path.Combine(dir, "gone-a.txt");
             var b = Path.Combine(dir, "gone-b.txt");
-            dd.RecordPending(new List<string> { a, b }, 10, dir);
+            dd.RecordPending(new List<string> { a, b }, dir);
 
             var action = dd.Check();
 
@@ -78,7 +78,7 @@ public class DeferredDeletionTests
         {
             var dd = new DeferredDeletion(Path.Combine(dir, "deferred.json"), 0, new RecordingLogger());
             var back = Path.Combine(dir, "back.txt");
-            dd.RecordPending(new List<string> { back }, 10, dir);
+            dd.RecordPending(new List<string> { back }, dir);
             File.WriteAllText(back, "returned");
 
             var action = dd.Check();
@@ -99,7 +99,7 @@ public class DeferredDeletionTests
         {
             var log = new RecordingLogger();
             var dd = new DeferredDeletion(Path.Combine(dir, "deferred.json"), 7, log);
-            dd.RecordPending(new List<string> { Path.Combine(dir, "held.txt") }, 10, dir);
+            dd.RecordPending(new List<string> { Path.Combine(dir, "held.txt") }, dir);
 
             var action = dd.Check();
 
@@ -108,5 +108,55 @@ public class DeferredDeletionTests
             Assert.Contains(log.Messages, m => m.Contains("remaining"));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void RecordPending_SecondBatch_KeepsEarliestBlockedAt()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var path = Path.Combine(dir, "deferred.json");
+            var dd = new DeferredDeletion(path, 7, new RecordingLogger());
+            dd.RecordPending(new List<string> { Path.Combine(dir, "a.txt") }, dir);
+            var first = ReadBlockedAt(path);
+
+            Thread.Sleep(20);
+            dd.RecordPending(new List<string> { Path.Combine(dir, "b.txt") }, dir);
+
+            // Union must not restart the hold clock for already-aged entries.
+            Assert.Equal(first, ReadBlockedAt(path));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void RecordPending_CaseDistinctNames_KeptOnLinux()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var dd = new DeferredDeletion(Path.Combine(dir, "deferred.json"), 0, new RecordingLogger());
+            dd.RecordPending(new List<string>
+            {
+                Path.Combine(dir, "a.txt"),
+                Path.Combine(dir, "A.txt")
+            }, dir);
+
+            var action = dd.Check();
+
+            var expected = OperatingSystem.IsWindows() ? 1 : 2;
+            Assert.Equal(DeferredActionType.Proceed, action.Type);
+            Assert.Equal(expected, action.Files!.Count);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    private static DateTime ReadBlockedAt(string statePath)
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(statePath));
+        return doc.RootElement.GetProperty("BlockedAt").GetDateTime();
     }
 }

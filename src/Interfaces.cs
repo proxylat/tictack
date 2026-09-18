@@ -49,7 +49,17 @@ namespace TicTack
 
         private static string MapPath(string fromBase, string toBase, string path)
         {
-            if (path.StartsWith(fromBase, StringComparison.OrdinalIgnoreCase))
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            // Boundary-aware compare without depending on the current OS separator:
+            // base /a/src must not match /a/src2/f, while Windows-style literals
+            // still match on Linux (and vice versa). A base that already ends in
+            // a separator needs no further boundary check.
+            var baseMatches = path.StartsWith(fromBase, comparison);
+            var baseEndsWithSeparator = fromBase.Length > 0
+                && (fromBase[fromBase.Length - 1] == '\\' || fromBase[fromBase.Length - 1] == '/');
+            var boundaryOk = baseEndsWithSeparator
+                || (path.Length > fromBase.Length && (path[fromBase.Length] == '\\' || path[fromBase.Length] == '/'));
+            if (path.Equals(fromBase, comparison) || (baseMatches && boundaryOk))
             {
                 var rel = path.Substring(fromBase.Length).TrimStart('\\', '/');
                 return string.IsNullOrEmpty(rel) ? toBase : Path.Combine(toBase, rel);
@@ -108,8 +118,12 @@ namespace TicTack
     {
         public bool Success { get; set; }
         public string? ErrorMessage { get; set; }
+        // True for failures that a retry may clear (sharing violations,
+        // transient IO). Pipeline unwraps these into the retry wrapper.
+        public bool Retryable { get; set; }
         public static ActionResult Ok() { return new ActionResult { Success = true }; }
-        public static ActionResult Fail(string msg) { return new ActionResult { Success = false, ErrorMessage = msg }; }
+        public static ActionResult Fail(string msg, bool retryable = false) =>
+            new ActionResult { Success = false, ErrorMessage = msg, Retryable = retryable };
     }
 
     public interface IFileMonitor : IDisposable

@@ -13,12 +13,14 @@ namespace TicTack
         private readonly int _maxAttempts;
         private readonly int _initialDelayMs;
         private readonly double _backoff;
+        private readonly ILogger? _log;
 
-        public ExponentialBackoffRetry(int maxAttempts = 5, int initialDelayMs = 1000, double backoff = 2.0)
+        public ExponentialBackoffRetry(int maxAttempts = 5, int initialDelayMs = 1000, double backoff = 2.0, ILogger? log = null)
         {
             _maxAttempts = Math.Max(1, maxAttempts);
             _initialDelayMs = Math.Max(0, initialDelayMs);
             _backoff = Math.Max(1.0, backoff);
+            _log = log;
         }
 
         public async Task<T> ExecuteAsync<T>(Func<Task<T>> action, CancellationToken ct)
@@ -29,11 +31,14 @@ namespace TicTack
                 attempt++;
                 try { return await action(); }
                 catch (OperationCanceledException) { throw; }
-                catch (Exception)
+                catch (Exception ex)
                 {
                     if (attempt >= _maxAttempts) throw;
+                    _log?.Debug("Retry " + attempt + "/" + _maxAttempts + " after failure: " + ex.Message);
                 }
-                var delay = (int)(_initialDelayMs * Math.Pow(_backoff, attempt - 1));
+                // Cap the delay so a large user-configured backoff cannot overflow
+                // the int narrowing and hand Task.Delay a negative value.
+                var delay = (int)Math.Min(_initialDelayMs * Math.Pow(_backoff, attempt - 1), 60000);
                 await Task.Delay(delay, ct);
             }
         }
@@ -62,7 +67,8 @@ namespace TicTack
             {
                 // Bypass managed Unix sharing locks so active files remain readable.
                 var fd = OpenFile(path, O_RDONLY);
-                if (fd < 0) throw new IOException("Failed to open source file: " + path);
+                if (fd < 0)
+                    throw new IOException("Failed to open source file: " + path + " (errno " + Marshal.GetLastWin32Error() + ")");
                 return new FileStream(new SafeFileHandle((IntPtr)fd, true), FileAccess.Read);
             }
 

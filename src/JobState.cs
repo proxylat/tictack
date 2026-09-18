@@ -15,26 +15,7 @@ namespace TicTack
         public JobRunStore(string dbPath)
         {
             _dbPath = dbPath;
-            var dir = Path.GetDirectoryName(dbPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-
-            _conn = new SqliteConnection("Data Source=" + _dbPath);
-            _conn.Open();
-
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "PRAGMA journal_mode=WAL";
-                cmd.ExecuteNonQuery();
-            }
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = @"CREATE TABLE IF NOT EXISTS job_runs (
-                    name TEXT PRIMARY KEY,
-                    last_run TEXT NOT NULL
-                )";
-                cmd.ExecuteNonQuery();
-            }
+            _conn = SqliteBootstrap.Open(dbPath, SqliteSchema.JobRuns);
         }
 
         public DateTime? GetLastRun(string name)

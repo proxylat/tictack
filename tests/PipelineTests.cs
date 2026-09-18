@@ -161,6 +161,26 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void Created_WhenSourceVanished_RemovesDestAndStateRow()
+    {
+        // A Created/Modified event whose source is already gone must delete the
+        // destination through TrackedDeleter, so the stale state row cannot
+        // inflate CountAsync and skew the percent delete guard.
+        var rel = "vanished.txt";
+        var srcPath = Path.Combine(_srcDir, rel);
+        var destPath = Path.Combine(_dstDir, rel);
+        File.WriteAllText(destPath, "orphan");
+        _db.Upsert(rel, 6, 1);
+
+        _monitor.Fire(ChangeType.Created, srcPath);
+
+        WaitFor(() => !_db.LoadAll().ContainsKey(rel), "state row removal");
+
+        Assert.Equal((srcPath, destPath), _deletion.Calls.Single());
+        Assert.False(File.Exists(destPath));
+    }
+
+    [Fact]
     public void Renamed_MovesDestFile_AndUpdatesState()
     {
         var oldSrc = Path.Combine(_srcDir, "old.txt");

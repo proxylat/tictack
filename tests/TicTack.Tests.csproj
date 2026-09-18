@@ -60,6 +60,11 @@
     <Compile Include="../src/Scheduler.cs" Link="src/Scheduler.cs" />
     <Compile Include="../src/JobState.cs" Link="src/JobState.cs" />
     <Compile Include="../src/Metrics.cs" Link="src/Metrics.cs" />
+    <Compile Include="../src/DriveGuard.cs" Link="src/DriveGuard.cs" />
+    <Compile Include="../src/ParityScanner.cs" Link="src/ParityScanner.cs" />
+    <Compile Include="../src/TrackedDeleter.cs" Link="src/TrackedDeleter.cs" />
+    <Compile Include="../src/ProcessRunner.cs" Link="src/ProcessRunner.cs" />
+    <Compile Include="../src/SqliteBootstrap.cs" Link="src/SqliteBootstrap.cs" />
   </ItemGroup>
 
 </Project>

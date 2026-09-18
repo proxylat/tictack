@@ -17,6 +17,20 @@ namespace TicTack
                 return Convert.ToHexStringLower(sha256.ComputeHash(stream));
             }
         }
+
+        // Length pre-check + full-content compare, for the archive/recovery
+        // paths that used to reimplement SHA-256 (and uppercase hex) locally.
+        internal static bool SameContent(string left, string right)
+        {
+            try
+            {
+                var leftInfo = new FileInfo(PathUtil.EnsureExtended(left));
+                var rightInfo = new FileInfo(PathUtil.EnsureExtended(right));
+                if (!leftInfo.Exists || !rightInfo.Exists || leftInfo.Length != rightInfo.Length) return false;
+                return ComputeHex(left, null) == ComputeHex(right, null);
+            }
+            catch { return false; }
+        }
     }
 
     public static class ComparerFactory
@@ -26,9 +40,10 @@ namespace TicTack
             switch (level)
             {
                 case VerificationLevel.Size: return new SizeComparer();
+                case VerificationLevel.DateAndSize: return new DateSizeComparer();
                 case VerificationLevel.Hash: return new HashComparer(accessor);
                 case VerificationLevel.Full: return new FullComparer(accessor);
-                default: return new DateSizeComparer();
+                default: throw new ArgumentOutOfRangeException(nameof(level), level, "Unknown verification level");
             }
         }
     }

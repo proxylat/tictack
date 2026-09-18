@@ -58,6 +58,25 @@ public class MonitorTests : IDisposable
     }
 
     [Fact]
+    public void PollingMonitor_ThrowingChangedSubscriber_IsContained()
+    {
+        using var monitor = new PollingMonitor(_dir);
+        var errors = new List<MonitorErrorEventArgs>();
+        monitor.Changed += (_, _) => throw new InvalidOperationException("bad handler");
+        monitor.Error += (_, e) => errors.Add(e);
+
+        monitor.PollNow(); // empty baseline
+        File.WriteAllText(Path.Combine(_dir, "boom1.txt"), "x");
+        File.WriteAllText(Path.Combine(_dir, "boom2.txt"), "x");
+        monitor.PollNow();
+
+        // Containment must let the second event reach the handler too; an
+        // unguarded subscriber would abort the scan after the first throw.
+        Assert.Equal(2, errors.Count);
+        Assert.All(errors, e => Assert.Equal("bad handler", e.Exception.Message));
+    }
+
+    [Fact]
     public void CompositeMonitor_FansOutChangedAndError()
     {
         var a = new EventMonitor();

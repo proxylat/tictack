@@ -32,19 +32,10 @@ namespace TicTack
                 if (cfg == null)
                     throw new InvalidOperationException("Config not found: " + _configPath);
 
-                VolumeResolver.ResolveConfig(cfg);
+                var logDir = Path.GetDirectoryName(_configPath) ?? AppDomain.CurrentDomain.BaseDirectory;
+                _log = LoggerFactory.Create(cfg.Logging, logDir, console: cfg.Logging.Console, eventLog: true);
 
-                var level = LogLevelParser.Parse(cfg.Logging.Level);
-                var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                    ? Path.Combine(Path.GetDirectoryName(_configPath) ?? AppDomain.CurrentDomain.BaseDirectory, "tictack.log")
-                    : cfg.Logging.Path;
-                var loggers = new List<ILogger>();
-                loggers.Add(new BufferedLogger(new FileLogger(logPath, level, cfg.Logging.MaxSizeMb, cfg.Logging.MaxFiles)));
-                if (cfg.Logging.Console)
-                    loggers.Add(new ConsoleLogger(level));
-                loggers.Add(new DesktopAlertLogger(LogLevel.Warn, cfg.Logging.AlertPath));
-            loggers.Add(new EventLogLogger());
-                _log = new MultiLogger(loggers);
+                VolumeResolver.ResolveConfig(cfg, _log);
 
                 PowerGuard.Cleanup(cfg, _log);
 

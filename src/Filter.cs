@@ -72,12 +72,18 @@ namespace TicTack
             return true;
         }
 
+        // Windows filesystems are case-insensitive; Linux ones are not.
+        private static readonly bool CaseInsensitive = OperatingSystem.IsWindows();
+
+        private static bool CharsEqual(char a, char b) =>
+            CaseInsensitive ? char.ToUpperInvariant(a) == char.ToUpperInvariant(b) : a == b;
+
         private static bool MatchWildcard(string pattern, string text)
         {
             int pi = 0, ti = 0, starPos = -1, matchPos = 0;
             while (ti < text.Length)
             {
-                if (pi < pattern.Length && (char.ToUpperInvariant(pattern[pi]) == char.ToUpperInvariant(text[ti]) || pattern[pi] == '?'))
+                if (pi < pattern.Length && (CharsEqual(pattern[pi], text[ti]) || pattern[pi] == '?'))
                 { pi++; ti++; }
                 else if (pi < pattern.Length && pattern[pi] == '*')
                 { starPos = pi; matchPos = ti; pi++; }
@@ -93,17 +99,25 @@ namespace TicTack
     public class PathPrefixFilter : IFileFilter
     {
         private readonly string[] _prefixes;
+        // Windows paths are case-insensitive; Linux is not.
+        private static readonly StringComparison Comparison =
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
 
         public PathPrefixFilter(params string[] prefixes)
         {
-            _prefixes = prefixes;
+            _prefixes = prefixes ?? Array.Empty<string>();
         }
 
         public bool ShouldProcess(string fullPath)
         {
             foreach (var p in _prefixes)
-                if (fullPath.StartsWith(p, StringComparison.OrdinalIgnoreCase))
-                    return false;
+            {
+                if (string.IsNullOrEmpty(p)) continue;
+                // Boundary-aware: excluding /home/user must not exclude /home/user2.
+                if (!fullPath.StartsWith(p, Comparison)) continue;
+                if (fullPath.Length > p.Length && fullPath[p.Length] != '\\' && fullPath[p.Length] != '/') continue;
+                return false;
+            }
             return true;
         }
     }

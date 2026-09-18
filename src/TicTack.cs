@@ -34,7 +34,7 @@ namespace TicTack
 
         static async Task<int> Main(string[] args)
         {
-            MultiLogger? rootLogger = null;
+            ILogger? rootLogger = null;
             try
             {
                 var baseDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -64,21 +64,14 @@ namespace TicTack
                 return 1;
             }
 
-            VolumeResolver.ResolveConfig(cfg);
-
-            var level = LogLevelParser.Parse(cfg.Logging.Level);
-            var loggers = new List<ILogger>();
-            var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                ? Path.Combine(baseDir, "tictack.log")
-                : cfg.Logging.Path;
-            loggers.Add(new BufferedLogger(new FileLogger(logPath, level, cfg.Logging.MaxSizeMb, cfg.Logging.MaxFiles)));
-            if (isCli || isOnce || isValidate || cfg.Logging.Console)
-                loggers.Add(new ConsoleLogger(level));
-            loggers.Add(new DesktopAlertLogger(level > LogLevel.Debug ? LogLevel.Warn : LogLevel.Debug, cfg.Logging.AlertPath));
-            if (OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive))
-                loggers.Add(new EventLogLogger());
-            var log = new MultiLogger(loggers);
+            var log = LoggerFactory.Create(
+                cfg.Logging,
+                baseDir,
+                console: isCli || isOnce || isValidate || cfg.Logging.Console,
+                eventLog: OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive));
             rootLogger = log;
+
+            VolumeResolver.ResolveConfig(cfg, log);
 
             if (!Config.Validate(cfg, log))
                 return 1;
@@ -87,7 +80,7 @@ namespace TicTack
 
             if (isExternalDrives)
             {
-                RunExternalDrives(cfg, log);
+                await RunExternalDrivesAsync(cfg, log);
                 return 0;
             }
 
@@ -99,9 +92,8 @@ namespace TicTack
 
             if (isValidate)
             {
-                var valid = Config.Validate(cfg, log);
-                log.Info(valid ? "Configuration OK" : "Configuration INVALID");
-                return valid ? 0 : 1;
+                log.Info("Configuration OK");
+                return 0;
             }
 
             if (isOnce)
@@ -134,11 +126,11 @@ namespace TicTack
             }
             finally
             {
-                rootLogger?.Dispose();
+                (rootLogger as IDisposable)?.Dispose();
             }
         }
 
-        static void RunExternalDrives(TicTackConfig cfg, ILogger log)
+        static async Task RunExternalDrivesAsync(TicTackConfig cfg, ILogger log)
         {
             if (cfg.ExternalDrives == null || string.IsNullOrEmpty(cfg.ExternalDrives.Command))
             {
@@ -198,43 +190,17 @@ namespace TicTack
 
                 log.Info("Running backup for " + drive + ": " + fullCmd);
 
-                var psi = new ProcessStartInfo
+                try
                 {
-                    WorkingDirectory = wd,
-                    UseShellExecute = false,
-                    CreateNoWindow = false
-                };
-                if (OperatingSystem.IsWindows())
-                {
-                    psi.FileName = "cmd.exe";
-                    psi.Arguments = "/c " + fullCmd;
-                }
-                else
-                {
-                    psi.FileName = "/bin/sh";
-                    psi.ArgumentList.Add("-c");
-                    psi.ArgumentList.Add(fullCmd);
-                }
-
-                    try
-                    {
-                    using (var p = Process.Start(psi))
-                    {
-                        if (p == null)
-                        {
-                            log.Error("Backup on " + drive + " failed to start");
-                            continue;
-                        }
-                        if (!p.WaitForExit(600000))
-                        {
-                            try { p.Kill(); } catch { }
-                            log.Error("Backup on " + drive + " timed out after 10 minutes, killed");
-                        }
-                        else if (p.ExitCode != 0)
-                            log.Error("Backup on " + drive + " exited " + p.ExitCode);
-                        else
-                            log.Info("Backup on " + drive + " completed");
-                    }
+                    // No redirection: the backup tool's output stays on the
+                    // console; the runner owns the timeout and tree kill.
+                    var (exitCode, _, _, timedOut) = await ProcessRunner.RunAsync(fullCmd, wd, redirect: false);
+                    if (timedOut)
+                        log.Error("Backup on " + drive + " timed out after 10 minutes, killed");
+                    else if (exitCode != 0)
+                        log.Error("Backup on " + drive + " exited " + exitCode);
+                    else
+                        log.Info("Backup on " + drive + " completed");
                 }
                 catch (Exception ex)
                 {
@@ -256,7 +222,7 @@ namespace TicTack
                     log.Warn("Source folder missing, skipping once-off sync: " + src.Path);
                     continue;
                 }
-                if (!SyncPipeline.IsDriveReady(src.Destination))
+                if (!DriveGuard.IsReady(src.Destination))
                 {
                     log.Error("Destination drive is not ready: " + src.Destination);
                     continue;
@@ -300,7 +266,7 @@ namespace TicTack
                     log.Error("Source folder missing, rebuild skipped: " + src.Path);
                     continue;
                 }
-                if (!SyncPipeline.IsDriveReady(src.Destination))
+                if (!DriveGuard.IsReady(src.Destination))
                 {
                     log.Error("Destination drive is not ready: " + src.Destination);
                     return;
@@ -309,9 +275,7 @@ namespace TicTack
                 try
                 {
                     using var pipeline = BuildPipeline(src, cfg, log);
-                    var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
-                    if (string.IsNullOrEmpty(name)) name = "default";
-                    var deferredFile = Path.Combine(deferredDir, "tictack-deferred-" + name.ToLowerInvariant() + ".json");
+                    var deferredFile = Path.Combine(deferredDir, DeferredFileName(src));
                     var rebuilt = await pipeline.RunOnceAsync(() =>
                     {
                         pipeline.ResetState();
@@ -353,21 +317,8 @@ namespace TicTack
             }
         }
 
-        static bool UnderDir(string path, string prefix)
-        {
-            return path.StartsWith(prefix + '/', StringComparison.OrdinalIgnoreCase)
-                || path.StartsWith(prefix + '\\', StringComparison.OrdinalIgnoreCase);
-        }
-
         static void RunCli(TicTackConfig cfg, ILogger log)
         {
-            var valid = Config.Validate(cfg, log);
-            if (!valid)
-            {
-                log.Error("Configuration invalid, exiting.");
-                return;
-            }
-
             var pipelines = new List<SyncPipeline>();
 
             foreach (var src in cfg.Sources)
@@ -406,19 +357,29 @@ namespace TicTack
 
         static void LogCrash(Exception ex)
         {
+            if (!OperatingSystem.IsWindows()) return;
             try { EventLog.WriteEntry("TicTackSv", "Main failed: " + ex, EventLogEntryType.Error); } catch { }
         }
 
-        static string GetStateDbPath(SourceConfig src)
+        // One derivation for the per-source name, state DB file, and deferred
+        // file: the rebuild, the pipeline build, and the state path must agree.
+        internal static string SourceName(SourceConfig src)
         {
             var name = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
-            if (string.IsNullOrEmpty(name)) name = "default";
+            return string.IsNullOrEmpty(name) ? "default" : name;
+        }
+
+        internal static string DeferredFileName(SourceConfig src) =>
+            "tictack-deferred-" + SourceName(src).ToLowerInvariant() + ".json";
+
+        static string GetStateDbPath(SourceConfig src)
+        {
             var root = !string.IsNullOrEmpty(src.StateDbPath)
                 ? src.StateDbPath
                 : OperatingSystem.IsWindows()
                     ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TicTack")
                     : "/var/lib/tictack";
-            return Path.Combine(root, name + ".db");
+            return Path.Combine(root, SourceName(src) + ".db");
         }
 
         internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log)
@@ -428,19 +389,19 @@ namespace TicTack
             var comparer = ComparerFactory.Create(level, accessor);
             var validator = ValidatorFactory.Create(level, accessor);
             var retry = src.Sync != null && src.Sync.Retry != null
-                ? new ExponentialBackoffRetry(src.Sync.Retry.MaxAttempts, src.Sync.Retry.DelayMs, src.Sync.Retry.Backoff)
-                : new ExponentialBackoffRetry();
+                ? new ExponentialBackoffRetry(src.Sync.Retry.MaxAttempts, src.Sync.Retry.DelayMs, src.Sync.Retry.Backoff, log)
+                : new ExponentialBackoffRetry(log: log);
             var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, src.Destination);
             var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, src.Destination);
 
-            var copyAction = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
+            var copyAction = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase), log);
             var renameAction = new RenameAction(deletion, log);
 
             StateDb? stateDb = null;
             try
             {
                 var dbPath = GetStateDbPath(src);
-                stateDb = new StateDb(dbPath);
+                stateDb = new StateDb(dbPath, log);
             }
             catch (Exception ex)
             {
@@ -481,9 +442,7 @@ namespace TicTack
             if (logDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase) && !excludes.Contains(logDir))
                 excludes.Add(logDir);
 
-            var dname = Path.GetFileName(src.Path.TrimEnd('\\', '/'));
-            if (string.IsNullOrEmpty(dname)) dname = "default";
-            var deferredPath = Path.Combine(Path.GetDirectoryName(logPath) ?? baseDir, "tictack-deferred-" + dname.ToLowerInvariant() + ".json");
+            var deferredPath = Path.Combine(Path.GetDirectoryName(logPath) ?? baseDir, DeferredFileName(src));
             var legacyDeferred = Path.Combine(src.Destination, ".tictack-deferred.json");
             try
             {
@@ -495,7 +454,7 @@ namespace TicTack
                     File.Move(legacyDeferred, deferredPath);
                 }
             }
-            catch { }
+            catch (Exception ex) { log.Warn("Legacy deferred-state migration failed: " + ex.Message); }
 
             return new SyncPipeline(src, monitor, comparer, copyAction, renameAction,
                 retry, validator, versioning, deletion, log, stateDb,

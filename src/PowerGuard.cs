@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Security.Cryptography;
 
 namespace TicTack
 {
@@ -46,24 +45,17 @@ namespace TicTack
                     catch (Exception ex) { log.Warn(string.Format("Could not clean {0}: {1}", Path.GetFileName(tmp), ex.Message)); }
                 }
             }
-            catch (UnauthorizedAccessException) { }
+            catch (UnauthorizedAccessException ex)
+            {
+                log.Warn(string.Format("PowerGuard: {0}: {1}", dir, ex.Message));
+            }
             catch (Exception ex) { log.Warn(string.Format("PowerGuard: {0}: {1}", dir, ex.Message)); }
         }
 
         private static bool FilesMatch(string source, string temp)
         {
-            try
-            {
-                if (!File.Exists(source)) return false;
-                var sourceInfo = new FileInfo(source);
-                var tempInfo = new FileInfo(temp);
-                if (sourceInfo.Length != tempInfo.Length) return false;
-                using var sourceStream = File.OpenRead(source);
-                using var tempStream = File.OpenRead(temp);
-                return Convert.ToHexString(SHA256.HashData(sourceStream)) ==
-                    Convert.ToHexString(SHA256.HashData(tempStream));
-            }
-            catch { return false; }
+            if (!File.Exists(source)) return false;
+            return FileHasher.SameContent(source, temp);
         }
     }
 }
