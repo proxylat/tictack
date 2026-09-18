@@ -119,4 +119,19 @@ public class MonitorTests : IDisposable
 
         Assert.NotNull(seen);
     }
+
+    [Fact]
+    public void FileWatcherMonitor_Start_ReturnsWhenTheDirectoryCannotBeOpened()
+    {
+        // The worker signals "armed" on its failure paths too, so Start() is
+        // bounded: missing directory on Windows (CreateFile fails) and on
+        // Linux (kernel32 P/Invoke throws) both return promptly.
+        using var monitor = new FileWatcherMonitor(Path.Combine(_dir, "missing"));
+        var start = DateTime.UtcNow;
+
+        monitor.Start();
+
+        Assert.True(DateTime.UtcNow - start < TimeSpan.FromSeconds(9),
+            "Start blocked waiting for a watcher that never armed");
+    }
 }
