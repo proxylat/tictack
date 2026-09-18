@@ -127,8 +127,13 @@ public class StateDbTests : IDisposable
     public void CaseInsensitivePaths()
     {
         _db.Upsert("File.Txt", 100, 1000);
+        _db.Upsert("FILE.txt", 200, 2000);
+        // The table itself is case-sensitive (BINARY collation, correct for
+        // Linux where these are two distinct files); the case-insensitivity
+        // lives in the LoadAll cache, which must still collapse to one key.
+        Assert.Equal(2, _db.Count());
         var all = _db.LoadAll();
-        Assert.True(all.ContainsKey("FILE.TXT"));
+        Assert.Single(all);
         Assert.True(all.ContainsKey("file.txt"));
     }
 

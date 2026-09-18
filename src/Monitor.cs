@@ -288,13 +288,13 @@ namespace TicTack
 
                 foreach (var kv in current)
                 {
-                    if (!prev.ContainsKey(kv.Key))
+                    if (!prev.TryGetValue(kv.Key, out var oldSnap))
                     {
                         var handler = Changed;
                         if (handler != null)
                             handler(this, new FileChangedEventArgs(ChangeType.Created, _prefix + kv.Key));
                     }
-                    else if (!prev[kv.Key].Equals(kv.Value))
+                    else if (!oldSnap.Equals(kv.Value))
                     {
                         var handler = Changed;
                         if (handler != null)

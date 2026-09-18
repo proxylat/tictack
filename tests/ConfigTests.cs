@@ -195,6 +195,8 @@ sources:
             Assert.Contains("Documents", cfg.Sources[1].Path);
             Assert.Contains("Desktop", cfg.Sources[0].Destination);
             Assert.Contains("Documents", cfg.Sources[1].Destination);
+            Assert.Equal(Path.Combine(@"D:\Sync", "Desktop"), cfg.Sources[0].Destination);
+            Assert.Equal(Path.Combine(@"D:\Sync", "Documents"), cfg.Sources[1].Destination);
         }
         finally { File.Delete(path); }
     }
