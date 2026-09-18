@@ -87,6 +87,27 @@ public class VersioningTests : IDisposable
     }
 
     [Fact]
+    public async Task TimestampVersioning_PrunesNamesWithGlobChars()
+    {
+        // '[' used to be a char class in the prune glob, so these names were
+        // never pruned; prefix/suffix matching fixes it.
+        var dest = Dst("a[1].txt");
+        File.WriteAllText(dest, "v0");
+        var versioning = new TimestampVersioning(_verDir, _dstDir, 3);
+
+        for (int i = 0; i < 8; i++)
+        {
+            File.WriteAllText(dest, "v" + i);
+            await versioning.ArchivePreviousVersionAsync(dest, CancellationToken.None);
+        }
+
+        var files = Directory.GetFiles(Path.Combine(_verDir, "Desktop"))
+            .Where(f => Path.GetFileName(f).StartsWith("a[1]_", StringComparison.Ordinal))
+            .ToArray();
+        Assert.Equal(3, files.Length);
+    }
+
+    [Fact]
     public void Factory_ReturnsNoVersioning_WhenNullConfig()
     {
         var versioning = VersioningFactory.Create(null!, _dstDir);

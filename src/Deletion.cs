@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -52,23 +51,12 @@ namespace TicTack
                     input.CopyTo(output);
                     output.Flush(true);
                 }
-                if (!FilesMatch(src, temp))
+                if (!FileHasher.SameContent(src, temp))
                     throw new IOException("Archive validation failed: " + src);
                 File.Move(temp, archivePath, true);
                 File.Delete(src);
             }
             finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
-        }
-
-        static bool FilesMatch(string left, string right)
-        {
-            var leftInfo = new FileInfo(left);
-            var rightInfo = new FileInfo(right);
-            if (leftInfo.Length != rightInfo.Length) return false;
-            using var leftStream = File.OpenRead(left);
-            using var rightStream = File.OpenRead(right);
-            return Convert.ToHexString(SHA256.HashData(leftStream)) ==
-                Convert.ToHexString(SHA256.HashData(rightStream));
         }
 
         public Task<ActionResult> HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct)
@@ -80,9 +68,9 @@ namespace TicTack
                 string RelFromSyncRoot(string p)
                 {
                     if (syncRoot != null && p.StartsWith(syncRoot, StringComparison.OrdinalIgnoreCase))
-                        return p.Substring(syncRoot.Length).TrimStart('\\', '/');
+                        return PathUtil.Relative(p, syncRoot);
                     if (p.StartsWith(_destBase, StringComparison.OrdinalIgnoreCase))
-                        return p.Substring(_destBase.Length).TrimStart('\\', '/');
+                        return PathUtil.Relative(p, _destBase);
                     return "";
                 }
 
@@ -95,7 +83,7 @@ namespace TicTack
                     var relDir = RelFromSyncRoot(destPath);
                     foreach (var f in Directory.EnumerateFiles(destPath, "*", SearchOption.AllDirectories))
                     {
-                        var rel = Path.Combine(relDir, f.Substring(destPath.Length).TrimStart('\\', '/'));
+                        var rel = Path.Combine(relDir, PathUtil.Relative(f, destPath));
                         ArchiveFile(f, Path.Combine(_archiveBase, rel));
                     }
                     Directory.Delete(destPath, true);

@@ -9,6 +9,7 @@ namespace TicTack
     {
         private readonly string _path;
         private readonly string _identity;
+        private readonly ILogger _log;
         private readonly Timer? _refreshTimer;
         private FileStream? _handle;
         private bool _disposed;
@@ -18,8 +19,13 @@ namespace TicTack
         public SrcLock(string path, ILogger log, TimeSpan? retryTimeout = null, TimeSpan? refreshInterval = null)
         {
             _path = path;
+            _log = log;
             _identity = Environment.MachineName + ":" + Process.GetCurrentProcess().Id;
             var deadline = retryTimeout.HasValue ? DateTime.UtcNow + retryTimeout.Value : DateTime.MinValue;
+            var refresh = refreshInterval ?? TimeSpan.FromSeconds(30);
+            // Stale threshold must exceed the refresh cadence, or a live holder
+            // whose refreshInterval is set above 5 minutes looks stale.
+            var staleAfter = TimeSpan.FromTicks(Math.Max(TimeSpan.FromMinutes(5).Ticks, refresh.Ticks * 10));
 
             try
             {
@@ -40,11 +46,13 @@ namespace TicTack
                         _handle = null;
                         if (!File.Exists(path)) throw;
                         var content = "unknown";
-                        try { content = ReadIdentity(path); } catch { }
+                        try { content = ReadIdentity(path); }
+                        catch (Exception ex) { log.Debug("Lock identity read failed: " + ex.Message); }
                         var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(path);
-                        if (age.TotalMinutes >= 5)
+                        if (age >= staleAfter)
                         {
-                            try { File.Delete(path); continue; } catch { }
+                            try { File.Delete(path); continue; }
+                            catch (Exception ex) { log.Debug("Stale lock delete failed: " + ex.Message); }
                         }
                         if (DateTime.UtcNow >= deadline)
                         {
@@ -56,11 +64,10 @@ namespace TicTack
                     }
                 }
 
-                var refresh = refreshInterval ?? TimeSpan.FromSeconds(30);
                 _refreshTimer = new Timer(_ =>
                 {
                     try { File.SetLastWriteTimeUtc(_path, DateTime.UtcNow); }
-                    catch { }
+                    catch (Exception ex) { _log.Debug("Lock refresh failed: " + ex.Message); }
                 }, null, refresh, refresh);
             }
             catch (Exception ex)
@@ -93,7 +100,7 @@ namespace TicTack
                     _handle = null;
                     if (File.Exists(_path)) File.Delete(_path);
                 }
-                catch { }
+                catch (Exception ex) { _log.Debug("Lock release failed: " + ex.Message); }
             }
         }
     }

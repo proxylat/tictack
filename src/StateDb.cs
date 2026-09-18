@@ -12,12 +12,14 @@ namespace TicTack
     {
         private SqliteConnection _conn = null!;
         private readonly string _dbPath;
+        private readonly ILogger? _log;
         private readonly SemaphoreSlim _gate = new SemaphoreSlim(1, 1);
         private bool _disposed;
 
-        public StateDb(string dbPath)
+        public StateDb(string dbPath, ILogger? log = null)
         {
             _dbPath = dbPath;
+            _log = log;
             var dir = Path.GetDirectoryName(dbPath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
@@ -32,28 +34,7 @@ namespace TicTack
                 try { _conn.Close(); } catch { }
                 _conn.Dispose();
             }
-            _conn = new SqliteConnection("Data Source=" + _dbPath);
-            _conn.Open();
-
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "PRAGMA journal_mode=WAL";
-                cmd.ExecuteNonQuery();
-            }
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "PRAGMA cache_size = -500";
-                cmd.ExecuteNonQuery();
-            }
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = @"CREATE TABLE IF NOT EXISTS state (
-                    path TEXT PRIMARY KEY,
-                    size INTEGER NOT NULL,
-                    mtime INTEGER NOT NULL
-                )";
-                cmd.ExecuteNonQuery();
-            }
+            _conn = SqliteBootstrap.Open(_dbPath, SqliteSchema.State);
         }
 
         void EnsureConnected()
@@ -67,22 +48,27 @@ namespace TicTack
                     cmd.ExecuteScalar();
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 var root = Path.GetPathRoot(_dbPath);
-                if (!string.IsNullOrEmpty(root) &&
-                    !DriveInfo.GetDrives().Any(d => d.Name.StartsWith(root, StringComparison.OrdinalIgnoreCase) && d.IsReady))
+                if (!string.IsNullOrEmpty(root) && !DriveGuard.IsReady(root))
+                {
+                    _log?.Warn("StateDb drive not ready, reconnect skipped: " + _dbPath);
                     return;
+                }
 
+                Exception? last = ex;
                 for (int i = 0; i < 5; i++)
                 {
                     try { Reconnect(); return; }
-                    catch
+                    catch (Exception retryEx)
                     {
+                        last = retryEx;
                         if (i < 4)
                             Thread.Sleep((int)Math.Pow(2, i) * 1000);
                     }
                 }
+                _log?.Warn("StateDb reconnect failed after 5 attempts: " + _dbPath + " (" + last?.Message + ")");
             }
         }
 
@@ -97,22 +83,27 @@ namespace TicTack
                     await cmd.ExecuteScalarAsync().ConfigureAwait(false);
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 var root = Path.GetPathRoot(_dbPath);
-                if (!string.IsNullOrEmpty(root) &&
-                    !DriveInfo.GetDrives().Any(d => d.Name.StartsWith(root, StringComparison.OrdinalIgnoreCase) && d.IsReady))
+                if (!string.IsNullOrEmpty(root) && !DriveGuard.IsReady(root))
+                {
+                    _log?.Warn("StateDb drive not ready, reconnect skipped: " + _dbPath);
                     return;
+                }
 
+                Exception? last = ex;
                 for (int i = 0; i < 5; i++)
                 {
                     try { await ReconnectAsync().ConfigureAwait(false); return; }
-                    catch
+                    catch (Exception retryEx)
                     {
+                        last = retryEx;
                         if (i < 4)
                             await Task.Delay((int)Math.Pow(2, i) * 1000).ConfigureAwait(false);
                     }
                 }
+                _log?.Warn("StateDb reconnect failed after 5 attempts: " + _dbPath + " (" + last?.Message + ")");
             }
         }
 
@@ -143,28 +134,7 @@ namespace TicTack
                 try { _conn.Close(); } catch { }
                 _conn.Dispose();
             }
-            _conn = new SqliteConnection("Data Source=" + _dbPath);
-            await _conn.OpenAsync().ConfigureAwait(false);
-
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "PRAGMA journal_mode=WAL";
-                await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-            }
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "PRAGMA cache_size = -500";
-                await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-            }
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = @"CREATE TABLE IF NOT EXISTS state (
-                    path TEXT PRIMARY KEY,
-                    size INTEGER NOT NULL,
-                    mtime INTEGER NOT NULL
-                )";
-                await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-            }
+            _conn = await SqliteBootstrap.OpenAsync(_dbPath, SqliteSchema.State).ConfigureAwait(false);
         }
 
         public Dictionary<string, (long size, long mtime)> LoadAll()
@@ -199,7 +169,7 @@ namespace TicTack
             try
             {
                 await EnsureConnectedAsync().ConfigureAwait(false);
-                var result = new Dictionary<string, (long, long)>(CountInternal(), StringComparer.OrdinalIgnoreCase);
+                var result = new Dictionary<string, (long, long)>(await CountInternalAsync().ConfigureAwait(false), StringComparer.OrdinalIgnoreCase);
                 using (var cmd = _conn.CreateCommand())
                 {
                     cmd.CommandText = "SELECT path, size, mtime FROM state";
@@ -321,8 +291,11 @@ namespace TicTack
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
                 {
-                    cmd.CommandText = "UPDATE state SET path = @new || SUBSTR(path, LENGTH(@old) + 1) WHERE path LIKE @old || @sep || '%'";
+                    // ESCAPE: a renamed folder like "My_Documents" must not let
+                    // _ or % match unrelated rows.
+                    cmd.CommandText = "UPDATE state SET path = @new || SUBSTR(path, LENGTH(@old) + 1) WHERE path LIKE @oldLike || @sep || '%' ESCAPE '\\'";
                     cmd.Parameters.AddWithValue("@old", oldPrefix);
+                    cmd.Parameters.AddWithValue("@oldLike", EscapeLike(oldPrefix));
                     cmd.Parameters.AddWithValue("@new", newPrefix);
                     cmd.Parameters.AddWithValue("@sep", sep.ToString());
                     cmd.ExecuteNonQuery();
@@ -341,8 +314,11 @@ namespace TicTack
                 await EnsureConnectedAsync().ConfigureAwait(false);
                 using (var cmd = _conn.CreateCommand())
                 {
-                    cmd.CommandText = "UPDATE state SET path = @new || SUBSTR(path, LENGTH(@old) + 1) WHERE path LIKE @old || @sep || '%'";
+                    // ESCAPE: a renamed folder like "My_Documents" must not let
+                    // _ or % match unrelated rows.
+                    cmd.CommandText = "UPDATE state SET path = @new || SUBSTR(path, LENGTH(@old) + 1) WHERE path LIKE @oldLike || @sep || '%' ESCAPE '\\'";
                     cmd.Parameters.AddWithValue("@old", oldPrefix);
+                    cmd.Parameters.AddWithValue("@oldLike", EscapeLike(oldPrefix));
                     cmd.Parameters.AddWithValue("@new", newPrefix);
                     cmd.Parameters.AddWithValue("@sep", sep.ToString());
                     await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
@@ -427,6 +403,19 @@ namespace TicTack
             }
         }
 
+        private async Task<int> CountInternalAsync()
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT COUNT(*) FROM state";
+                var count = (long)(await cmd.ExecuteScalarAsync().ConfigureAwait(false) ?? 0L);
+                return count > 1_000_000 ? 1_000_000 : (int)count;
+            }
+        }
+
+        private static string EscapeLike(string value) =>
+            value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+
         public void Clear()
         {
             Enter();
@@ -451,7 +440,8 @@ namespace TicTack
                 _disposed = true;
                 if (_conn != null)
                 {
-                    _conn.Close();
+                    try { _conn.Close(); }
+                    catch (Exception ex) { _log?.Warn("StateDb close failed: " + ex.Message); }
                     _conn.Dispose();
                 }
             }

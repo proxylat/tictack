@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -40,9 +41,9 @@ namespace TicTack
                 var syncRoot = Path.GetDirectoryName(_versionBase.TrimEnd('\\', '/'));
                 string relDir;
                 if (dir != null && syncRoot != null && dir.StartsWith(syncRoot, StringComparison.OrdinalIgnoreCase))
-                    relDir = dir.Substring(syncRoot.Length).TrimStart('\\', '/');
+                    relDir = PathUtil.Relative(dir, syncRoot);
                 else if (dir != null && dir.StartsWith(_destBase, StringComparison.OrdinalIgnoreCase))
-                    relDir = dir.Substring(_destBase.Length).TrimStart('\\', '/');
+                    relDir = PathUtil.Relative(dir, _destBase);
                 else
                     relDir = "";
                 var verDir = string.IsNullOrEmpty(relDir) ? _versionBase : Path.Combine(_versionBase, relDir);
@@ -50,16 +51,35 @@ namespace TicTack
                 var temp = verFile + ".tictack.tmp";
 
                 Directory.CreateDirectory(verDir);
-                using (var input = File.OpenRead(PathUtil.EnsureExtended(destPath)))
-                using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                try
                 {
-                    input.CopyTo(output);
-                    output.Flush(true);
+                    using (var input = File.OpenRead(PathUtil.EnsureExtended(destPath)))
+                    using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    {
+                        input.CopyTo(output);
+                        output.Flush(true);
+                    }
+                    // Same post-write validation as the copy and archive paths:
+                    // never trust a version file that was not verified.
+                    if (!FileHasher.SameContent(destPath, temp))
+                        throw new IOException("Version validation failed: " + destPath);
+                    File.Move(temp, verFile);
                 }
-                File.Move(temp, verFile);
+                finally
+                {
+                    try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+                }
 
-                // delete oldest versions beyond the cap
-                var files = Directory.GetFiles(verDir, name + "_*" + ext);
+                // delete oldest versions beyond the cap. Match by prefix/suffix
+                // instead of a glob: file names may contain * ? or [.
+                var files = Directory.GetFiles(verDir)
+                    .Where(f =>
+                    {
+                        var fileName = Path.GetFileName(f);
+                        return fileName.StartsWith(name + "_", StringComparison.Ordinal)
+                            && fileName.EndsWith(ext, StringComparison.Ordinal);
+                    })
+                    .ToArray();
                 if (files.Length > _maxVersions)
                 {
                     Array.Sort(files, StringComparer.Ordinal);

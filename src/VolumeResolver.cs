@@ -18,13 +18,17 @@ namespace TicTack
 
         public static string Resolve(string path)
         {
-            return Resolve(path, GetVolumes());
+            return Resolve(path, BuildVolumeMap(GetVolumes(null)));
         }
 
         internal static string Resolve(string path, IEnumerable<(string label, string root)> volumes)
         {
+            return Resolve(path, BuildVolumeMap(volumes));
+        }
+
+        private static string Resolve(string path, Dictionary<string, string> map)
+        {
             if (string.IsNullOrEmpty(path)) return path;
-            var map = BuildVolumeMap(volumes);
             if (map.Count == 0) return path;
             return VolumePattern.Replace(path, m =>
             {
@@ -33,44 +37,47 @@ namespace TicTack
             });
         }
 
-        public static void ResolveConfig(TicTackConfig cfg)
+        public static void ResolveConfig(TicTackConfig cfg, ILogger? log = null)
         {
-            ResolveConfig(cfg, GetVolumes());
+            ResolveConfig(cfg, GetVolumes(log));
         }
 
         internal static void ResolveConfig(TicTackConfig cfg, IEnumerable<(string label, string root)> volumes)
         {
             if (cfg == null || cfg.Sources == null) return;
 
+            // Build the map once per config instead of once per path.
+            var map = BuildVolumeMap(volumes);
+
             foreach (var src in cfg.Sources)
             {
-                src.Path = Resolve(src.Path, volumes);
+                src.Path = Resolve(src.Path, map);
                 for (var i = 0; i < src.Paths.Count; i++)
-                    src.Paths[i] = Resolve(src.Paths[i], volumes);
-                src.Destination = Resolve(src.Destination, volumes);
-                src.StateDbPath = Resolve(src.StateDbPath, volumes);
+                    src.Paths[i] = Resolve(src.Paths[i], map);
+                src.Destination = Resolve(src.Destination, map);
+                src.StateDbPath = Resolve(src.StateDbPath, map);
                 if (src.Sync != null && src.Sync.Versioning != null && src.Sync.Versioning.Path != null)
-                    src.Sync.Versioning.Path = Resolve(src.Sync.Versioning.Path, volumes);
+                    src.Sync.Versioning.Path = Resolve(src.Sync.Versioning.Path, map);
                 if (src.Sync != null && src.Sync.Deletion != null && src.Sync.Deletion.Path != null)
-                    src.Sync.Deletion.Path = Resolve(src.Sync.Deletion.Path, volumes);
+                    src.Sync.Deletion.Path = Resolve(src.Sync.Deletion.Path, map);
             }
 
             if (cfg.Logging != null && cfg.Logging.Path != null)
-                cfg.Logging.Path = Resolve(cfg.Logging.Path, volumes);
+                cfg.Logging.Path = Resolve(cfg.Logging.Path, map);
             if (cfg.Logging != null && cfg.Logging.AlertPath != null)
-                cfg.Logging.AlertPath = Resolve(cfg.Logging.AlertPath, volumes);
+                cfg.Logging.AlertPath = Resolve(cfg.Logging.AlertPath, map);
 
             foreach (var job in cfg.Jobs ?? Enumerable.Empty<JobConfig>())
             {
                 if (job.WorkingDir != null)
-                    job.WorkingDir = Resolve(job.WorkingDir, volumes);
+                    job.WorkingDir = Resolve(job.WorkingDir, map);
             }
 
             if (cfg.ExternalDrives != null && cfg.ExternalDrives.WorkingDir != null)
-                cfg.ExternalDrives.WorkingDir = Resolve(cfg.ExternalDrives.WorkingDir, volumes);
+                cfg.ExternalDrives.WorkingDir = Resolve(cfg.ExternalDrives.WorkingDir, map);
         }
 
-        private static IEnumerable<(string label, string root)> GetVolumes()
+        private static IEnumerable<(string label, string root)> GetVolumes(ILogger? log)
         {
             try
             {
@@ -79,7 +86,11 @@ namespace TicTack
                     .Select(d => (d.VolumeLabel, d.RootDirectory.FullName.TrimEnd('\\')))
                     .ToList();
             }
-            catch { return Array.Empty<(string label, string root)>(); }
+            catch (Exception ex)
+            {
+                log?.Warn("Volume table unavailable, [Label] paths left unresolved: " + ex.Message);
+                return Array.Empty<(string label, string root)>();
+            }
         }
 
         private static Dictionary<string, string> BuildVolumeMap(IEnumerable<(string label, string root)> volumes)

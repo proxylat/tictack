@@ -34,6 +34,15 @@ public class FilterTests
     }
 
     [Fact]
+    public void PatternFilter_CaseSensitivity_IsOsAware()
+    {
+        var filter = new PatternFilter(new[] { "*.txt" });
+        var path = Path.Combine(Path.GetTempPath(), "REPORT.TXT");
+        // Windows matches case-insensitively (blocked); Linux is exact (processed).
+        Assert.Equal(!OperatingSystem.IsWindows(), filter.ShouldProcess(path));
+    }
+
+    [Fact]
     public void PatternFilter_NullPatterns_ProcessesAll()
     {
         var filter = new PatternFilter(null!);
@@ -136,5 +145,22 @@ public class FilterTests
     {
         var filter = new CompositeFilter(null!);
         Assert.True(filter.ShouldProcess(@"C:\any\file.txt"));
+    }
+
+    [Fact]
+    public void PathPrefixFilter_ExcludesSubtreeOnly()
+    {
+        var filter = new PathPrefixFilter("/home/user/Sync");
+        Assert.False(filter.ShouldProcess("/home/user/Sync/file.txt"));
+        // Sibling sharing the prefix must still be processed.
+        Assert.True(filter.ShouldProcess("/home/user/Sync2/file.txt"));
+    }
+
+    [Fact]
+    public void PathPrefixFilter_CaseSensitivity_IsOsAware()
+    {
+        var filter = new PathPrefixFilter("/home/user/Sync");
+        var path = "/home/user/sync/file.txt";
+        Assert.Equal(!OperatingSystem.IsWindows(), filter.ShouldProcess(path));
     }
 }

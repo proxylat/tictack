@@ -32,19 +32,22 @@ namespace TicTack
         private Task? _processor;
         private Task<bool>? _initialSync;
         private readonly List<Task> _deferredTasks = new List<Task>();
-        private readonly List<Task> _backgroundTasks = new List<Task>();
         private readonly object _taskLock = new object();
         private Timer? _startRetryTimer;
         private Timer? _deferredCheckTimer;
         private SrcLock? _lock;
         private readonly StateDb? _stateDb;
         private readonly DeferredDeletion _deferred;
+        private readonly TrackedDeleter _deleter;
+        private readonly ParityScanner _parityScanner;
         private readonly Func<string, bool> _directoryExists;
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateFiles;
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateDirectories;
         private readonly Func<string, bool> _driveReady;
         private readonly List<PendingDeletion> _pendingDeletions = new List<PendingDeletion>();
         private Timer? _parityTimer;
+        private EventHandler<MonitorErrorEventArgs>? _monitorErrorHandler;
+        private volatile bool _parityRequested;
         private bool _disposed;
 
         public SyncPipeline(
@@ -80,7 +83,7 @@ namespace TicTack
             _directoryExists = directoryExists ?? Directory.Exists;
             _enumerateFiles = enumerateFiles ?? ((path, option) => Directory.EnumerateFiles(path, "*", option));
             _enumerateDirectories = enumerateDirectories ?? ((path, option) => Directory.EnumerateDirectories(path, "*", option));
-            _driveReady = driveReady ?? (path => IsDriveReady(path));
+            _driveReady = driveReady ?? (path => DriveGuard.IsReady(path));
             // Capture the queue itself, not `this`: a constructor that throws
             // after this point would otherwise leak the whole pipeline through
             // the static EventSource's counter callback.
@@ -99,59 +102,8 @@ namespace TicTack
             if (maxSize.HasValue && maxSize.Value > 0)
                 filters.Add(new SizeFilter(maxSize.Value));
             _filter = filters.Count > 0 ? new CompositeFilter(filters) : null;
-        }
-
-        // Mount-table snapshot cache: GetDrives()+IsReady costs ~218us/26KB per
-        // call, and the initial sync probes once per file. Fail-closed TTL:
-        // a vanished drive reports ready for at most 30s (copy then errors),
-        // a fresh drive waits at most 30s (start-retry loop covers it).
-        private static readonly Func<DriveInfo[]> _defaultDriveProbe = static () => DriveInfo.GetDrives();
-        private static readonly object _driveCacheLock = new();
-        private static List<(string Root, bool Ready)>? _driveCache;
-        private static DateTime _driveCacheAt;
-        private static Func<DriveInfo[]>? _driveCacheProbe;
-
-        private static List<(string Root, bool Ready)> GetCachedDrives(Func<DriveInfo[]>? getDrives)
-        {
-            getDrives ??= _defaultDriveProbe;
-            lock (_driveCacheLock)
-            {
-                if (_driveCache != null && ReferenceEquals(_driveCacheProbe, getDrives)
-                    && DateTime.UtcNow - _driveCacheAt < TimeSpan.FromSeconds(30))
-                    return _driveCache;
-                _driveCache = getDrives()
-                    .Select(d =>
-                    {
-                        bool ready;
-                        try { ready = d.IsReady; } catch { ready = false; }
-                        return (d.RootDirectory.FullName, ready);
-                    })
-                    .ToList();
-                _driveCacheAt = DateTime.UtcNow;
-                _driveCacheProbe = getDrives;
-                return _driveCache;
-            }
-        }
-
-        internal static bool IsDriveReady(string path, Func<DriveInfo[]>? getDrives = null)
-        {
-            try
-            {
-                var fullPath = Path.GetFullPath(path);
-                var mounts = GetCachedDrives(getDrives)
-                    .Where(d => d.Ready && fullPath.StartsWith(d.Root, StringComparison.OrdinalIgnoreCase))
-                    .OrderByDescending(d => d.Root.Length)
-                    .ToList();
-                if (mounts.Count == 0) return false;
-                if (OperatingSystem.IsLinux() && mounts[0].Root == "/"
-                    && (fullPath == "/srv" || fullPath.StartsWith("/srv/", StringComparison.Ordinal)
-                        || fullPath == "/mnt" || fullPath.StartsWith("/mnt/", StringComparison.Ordinal)
-                        || fullPath == "/media" || fullPath.StartsWith("/media/", StringComparison.Ordinal)
-                        || fullPath.StartsWith("/run/media/", StringComparison.Ordinal)))
-                    return false;
-                return true;
-            }
-            catch { return false; }
+            _deleter = new TrackedDeleter(_deletion, _stateDb, _log);
+            _parityScanner = new ParityScanner(_config, _filter, _directoryExists, _enumerateFiles, _enumerateDirectories, _deleter, _log);
         }
 
         public void Start()
@@ -182,14 +134,14 @@ namespace TicTack
         {
             // Start is not re-entrant: a second call would replace the CTS,
             // double-subscribe the monitor, and launch duplicate workers.
-            // Worse, the duplicate DoStart would block forever in SrcLock
-            // (null retry timeout retries every 5s with no deadline).
+            // Worse, the duplicate DoStart would block in SrcLock acquisition.
             if (_started) return;
             _started = true;
             var lockTimeout = _config.Sync != null && _config.Sync.LockHandling == "retry"
                 ? (TimeSpan?)TimeSpan.FromMinutes(_config.Sync.RetryLockMinutes > 0 ? _config.Sync.RetryLockMinutes : 10)
                 : null;
-            try { Directory.CreateDirectory(_config.Destination); } catch { }
+            try { Directory.CreateDirectory(_config.Destination); }
+            catch (Exception ex) { _log.Debug("Destination create failed: " + ex.Message); }
             _lock = new SrcLock(Path.Combine(_config.Destination, ".tictack.lock"), _log, lockTimeout);
             if (!_lock.IsHeld)
             {
@@ -200,7 +152,8 @@ namespace TicTack
                 return;
             }
             _monitor.Changed += OnChanged;
-            _monitor.Error += (s, e) => _log.Error("Monitor error", e.Exception);
+            _monitorErrorHandler = (s, e) => _log.Error("Monitor error", e.Exception);
+            _monitor.Error += _monitorErrorHandler;
             _monitor.Start();
             if (startWorkers) StartWorkers();
             _log.Debug("Started: " + _config.Path + " -> " + _config.Destination);
@@ -265,7 +218,7 @@ namespace TicTack
         {
             _debounce[e.FullPath] = DateTime.UtcNow.AddSeconds(_config.DebounceSeconds);
             _pendingEvents[e.FullPath] = e;
-            try { _signal.Release(); } catch (SemaphoreFullException) { }
+            _signal.Release();
         }
 
         private async Task ProcessLoop()
@@ -289,6 +242,15 @@ namespace TicTack
                 }
                 else
                 {
+                    if (_parityRequested)
+                    {
+                        // Runs on the processor thread so parity never races
+                        // live copies (a file copied mid-scan was being seen
+                        // as destination-only and deleted).
+                        _parityRequested = false;
+                        await _parityScanner.EnforceAsync(token);
+                        continue;
+                    }
                     SweepDebounced();
                     await FlushPendingDeletions(token);
                     await WaitForSignal(token);
@@ -339,7 +301,7 @@ namespace TicTack
                         _pendingEvents[path] = new FileChangedEventArgs(ChangeType.Deleted, path);
                     else
                         continue;
-                    try { _signal.Release(); } catch (SemaphoreFullException) { }
+                    _signal.Release();
                 }
             }
         }
@@ -396,7 +358,7 @@ namespace TicTack
                             Interlocked.Exchange(ref scanFailed, 1);
                             return;
                         }
-                        var rel = f.Substring(_config.Path.Length).TrimStart('\\', '/');
+                        var rel = PathUtil.Relative(f, _config.Path);
                         sourcePaths.TryAdd(rel, 0);
                         var dst = Path.Combine(_config.Destination, rel);
 
@@ -421,7 +383,7 @@ namespace TicTack
                         var e = new FileChangedEventArgs(ChangeType.Created, f);
                         var args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                         var fresh = await ExecuteCopyAsync(args,
-                            (a, c) => _copyAction.ExecuteAsync(a, c),
+                            CopyWithRetryAsync,
                             "Initial sync failed", "Initial sync validation FAILED", token);
                         if (fresh == null) return;
 
@@ -449,7 +411,7 @@ namespace TicTack
                     _log.Warn("Initial source scan incomplete, parity cleanup blocked: " + _config.Path);
                     return false;
                 }
-                await EnforceParityAsync(new HashSet<string>(sourcePaths.Keys, StringComparer.OrdinalIgnoreCase), _cts!.Token);
+                await _parityScanner.EnforceAsync(new HashSet<string>(sourcePaths.Keys, StringComparer.OrdinalIgnoreCase), _cts!.Token);
             }
             catch (UnauthorizedAccessException) { _log.Warn("Access denied scanning " + _config.Path); return false; }
             catch (PathTooLongException) { _log.Warn("Path too long scanning " + _config.Path); return false; }
@@ -487,7 +449,19 @@ namespace TicTack
                 return null;
             }
 
-            var result = await copy(args, ct);
+            ActionResult result;
+            try
+            {
+                result = await copy(args, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // Retryable failures surface here after the retry budget is
+                // exhausted; keep the caller's original log label.
+                _log.Error(failLabel + ": " + src + ": " + ex.Message);
+                return null;
+            }
             if (!result.Success)
             {
                 _log.Error(failLabel + ": " + src + ": " + result.ErrorMessage);
@@ -507,6 +481,15 @@ namespace TicTack
             }
             return freshSnapshot;
         }
+
+        private Task<ActionResult> CopyWithRetryAsync(FileActionArgs args, CancellationToken ct) =>
+            _retry.ExecuteAsync(async () =>
+            {
+                var copyResult = await _copyAction.ExecuteAsync(args, ct);
+                if (!copyResult.Success && copyResult.Retryable)
+                    throw new IOException(copyResult.ErrorMessage);
+                return copyResult;
+            }, ct);
 
         private async Task WaitForSignal(CancellationToken token)
         {
@@ -536,11 +519,12 @@ namespace TicTack
                             _log.Warn("Source folder missing, deletion blocked: " + e.FullPath);
                             break;
                         }
-                        var delRel = e.FullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
+                        var delRel = PathUtil.Relative(e.FullPath, _config.Path);
                         long size = 0;
                         if (_stateDb != null)
                         {
-                            try { size = await _stateDb.GetSizeAsync(delRel) ?? 0; } catch { }
+                            try { size = await _stateDb.GetSizeAsync(delRel) ?? 0; }
+                            catch (Exception ex) { _log.Warn("StateDb size lookup failed, using destination size: " + ex.Message); }
                         }
                         _pendingDeletions.Add(new PendingDeletion { Path = e.FullPath, DestPath = args.DestPath, SizeBytes = size });
                         break;
@@ -548,12 +532,20 @@ namespace TicTack
                     case ChangeType.Renamed:
                         await FlushPendingDeletions(ct);
                         if (args.OldDestPath != null && (File.Exists(args.OldDestPath) || _directoryExists(args.OldDestPath)))
-                            await _retry.ExecuteAsync(() => _renameAction.ExecuteAsync(args, ct), ct);
+                        {
+                            await _retry.ExecuteAsync(async () =>
+                            {
+                                var renameResult = await _renameAction.ExecuteAsync(args, ct);
+                                if (!renameResult.Success && renameResult.Retryable)
+                                    throw new IOException(renameResult.ErrorMessage);
+                                return renameResult;
+                            }, ct);
+                        }
                         if (_stateDb != null)
                         {
-                            var oldRel = e.OldFullPath!.Substring(_config.Path.Length).TrimStart('\\', '/');
-                            var newRel = e.FullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
-                        if (_directoryExists(e.FullPath))
+                            var oldRel = PathUtil.Relative(e.OldFullPath!, _config.Path);
+                            var newRel = PathUtil.Relative(e.FullPath, _config.Path);
+                            if (_directoryExists(e.FullPath))
                             {
                                 await _stateDb.DeleteAsync(oldRel);
                                 await _stateDb.UpdatePrefixAsync(oldRel, newRel);
@@ -581,13 +573,14 @@ namespace TicTack
                         await FlushPendingDeletions(ct);
                         if (!File.Exists(e.FullPath))
                         {
-                        if (_directoryExists(e.FullPath))
+                            if (_directoryExists(e.FullPath))
                                 return;
                             if (File.Exists(args.DestPath))
                             {
-                                var deletionResult = await _deletion.HandleDeletionAsync(e.FullPath, args.DestPath, ct);
-                                if (!deletionResult.Success)
-                                    _log.Error("Deletion failed: " + args.DestPath + ": " + deletionResult.ErrorMessage);
+                                // Route through TrackedDeleter so the state row is
+                                // removed too; a stale row inflates CountAsync and
+                                // skews the percent delete guard's denominator.
+                                await _deleter.DeleteAsync(e.FullPath, args.DestPath, PathUtil.Relative(e.FullPath, _config.Path), "Deletion failed", ct);
                             }
                             return;
                         }
@@ -600,7 +593,7 @@ namespace TicTack
                         if (_comparer.AreEqual(e.FullPath, args.DestPath, sourceSnapshot)) return;
 
                         var fresh = await ExecuteCopyAsync(args,
-                            (a, c) => _retry.ExecuteAsync(() => _copyAction.ExecuteAsync(a, c), c),
+                            CopyWithRetryAsync,
                             "Copy failed", "Validation FAILED", ct);
                         if (fresh == null) return;
                         var freshSnapshot = fresh.Value;
@@ -608,7 +601,7 @@ namespace TicTack
                         {
                             try
                             {
-                                var rel = e.FullPath.Substring(_config.Path.Length).TrimStart('\\', '/');
+                                var rel = PathUtil.Relative(e.FullPath, _config.Path);
                                 await _stateDb.UpsertAsync(rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks);
                             }
                             catch (Exception ex) { _log.Debug("StateDb update skipped: " + ex.Message); }
@@ -629,6 +622,11 @@ namespace TicTack
             _started = false;
             if (_cts != null) _cts.Cancel();
             _monitor.Changed -= OnChanged;
+            if (_monitorErrorHandler != null)
+            {
+                _monitor.Error -= _monitorErrorHandler;
+                _monitorErrorHandler = null;
+            }
             _monitor.Stop();
             _startRetryTimer?.Dispose();
             _deferredCheckTimer?.Dispose();
@@ -638,7 +636,6 @@ namespace TicTack
             if (_processor != null) tasks.Add(_processor);
             if (_initialSync != null) tasks.Add(_initialSync);
             lock (_taskLock) tasks.AddRange(_deferredTasks);
-            lock (_taskLock) tasks.AddRange(_backgroundTasks);
             try { await Task.WhenAll(tasks); }
             catch (OperationCanceledException) { }
             catch (Exception ex) { _log.Error("Pipeline shutdown worker failed", ex); }
@@ -674,13 +671,32 @@ namespace TicTack
 
             int totalCount = batch.Count;
             long totalSize = 0;
-            foreach (var d in batch) totalSize += d.SizeBytes;
+            foreach (var d in batch)
+            {
+                // The state lookup can be unavailable; the destination file
+                // still has the size the guard needs.
+                if (d.SizeBytes == 0)
+                {
+                    try
+                    {
+                        var fi = new FileInfo(PathUtil.EnsureExtended(d.DestPath));
+                        if (fi.Exists) d.SizeBytes = fi.Length;
+                    }
+                    catch (Exception ex) { _log.Debug("Delete size probe failed for " + d.DestPath + ": " + ex.Message); }
+                }
+                totalSize += d.SizeBytes;
+            }
 
             long stateCount = 0;
+            var countKnown = true;
             if (_stateDb != null)
             {
                 try { stateCount = await _stateDb.CountAsync(); }
-                catch { _log.Debug("StateDb count failed"); }
+                catch (Exception ex)
+                {
+                    countKnown = false;
+                    _log.Error("StateDb count failed, percent delete guard cannot be evaluated: " + ex.Message);
+                }
             }
             bool blocked = false;
             string? reason = null;
@@ -696,6 +712,13 @@ namespace TicTack
                 blocked = true;
                 reason = (totalSize / (1024L * 1024L)) + " MB deleted >= threshold " + _config.Sync.DeleteThresholdSizeGb.Value + " GB";
             }
+            else if (_config.Sync != null && _config.Sync.DeleteThresholdPercent > 0 && !countKnown)
+            {
+                // Fail closed: without a baseline the percent guard cannot be
+                // evaluated, so the batch is held instead of deleted.
+                blocked = true;
+                reason = "StateDb count unavailable, percent guard cannot be evaluated";
+            }
             else if (_config.Sync != null && _config.Sync.DeleteThresholdPercent > 0 && stateCount > 50
                 && (double)totalCount / stateCount * 100 >= _config.Sync.DeleteThresholdPercent)
             {
@@ -708,171 +731,23 @@ namespace TicTack
             {
                 _log.Error("Delete guard: " + reason + ". Deferring.");
                 var files = batch.ConvertAll(d => d.Path);
-                _deferred.RecordPending(files, totalSize, _config.Path);
+                _deferred.RecordPending(files, _config.Path);
                 ArmDeferredCheckTimer();
                 return;
             }
 
             foreach (var d in batch)
             {
-                var deletionResult = await _deletion.HandleDeletionAsync(d.Path, d.DestPath, ct);
-                if (!deletionResult.Success)
-                {
-                    _log.Error("Deletion failed: " + d.DestPath + ": " + deletionResult.ErrorMessage);
-                    continue;
-                }
-                if (_stateDb != null)
-                {
-                    try
-                    {
-                        var rel = d.Path.Substring(_config.Path.Length).TrimStart('\\', '/');
-                        await _stateDb.DeleteAsync(rel);
-                    }
-                    catch (Exception ex) { _log.Debug("StateDb delete failed: " + ex.Message); }
-                }
+                await _deleter.DeleteAsync(d.Path, d.DestPath, PathUtil.Relative(d.Path, _config.Path), "Deletion failed", ct);
             }
             _log.Debug("Deleted: " + batch.Count + " files");
         }
 
         private void QueueParityCheck()
         {
-            var token = _cts?.Token;
-            if (!token.HasValue || token.Value.IsCancellationRequested || _disposed) return;
-            Task task;
-            lock (_taskLock)
-            {
-                if (_cts == null || _cts.IsCancellationRequested || _disposed)
-                    return;
-                task = Task.Run(() => EnforceParityAsync(token.Value), token.Value);
-                _backgroundTasks.Add(task);
-            }
-            _ = task.ContinueWith(t =>
-            {
-                lock (_taskLock) _backgroundTasks.Remove(task);
-                if (t.IsFaulted && t.Exception != null)
-                    _log.Error("Parity worker failed", t.Exception.GetBaseException());
-            }, TaskScheduler.Default);
-        }
-
-        async Task EnforceParityAsync(CancellationToken ct)
-        {
-            if (_disposed) return;
-            var sourcePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (!_directoryExists(_config.Path))
-            {
-                _log.Warn("Source folder missing, parity cleanup blocked: " + _config.Path);
-                return;
-            }
-            try
-            {
-                foreach (var f in _enumerateFiles(_config.Path, SearchOption.AllDirectories))
-                {
-                    if (ct.IsCancellationRequested) return;
-                    if (_filter != null && !_filter.ShouldProcess(f)) continue;
-                    var rel = f.Substring(_config.Path.Length).TrimStart('\\', '/');
-                    sourcePaths.Add(rel);
-                }
-            }
-            catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException || ex is DirectoryNotFoundException)
-            {
-                _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message);
-                return;
-            }
-            await EnforceParityAsync(sourcePaths, ct);
-        }
-
-        static bool UnderDir(string path, string prefix)
-        {
-            return path.StartsWith(prefix + '/', StringComparison.OrdinalIgnoreCase)
-                || path.StartsWith(prefix + '\\', StringComparison.OrdinalIgnoreCase);
-        }
-
-        async Task EnforceParityAsync(HashSet<string> sourcePaths, CancellationToken ct)
-        {
-            if (_disposed || !_directoryExists(_config.Destination)) return;
-
-            var staleFiles = new List<(string path, string rel)>();
-            try
-            {
-                foreach (var f in _enumerateFiles(_config.Destination, SearchOption.AllDirectories))
-                {
-                    if (ct.IsCancellationRequested) return;
-                    var name = Path.GetFileName(f);
-                    if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
-                    var rel = f.Substring(_config.Destination.Length).TrimStart('\\', '/');
-                    if (UnderDir(rel, ".archive") || UnderDir(rel, ".versions")) continue;
-                    if (sourcePaths.Contains(rel)) continue;
-                    staleFiles.Add((f, rel));
-                }
-            }
-            catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException || ex is DirectoryNotFoundException)
-            {
-                _log.Warn("Destination scan incomplete, parity cleanup blocked: " + ex.Message);
-                return;
-            }
-
-            if (staleFiles.Count > 0)
-            {
-                foreach (var sf in staleFiles)
-                {
-                    var deletionResult = await _deletion.HandleDeletionAsync(null, sf.path, ct);
-                    if (!deletionResult.Success)
-                    {
-                        _log.Error("Parity deletion failed: " + sf.path + ": " + deletionResult.ErrorMessage);
-                        continue;
-                    }
-                    if (_stateDb != null)
-                    {
-                        try { await _stateDb.DeleteAsync(sf.rel); }
-                        catch (Exception ex) { _log.Debug("StateDb parity delete failed: " + ex.Message); }
-                    }
-                }
-                _log.Info("Cleanup: archived " + staleFiles.Count + " stale files");
-            }
-
-            var sourceDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in sourcePaths)
-            {
-                var parent = Path.GetDirectoryName(file);
-                while (!string.IsNullOrEmpty(parent) && parent != ".")
-                {
-                    sourceDirectories.Add(parent);
-                    parent = Path.GetDirectoryName(parent);
-                }
-            }
-
-            IEnumerable<string> destinationDirectories;
-            try
-            {
-                destinationDirectories = _enumerateDirectories(_config.Destination, SearchOption.AllDirectories)
-                    .OrderByDescending(d => d.Length).ToList();
-            }
-            catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException || ex is DirectoryNotFoundException)
-            {
-                _log.Warn("Destination directory scan incomplete, parity cleanup blocked: " + ex.Message);
-                return;
-            }
-            foreach (var dir in destinationDirectories)
-            {
-                if (ct.IsCancellationRequested) return;
-                var rel = dir.Substring(_config.Destination.Length).TrimStart('\\', '/');
-                if (rel == ".archive" || UnderDir(rel, ".archive")) continue;
-                if (rel == ".versions" || UnderDir(rel, ".versions")) continue;
-                if (rel == ".tictack.lock") continue;
-                if (sourceDirectories.Contains(rel)) continue;
-                _log.Info("Cleanup: removing stale dir " + dir);
-                var deletionResult = await _deletion.HandleDeletionAsync(null, dir, ct);
-                if (!deletionResult.Success)
-                {
-                    _log.Error("Parity deletion failed: " + dir + ": " + deletionResult.ErrorMessage);
-                    continue;
-                }
-                if (_stateDb != null)
-                {
-                    try { await _stateDb.DeleteAsync(rel); }
-                    catch (Exception ex) { _log.Debug("StateDb parity dir delete failed: " + ex.Message); }
-                }
-            }
+            if (_disposed || _cts == null || _cts.IsCancellationRequested) return;
+            _parityRequested = true;
+            _signal.Release();
         }
 
         private void ArmDeferredCheckTimer()
@@ -885,7 +760,7 @@ namespace TicTack
 
         private void CheckDeferredDeletions()
         {
-            if (_deferred == null || !_deferred.HasPending) return;
+            if (!_deferred.HasPending) return;
 
             var action = _deferred.Check();
             if (action.Type == DeferredActionType.Proceed)
@@ -895,22 +770,9 @@ namespace TicTack
                 {
                     foreach (var f in action.Files!)
                     {
-                        var destPath = Path.Combine(_config.Destination, f.Substring(_config.Path.Length).TrimStart('\\', '/'));
-                        var deletionResult = await _deletion.HandleDeletionAsync(f, destPath, CancellationToken.None);
-                        if (!deletionResult.Success)
-                        {
-                            _log.Error("Deferred deletion failed: " + destPath + ": " + deletionResult.ErrorMessage);
-                            continue;
-                        }
-                        if (_stateDb != null)
-                        {
-                            try
-                            {
-                                var rel = f.Substring(_config.Path.Length).TrimStart('\\', '/');
-                                await _stateDb.DeleteAsync(rel);
-                            }
-                            catch (Exception ex) { _log.Debug("StateDb deferred delete failed: " + ex.Message); }
-                        }
+                        var rel = PathUtil.Relative(f, _config.Path);
+                        var destPath = Path.Combine(_config.Destination, rel);
+                        await _deleter.DeleteAsync(f, destPath, rel, "Deferred deletion failed", CancellationToken.None);
                     }
                 });
                 lock (_taskLock) _deferredTasks.Add(task);

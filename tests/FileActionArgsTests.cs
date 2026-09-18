@@ -52,6 +52,17 @@ public class FileActionArgsTests
     }
 
     [Fact]
+    public void SiblingPathSharingPrefix_IsNotMapped()
+    {
+        // /a/src must not swallow /a/src2 — the destination would silently
+        // become the source path and a later move could relocate the source.
+        var e = new FileChangedEventArgs(ChangeType.Created, @"C:\src2\file.txt", null);
+        var args = new FileActionArgs(e, @"C:\src", @"D:\dst");
+
+        Assert.Equal(@"C:\src2\file.txt", args.DestPath);
+    }
+
+    [Fact]
     public void HandlesRootDest()
     {
         var e = new FileChangedEventArgs(ChangeType.Created, @"C:\src\file.txt", null);

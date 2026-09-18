@@ -13,6 +13,10 @@ namespace TicTack
         private readonly ILogger _log;
         private readonly object _lock = new object();
         private DeferredState? _state;
+        // Windows paths are case-insensitive; Linux is not, so 'a.txt' and
+        // 'A.txt' must both stay in the pending set there.
+        private static readonly StringComparer PathComparer =
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
         public DeferredDeletion(string dbPath, int holdDays, ILogger log)
         {
@@ -22,7 +26,7 @@ namespace TicTack
             Load();
         }
 
-        public void RecordPending(List<string> files, long totalSizeBytes, string? sourceRoot = null)
+        public void RecordPending(IEnumerable<string> files, string? sourceRoot = null)
         {
             lock (_lock)
             {
@@ -34,20 +38,29 @@ namespace TicTack
                 if (_state.PendingFiles == null)
                     _state.PendingFiles = new List<string>();
                 var pending = _state.PendingFiles;
-                var seen = new HashSet<string>(pending, StringComparer.OrdinalIgnoreCase);
+                var wasEmpty = pending.Count == 0;
+                var seen = new HashSet<string>(pending, PathComparer);
+                var added = new List<string>();
                 foreach (var f in files)
                 {
                     if (seen.Add(f))
+                    {
                         pending.Add(f);
+                        added.Add(f);
+                    }
                 }
 
-                _state.TotalSizeBytes += totalSizeBytes;
                 _state.SourceRoot = sourceRoot;
-                _state.BlockedAt = DateTime.UtcNow;
-                _state.LastWarningAt = DateTime.MinValue;
+                // Keep the earliest hold start: resetting it on every blocked
+                // batch would restart the clock for already-aged entries.
+                if (wasEmpty)
+                {
+                    _state.BlockedAt = DateTime.UtcNow;
+                    _state.LastWarningAt = DateTime.MinValue;
+                }
                 Save();
                 _log.Warn("Deferred deletion: " + pending.Count + " files, hold for " + _holdDays + " days");
-                LogSample(files);
+                if (added.Count > 0) LogSample(added);
             }
         }
 
@@ -56,7 +69,7 @@ namespace TicTack
             lock (_lock)
             {
                 if (_state == null || _state.PendingFiles == null || _state.PendingFiles.Count == 0)
-                    return DeferredAction.None;
+                    return new DeferredAction { Type = DeferredActionType.None };
 
                 var elapsed = (DateTime.UtcNow - _state.BlockedAt).TotalDays;
 
@@ -69,14 +82,21 @@ namespace TicTack
                         _state.LastWarningAt = DateTime.UtcNow;
                         Save();
                     }
-                    return DeferredAction.Waiting;
+                    return new DeferredAction { Type = DeferredActionType.Waiting };
                 }
 
                 var filesStillDeleted = new List<string>();
                 if (!string.IsNullOrEmpty(_state.SourceRoot) && !Directory.Exists(_state.SourceRoot))
                 {
-                    _log.Warn("Deferred deletion: source unavailable, holding pending deletions");
-                    return DeferredAction.Waiting;
+                    // Same 1/day throttle as the hold branch: the pipeline
+                    // rechecks hourly and must not warn every hour.
+                    if ((DateTime.UtcNow - _state.LastWarningAt).TotalDays >= 1)
+                    {
+                        _log.Warn("Deferred deletion: source unavailable, holding pending deletions");
+                        _state.LastWarningAt = DateTime.UtcNow;
+                        Save();
+                    }
+                    return new DeferredAction { Type = DeferredActionType.Waiting };
                 }
                 foreach (var f in _state.PendingFiles)
                 {
@@ -87,8 +107,7 @@ namespace TicTack
                 var result = new DeferredAction
                 {
                     Type = filesStillDeleted.Count > 0 ? DeferredActionType.Proceed : DeferredActionType.Cancel,
-                    Files = filesStillDeleted,
-                    TotalSizeBytes = _state.TotalSizeBytes
+                    Files = filesStillDeleted
                 };
 
                 if (filesStillDeleted.Count > 0)
@@ -161,7 +180,6 @@ namespace TicTack
             public DateTime BlockedAt { get; set; }
             public DateTime LastWarningAt { get; set; }
             public List<string>? PendingFiles { get; set; }
-            public long TotalSizeBytes { get; set; }
             public string? SourceRoot { get; set; }
         }
     }
@@ -170,10 +188,6 @@ namespace TicTack
     {
         public DeferredActionType Type { get; set; }
         public List<string>? Files { get; set; }
-        public long TotalSizeBytes { get; set; }
-
-        public static readonly DeferredAction None = new DeferredAction { Type = DeferredActionType.None };
-        public static readonly DeferredAction Waiting = new DeferredAction { Type = DeferredActionType.Waiting };
     }
 
     public enum DeferredActionType

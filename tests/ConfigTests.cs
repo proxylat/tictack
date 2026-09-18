@@ -247,6 +247,75 @@ logging:
     }
 
     [Fact]
+    public void Validate_RejectsDuplicateDestination()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = "/tmp/tt-src-a", Destination = "/tmp/tt-dst" });
+        cfg.Sources.Add(new SourceConfig { Path = "/tmp/tt-src-b", Destination = "/tmp/tt-dst" });
+        var log = new RecordingLogger();
+
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("same destination"));
+    }
+
+    [Fact]
+    public void Validate_CaseDistinctPaths_OverlapIsOsAware()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = "/tmp/tt-Data", Destination = "/tmp/tt-data/sub" });
+        var log = new RecordingLogger();
+
+        // Linux is case-sensitive, so these are not overlapping.
+        bool valid = Config.Validate(cfg, log);
+        Assert.Equal(!OperatingSystem.IsWindows(), valid);
+    }
+
+    [Fact]
+    public void Validate_RejectsInvalidFileSizeLimit()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig
+        {
+            Path = "/tmp/tt-src",
+            Destination = "/tmp/tt-dst",
+            Filter = new FilterConfig { MaxFileSizeMb = "abc" }
+        });
+        var log = new RecordingLogger();
+
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("max_file_size_mb"));
+    }
+
+    [Fact]
+    public void Validate_RejectsUnknownMonitorType()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = "/tmp/tt-src", Destination = "/tmp/tt-dst" });
+        cfg.Monitor = new MonitorConfig { Type = "watchr" };
+        var log = new RecordingLogger();
+
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("monitor.type"));
+    }
+
+    [Fact]
+    public void Validate_ReportsPathAndPathsConflict()
+    {
+        var yaml = "sources:\n  - path: '/tmp/tt-src'\n    paths:\n      - '/tmp/tt-other'\n    destination: '/tmp/tt-dst'\n";
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, yaml);
+            var cfg = Config.Load(path)!;
+            var log = new RecordingLogger();
+
+            Assert.False(Config.Validate(cfg, log));
+            Assert.Contains(log.Messages, m => m.Contains("both 'path' and 'paths'"));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
     public void DefaultValues_AreSet()
     {
         Assert.Equal(10.0, new SourceConfig().DebounceSeconds);

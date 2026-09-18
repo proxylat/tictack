@@ -129,10 +129,9 @@ public class ComparerTests : IDisposable
     }
 
     [Fact]
-    public void Factory_DefaultsToDateSize()
+    public void Factory_ThrowsOnUnknownLevel()
     {
-        var comparer = ComparerFactory.Create((VerificationLevel)999);
-        Assert.IsType<DateSizeComparer>(comparer);
+        Assert.Throws<ArgumentOutOfRangeException>(() => ComparerFactory.Create((VerificationLevel)999));
     }
 
     [Fact]

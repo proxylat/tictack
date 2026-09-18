@@ -44,4 +44,43 @@ public class PathUtilTests
         var path = "/data/" + new string('x', 300);
         Assert.Equal(path, PathUtil.EnsureExtended(path, false));
     }
+
+    [Fact]
+    public void WindowsBranch_UncLongPath_GetsUncPrefix()
+    {
+        var path = @"\\server\share\" + new string('x', 260);
+        Assert.Equal(@"\\?\UNC\server\share\" + new string('x', 260), PathUtil.EnsureExtended(path, true));
+    }
+
+    [Fact]
+    public void WindowsBranch_LongRelativePath_Untouched()
+    {
+        var path = new string('x', 300) + @"\file.txt";
+        Assert.Equal(path, PathUtil.EnsureExtended(path, true));
+    }
+
+    [Fact]
+    public void Relative_TrimsRootPrefix()
+    {
+        Assert.Equal("sub/file.txt", PathUtil.Relative("/a/b/sub/file.txt", "/a/b").Replace('\\', '/'));
+    }
+
+    [Fact]
+    public void Relative_ExactRoot_ReturnsEmpty()
+    {
+        Assert.Equal("", PathUtil.Relative("/a/b", "/a/b"));
+    }
+
+    [Fact]
+    public void Relative_BoundaryMismatch_ReturnsPathUnchanged()
+    {
+        // /a/src must not swallow /a/src2.
+        Assert.Equal("/a/src2/f.txt", PathUtil.Relative("/a/src2/f.txt", "/a/src"));
+    }
+
+    [Fact]
+    public void Relative_TrailingSeparatorRoot_StillTrims()
+    {
+        Assert.Equal("f.txt", PathUtil.Relative("/a/b/f.txt", "/a/b/"));
+    }
 }

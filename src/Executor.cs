@@ -21,6 +21,7 @@ namespace TicTack
         private readonly IFileAccessor _accessor;
         private readonly bool _fullDurability;
         private readonly Action<CopyCheckpoint>? _checkpoint;
+        private readonly ILogger? _log;
 
         [DllImport("libc", EntryPoint = "open", SetLastError = true)]
         static extern int OpenDirectory(string path, int flags);
@@ -42,16 +43,17 @@ namespace TicTack
 
         const uint FSCTL_SET_SPARSE = 0x000900C4;
 
-        public CopyAction(IFileAccessor accessor, bool fullDurability = true)
-            : this(accessor, fullDurability, null)
+        public CopyAction(IFileAccessor accessor, bool fullDurability = true, ILogger? log = null)
+            : this(accessor, fullDurability, null, log)
         {
         }
 
-        internal CopyAction(IFileAccessor accessor, bool fullDurability, Action<CopyCheckpoint>? checkpoint)
+        internal CopyAction(IFileAccessor accessor, bool fullDurability, Action<CopyCheckpoint>? checkpoint, ILogger? log = null)
         {
             _accessor = accessor;
             _fullDurability = fullDurability;
             _checkpoint = checkpoint;
+            _log = log;
         }
 
         public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
@@ -74,7 +76,8 @@ namespace TicTack
                 double copyMs = -1;
 
                 var isSparse = false;
-                try { isSparse = (File.GetAttributes(src) & FileAttributes.SparseFile) == FileAttributes.SparseFile; } catch { }
+                try { isSparse = (File.GetAttributes(src) & FileAttributes.SparseFile) == FileAttributes.SparseFile; }
+                catch (Exception ex) { _log?.Debug("Sparse attribute probe failed for " + src + ": " + ex.Message); }
 
                 using (var srcStream = _accessor.OpenRead(src))
                 using (var dstStream = File.Create(tmp))
@@ -116,7 +119,12 @@ namespace TicTack
                     if (sourceSnapshot.HasValue)
                         File.SetLastWriteTimeUtc(tmp, sourceSnapshot.Value.LastWriteTimeUtc);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    // Without the source mtime the destination re-copies on
+                    // every date/size comparison; never fail the copy for it.
+                    _log?.Warn("Could not preserve source timestamp on " + dst + ": " + ex.Message);
+                }
 
                 _checkpoint?.Invoke(CopyCheckpoint.BeforeCommit);
                 if (File.Exists(dst))
@@ -142,8 +150,10 @@ namespace TicTack
             catch (DirectoryNotFoundException ex) { return ActionResult.Fail(ex.Message); }
             catch (PathTooLongException ex) { return ActionResult.Fail(ex.Message); }
             catch (NotSupportedException ex) { return ActionResult.Fail(ex.Message); }
-            catch (IOException ex) { return ActionResult.Fail(ex.Message); }
-            catch (Win32Exception ex) { return ActionResult.Fail(ex.Message); }
+            // Retryable: sharing violations and transient IO. Pipeline unwraps
+            // these into ExponentialBackoffRetry.
+            catch (IOException ex) { return ActionResult.Fail(ex.Message, retryable: true); }
+            catch (Win32Exception ex) { return ActionResult.Fail(ex.Message, retryable: true); }
         }
 
         static bool FlushDirectory(string? path)
@@ -173,12 +183,15 @@ namespace TicTack
             if (args.OldDestPath == null)
                 return ActionResult.Ok();
 
+            var oldDest = PathUtil.EnsureExtended(args.OldDestPath);
+            var dest = PathUtil.EnsureExtended(args.DestPath);
+
             try
             {
-                if (Directory.Exists(args.OldDestPath))
+                if (Directory.Exists(oldDest))
                 {
-                    if (!Directory.Exists(args.DestPath))
-                        Directory.Move(args.OldDestPath, args.DestPath);
+                    if (!Directory.Exists(dest))
+                        Directory.Move(oldDest, dest);
                     else
                     {
                         // Collision: the old-name tree holds destination-only content.
@@ -191,18 +204,22 @@ namespace TicTack
                             return ActionResult.Fail(msg);
                         }
                         var deleted = await _deletion.HandleDeletionAsync(null, args.OldDestPath, ct);
-                        if (!deleted.Success) return deleted;
+                        if (!deleted.Success)
+                        {
+                            _log?.Error("Rename cleanup failed: " + args.OldDestPath + ": " + deleted.ErrorMessage);
+                            return deleted;
+                        }
                         // The strategy consumed the old tree (mirror deletes, archive
                         // moves it aside); move only if something is left to move.
-                        if (Directory.Exists(args.OldDestPath))
-                            Directory.Move(args.OldDestPath, args.DestPath);
+                        if (Directory.Exists(oldDest))
+                            Directory.Move(oldDest, dest);
                     }
                 }
-                else if (File.Exists(args.OldDestPath))
+                else if (File.Exists(oldDest))
                 {
-                    var dir = Path.GetDirectoryName(args.DestPath);
+                    var dir = Path.GetDirectoryName(dest);
                     if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                    if (File.Exists(args.DestPath))
+                    if (File.Exists(dest))
                     {
                         if (_deletion == null)
                         {
@@ -211,13 +228,28 @@ namespace TicTack
                             return ActionResult.Fail(msg);
                         }
                         var deleted = await _deletion.HandleDeletionAsync(null, args.DestPath, ct);
-                        if (!deleted.Success) return deleted;
+                        if (!deleted.Success)
+                        {
+                            _log?.Error("Rename cleanup failed: " + args.DestPath + ": " + deleted.ErrorMessage);
+                            return deleted;
+                        }
                     }
-                    File.Move(args.OldDestPath, args.DestPath);
+                    File.Move(oldDest, dest);
                 }
+            }
+            catch (IOException ex)
+            {
+                _log?.Error("Rename failed: " + args.OldDestPath + " -> " + args.DestPath + ": " + ex.Message);
+                return ActionResult.Fail(ex.Message, retryable: true);
+            }
+            catch (Win32Exception ex)
+            {
+                _log?.Error("Rename failed: " + args.OldDestPath + " -> " + args.DestPath + ": " + ex.Message);
+                return ActionResult.Fail(ex.Message, retryable: true);
             }
             catch (Exception ex)
             {
+                _log?.Error("Rename failed: " + args.OldDestPath + " -> " + args.DestPath + ": " + ex.Message);
                 return ActionResult.Fail(ex.Message);
             }
             return ActionResult.Ok();

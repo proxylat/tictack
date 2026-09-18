@@ -195,6 +195,39 @@ public class StateDbTests : IDisposable
         Assert.Equal((3L, 30L), all["other/c.txt"]);
     }
 
+    [Fact]
+    public void UpdatePrefix_WildcardChars_DoNotMatchUnrelatedRows()
+    {
+        _db.Upsert("a_b/keep.txt", 1, 10);
+        _db.Upsert("aXb/keep.txt", 2, 20);
+        _db.Upsert("a%b/keep.txt", 3, 30);
+        _db.Upsert("aZZb/keep.txt", 4, 40);
+
+        _db.UpdatePrefix("a_b", "new_under");
+        _db.UpdatePrefix("a%b", "new_pct");
+
+        var all = _db.LoadAll();
+        // '_' and '%' are LIKE metacharacters: without ESCAPE this rewrites
+        // aXb/aZZb too (and can collide into a UNIQUE constraint failure).
+        Assert.Equal((1L, 10L), all["new_under/keep.txt"]);
+        Assert.Equal((3L, 30L), all["new_pct/keep.txt"]);
+        Assert.Equal((2L, 20L), all["aXb/keep.txt"]);
+        Assert.Equal((4L, 40L), all["aZZb/keep.txt"]);
+    }
+
+    [Fact]
+    public async Task UpdatePrefixAsync_WildcardChars_DoNotMatchUnrelatedRows()
+    {
+        await _db.UpsertAsync("a_b/keep.txt", 1, 10);
+        await _db.UpsertAsync("aXb/keep.txt", 2, 20);
+
+        await _db.UpdatePrefixAsync("a_b", "new");
+
+        var all = await _db.LoadAllAsync();
+        Assert.Equal((1L, 10L), all["new/keep.txt"]);
+        Assert.Equal((2L, 20L), all["aXb/keep.txt"]);
+    }
+
     private void BreakConnection()
     {
         var field = typeof(StateDb).GetField("_conn", BindingFlags.NonPublic | BindingFlags.Instance);

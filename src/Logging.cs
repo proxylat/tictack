@@ -210,16 +210,45 @@ namespace TicTack
 
     public static class LogLevelParser
     {
-        public static LogLevel Parse(string? level, LogLevel defaultLevel = LogLevel.Info)
+        public static LogLevel Parse(string? level, LogLevel defaultLevel = LogLevel.Info) =>
+            TryParse(level, out var parsed) ? parsed : defaultLevel;
+
+        public static bool IsValid(string? level) => TryParse(level, out _);
+
+        // Single token table: Parse and IsValid cannot drift.
+        private static bool TryParse(string? level, out LogLevel result)
         {
             switch (level != null ? level.ToLowerInvariant() : null)
             {
-                case "debug": return LogLevel.Debug;
-                case "info": return LogLevel.Info;
-                case "warn": case "warning": return LogLevel.Warn;
-                case "error": return LogLevel.Error;
-                default: return defaultLevel;
+                case "debug": result = LogLevel.Debug; return true;
+                case "info": result = LogLevel.Info; return true;
+                case "warn": case "warning": result = LogLevel.Warn; return true;
+                case "error": result = LogLevel.Error; return true;
+                default: result = LogLevel.Info; return false;
             }
+        }
+    }
+
+    // Single owner for the logger stack: Program.Main and TicTackService had
+    // drifted (desktop-alert level, default log directory, EventLog condition).
+    internal static class LoggerFactory
+    {
+        public static ILogger Create(LoggingConfig cfg, string defaultLogDir, bool console, bool eventLog)
+        {
+            var level = LogLevelParser.Parse(cfg.Level);
+            var logPath = string.IsNullOrEmpty(cfg.Path) ? Path.Combine(defaultLogDir, "tictack.log") : cfg.Path;
+            var loggers = new List<ILogger>
+            {
+                new BufferedLogger(new FileLogger(logPath, level, cfg.MaxSizeMb, cfg.MaxFiles))
+            };
+            if (console) loggers.Add(new ConsoleLogger(level));
+            // Alerts are a Warn/Error channel per the documented contract.
+            loggers.Add(new DesktopAlertLogger(LogLevel.Warn, cfg.AlertPath));
+            if (eventLog) loggers.Add(new EventLogLogger());
+            var log = new MultiLogger(loggers);
+            if (!string.IsNullOrEmpty(cfg.Level) && !LogLevelParser.IsValid(cfg.Level))
+                log.Warn("Unknown logging.level '" + cfg.Level + "', using " + level);
+            return log;
         }
     }
 }

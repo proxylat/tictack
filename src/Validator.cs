@@ -10,55 +10,34 @@ namespace TicTack
         {
             switch (level)
             {
+                case VerificationLevel.Size:
+                case VerificationLevel.DateAndSize:
+                    return new SizeValidator();
                 case VerificationLevel.Hash:
                 case VerificationLevel.Full:
                     return new HashValidator(accessor);
-                default: return new SizeValidator();
+                default: throw new ArgumentOutOfRangeException(nameof(level), level, "Unknown verification level");
             }
         }
     }
 
+    // Validation mirrors comparison; the validators wrap the comparers instead
+    // of duplicating their bodies (the two had drifted as copy-paste twins).
     public class SizeValidator : IValidator
     {
-        public Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
-        {
-            try
-            {
-                var source = sourceSnapshot;
-                if (!source.HasValue)
-                {
-                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return Task.FromResult(false);
-                    source = current;
-                }
-                var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                return Task.FromResult(dInfo.Exists && source.Value.Length == dInfo.Length);
-            }
-            catch { return Task.FromResult(false); }
-        }
+        private readonly SizeComparer _comparer = new SizeComparer();
+
+        public Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null) =>
+            Task.FromResult(_comparer.AreEqual(sourcePath, destPath, sourceSnapshot));
     }
 
     public class HashValidator : IValidator
     {
-        private readonly IFileAccessor? _accessor;
-        public HashValidator(IFileAccessor? accessor = null) { _accessor = accessor; }
+        private readonly HashComparer _comparer;
 
-        public Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
-        {
-            try
-            {
-                var source = sourceSnapshot;
-                if (!source.HasValue)
-                {
-                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return Task.FromResult(false);
-                    source = current;
-                }
-                var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
-                if (!dInfo.Exists || source.Value.Length != dInfo.Length) return Task.FromResult(false);
-                var srcHash = FileHasher.ComputeHex(sourcePath, _accessor);
-                var dstHash = FileHasher.ComputeHex(destPath, _accessor);
-                return Task.FromResult(srcHash == dstHash);
-            }
-            catch { return Task.FromResult(false); }
-        }
+        public HashValidator(IFileAccessor? accessor = null) { _comparer = new HashComparer(accessor); }
+
+        public Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null) =>
+            Task.FromResult(_comparer.AreEqual(sourcePath, destPath, sourceSnapshot));
     }
 }

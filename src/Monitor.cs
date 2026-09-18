@@ -178,15 +178,8 @@ namespace TicTack
 
         internal void RescanNow() => Rescan();
 
-        private void Rescan()
-        {
-            try
-            {
-                foreach (var file in Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories))
-                    FireChanged(ChangeType.Modified, file);
-            }
-            catch (Exception ex) { FireError(ex); }
-        }
+        private void Rescan() =>
+            MonitorRescan.FireModifiedFiles(_path, FireError, (t, p) => FireChanged(t, p));
 
         private void FlushRename()
         {
@@ -203,7 +196,7 @@ namespace TicTack
             if (h != null)
             {
                 try { h(this, new FileChangedEventArgs(type, path, oldPath)); }
-                catch { }
+                catch (Exception ex) { FireError(ex); }
             }
         }
 
@@ -237,13 +230,30 @@ namespace TicTack
             }
             if (_worker != null && _worker.IsAlive)
             {
-                if (!_worker.Join(3000))
-                    _worker.Interrupt();
+                // CancelIoEx above is the mechanism that unblocks the worker;
+                // Thread.Interrupt cannot interrupt native ReadDirectoryChangesW
+                // and would leave a pending interrupt behind.
+                _worker.Join(3000);
                 _worker = null;
             }
         }
 
         public void Dispose() => Stop();
+    }
+
+    // Shared by the two watcher implementations: report every existing file as
+    // Modified so a missed event or overflow is recovered by a normal compare.
+    internal static class MonitorRescan
+    {
+        internal static void FireModifiedFiles(string path, Action<Exception> onError, Action<ChangeType, string> fire)
+        {
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+                    fire(ChangeType.Modified, file);
+            }
+            catch (Exception ex) { onError(ex); }
+        }
     }
 
     public class PollingMonitor : IFileMonitor
@@ -256,7 +266,8 @@ namespace TicTack
         // allocate (and later discard) two full per-file dictionaries per tick.
         // Both dictionaries keep their capacity; detection logic is unchanged.
         private Dictionary<string, FileSnapshot>? _scratch;
-        private string _prefix;
+        private readonly string _prefix;
+        private int _scanning;
 
         public event EventHandler<FileChangedEventArgs>? Changed;
         public event EventHandler<MonitorErrorEventArgs>? Error;
@@ -270,6 +281,7 @@ namespace TicTack
 
         public void Start()
         {
+            Stop();
             _timer = new Timer(_ => Poll(), null, _intervalSec * 1000, _intervalSec * 1000);
         }
 
@@ -277,63 +289,73 @@ namespace TicTack
 
         private void Poll()
         {
+            // Timer callbacks can overlap when a scan outruns the interval;
+            // skip the tick instead of mutating the shared dictionaries twice.
+            if (Interlocked.Exchange(ref _scanning, 1) == 1) return;
             try
             {
-                if (_snapshot == null) { _snapshot = new Dictionary<string, FileSnapshot>(StringComparer.Ordinal); ScanInto(_snapshot); return; }
+                if (_snapshot == null) { _snapshot = new Dictionary<string, FileSnapshot>(StringComparer.Ordinal); ScanInto(_snapshot, null); return; }
                 _scratch ??= new Dictionary<string, FileSnapshot>(_snapshot.Count, StringComparer.Ordinal);
                 _scratch.Clear();
-                ScanInto(_scratch);
-                var current = _scratch;
                 var prev = _snapshot;
+                ScanInto(_scratch, prev);
+                var current = _scratch;
 
                 foreach (var kv in current)
                 {
                     if (!prev.TryGetValue(kv.Key, out var oldSnap))
-                    {
-                        var handler = Changed;
-                        if (handler != null)
-                            handler(this, new FileChangedEventArgs(ChangeType.Created, _prefix + kv.Key));
-                    }
+                        FireChanged(ChangeType.Created, _prefix + kv.Key);
                     else if (!oldSnap.Equals(kv.Value))
-                    {
-                        var handler = Changed;
-                        if (handler != null)
-                            handler(this, new FileChangedEventArgs(ChangeType.Modified, _prefix + kv.Key));
-                    }
+                        FireChanged(ChangeType.Modified, _prefix + kv.Key);
                 }
                 foreach (var kv in prev)
                 {
                     if (!current.ContainsKey(kv.Key))
-                    {
-                        var handler = Changed;
-                        if (handler != null)
-                            handler(this, new FileChangedEventArgs(ChangeType.Deleted, _prefix + kv.Key));
-                    }
+                        FireChanged(ChangeType.Deleted, _prefix + kv.Key);
                 }
 
                 _snapshot = current;
                 _scratch = prev;
             }
-            catch (Exception ex)
-            {
-                var handler = Error;
-                if (handler != null)
-                    handler(this, new MonitorErrorEventArgs(ex));
-            }
+            catch (Exception ex) { FireError(ex); }
+            finally { Interlocked.Exchange(ref _scanning, 0); }
         }
 
-        private void ScanInto(Dictionary<string, FileSnapshot> result)
+        private void FireChanged(ChangeType type, string path)
+        {
+            var handler = Changed;
+            if (handler == null) return;
+            try { handler(this, new FileChangedEventArgs(type, path)); }
+            catch (Exception ex) { FireError(ex); }
+        }
+
+        private void FireError(Exception ex)
+        {
+            var handler = Error;
+            if (handler == null) return;
+            try { handler(this, new MonitorErrorEventArgs(ex)); }
+            catch { }
+        }
+
+        private void ScanInto(Dictionary<string, FileSnapshot> result, Dictionary<string, FileSnapshot>? previous)
         {
             if (!Directory.Exists(_path)) return;
-            var prefix = _path.EndsWith(Path.DirectorySeparatorChar) ? _path : _path + Path.DirectorySeparatorChar;
             foreach (var f in Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories))
             {
+                var key = f.Substring(_prefix.Length);
                 try
                 {
                     var info = new FileInfo(f);
-                    result[f.Substring(prefix.Length)] = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks);
+                    result[key] = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks);
                 }
-                catch { }
+                catch
+                {
+                    // A failed stat must not look like a deletion: carry the
+                    // previous snapshot forward so no spurious Deleted event
+                    // can reach the delete guard.
+                    if (previous != null && previous.TryGetValue(key, out var prev))
+                        result[key] = prev;
+                }
             }
         }
 
@@ -356,6 +378,7 @@ namespace TicTack
     public class CompositeMonitor : IFileMonitor
     {
         private readonly IFileMonitor[] _monitors;
+        private readonly List<(IFileMonitor Monitor, EventHandler<FileChangedEventArgs> Changed, EventHandler<MonitorErrorEventArgs> Error)> _wired = new();
 
         public CompositeMonitor(params IFileMonitor[] monitors)
         {
@@ -367,26 +390,28 @@ namespace TicTack
 
         public void Start()
         {
+            // Idempotent: re-subscribing forwarding lambdas on a second Start
+            // would double-deliver every child event.
+            Stop();
             foreach (var m in _monitors)
             {
-                m.Changed += (s, e) =>
-                {
-                    var handler = Changed;
-                    if (handler != null)
-                        handler(s, e);
-                };
-                m.Error += (s, e) =>
-                {
-                    var handler = Error;
-                    if (handler != null)
-                        handler(s, e);
-                };
+                EventHandler<FileChangedEventArgs> changed = (s, e) => Changed?.Invoke(s, e);
+                EventHandler<MonitorErrorEventArgs> error = (s, e) => Error?.Invoke(s, e);
+                m.Changed += changed;
+                m.Error += error;
+                _wired.Add((m, changed, error));
                 m.Start();
             }
         }
 
         public void Stop()
         {
+            foreach (var (m, changed, error) in _wired)
+            {
+                m.Changed -= changed;
+                m.Error -= error;
+            }
+            _wired.Clear();
             foreach (var m in _monitors) m.Stop();
         }
 
@@ -405,6 +430,7 @@ namespace TicTack
         private readonly int _restartDelaySec;
         private FileSystemWatcher? _watcher;
         private volatile bool _stopping;
+        private readonly object _gate = new();
 
         public event EventHandler<FileChangedEventArgs>? Changed;
         public event EventHandler<MonitorErrorEventArgs>? Error;
@@ -418,85 +444,89 @@ namespace TicTack
 
         public void Start()
         {
-            _stopping = false;
+            lock (_gate) { _stopping = false; }
             StartWatcher();
         }
 
         private void StartWatcher()
         {
-            var watcher = new FileSystemWatcher(_path)
+            lock (_gate)
             {
-                IncludeSubdirectories = true,
-                InternalBufferSize = _bufferSize,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime
-            };
-            watcher.Created += (s, e) => FireChanged(ChangeType.Created, e.FullPath);
-            watcher.Changed += (s, e) => FireChanged(ChangeType.Modified, e.FullPath);
-            watcher.Deleted += (s, e) => FireChanged(ChangeType.Deleted, e.FullPath);
-            watcher.Renamed += (s, e) => FireChanged(ChangeType.Renamed, e.FullPath, e.OldFullPath);
-            watcher.Error += (s, e) =>
-            {
-                var handler = Error;
-                if (handler != null)
-                    handler(this, new MonitorErrorEventArgs(e.GetException()));
-                if (!_stopping)
+                // Stop() may have won the race while the restart thread slept.
+                if (_stopping) return;
+                var watcher = new FileSystemWatcher(_path)
                 {
-                    var t = new Thread(() =>
+                    IncludeSubdirectories = true,
+                    InternalBufferSize = _bufferSize,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime
+                };
+                watcher.Created += (s, e) => FireChanged(ChangeType.Created, e.FullPath);
+                watcher.Changed += (s, e) => FireChanged(ChangeType.Modified, e.FullPath);
+                watcher.Deleted += (s, e) => FireChanged(ChangeType.Deleted, e.FullPath);
+                watcher.Renamed += (s, e) => FireChanged(ChangeType.Renamed, e.FullPath, e.OldFullPath);
+                watcher.Error += (s, e) =>
+                {
+                    FireError(e.GetException());
+                    if (!_stopping)
                     {
-                        try { watcher.Dispose(); } catch { }
-                        Rescan();
-                        while (!_stopping)
+                        var t = new Thread(() =>
                         {
-                            Thread.Sleep(_restartDelaySec * 1000);
-                            if (_stopping) return;
-                            try { StartWatcher(); return; }
-                            catch (Exception ex)
+                            try { watcher.Dispose(); } catch { }
+                            Rescan();
+                            while (!_stopping)
                             {
-                                var eh = Error;
-                                if (eh != null)
-                                    eh(this, new MonitorErrorEventArgs(ex));
+                                Thread.Sleep(_restartDelaySec * 1000);
+                                if (_stopping) return;
+                                try { StartWatcher(); return; }
+                                catch (Exception ex) { FireError(ex); }
                             }
-                        }
-                    });
-                    t.IsBackground = true;
-                    t.Start();
-                }
-            };
-            _watcher = watcher;
-            watcher.EnableRaisingEvents = true;
+                        });
+                        t.IsBackground = true;
+                        t.Start();
+                    }
+                };
+                _watcher = watcher;
+                watcher.EnableRaisingEvents = true;
+            }
         }
 
         internal void RescanNow() => Rescan();
 
-        private void Rescan()
-        {
-            try
-            {
-                foreach (var file in Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories))
-                    FireChanged(ChangeType.Modified, file);
-            }
-            catch (Exception ex)
-            {
-                var handler = Error;
-                if (handler != null)
-                    handler(this, new MonitorErrorEventArgs(ex));
-            }
-        }
+        private void Rescan() =>
+            MonitorRescan.FireModifiedFiles(_path, FireError, (t, p) => FireChanged(t, p));
 
         private void FireChanged(ChangeType type, string path, string? oldPath = null)
         {
             if (_stopping) return;
             var handler = Changed;
             if (handler != null)
-                handler(this, new FileChangedEventArgs(type, path, oldPath));
+            {
+                // Contain a throwing subscriber the same way FileWatcherMonitor
+                // does, so one bad handler cannot abort dispatch.
+                try { handler(this, new FileChangedEventArgs(type, path, oldPath)); }
+                catch (Exception ex) { FireError(ex); }
+            }
+        }
+
+        private void FireError(Exception ex)
+        {
+            var handler = Error;
+            if (handler != null)
+            {
+                try { handler(this, new MonitorErrorEventArgs(ex)); }
+                catch { }
+            }
         }
 
         public void Stop()
         {
-            _stopping = true;
-            try { _watcher?.EnableRaisingEvents = false; } catch { }
-            try { _watcher?.Dispose(); } catch { }
-            _watcher = null;
+            lock (_gate)
+            {
+                _stopping = true;
+                try { _watcher?.EnableRaisingEvents = false; } catch { }
+                try { _watcher?.Dispose(); } catch { }
+                _watcher = null;
+            }
         }
 
         public void Dispose()

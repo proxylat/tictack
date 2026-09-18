@@ -15,8 +15,14 @@ namespace TicTack
         public WatchdogConfig Watchdog { get; set; }
         public ExternalDrivesConfig ExternalDrives { get; set; }
 
+        // Populated by ExpandPathsList for problems that are only visible
+        // during expansion; Validate reports them.
+        [YamlIgnore]
+        public List<string> Errors { get; set; }
+
         public TicTackConfig()
         {
+            Errors = new List<string>();
             Sources = new List<SourceConfig>();
             Monitor = new MonitorConfig();
             Logging = new LoggingConfig();
@@ -189,7 +195,9 @@ namespace TicTack
 
         public ExternalDrivesConfig()
         {
-            Command = "restic.exe backup --compression auto \"{source}\" -r \"{drive}\\restic-repo\"";
+            Command = OperatingSystem.IsWindows()
+                ? "restic.exe backup --compression auto \"{source}\" -r \"{drive}\\restic-repo\""
+                : "restic backup --compression auto \"{source}\" -r \"{drive}/restic-repo\"";
             ExcludeDrives = new List<string>();
             RequireMarkerFile = true;
             MarkerFileName = ".tictack-target";
@@ -223,6 +231,20 @@ namespace TicTack
                 return false;
             }
             bool valid = true;
+            if (cfg.Errors != null)
+            {
+                foreach (var err in cfg.Errors)
+                {
+                    log.Error(err);
+                    valid = false;
+                }
+            }
+            if (cfg.Monitor != null && !IsValidMonitorType(cfg.Monitor.Type))
+            {
+                log.Error("monitor.type must be 'watcher', 'polling', or 'composite' (got: " + (cfg.Monitor.Type ?? "null") + ")");
+                valid = false;
+            }
+            var destinations = new Dictionary<string, string>(PathComparer);
             foreach (var src in cfg.Sources)
             {
                 if (string.IsNullOrEmpty(src.Path))
@@ -241,9 +263,12 @@ namespace TicTack
                     {
                         var source = Path.GetFullPath(src.Path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                         var destination = Path.GetFullPath(src.Destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                        if (source.Equals(destination, StringComparison.OrdinalIgnoreCase)
-                            || destination.StartsWith(source + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                            || source.StartsWith(destination + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                        // Case-sensitive on Linux, where two paths differing only
+                        // in case are genuinely different directories.
+                        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                        if (source.Equals(destination, cmp)
+                            || destination.StartsWith(source + Path.DirectorySeparatorChar, cmp)
+                            || source.StartsWith(destination + Path.DirectorySeparatorChar, cmp))
                         {
                             log.Error("Source and destination overlap: " + src.Path + " -> " + src.Destination);
                             valid = false;
@@ -266,23 +291,64 @@ namespace TicTack
                     log.Error("Verification must be 'size', 'date_and_size', 'hash', or 'full' for source: " + src.Path);
                     valid = false;
                 }
+                if (src.Filter != null && !IsValidFileSizeLimit(src.Filter.MaxFileSizeMb))
+                {
+                    log.Error("max_file_size_mb must be a number, 'no-limit', or 'none' for source: " + src.Path);
+                    valid = false;
+                }
+                if (!string.IsNullOrEmpty(src.Destination))
+                {
+                    try
+                    {
+                        var dest = Path.GetFullPath(src.Destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                        if (destinations.TryGetValue(dest, out var other))
+                        {
+                            log.Error("Two sources map to the same destination: " + other + " and " + src.Path + " -> " + src.Destination);
+                            valid = false;
+                        }
+                        else
+                        {
+                            destinations[dest] = src.Path;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error("Invalid destination path: " + ex.Message);
+                        valid = false;
+                    }
+                }
             }
             return valid;
         }
 
-        public static long? ParseFileSizeLimit(object? val)
+        private static readonly StringComparer PathComparer =
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
+        public static bool IsValidMonitorType(string? type)
         {
-            if (val == null) return null;
-            if (val is int) return (long)(int)val;
-            if (val is long) return (long)val;
-            string? s = val as string;
-            if (s != null)
+            if (string.IsNullOrEmpty(type)) return false;
+            var t = type.ToLowerInvariant();
+            return t == "watcher" || t == "polling" || t == "composite";
+        }
+
+        public static long? ParseFileSizeLimit(object? val) =>
+            TryParseFileSizeLimit(val, out var limit) ? limit : null;
+
+        public static bool IsValidFileSizeLimit(object? val) => TryParseFileSizeLimit(val, out _);
+
+        // Single token table: parser and validator cannot drift.
+        private static bool TryParseFileSizeLimit(object? val, out long? limit)
+        {
+            limit = null;
+            switch (val)
             {
-                if (s == "no-limit" || s == "none") return null;
-                long n;
-                if (long.TryParse(s, out n)) return n;
+                case null: return true;
+                case int i when i >= 0: limit = i; return true;
+                case long l when l >= 0: limit = l; return true;
+                case string s when s == "no-limit" || s == "none": return true;
+                case string s when long.TryParse(s, out var n) && n >= 0: limit = n; return true;
+                default: return false;
             }
-            return null;
         }
 
         static void ExpandPathsList(TicTackConfig cfg)
@@ -292,6 +358,8 @@ namespace TicTack
             {
                 if (src.Paths != null && src.Paths.Count > 0)
                 {
+                    if (!string.IsNullOrEmpty(src.Path))
+                        cfg.Errors.Add("Source has both 'path' and 'paths'; 'path' is ignored for: " + src.Path);
                     foreach (var p in src.Paths)
                     {
                         // Path.GetFileName only splits on the platform
@@ -321,30 +389,38 @@ namespace TicTack
             cfg.Sources = expanded;
         }
 
+        // Single source of truth for the token set: display names, the parse
+        // switch, and validation cannot drift apart.
+        private static readonly (string Token, VerificationLevel Level)[] VerificationTokens =
+        {
+            ("size", VerificationLevel.Size),
+            ("dateandsize", VerificationLevel.DateAndSize),
+            ("hash", VerificationLevel.Hash),
+            ("full", VerificationLevel.Full)
+        };
+
         public static VerificationLevel ParseVerification(string? value)
         {
-            switch (NormalizeVerification(value))
+            var normalized = NormalizeVerification(value);
+            if (normalized != null)
             {
-                case "size": return VerificationLevel.Size;
-                case "dateandsize": return VerificationLevel.DateAndSize;
-                case "hash": return VerificationLevel.Hash;
-                case "full": return VerificationLevel.Full;
-                default: return VerificationLevel.DateAndSize;
+                foreach (var (token, level) in VerificationTokens)
+                {
+                    if (token == normalized) return level;
+                }
             }
+            return VerificationLevel.DateAndSize;
         }
 
         public static bool IsValidVerification(string? value)
         {
-            switch (NormalizeVerification(value))
+            var normalized = NormalizeVerification(value);
+            if (normalized == null) return false;
+            foreach (var (token, _) in VerificationTokens)
             {
-                case "size":
-                case "dateandsize":
-                case "hash":
-                case "full":
-                    return true;
-                default:
-                    return false;
+                if (token == normalized) return true;
             }
+            return false;
         }
 
         static string? NormalizeVerification(string? value) =>
