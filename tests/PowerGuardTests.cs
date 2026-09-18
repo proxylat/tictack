@@ -140,4 +140,106 @@ public class PowerGuardTests : IDisposable
         Assert.False(File.Exists(Path.Combine(versionDir, "v1.txt")));
         Assert.False(File.Exists(tmp));
     }
+
+    [Fact]
+    public void Cleanup_DeletesTemp_WhenSameLengthButDifferentContent()
+    {
+        var tmpFile = Path.Combine(_dstDir, "same.txt.tictack.tmp");
+        File.WriteAllText(Path.Combine(_srcDir, "same.txt"), "AAAAAAAA");
+        File.WriteAllText(tmpFile, "BBBBBBBB");
+
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
+
+        PowerGuard.Cleanup(cfg, _log);
+
+        Assert.False(File.Exists(Path.Combine(_dstDir, "same.txt")));
+        Assert.False(File.Exists(tmpFile));
+    }
+
+    [Fact]
+    public void Cleanup_RecoversNestedTemp()
+    {
+        var sub = Path.Combine(_dstDir, "sub");
+        var srcSub = Path.Combine(_srcDir, "sub");
+        Directory.CreateDirectory(sub);
+        Directory.CreateDirectory(srcSub);
+        File.WriteAllText(Path.Combine(srcSub, "x.txt"), "nested data");
+        File.Copy(Path.Combine(srcSub, "x.txt"), Path.Combine(sub, "x.txt.tictack.tmp"));
+
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
+
+        PowerGuard.Cleanup(cfg, _log);
+
+        Assert.Equal("nested data", File.ReadAllText(Path.Combine(sub, "x.txt")));
+        Assert.False(File.Exists(Path.Combine(sub, "x.txt.tictack.tmp")));
+    }
+
+    [Fact]
+    public void Cleanup_DeletesTemp_WhenSourceMissing()
+    {
+        var tmpFile = Path.Combine(_dstDir, "orphan.txt.tictack.tmp");
+        File.WriteAllText(tmpFile, "orphan");
+
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
+
+        PowerGuard.Cleanup(cfg, _log);
+
+        Assert.False(File.Exists(Path.Combine(_dstDir, "orphan.txt")));
+        Assert.False(File.Exists(tmpFile));
+    }
+
+    [Fact]
+    public void Cleanup_HandlesDeletionDir()
+    {
+        var delDir = Path.Combine(Path.GetDirectoryName(_srcDir)!, "deleted");
+        Directory.CreateDirectory(delDir);
+        var tmp = Path.Combine(delDir, "d1.txt.tictack.tmp");
+        File.WriteAllText(tmp, "deleted data");
+
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig
+        {
+            Path = _srcDir,
+            Destination = _dstDir,
+            Sync = new SyncConfig
+            {
+                Deletion = new DeletionConfig { Path = delDir }
+            }
+        });
+
+        PowerGuard.Cleanup(cfg, _log);
+
+        Assert.False(File.Exists(Path.Combine(delDir, "d1.txt")));
+        Assert.False(File.Exists(tmp));
+    }
+
+    [Fact]
+    public void Cleanup_SkipsUnauthorizedDirectory()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        if (Environment.UserName == "root") return; // chmod is meaningless for root
+        var locked = Path.Combine(_dstDir, "locked");
+        Directory.CreateDirectory(locked);
+        var tmp = Path.Combine(locked, "x.txt.tictack.tmp");
+        File.WriteAllText(tmp, "data");
+        File.SetUnixFileMode(locked, UnixFileMode.None);
+        try
+        {
+            var cfg = new TicTackConfig();
+            cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
+
+            // Must not throw; the locked dir is skipped silently.
+            PowerGuard.Cleanup(cfg, _log);
+        }
+        finally
+        {
+            File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        // Checked after permissions are restored: File.Exists cannot traverse
+        // a 000 directory, so asserting inside the try would always fail.
+        Assert.True(File.Exists(tmp));
+    }
 }

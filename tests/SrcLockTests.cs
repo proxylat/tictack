@@ -53,12 +53,57 @@ public class SrcLockTests : IDisposable
         File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow);
 
         var sw = Stopwatch.StartNew();
-        using var lockObj = new SrcLock(_lockPath, _log);
+        var lockObj = new SrcLock(_lockPath, _log);
         sw.Stop();
 
         Assert.False(lockObj.IsHeld);
         // advisory lock, doesn't wait — returns < 500ms
         Assert.True(sw.ElapsedMilliseconds < 500);
+        lockObj.Dispose();
+        // A lock that was never held must not delete the foreign lock file.
+        Assert.True(File.Exists(_lockPath));
+        Assert.Contains(_log.Messages, m => m.Contains("lock acquisition failed"));
+    }
+
+    [Fact]
+    public void StaleLock_JustUnderFiveMinutes_IsNotTakenOver()
+    {
+        File.WriteAllText(_lockPath, "other:12345");
+        File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow.AddMinutes(-5).AddSeconds(1));
+
+        using var lockObj = new SrcLock(_lockPath, _log);
+
+        Assert.False(lockObj.IsHeld);
+        Assert.True(File.Exists(_lockPath));
+    }
+
+    [Fact]
+    public void StaleLock_JustOverFiveMinutes_IsTakenOver()
+    {
+        File.WriteAllText(_lockPath, "other:12345");
+        File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow.AddMinutes(-5).AddSeconds(-1));
+
+        using var lockObj = new SrcLock(_lockPath, _log);
+
+        Assert.True(lockObj.IsHeld);
+    }
+
+    [Fact]
+    public void ContendedLock_WithRetryTimeout_GivesUpAndWarns()
+    {
+        File.WriteAllText(_lockPath, "other:12345");
+        File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow);
+
+        var sw = Stopwatch.StartNew();
+        var lockObj = new SrcLock(_lockPath, _log, TimeSpan.FromMilliseconds(300));
+        sw.Stop();
+
+        Assert.False(lockObj.IsHeld);
+        // One 5 s retry sleep must elapse: a zero sleep would return at ~300 ms.
+        Assert.True(sw.ElapsedMilliseconds >= 4000);
+        Assert.Contains(_log.Messages, m => m.Contains("lock acquisition failed"));
+        lockObj.Dispose();
+        Assert.True(File.Exists(_lockPath));
     }
 
     [Fact]

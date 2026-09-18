@@ -295,4 +295,101 @@ public class PipelineTests : IDisposable
         Assert.False(File.Exists(Path.Combine(_dstDir, "mount-loss.txt")));
     }
 
+    [Fact]
+    public void DeleteThreshold_Count_BlocksBatch_AndDefers()
+    {
+        _pipeline.Dispose();
+        // Debounce holds both deletes so they flush as one batch of 2.
+        StartPipeline(c =>
+        {
+            c.Sync.DeleteThresholdCount = 2;
+            c.DebounceSeconds = 0.5;
+        });
+
+        var destA = Path.Combine(_dstDir, "a.txt");
+        var destB = Path.Combine(_dstDir, "b.txt");
+        File.WriteAllText(destA, "a");
+        File.WriteAllText(destB, "b");
+        _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "a.txt"));
+        _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "b.txt"));
+
+        var deferredPath = Path.Combine(_dstDir, ".tictack-deferred.json");
+        WaitFor(() => File.Exists(deferredPath), "deferred record");
+
+        Assert.Empty(_deletion.Calls);
+        Assert.True(File.Exists(destA));
+        Assert.True(File.Exists(destB));
+        Assert.Contains(_log.Messages, m => m.Contains("Delete guard"));
+        var deferred = File.ReadAllText(deferredPath);
+        Assert.Contains("a.txt", deferred);
+        Assert.Contains("b.txt", deferred);
+    }
+
+    [Fact]
+    public void DeleteThreshold_Size_BlocksBatch()
+    {
+        _pipeline.Dispose();
+        StartPipeline(c => c.Sync.DeleteThresholdSizeGb = 1);
+
+        // Sizes come from the state DB, so no real 2 GB file is needed.
+        _db.Upsert("big.bin", 2L * 1024 * 1024 * 1024, DateTime.UtcNow.Ticks);
+        var dest = Path.Combine(_dstDir, "big.bin");
+        File.WriteAllText(dest, "small");
+        _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "big.bin"));
+
+        WaitFor(() => _log.Messages.Any(m => m.Contains("Delete guard")), "guard");
+
+        Assert.Empty(_deletion.Calls);
+        Assert.True(File.Exists(dest));
+    }
+
+    [Fact]
+    public void DeleteThreshold_Percent_BlocksAboveFloor()
+    {
+        _pipeline.Dispose();
+        // DeleteThresholdSizeGb keeps its 50 GB default: the percent branch
+        // must still fire when the size branch does not trip.
+        StartPipeline(c => c.Sync.DeleteThresholdPercent = 1);
+
+        for (int i = 0; i < 51; i++)
+            _db.Upsert($"p{i}.txt", 1, 1);
+        var dest = Path.Combine(_dstDir, "p0.txt");
+        File.WriteAllText(dest, "x");
+        _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "p0.txt"));
+
+        WaitFor(() => _log.Messages.Any(m => m.Contains("Delete guard")), "guard");
+
+        Assert.Empty(_deletion.Calls);
+        Assert.True(File.Exists(dest));
+    }
+
+    [Fact]
+    public void DeleteThreshold_Percent_FloorLetsSmallStateThrough()
+    {
+        _pipeline.Dispose();
+        StartPipeline(c => c.Sync.DeleteThresholdPercent = 1);
+
+        for (int i = 0; i < 50; i++)
+            _db.Upsert($"q{i}.txt", 1, 1);
+        _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "q0.txt"));
+
+        WaitFor(() => _deletion.Calls.Count == 1, "deletion");
+    }
+
+    [Fact]
+    public void DeleteThreshold_Percent_ExactBoundaryBlocks()
+    {
+        _pipeline.Dispose();
+        // 1/64*100 is exactly 1.5625 in binary: >= blocks, > would not.
+        StartPipeline(c => c.Sync.DeleteThresholdPercent = 1.5625);
+
+        for (int i = 0; i < 64; i++)
+            _db.Upsert($"r{i}.txt", 1, 1);
+        _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "r0.txt"));
+
+        WaitFor(() => _log.Messages.Any(m => m.Contains("Delete guard")), "guard");
+
+        Assert.Empty(_deletion.Calls);
+    }
+
 }

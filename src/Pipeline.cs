@@ -644,23 +644,18 @@ namespace TicTack
                 blocked = true;
                 reason = totalCount + " deletions >= threshold " + _config.Sync.DeleteThresholdCount;
             }
-            else if (_config.Sync != null && _config.Sync.DeleteThresholdSizeGb.HasValue && _config.Sync.DeleteThresholdSizeGb.Value > 0)
+            else if (_config.Sync != null && _config.Sync.DeleteThresholdSizeGb.HasValue && _config.Sync.DeleteThresholdSizeGb.Value > 0
+                && totalSize >= _config.Sync.DeleteThresholdSizeGb.Value * 1024L * 1024L * 1024L)
             {
-                var thresholdBytes = _config.Sync.DeleteThresholdSizeGb.Value * 1024L * 1024L * 1024L;
-                if (totalSize >= thresholdBytes)
-                {
-                    blocked = true;
-                    reason = (totalSize / (1024L * 1024L)) + " MB deleted >= threshold " + _config.Sync.DeleteThresholdSizeGb.Value + " GB";
-                }
+                blocked = true;
+                reason = (totalSize / (1024L * 1024L)) + " MB deleted >= threshold " + _config.Sync.DeleteThresholdSizeGb.Value + " GB";
             }
-            else if (_config.Sync != null && _config.Sync.DeleteThresholdPercent > 0 && stateCount > 50)
+            else if (_config.Sync != null && _config.Sync.DeleteThresholdPercent > 0 && stateCount > 50
+                && (double)totalCount / stateCount * 100 >= _config.Sync.DeleteThresholdPercent)
             {
+                blocked = true;
                 var percent = (double)totalCount / stateCount * 100;
-                if (percent >= _config.Sync.DeleteThresholdPercent)
-                {
-                    blocked = true;
-                    reason = percent.ToString("F1") + "% of " + stateCount + " files >= " + _config.Sync.DeleteThresholdPercent + "%";
-                }
+                reason = percent.ToString("F1") + "% of " + stateCount + " files >= " + _config.Sync.DeleteThresholdPercent + "%";
             }
 
             if (blocked)
