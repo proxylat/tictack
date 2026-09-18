@@ -94,8 +94,10 @@ namespace TicTack
                     {
                         dstStream.SetLength(srcStream.Length);
                     }
-                    bytesCopied = srcStream.Length;
                     await srcStream.CopyToAsync(dstStream, 81920, ct);
+                    // Prefer the bytes actually written: a source appended
+                    // mid-copy makes Length a lie.
+                    bytesCopied = dstStream.Position;
                     Stopwatch? fsw = timed ? Stopwatch.StartNew() : null;
                     if (_fullDurability)
                         dstStream.Flush(true);

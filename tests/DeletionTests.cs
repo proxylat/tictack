@@ -41,7 +41,9 @@ public class DeletionTests : IDisposable
     public async Task MirrorDeletion_NoError_OnMissingDest()
     {
         var deletion = new MirrorDeletion();
-        await deletion.HandleDeletionAsync(Path.Combine(_srcDir, "missing.txt"), Dst("missing.txt"), CancellationToken.None);
+        var result = await deletion.HandleDeletionAsync(
+            Path.Combine(_srcDir, "missing.txt"), Dst("missing.txt"), CancellationToken.None);
+        Assert.True(result.Success, result.ErrorMessage);
     }
 
     [Fact]

@@ -53,9 +53,10 @@ namespace TicTack
 
         // NOTE: every public helper below is [NonEvent]. Without it, EventSource
         // inspects public methods during initialization, and a method like
-        // RegisterQueueCounter(Func<double>) silently disables ALL counter
-        // emission from the source — with ConstructionException left null,
-        // so there is no error to find. Verified by probe test, do not remove.
+        // RegisterQueueCounter(string, Func<double>) silently disables ALL
+        // counter emission from the source — with ConstructionException left
+        // null, so there is no error to find. Verified by probe test, do not
+        // remove.
         [NonEvent]
         public void FileCopied(long bytes)
         {
@@ -69,14 +70,18 @@ namespace TicTack
         [NonEvent]
         public void FsyncCompleted(double milliseconds) => _fsyncTime.WriteMetric((float)milliseconds);
 
-        // One pending-events gauge per pipeline (usually one source = one row).
-        // The returned token MUST be disposed by the owner: until then the
-        // counter is rooted by this static source, and the counter roots the
-        // pipeline its callback captures.
+        // One pending-events gauge per pipeline, named with the source path so
+        // multi-source setups get distinct rows instead of collapsing onto one
+        // counter. The returned token MUST be disposed by the owner: until then
+        // the counter is rooted by this static source, and the counter roots
+        // whatever its callback captures (capture only the queue, not the
+        // pipeline, so a constructor that throws after registering leaks a
+        // dictionary instead of the whole object).
         [NonEvent]
-        public IDisposable RegisterQueueCounter(Func<double> readPending)
+        public IDisposable RegisterQueueCounter(string instance, Func<double> readPending)
         {
-            var counter = new PollingCounter("pending-events", this, readPending)
+            var name = string.IsNullOrEmpty(instance) ? "pending-events" : "pending-events:" + instance;
+            var counter = new PollingCounter(name, this, readPending)
             {
                 DisplayName = "Pending events"
             };

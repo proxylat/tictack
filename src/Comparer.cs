@@ -4,6 +4,21 @@ using System.Security.Cryptography;
 
 namespace TicTack
 {
+    // Single SHA-256 implementation for comparison and validation: same
+    // accessor seam, same lowercase hex format.
+    internal static class FileHasher
+    {
+        internal static string ComputeHex(string path, IFileAccessor? accessor)
+        {
+            path = PathUtil.EnsureExtended(path);
+            using (var sha256 = SHA256.Create())
+            using (var stream = accessor != null ? accessor.OpenRead(path) : File.OpenRead(path))
+            {
+                return Convert.ToHexStringLower(sha256.ComputeHash(stream));
+            }
+        }
+    }
+
     public static class ComparerFactory
     {
         public static IFileComparer Create(VerificationLevel level, IFileAccessor? accessor = null)
@@ -76,20 +91,9 @@ namespace TicTack
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
                 if (!dInfo.Exists) return false;
                 if (source.Value.Length != dInfo.Length) return false;
-                return ComputeHash(sourcePath) == ComputeHash(destPath);
+                return FileHasher.ComputeHex(sourcePath, _accessor) == FileHasher.ComputeHex(destPath, _accessor);
             }
             catch { return false; }
-        }
-
-        private string ComputeHash(string path)
-        {
-            path = PathUtil.EnsureExtended(path);
-            using (var sha256 = SHA256.Create())
-            using (var stream = _accessor != null ? _accessor.OpenRead(path) : File.OpenRead(path))
-            {
-                var hash = sha256.ComputeHash(stream);
-                return Convert.ToHexStringLower(hash);
-            }
         }
     }
 

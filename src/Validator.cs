@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Security.Cryptography;
 using System.Threading.Tasks;
 
 namespace TicTack
@@ -55,22 +54,11 @@ namespace TicTack
                 }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
                 if (!dInfo.Exists || source.Value.Length != dInfo.Length) return Task.FromResult(false);
-                var srcHash = ComputeHash(sourcePath);
-                var dstHash = ComputeHash(destPath);
+                var srcHash = FileHasher.ComputeHex(sourcePath, _accessor);
+                var dstHash = FileHasher.ComputeHex(destPath, _accessor);
                 return Task.FromResult(srcHash == dstHash);
             }
             catch { return Task.FromResult(false); }
-        }
-
-        private string ComputeHash(string path)
-        {
-            path = PathUtil.EnsureExtended(path);
-            using (var sha256 = SHA256.Create())
-            using (var stream = _accessor != null ? _accessor.OpenRead(path) : File.OpenRead(path))
-            {
-                var hash = sha256.ComputeHash(stream);
-                return Convert.ToHexStringLower(hash);
-            }
         }
     }
 }

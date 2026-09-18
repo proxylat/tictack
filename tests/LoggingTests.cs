@@ -91,9 +91,12 @@ public class LoggingTests
         var path = Path.GetTempFileName();
         try
         {
-            var logger = new FileLogger(path, LogLevel.Info, maxSizeMb: 0); // Force rotation after 1 write
-            logger.Info("line 1");
-            Assert.True(File.Exists(path + ".1") || new FileInfo(path).Length > 0);
+            var logger = new FileLogger(path, LogLevel.Info, maxSizeMb: 0);
+            logger.Info("line 1"); // appends to the empty temp file, no rotation
+            logger.Info("line 2"); // existing length > 0: rotates, then appends
+            Assert.True(File.Exists(path + ".1"));
+            Assert.Contains("line 1", File.ReadAllText(path + ".1"));
+            Assert.Contains("line 2", File.ReadAllText(path));
         }
         finally
         {

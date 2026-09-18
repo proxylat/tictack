@@ -3,6 +3,9 @@ using System.Runtime.CompilerServices;
 
 namespace TicTack;
 
+// Process-wide EventSource: every pipeline in every parallel test class emits
+// these counters, so serialize against other collections.
+[Collection("SerialConsole")]
 public class MetricsTests : IDisposable
 {
     private readonly string _srcDir;
@@ -112,7 +115,7 @@ public class MetricsTests : IDisposable
     private static (IDisposable Token, WeakReference Owner) RegisterWithTemporaryOwner()
     {
         var owner = new object();
-        var token = TicTackEventSource.Log.RegisterQueueCounter(() => owner.GetHashCode());
+        var token = TicTackEventSource.Log.RegisterQueueCounter("probe", () => owner.GetHashCode());
         return (token, new WeakReference(owner));
     }
 
