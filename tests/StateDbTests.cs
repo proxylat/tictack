@@ -1,3 +1,5 @@
+using System.Reflection;
+
 namespace TicTack;
 
 public class StateDbTests : IDisposable
@@ -143,5 +145,81 @@ public class StateDbTests : IDisposable
         // Verify table still exists and works
         _db.Upsert("safe.txt", 1, 1);
         Assert.Equal(1, _db.Count());
+    }
+
+    [Fact]
+    public void UpdatePrefix_RenamesSubtreeOnly()
+    {
+        _db.Upsert("old/a.txt", 1, 10);
+        _db.Upsert("old/sub/b.txt", 2, 20);
+        _db.Upsert("other/c.txt", 3, 30);
+
+        _db.UpdatePrefix("old", "new");
+
+        var all = _db.LoadAll();
+        Assert.Equal(3, all.Count);
+        Assert.Equal((1L, 10L), all["new/a.txt"]);
+        Assert.Equal((2L, 20L), all["new/sub/b.txt"]);
+        Assert.Equal((3L, 30L), all["other/c.txt"]);
+    }
+
+    [Fact]
+    public void UpdatePrefix_EmptyPrefix_IsNoOp()
+    {
+        _db.Upsert("a.txt", 1, 10);
+
+        _db.UpdatePrefix("", "new");
+        _db.UpdatePrefix(null!, "new");
+
+        Assert.Equal((1L, 10L), _db.LoadAll()["a.txt"]);
+    }
+
+    [Fact]
+    public async Task UpdatePrefixAsync_RenamesSubtreeOnly()
+    {
+        await _db.UpsertAsync("old/a.txt", 1, 10);
+        await _db.UpsertAsync("old/sub/b.txt", 2, 20);
+        await _db.UpsertAsync("other/c.txt", 3, 30);
+
+        await _db.UpdatePrefixAsync("old", "new");
+
+        var all = await _db.LoadAllAsync();
+        Assert.Equal(3, all.Count);
+        Assert.Equal((1L, 10L), all["new/a.txt"]);
+        Assert.Equal((2L, 20L), all["new/sub/b.txt"]);
+        Assert.Equal((3L, 30L), all["other/c.txt"]);
+    }
+
+    private void BreakConnection()
+    {
+        var field = typeof(StateDb).GetField("_conn", BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(field);
+        ((IDisposable?)field.GetValue(_db))?.Dispose();
+    }
+
+    [Fact]
+    public void Reconnect_AfterConnectionBreak_RoundTrips()
+    {
+        _db.Upsert("keep.txt", 5, 50);
+        BreakConnection();
+
+        _db.Upsert("after.txt", 6, 60);
+
+        var all = _db.LoadAll();
+        Assert.Equal((5L, 50L), all["keep.txt"]);
+        Assert.Equal((6L, 60L), all["after.txt"]);
+    }
+
+    [Fact]
+    public async Task ReconnectAsync_AfterConnectionBreak_RoundTrips()
+    {
+        await _db.UpsertAsync("keep.txt", 5, 50);
+        BreakConnection();
+
+        await _db.UpsertAsync("after.txt", 6, 60);
+
+        var all = await _db.LoadAllAsync();
+        Assert.Equal((5L, 50L), all["keep.txt"]);
+        Assert.Equal((6L, 60L), all["after.txt"]);
     }
 }

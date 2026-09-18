@@ -114,4 +114,17 @@ public class SrcLockTests : IDisposable
         Assert.Contains(Environment.MachineName, content);
         Assert.Contains(Environment.ProcessId.ToString(), content);
     }
+
+    [Fact]
+    public void RefreshTimer_TouchesLockFile()
+    {
+        using var lockObj = new SrcLock(_lockPath, _log, refreshInterval: TimeSpan.FromMilliseconds(100));
+        Assert.True(lockObj.IsHeld);
+        var t0 = File.GetLastWriteTimeUtc(_lockPath);
+
+        Thread.Sleep(700);
+
+        Assert.True(lockObj.IsHeld);
+        Assert.True(File.GetLastWriteTimeUtc(_lockPath) > t0);
+    }
 }

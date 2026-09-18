@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace TicTack;
 
 public class ExecutorTests : IDisposable
@@ -92,6 +94,45 @@ public class ExecutorTests : IDisposable
 
         Assert.True(result.Success);
         Assert.True(File.Exists(Path.Combine(_dstDir, "sub", "deep", "file.txt")));
+    }
+
+    [Fact]
+    public async Task CopyAction_ReadOnlyDestination_Overwrites()
+    {
+        // Windows needs the read-only flag cleared before File.Replace;
+        // on Linux the replace succeeds either way, so this pins the
+        // overwrite behavior while its mutant only dies on Windows CI.
+        File.WriteAllText(Src("a.txt"), "new content");
+        var dst = Dst("a.txt");
+        File.WriteAllText(dst, "old content");
+        File.SetAttributes(dst, FileAttributes.ReadOnly);
+        try
+        {
+            var action = new CopyAction(_accessor);
+            var result = await action.ExecuteAsync(MakeArgs(Src("a.txt"), "a.txt"), CancellationToken.None);
+
+            Assert.True(result.Success);
+            Assert.Equal("new content", File.ReadAllText(dst));
+        }
+        finally { File.SetAttributes(dst, FileAttributes.Normal); }
+    }
+
+    [Fact]
+    public async Task CopyAction_DestDirRemovedBeforeCommit_FailsDirectoryFsync()
+    {
+        // FlushDirectory is Linux-only; on Windows it always reports success.
+        if (!OperatingSystem.IsLinux()) return;
+
+        File.WriteAllText(Src("a.txt"), "fsync fail test");
+        var action = new CopyAction(_accessor, true, cp =>
+        {
+            if (cp == CopyCheckpoint.AfterCommit)
+                Directory.Delete(_dstDir, true);
+        });
+        var result = await action.ExecuteAsync(MakeArgs(Src("a.txt"), "a.txt"), CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("fsync", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -252,4 +293,39 @@ public class ExecutorTests : IDisposable
         Assert.True(File.Exists(Path.Combine(Dst("old"), "keep.txt")));
     }
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DeviceIoControl(IntPtr hDevice, uint dwIoControlCode,
+        IntPtr lpInBuffer, uint nInBufferSize,
+        IntPtr lpOutBuffer, uint nOutBufferSize,
+        out uint lpBytesReturned, IntPtr lpOverlapped);
+
+    [Fact]
+    [Trait("Category", "Windows")]
+    public async Task CopyAction_SparseSource_CopiesContent()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var src = Src("sparse.bin");
+        using (var fs = new FileStream(src, FileMode.CreateNew, FileAccess.Write))
+        {
+            fs.SetLength(1024 * 1024);
+            uint dummy;
+            Assert.True(DeviceIoControl(fs.SafeFileHandle.DangerousGetHandle(),
+                0x000900C4, IntPtr.Zero, 0, IntPtr.Zero, 0, out dummy, IntPtr.Zero),
+                "FSCTL_SET_SPARSE failed — not a real sparse file");
+            fs.Position = fs.Length;
+            fs.WriteByte(42);
+        }
+        Assert.True((File.GetAttributes(src) & FileAttributes.SparseFile) != 0);
+
+        var action = new CopyAction(_accessor);
+        var result = await action.ExecuteAsync(MakeArgs(src, "sparse.bin"), CancellationToken.None);
+
+        Assert.True(result.Success);
+        var dstInfo = new FileInfo(Dst("sparse.bin"));
+        Assert.Equal(1024 * 1024 + 1, dstInfo.Length);
+        using var dst = File.OpenRead(Dst("sparse.bin"));
+        dst.Seek(1024 * 1024, SeekOrigin.Begin);
+        Assert.Equal(42, dst.ReadByte());
+    }
 }
