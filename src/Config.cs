@@ -67,6 +67,8 @@ namespace TicTack
 
     public class SyncConfig
     {
+        public const int DefaultDeleteHoldDays = 7;
+
         public string? Verification { get; set; }
         public string Durability { get; set; }
         public int InitialSyncWorkers { get; set; }
@@ -91,7 +93,7 @@ namespace TicTack
             DeleteThresholdCount = 1000;
             DeleteThresholdSizeGb = 50;
             DeleteThresholdPercent = 50;
-            DeleteHoldDays = 7;
+            DeleteHoldDays = DefaultDeleteHoldDays;
         }
     }
 
@@ -362,6 +364,8 @@ namespace TicTack
                         cfg.Errors.Add("Source has both 'path' and 'paths'; 'path' is ignored for: " + src.Path);
                     foreach (var p in src.Paths)
                     {
+                        if (src.Sync == null || src.StateDbPath == null)
+                            cfg.Errors.Add("Source is missing 'sync' or 'state_db_path': " + p);
                         // Path.GetFileName only splits on the platform
                         // separator, so on Linux a Windows path returns whole.
                         // Fall back to '\' splitting (no-op on Windows, where
@@ -376,8 +380,8 @@ namespace TicTack
                             Destination = Path.Combine(src.Destination ?? "", folder),
                             DebounceSeconds = src.DebounceSeconds,
                             Filter = src.Filter,
-                            Sync = src.Sync!,
-                            StateDbPath = src.StateDbPath!
+                            Sync = src.Sync ?? new SyncConfig(),
+                            StateDbPath = src.StateDbPath ?? string.Empty
                         });
                     }
                 }

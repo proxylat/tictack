@@ -14,6 +14,7 @@ namespace TicTack
         private readonly string _dbPath;
         private readonly ILogger? _log;
         private readonly SemaphoreSlim _gate = new SemaphoreSlim(1, 1);
+        private readonly object _disposeLock = new object();
         private bool _disposed;
 
         public StateDb(string dbPath, ILogger? log = null)
@@ -31,7 +32,8 @@ namespace TicTack
         {
             if (_conn != null)
             {
-                try { _conn.Close(); } catch { }
+                try { _conn.Close(); }
+                catch (Exception ex) { _log?.Debug("StateDb close failed during reconnect: " + ex.Message); }
                 _conn.Dispose();
             }
             _conn = SqliteBootstrap.Open(_dbPath, SqliteSchema.State);
@@ -109,6 +111,7 @@ namespace TicTack
 
         void Enter()
         {
+            if (_disposed) throw new ObjectDisposedException(nameof(StateDb));
             _gate.Wait();
             if (_disposed)
             {
@@ -119,6 +122,7 @@ namespace TicTack
 
         async Task EnterAsync()
         {
+            if (_disposed) throw new ObjectDisposedException(nameof(StateDb));
             await _gate.WaitAsync().ConfigureAwait(false);
             if (_disposed)
             {
@@ -131,7 +135,8 @@ namespace TicTack
         {
             if (_conn != null)
             {
-                try { _conn.Close(); } catch { }
+                try { _conn.Close(); }
+                catch (Exception ex) { _log?.Debug("StateDb close failed during reconnect: " + ex.Message); }
                 _conn.Dispose();
             }
             _conn = await SqliteBootstrap.OpenAsync(_dbPath, SqliteSchema.State).ConfigureAwait(false);
@@ -433,19 +438,23 @@ namespace TicTack
 
         public void Dispose()
         {
-            _gate.Wait();
-            try
+            lock (_disposeLock)
             {
                 if (_disposed) return;
-                _disposed = true;
-                if (_conn != null)
+                _gate.Wait();
+                try
                 {
-                    try { _conn.Close(); }
-                    catch (Exception ex) { _log?.Warn("StateDb close failed: " + ex.Message); }
-                    _conn.Dispose();
+                    _disposed = true;
+                    if (_conn != null)
+                    {
+                        try { _conn.Close(); }
+                        catch (Exception ex) { _log?.Warn("StateDb close failed: " + ex.Message); }
+                        _conn.Dispose();
+                    }
                 }
+                finally { _gate.Release(); }
+                _gate.Dispose();
             }
-            finally { _gate.Release(); }
         }
     }
 }
