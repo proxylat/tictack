@@ -121,7 +121,7 @@ namespace TicTack
 
                 if (timedOut)
                 {
-                    _log.Error("Job '" + job.Config.Name + "' timed out after " + (ProcessRunner.TimeoutMs / 60000) + " minutes, killed");
+                    _log.Error(TimeoutMessage(job.Config.Name));
                     return;
                 }
                 if (exitCode != 0)
@@ -141,6 +141,9 @@ namespace TicTack
                 _log.Error("Scheduled job '" + job.Config.Name + "'", ex);
             }
         }
+
+        internal static string TimeoutMessage(string? jobName) =>
+            "Job '" + jobName + "' timed out after " + (ProcessRunner.TimeoutMs / 60000) + " minutes, killed";
 
         public void Stop()
         {

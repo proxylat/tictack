@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
@@ -181,4 +182,119 @@ public class StateDbBenchmarks
 
     [Benchmark]
     public void UpsertBatch1000() => _db.UpsertBatch(_batch);
+}
+
+[MemoryDiagnoser]
+[ShortRunJob]
+public class DriveGuardBenchmarks
+{
+    private List<(string Root, bool Ready)> _mounts = null!;
+    private string _path = null!;
+    private Func<DriveInfo[]> _probe = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _mounts = new List<(string, bool)>(41) { ("/", true) };
+        for (var i = 0; i < 40; i++) _mounts.Add(("/mnt/drive" + i, true));
+        _path = "/mnt/drive17/folder/file.txt";
+        _probe = static () => DriveInfo.GetDrives();
+    }
+
+    // Pure selection: no probe, no cache, no GetFullPath.
+    [Benchmark(Baseline = true, OperationsPerInvoke = 10_000)]
+    public int SelectOnly()
+    {
+        var n = 0;
+        for (var i = 0; i < 10_000; i++) { if (DriveGuard.SelectReady(_path, _mounts)) n++; }
+        return n;
+    }
+
+    // The production path: GetFullPath + a warm mount-table cache.
+    [Benchmark(OperationsPerInvoke = 10_000)]
+    public int CachedIsReady()
+    {
+        var n = 0;
+        for (var i = 0; i < 10_000; i++) { if (DriveGuard.IsReady(_path, _probe)) n++; }
+        return n;
+    }
+}
+
+[MemoryDiagnoser]
+[ShortRunJob]
+public class PollDiffBenchmarks
+{
+    private const int Count = 10_000;
+
+    private Dictionary<string, long> _prev = null!;
+    private Dictionary<string, long> _cur = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _prev = new Dictionary<string, long>(Count);
+        _cur = new Dictionary<string, long>(Count);
+        for (var i = 0; i < Count; i++)
+        {
+            var key = "/data/file" + i.ToString("D5");
+            _prev[key] = i;
+            // 1% changed, like a quiet poll scan.
+            _cur[key] = i % 100 == 0 ? i + 1 : i;
+        }
+    }
+
+    [Benchmark(Baseline = true)]
+    public int ContainsKeyThenIndexer()
+    {
+        var changed = 0;
+        foreach (var kv in _cur)
+        {
+            if (!_prev.ContainsKey(kv.Key) || _prev[kv.Key] != kv.Value) changed++;
+        }
+        return changed;
+    }
+
+    [Benchmark]
+    public int TryGetValue()
+    {
+        var changed = 0;
+        foreach (var kv in _cur)
+        {
+            if (!_prev.TryGetValue(kv.Key, out var old) || old != kv.Value) changed++;
+        }
+        return changed;
+    }
+}
+
+[MemoryDiagnoser]
+[ShortRunJob]
+public class PendingDrainBenchmarks
+{
+    private ConcurrentDictionary<string, FileChangedEventArgs> _events = null!;
+
+    [Params(1_000, 100_000)]
+    public int Count;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _events = new ConcurrentDictionary<string, FileChangedEventArgs>();
+        for (var i = 0; i < Count; i++)
+        {
+            var key = "/data/file" + i.ToString("D6");
+            _events[key] = new FileChangedEventArgs(ChangeType.Modified, key);
+        }
+    }
+
+    // One extraction from a backlog where every entry is ready: the O(pending)
+    // scan the drain does per event under a watcher-overflow backlog.
+    [Benchmark]
+    public FileChangedEventArgs DrainOne()
+    {
+        foreach (var item in _events)
+        {
+            if (_events.TryRemove(item.Key, out var e)) return e;
+        }
+        return null!;
+    }
 }
