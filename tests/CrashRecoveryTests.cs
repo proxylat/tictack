@@ -41,6 +41,40 @@ public class CrashRecoveryTests
     }
 
     [Fact]
+    [Trait("Category", "CrashRecovery")]
+    public async Task KillBeforeCheckpoint_WalReplaysOnReopen()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-wal-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var dbPath = Path.Combine(root, "state.db");
+            var sentinel = Path.Combine(root, "writes.reached");
+            using var process = StartWorker("statedb", dbPath, sentinel);
+            await WaitForFileAsync(sentinel, TimeSpan.FromSeconds(15));
+
+            // Committed but uncheckpointed: the worker's connection never
+            // closed, so the -wal file must hold frames (header alone is 32
+            // bytes). A clean close would checkpoint and remove it, so this
+            // asserts the crash path, not just durability.
+            var wal = new FileInfo(dbPath + "-wal");
+            Assert.True(wal.Exists && wal.Length > 32,
+                "expected uncheckpointed WAL frames, wal length=" + (wal.Exists ? wal.Length : -1));
+
+            process.Kill();
+            await WaitForExitAsync(process, TimeSpan.FromSeconds(10));
+            Assert.True(process.HasExited);
+
+            using var db = new StateDb(dbPath);
+            var all = db.LoadAll();
+            Assert.Equal(2, all.Count);
+            Assert.Equal((100L, 1000L), all["crash-a.txt"]);
+            Assert.Equal((200L, 2000L), all["crash-b.txt"]);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
     [Trait("Category", "LockContention")]
     public async Task LockHolder_BlocksSecondProcess()
     {

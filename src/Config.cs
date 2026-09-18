@@ -294,7 +294,14 @@ namespace TicTack
                 {
                     foreach (var p in src.Paths)
                     {
-                        var folder = Path.GetFileName(p.TrimEnd('\\', '/'));
+                        // Path.GetFileName only splits on the platform
+                        // separator, so on Linux a Windows path returns whole.
+                        // Fall back to '\' splitting (no-op on Windows, where
+                        // GetFileName already handles it).
+                        var trimmed = p.TrimEnd('\\', '/');
+                        var folder = Path.GetFileName(trimmed);
+                        if (folder == trimmed && trimmed.Contains('\\'))
+                            folder = trimmed.Substring(trimmed.LastIndexOf('\\') + 1);
                         expanded.Add(new SourceConfig
                         {
                             Path = p,

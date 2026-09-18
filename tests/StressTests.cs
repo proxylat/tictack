@@ -460,6 +460,7 @@ public class StressTests
             var locks = new ConcurrentBag<SrcLock>();
             Parallel.For(0, 10, _ => locks.Add(new SrcLock(lockPath, new RecordingLogger())));
             Assert.True(File.Exists(lockPath));
+            Assert.Equal(1, locks.Count(l => l.IsHeld));
             foreach (var l in locks) l.Dispose();
         }
         finally { try { Directory.Delete(dir, true); } catch { } }

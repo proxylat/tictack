@@ -95,8 +95,8 @@ namespace TicTack
 
     public class FullComparer : IFileComparer
     {
-        private readonly IFileAccessor? _accessor;
-        public FullComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
+        private readonly HashComparer _hash;
+        public FullComparer(IFileAccessor? accessor = null) { _hash = new HashComparer(accessor); }
 
         public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
@@ -112,7 +112,7 @@ namespace TicTack
                 if (!dInfo.Exists) return false;
                 if (source.Value.Length != dInfo.Length) return false;
                 if (source.Value.LastWriteTimeUtcTicks != dInfo.LastWriteTimeUtc.Ticks) return false;
-                return new HashComparer(_accessor).AreEqual(sourcePath, destPath, source);
+                return _hash.AreEqual(sourcePath, destPath, source);
             }
             catch { return false; }
         }

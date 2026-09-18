@@ -37,6 +37,21 @@ if (args[0].Equals("lock", StringComparison.OrdinalIgnoreCase))
     return 0;
 }
 
+if (args[0].Equals("statedb", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length != 3)
+        return 2;
+    using var db = new StateDb(args[1]);
+    db.Upsert("crash-a.txt", 100, 1000);
+    db.Upsert("crash-b.txt", 200, 2000);
+    // Signal the writes are committed, then hang until the parent kills us.
+    // The worker's connection never closes, so the -wal file must still hold
+    // uncheckpointed frames at kill time. (Environment.FailFast hangs on
+    // Windows under Error Reporting.)
+    File.WriteAllText(args[2], "reached");
+    Thread.Sleep(Timeout.Infinite);
+}
+
 if (args[0].Equals("repro", StringComparison.OrdinalIgnoreCase))
 {
     if (args.Length != 2)
