@@ -434,7 +434,7 @@ namespace TicTack
             var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, src.Destination);
 
             var copyAction = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase));
-            var renameAction = new RenameAction();
+            var renameAction = new RenameAction(deletion, log);
 
             StateDb? stateDb = null;
             try

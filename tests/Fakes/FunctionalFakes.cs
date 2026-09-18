@@ -70,6 +70,21 @@ public sealed class BlockingAction : IFileAction
     }
 }
 
+public sealed class CountingComparer : IFileComparer
+{
+    private readonly IFileComparer _inner;
+
+    public int Calls;
+
+    public CountingComparer(IFileComparer inner) => _inner = inner;
+
+    public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
+    {
+        Calls++;
+        return _inner.AreEqual(sourcePath, destPath, sourceSnapshot);
+    }
+}
+
 public sealed class RecordingValidator : IValidator
 {
     private readonly IValidator _inner;

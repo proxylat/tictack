@@ -56,6 +56,17 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void Start_Twice_OnlyStartsOnce()
+    {
+        // Guarded by Task.Wait: without the re-entry guard the second Start
+        // blocks forever in SrcLock (observed as a 600s runner hang).
+        var second = Task.Run(() => _pipeline.Start());
+        Assert.True(second.Wait(TimeSpan.FromSeconds(20)), "second Start blocked");
+        Assert.Equal(1, _log.Messages.Count(m => m.Contains("Started:")));
+        Assert.DoesNotContain(_log.Messages, m => m.Contains("Could not acquire sync lock"));
+    }
+
+    [Fact]
     public void Created_CopiesValidatesAndUpdatesState()
     {
         var file = Path.Combine(_srcDir, "a.txt");

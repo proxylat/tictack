@@ -62,26 +62,29 @@ public sealed class PerfTests
         {
             WriteFiles(src, 200, 512, ".txt");
             var copy = new RecordingAction(new CopyAction(new FileAccessor()));
+            var comparer = new CountingComparer(new DateSizeComparer());
             var statePath = Path.Combine(dir, "state.db");
 
             using (var db = new StateDb(statePath))
             using (var pipeline = MakePipeline(MakeConfig(src, dst), new EventMonitor(),
-                new DateSizeComparer(), new SizeValidator(), copy, new RecordingLogger(), db))
+                comparer, new SizeValidator(), copy, new RecordingLogger(), db))
             {
                 Assert.True(await pipeline.RunOnceAsync());
                 Assert.Equal(200, copy.Calls.Count);
             }
+            var coldComparerCalls = comparer.Calls;
 
             var allocBefore = GC.GetTotalAllocatedBytes(true);
             using (var db = new StateDb(statePath))
             using (var pipeline = MakePipeline(MakeConfig(src, dst), new EventMonitor(),
-                new DateSizeComparer(), new SizeValidator(), copy, new RecordingLogger(), db))
+                comparer, new SizeValidator(), copy, new RecordingLogger(), db))
             {
                 Assert.True(await pipeline.RunOnceAsync());
             }
             var alloc = GC.GetTotalAllocatedBytes(true) - allocBefore;
 
             Assert.Equal(200, copy.Calls.Count);
+            Assert.Equal(coldComparerCalls, comparer.Calls);
             Assert.True(alloc < 12 * 1024 * 1024, $"Warm resync allocated {alloc} bytes");
         }
         finally { TryDelete(dir); }
