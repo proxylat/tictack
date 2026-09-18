@@ -1,0 +1,16 @@
+# No sync-over-async via .Result in product code: it blocks a threadpool
+# thread and deadlocks under a single-threaded context. Await the task
+# instead — blocked await chains are triaged via pstacks/syncblk (see
+# docs/linux-debug-perf.md §4).
+
+id: no-sync-over-async-result
+language: csharp
+severity: error
+message: >-
+  Sync-over-async (.Result blocks a threadpool thread). Await the task
+  instead — blocked await chains are triaged via pstacks/syncblk (see
+  docs/linux-debug-perf.md §4).
+files:
+  - src/**
+rule:
+  pattern: $TASK.Result

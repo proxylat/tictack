@@ -1,0 +1,17 @@
+# No BitConverter.ToString + Replace hex formatting: ~3 string allocations
+# per hash. Use Convert.ToHexStringLower(hash) — one allocation, identical
+# output (see docs/perf-analysis.md finding #2).
+
+id: no-bitconverter-hex
+language: csharp
+severity: error
+message: >-
+  BitConverter.ToString + Replace allocates ~3 strings per hash. Use
+  Convert.ToHexStringLower(hash) — one allocation, identical output
+  (see docs/perf-analysis.md finding #2).
+files:
+  - src/**
+rule:
+  any:
+    - pattern: BitConverter.ToString($HASH).Replace($A, $B)
+    - pattern: $NS.BitConverter.ToString($HASH).Replace($A, $B)

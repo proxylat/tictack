@@ -174,7 +174,7 @@ namespace TicTack
             Console.WriteLine("Eligible drives:");
             foreach (var drive in drives)
             {
-                var repoPath = cmd.Contains("{drive}")
+                var repoPath = cmd.Contains("{drive}", StringComparison.Ordinal)
                     ? cmd.Split(new[] { "-r " }, StringSplitOptions.None).LastOrDefault()?.Replace("{drive}", drive.TrimEnd('\\'))
                     : null;
                 Console.WriteLine("  " + drive + (repoPath != null ? " → " + repoPath : ""));

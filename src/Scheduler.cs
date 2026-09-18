@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace TicTack
 {
@@ -84,12 +85,17 @@ namespace TicTack
                 if (IsDue(now, job.LastRunOn, job.TimeOfDay))
                 {
                     job.LastRunOn = now.Date; // in-memory guard against same-day re-trigger
+                    // Deliberate fire-and-forget: daily jobs must not block the
+                    // timer, and RunJob is fully try-wrapped so the task cannot
+                    // fault with anything observable.
+#pragma warning disable MA0134 // Observe result of async calls
                     System.Threading.Tasks.Task.Run(() => RunJob(job));
+#pragma warning restore MA0134
                 }
             }
         }
 
-        private void RunJob(JobEntry job)
+        private async Task RunJob(JobEntry job)
         {
             try
             {
@@ -124,14 +130,34 @@ namespace TicTack
                 using (var p = Process.Start(psi))
                 {
                     if (p == null) return;
-                    if (!p.WaitForExit(600000))
+
+                    // Both pipes must be drained concurrently: a child that
+                    // fills a redirected pipe buffer blocks on write, so
+                    // waiting before reading deadlocks until the timeout
+                    // kills it and its output is lost.
+                    var stdout = p.StandardOutput.ReadToEndAsync();
+                    var stderr = p.StandardError.ReadToEndAsync();
+
+                    using (var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(10)))
                     {
-                        try { p.Kill(); } catch { }
-                        _log.Error("Job '" + job.Config.Name + "' timed out after 10 minutes, killed");
+                        try
+                        {
+                            await p.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            try { p.Kill(); } catch { }
+                            await DrainAsync(stdout).ConfigureAwait(false);
+                            await DrainAsync(stderr).ConfigureAwait(false);
+                            _log.Error("Job '" + job.Config.Name + "' timed out after 10 minutes, killed");
+                            return;
+                        }
                     }
-                    else if (p.ExitCode != 0)
+
+                    _ = await DrainAsync(stdout).ConfigureAwait(false);
+                    var err = await DrainAsync(stderr).ConfigureAwait(false);
+                    if (p.ExitCode != 0)
                     {
-                        var err = p.StandardError.ReadToEnd();
                         _log.Error("Job '" + job.Config.Name + "' exited " + p.ExitCode + ": " + err);
                     }
                     else
@@ -146,6 +172,12 @@ namespace TicTack
             {
                 _log.Error("Scheduled job '" + job.Config.Name + "'", ex);
             }
+        }
+
+        private static async Task<string> DrainAsync(Task<string> read)
+        {
+            try { return await read.ConfigureAwait(false); }
+            catch { return string.Empty; }
         }
 
         public void Stop()

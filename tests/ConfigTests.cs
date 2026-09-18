@@ -65,6 +65,27 @@ public class ConfigTests
         Assert.Contains(log.Messages, m => m.Contains("Durability"));
     }
 
+    [Theory]
+    [InlineData("hashh")]
+    [InlineData("md5")]
+    [InlineData("")]
+    public void Validate_RejectsUnknownVerification(string verification)
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { Verification = verification } });
+        var log = new RecordingLogger();
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("Verification"));
+    }
+
+    [Fact]
+    public void Validate_AllowsVerificationAliases()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { Verification = "Date-And-Size" } });
+        Assert.True(Config.Validate(cfg, new RecordingLogger()));
+    }
+
     [Fact]
     public void Validate_ReturnsFalse_WhenNoSources()
     {

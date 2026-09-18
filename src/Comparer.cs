@@ -88,7 +88,7 @@ namespace TicTack
             using (var stream = _accessor != null ? _accessor.OpenRead(path) : File.OpenRead(path))
             {
                 var hash = sha256.ComputeHash(stream);
-                return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                return Convert.ToHexStringLower(hash);
             }
         }
     }

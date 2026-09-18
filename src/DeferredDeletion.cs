@@ -29,13 +29,24 @@ namespace TicTack
                 if (_state == null)
                     _state = new DeferredState();
 
-                _state.PendingFiles = files;
-                _state.TotalSizeBytes = totalSizeBytes;
+                // Union with any batch still held: replacing it would silently
+                // drop the earlier deletions, which would then never be applied.
+                if (_state.PendingFiles == null)
+                    _state.PendingFiles = new List<string>();
+                var pending = _state.PendingFiles;
+                var seen = new HashSet<string>(pending, StringComparer.OrdinalIgnoreCase);
+                foreach (var f in files)
+                {
+                    if (seen.Add(f))
+                        pending.Add(f);
+                }
+
+                _state.TotalSizeBytes += totalSizeBytes;
                 _state.SourceRoot = sourceRoot;
                 _state.BlockedAt = DateTime.UtcNow;
                 _state.LastWarningAt = DateTime.MinValue;
                 Save();
-                _log.Warn("Deferred deletion: " + files.Count + " files, hold for " + _holdDays + " days");
+                _log.Warn("Deferred deletion: " + pending.Count + " files, hold for " + _holdDays + " days");
                 LogSample(files);
             }
         }
@@ -142,7 +153,7 @@ namespace TicTack
                 }
                 File.Move(temp, _dbPath, true);
             }
-            catch { }
+            catch (Exception ex) { _log.Warn("Deferred deletion state could not be saved: " + _dbPath + " (" + ex.Message + ")"); }
         }
 
         private class DeferredState
@@ -161,8 +172,8 @@ namespace TicTack
         public List<string>? Files { get; set; }
         public long TotalSizeBytes { get; set; }
 
-        public static DeferredAction None = new DeferredAction { Type = DeferredActionType.None };
-        public static DeferredAction Waiting = new DeferredAction { Type = DeferredActionType.Waiting };
+        public static readonly DeferredAction None = new DeferredAction { Type = DeferredActionType.None };
+        public static readonly DeferredAction Waiting = new DeferredAction { Type = DeferredActionType.Waiting };
     }
 
     public enum DeferredActionType

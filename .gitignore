@@ -1,6 +1,13 @@
 bin/
 obj/
+.dotnet/
 *.log
+diag-out/
+TestResults/
+BenchmarkDotNet.Artifacts/
+.codemap/
+.code-review-graph/
+benchmarks/baseline.json
 service/win/TicTackSv.exe
 service/win/config.yaml
 service/win/*.dll

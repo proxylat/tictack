@@ -1,0 +1,18 @@
+# No GC.Collect() in product code. Never force collections in steady-state
+# code — fix the retention instead (gcdump/gcstats/dstrings, see
+# docs/linux-debug-perf.md §5). Test-only use belongs in tests/ with a comment
+# saying why.
+
+id: no-gc-collect
+language: csharp
+severity: error
+message: >-
+  GC.Collect() in product code. Never force collections in steady-state code
+  — fix the retention instead (gcdump/gcstats/dstrings, see
+  docs/linux-debug-perf.md §5).
+files:
+  - src/**
+rule:
+  any:
+    - pattern: GC.Collect($$$)
+    - pattern: $SYS.GC.Collect($$$)

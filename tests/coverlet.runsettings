@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat code coverage">
+        <Configuration>
+          <!-- The test project compiles the linked src/ files into its own
+               assembly, so without this the coverage report is empty. -->
+          <IncludeTestAssembly>true</IncludeTestAssembly>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

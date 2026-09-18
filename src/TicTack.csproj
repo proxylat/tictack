@@ -21,6 +21,10 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
+    <!-- Compile-time only: Roslyn perf/correctness rules. PrivateAssets=all
+         keeps it out of the published output — the 4-package runtime diet
+         is unchanged. -->
+    <PackageReference Include="Meziantou.Analyzer" Version="3.0.259" PrivateAssets="all" />
   </ItemGroup>
   <!-- .NET 10 SDK treats these as "type: platform" in deps.json but
        doesn't ship them in the shared framework. Force copy from NuGet cache. -->

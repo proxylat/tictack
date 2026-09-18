@@ -16,6 +16,12 @@ sources:
         - "*.vmdk"
         - "*.crdownload"
         - "*.part"
+        - "*.db-wal"
+        - "*.db-shm"
+        - "*.lock"
+        - ".git/*"
+        - ".opencode/*"
+        - ".code-review-graph/*"
     sync:
       verification: date_and_size
       durability: full

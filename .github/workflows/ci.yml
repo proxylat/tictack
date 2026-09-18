@@ -24,13 +24,54 @@ jobs:
       - name: Build application
         run: dotnet build src/TicTack.csproj --configuration Release --no-restore
       - name: Run tests
-        run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --logger "trx;LogFileName=test-results.trx" --collect:"XPlat Code Coverage" --blame-hang --blame-hang-timeout 180000 --blame-hang-dump-type mini
+        run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --settings tests/coverlet.runsettings --logger "trx;LogFileName=test-results.trx" --collect:"XPlat Code Coverage" --blame-hang --blame-hang-timeout 180000 --blame-hang-dump-type mini
+      - name: Analyze hang dumps
+        if: failure() && matrix.os == 'ubuntu-latest'
+        run: |
+          shopt -s nullglob globstar
+          dumps=(tests/TestResults/**/*.dmp)
+          if [ ${#dumps[@]} -eq 0 ]; then echo "no hang dumps"; exit 0; fi
+          # dnx (ships with the .NET 10 SDK) runs the tools one-shot without
+          # a global install; fall back to a global install otherwise.
+          if command -v dnx >/dev/null 2>&1; then
+            PSTACKS="dnx dotnet-pstacks"; DDUMP="dnx dotnet-dump"
+          else
+            dotnet tool install -g dotnet-pstacks dotnet-dump || true
+            export PATH="$PATH:$HOME/.dotnet/tools"
+            PSTACKS="dotnet-pstacks"; DDUMP="dotnet-dump"
+          fi
+          for d in "${dumps[@]}"; do
+            $PSTACKS "$d" > "${d%.dmp}.pstacks.txt" 2>&1 || true
+            $DDUMP analyze "$d" -c threads -c syncblk -c 'clrstack -all' -c exit > "${d%.dmp}.sos.txt" 2>&1 || true
+          done
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: test-results-${{ matrix.os }}
           path: tests/TestResults/
+          if-no-files-found: ignore
+
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: semgrep r/csharp
+        run: |
+          # Pinned: a new rule release must not turn the gate red on its own.
+          pipx install 'semgrep==1.177.0'
+          semgrep --config r/csharp --metrics off --json -o semgrep.json src
+      - name: ast-grep banked rules
+        run: |
+          npm install -g '@ast-grep/cli@0.45.3'
+          ast-grep scan
+      - name: Upload semgrep results
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: static-results
+          path: semgrep.json
           if-no-files-found: ignore
 
   native-windows:
@@ -46,6 +87,28 @@ jobs:
         run: dotnet restore tests/TicTack.Tests.csproj
       - name: Run Windows integration tests
         run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --filter "Category=Windows" --blame-hang --blame-hang-timeout 180000 --blame-hang-dump-type mini
+      - name: Analyze hang dumps
+        if: failure()
+        shell: pwsh
+        run: |
+          $dumps = Get-ChildItem -Path tests/TestResults -Recurse -Filter *.dmp -ErrorAction SilentlyContinue
+          if (-not $dumps) { Write-Host "no hang dumps"; exit 0 }
+          # dnx (ships with the .NET 10 SDK) runs the tools one-shot without
+          # a global install; fall back to a global install otherwise.
+          if (Get-Command dnx -ErrorAction SilentlyContinue) {
+            function Invoke-PStacks { dnx dotnet-pstacks @args }
+            function Invoke-DDump { dnx dotnet-dump @args }
+          } else {
+            dotnet tool install -g dotnet-pstacks dotnet-dump
+            $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
+            function Invoke-PStacks { dotnet-pstacks @args }
+            function Invoke-DDump { dotnet-dump @args }
+          }
+          foreach ($d in $dumps) {
+            $base = $d.FullName.Substring(0, $d.FullName.Length - 4)
+            Invoke-PStacks $d.FullName > "$base.pstacks.txt" 2>&1
+            Invoke-DDump analyze $d.FullName -c threads -c syncblk -c 'clrstack -all' -c exit > "$base.sos.txt" 2>&1
+          }
       - name: Upload hang diagnostics
         if: always()
         uses: actions/upload-artifact@v5

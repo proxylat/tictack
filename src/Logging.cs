@@ -194,7 +194,7 @@ namespace TicTack
         private readonly ILogger[] _loggers;
         public MultiLogger(IEnumerable<ILogger>? loggers)
         {
-            _loggers = loggers != null ? loggers.ToArray() : new ILogger[0];
+            _loggers = loggers != null ? loggers.ToArray() : Array.Empty<ILogger>();
         }
 
         public void Debug(string msg) { foreach (var l in _loggers) l.Debug(msg); }

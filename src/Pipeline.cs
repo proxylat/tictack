@@ -22,9 +22,10 @@ namespace TicTack
         private readonly IDeletionStrategy _deletion;
         private readonly ILogger _log;
         private readonly IFileFilter? _filter;
+        private readonly IDisposable? _queueCounter;
 
         private readonly ConcurrentDictionary<string, FileChangedEventArgs> _pendingEvents = new ConcurrentDictionary<string, FileChangedEventArgs>(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, DateTime> _debounce = new ConcurrentDictionary<string, DateTime>();
+        private readonly ConcurrentDictionary<string, DateTime> _debounce = new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly SemaphoreSlim _signal = new SemaphoreSlim(0);
         private CancellationTokenSource? _cts;
         private Task? _processor;
@@ -79,6 +80,7 @@ namespace TicTack
             _enumerateFiles = enumerateFiles ?? ((path, option) => Directory.EnumerateFiles(path, "*", option));
             _enumerateDirectories = enumerateDirectories ?? ((path, option) => Directory.EnumerateDirectories(path, "*", option));
             _driveReady = driveReady ?? IsDriveReady;
+            _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(() => _pendingEvents.Count);
 
             var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : 7;
             _deferred = new DeferredDeletion(deferredPath ?? Path.Combine(_config.Destination, ".tictack-deferred.json"), holdDays, _log);
@@ -311,6 +313,9 @@ namespace TicTack
             var pendingState = new List<(string path, long size, long mtime)>();
             var stateLock = new object();
             var scanFailed = 0;
+            long scanned = 0, copied = 0, skipped = 0;
+            var scanStart = DateTime.UtcNow;
+            _log.Info("Initial sync scan starting: " + _config.Path);
 
             void FlushState()
             {
@@ -339,6 +344,9 @@ namespace TicTack
                 {
                     try
                     {
+                        var n = Interlocked.Increment(ref scanned);
+                        if (n % 1000 == 0)
+                            _log.Info($"Initial sync progress: {n} scanned, {Interlocked.Read(ref copied)} copied, {Interlocked.Read(ref skipped)} skipped ({(DateTime.UtcNow - scanStart).TotalSeconds:F0}s): " + _config.Path);
                         if (!FileSnapshot.TryRead(f, out var sourceSnapshot))
                         {
                             Interlocked.Exchange(ref scanFailed, 1);
@@ -356,9 +364,16 @@ namespace TicTack
 
                         if (cache != null && File.Exists(dst) && cache.TryGetValue(rel, out var s)
                             && s.size == sourceSnapshot.Length && s.mtime == sourceSnapshot.LastWriteTimeUtcTicks)
+                        {
+                            Interlocked.Increment(ref skipped);
                             return;
+                        }
 
-                        if (_comparer.AreEqual(f, dst, sourceSnapshot)) return;
+                        if (_comparer.AreEqual(f, dst, sourceSnapshot))
+                        {
+                            Interlocked.Increment(ref skipped);
+                            return;
+                        }
                         var e = new FileChangedEventArgs(ChangeType.Created, f);
                         var args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                         try
@@ -404,6 +419,7 @@ namespace TicTack
                                 if (pendingState.Count >= 500) FlushState();
                             }
                         }
+                        Interlocked.Increment(ref copied);
                     }
                     catch (OperationCanceledException) { }
                     catch (Exception ex)
@@ -425,7 +441,7 @@ namespace TicTack
             catch (PathTooLongException) { _log.Warn("Path too long scanning " + _config.Path); return false; }
             catch (OperationCanceledException) { return false; }
             catch (Exception ex) { _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message); return false; }
-            _log.Info("Sync complete: " + _config.Path);
+            _log.Info($"Sync complete: {_config.Path} ({scanned} scanned, {copied} copied, {skipped} skipped, {scanned - copied - skipped} failed, {(DateTime.UtcNow - scanStart).TotalSeconds:F0}s)");
             return true;
         }
 
@@ -597,6 +613,7 @@ namespace TicTack
             if (_parityTimer != null) _parityTimer.Dispose();
             if (_cts != null) _cts.Dispose();
             _signal.Dispose();
+            _queueCounter?.Dispose();
             _monitor.Dispose();
             if (_stateDb != null) _stateDb.Dispose();
             if (_lock != null) _lock.Dispose();

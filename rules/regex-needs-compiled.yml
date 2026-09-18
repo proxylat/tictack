@@ -1,0 +1,19 @@
+# new Regex() without options: hot-path regexes pay parse cost per
+# construction. Hoist to a static readonly with RegexOptions.Compiled (like
+# VolumeResolver.cs), or use a source-generated [GeneratedRegex].
+# Single-argument form only — the two-argument (pattern, options) form is the
+# fixed shape and does not match $PAT (verified against VolumeResolver.cs).
+
+id: regex-needs-compiled
+language: csharp
+severity: error
+message: >-
+  new Regex() without RegexOptions.Compiled (or source-generated
+  [GeneratedRegex]). Hoist to a static readonly with Compiled, like
+  VolumeResolver.cs.
+files:
+  - src/**
+rule:
+  any:
+    - pattern: new Regex($PAT)
+    - pattern: new $NS.Regex($PAT)
