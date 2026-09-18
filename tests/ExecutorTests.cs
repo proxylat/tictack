@@ -151,4 +151,105 @@ public class ExecutorTests : IDisposable
         Assert.True(result.Success);
     }
 
+    [Fact]
+    public async Task RenameAction_DirCollision_WithoutStrategy_PreservesOldTree()
+    {
+        Directory.CreateDirectory(Dst("old"));
+        File.WriteAllText(Path.Combine(Dst("old"), "keep.txt"), "x");
+        Directory.CreateDirectory(Dst("new"));
+
+        var action = new RenameAction();
+        var e = new FileChangedEventArgs(ChangeType.Renamed, Src("new"), Src("old"));
+        var result = await action.ExecuteAsync(new FileActionArgs(e, _srcDir, _dstDir), CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.True(Directory.Exists(Dst("old")));
+        Assert.True(File.Exists(Path.Combine(Dst("old"), "keep.txt")));
+    }
+
+    [Fact]
+    public async Task RenameAction_DirCollision_WithMirror_DeletesOldTreeAndMoves()
+    {
+        Directory.CreateDirectory(Dst("old"));
+        File.WriteAllText(Path.Combine(Dst("old"), "gone.txt"), "x");
+        Directory.CreateDirectory(Dst("new"));
+
+        var deletion = new RecordingDeletion(new MirrorDeletion());
+        var action = new RenameAction(deletion, new RecordingLogger());
+        var e = new FileChangedEventArgs(ChangeType.Renamed, Src("new"), Src("old"));
+        var result = await action.ExecuteAsync(new FileActionArgs(e, _srcDir, _dstDir), CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.False(Directory.Exists(Dst("old")));
+        Assert.Single(deletion.Calls);
+    }
+
+    [Fact]
+    public async Task RenameAction_DirCollision_WithArchive_PreservesContentInArchive()
+    {
+        Directory.CreateDirectory(Dst("old"));
+        File.WriteAllText(Path.Combine(Dst("old"), "keep.txt"), "archive me");
+        Directory.CreateDirectory(Dst("new"));
+
+        var action = new RenameAction(new ArchiveDeletion(Path.Combine(_dstDir, ".archive"), _dstDir), new RecordingLogger());
+        var e = new FileChangedEventArgs(ChangeType.Renamed, Src("new"), Src("old"));
+        var result = await action.ExecuteAsync(new FileActionArgs(e, _srcDir, _dstDir), CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.True(File.Exists(Path.Combine(_dstDir, ".archive", "old", "keep.txt")));
+    }
+
+    [Fact]
+    public async Task RenameAction_FileCollision_WithoutStrategy_PreservesOldFile()
+    {
+        File.WriteAllText(Dst("old.txt"), "old");
+        File.WriteAllText(Dst("new.txt"), "new");
+
+        var action = new RenameAction();
+        var e = new FileChangedEventArgs(ChangeType.Renamed, Src("new.txt"), Src("old.txt"));
+        var result = await action.ExecuteAsync(new FileActionArgs(e, _srcDir, _dstDir), CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("old", File.ReadAllText(Dst("old.txt")));
+        Assert.Equal("new", File.ReadAllText(Dst("new.txt")));
+    }
+
+    private sealed class StubDeletion : IDeletionStrategy
+    {
+        private readonly ActionResult _result;
+        public StubDeletion(ActionResult result) => _result = result;
+        public Task<ActionResult> HandleDeletionAsync(string? sourcePath, string destPath, CancellationToken ct) =>
+            Task.FromResult(_result);
+    }
+
+    [Fact]
+    public async Task RenameAction_DirCollision_WhenStrategyFails_PreservesOldTree()
+    {
+        Directory.CreateDirectory(Dst("old"));
+        File.WriteAllText(Path.Combine(Dst("old"), "keep.txt"), "x");
+        Directory.CreateDirectory(Dst("new"));
+
+        var action = new RenameAction(new StubDeletion(ActionResult.Fail("nope")), new RecordingLogger());
+        var e = new FileChangedEventArgs(ChangeType.Renamed, Src("new"), Src("old"));
+        var result = await action.ExecuteAsync(new FileActionArgs(e, _srcDir, _dstDir), CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.True(File.Exists(Path.Combine(Dst("old"), "keep.txt")));
+    }
+
+    [Fact]
+    public async Task RenameAction_DirCollision_WhenStrategyKeepsTree_MoveFailsSafely()
+    {
+        Directory.CreateDirectory(Dst("old"));
+        File.WriteAllText(Path.Combine(Dst("old"), "keep.txt"), "x");
+        Directory.CreateDirectory(Dst("new"));
+
+        var action = new RenameAction(new StubDeletion(ActionResult.Ok()), new RecordingLogger());
+        var e = new FileChangedEventArgs(ChangeType.Renamed, Src("new"), Src("old"));
+        var result = await action.ExecuteAsync(new FileActionArgs(e, _srcDir, _dstDir), CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.True(File.Exists(Path.Combine(Dst("old"), "keep.txt")));
+    }
+
 }

@@ -157,10 +157,19 @@ namespace TicTack
 
     public class RenameAction : IFileAction
     {
-        public Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
+        private readonly IDeletionStrategy? _deletion;
+        private readonly ILogger? _log;
+
+        public RenameAction(IDeletionStrategy? deletion = null, ILogger? log = null)
+        {
+            _deletion = deletion;
+            _log = log;
+        }
+
+        public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
         {
             if (args.OldDestPath == null)
-                return Task.FromResult(ActionResult.Ok());
+                return ActionResult.Ok();
 
             try
             {
@@ -169,21 +178,47 @@ namespace TicTack
                     if (!Directory.Exists(args.DestPath))
                         Directory.Move(args.OldDestPath, args.DestPath);
                     else
-                        Directory.Delete(args.OldDestPath, true);
+                    {
+                        // Collision: the old-name tree holds destination-only content.
+                        // Never raw-delete it; route through the configured deletion
+                        // strategy (archive or mirror) or refuse when none is wired.
+                        if (_deletion == null)
+                        {
+                            var msg = "Rename target exists, old tree preserved: " + args.OldDestPath;
+                            _log?.Warn(msg);
+                            return ActionResult.Fail(msg);
+                        }
+                        var deleted = await _deletion.HandleDeletionAsync(null, args.OldDestPath, ct);
+                        if (!deleted.Success) return deleted;
+                        // The strategy consumed the old tree (mirror deletes, archive
+                        // moves it aside); move only if something is left to move.
+                        if (Directory.Exists(args.OldDestPath))
+                            Directory.Move(args.OldDestPath, args.DestPath);
+                    }
                 }
                 else if (File.Exists(args.OldDestPath))
                 {
                     var dir = Path.GetDirectoryName(args.DestPath);
                     if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                    if (File.Exists(args.DestPath)) File.Delete(args.DestPath);
+                    if (File.Exists(args.DestPath))
+                    {
+                        if (_deletion == null)
+                        {
+                            var msg = "Rename target exists, old file preserved: " + args.OldDestPath;
+                            _log?.Warn(msg);
+                            return ActionResult.Fail(msg);
+                        }
+                        var deleted = await _deletion.HandleDeletionAsync(null, args.DestPath, ct);
+                        if (!deleted.Success) return deleted;
+                    }
                     File.Move(args.OldDestPath, args.DestPath);
                 }
             }
             catch (Exception ex)
             {
-                return Task.FromResult(ActionResult.Fail(ex.Message));
+                return ActionResult.Fail(ex.Message);
             }
-            return Task.FromResult(ActionResult.Ok());
+            return ActionResult.Ok();
         }
     }
 

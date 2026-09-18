@@ -28,6 +28,7 @@ namespace TicTack
         private readonly ConcurrentDictionary<string, DateTime> _debounce = new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly SemaphoreSlim _signal = new SemaphoreSlim(0);
         private CancellationTokenSource? _cts;
+        private bool _started;
         private Task? _processor;
         private Task<bool>? _initialSync;
         private readonly List<Task> _deferredTasks = new List<Task>();
@@ -79,7 +80,7 @@ namespace TicTack
             _directoryExists = directoryExists ?? Directory.Exists;
             _enumerateFiles = enumerateFiles ?? ((path, option) => Directory.EnumerateFiles(path, "*", option));
             _enumerateDirectories = enumerateDirectories ?? ((path, option) => Directory.EnumerateDirectories(path, "*", option));
-            _driveReady = driveReady ?? IsDriveReady;
+            _driveReady = driveReady ?? (path => IsDriveReady(path));
             _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(() => _pendingEvents.Count);
 
             var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : 7;
@@ -96,17 +97,49 @@ namespace TicTack
             _filter = filters.Count > 0 ? new CompositeFilter(filters) : null;
         }
 
-        internal static bool IsDriveReady(string path)
+        // Mount-table snapshot cache: GetDrives()+IsReady costs ~218us/26KB per
+        // call, and the initial sync probes once per file. Fail-closed TTL:
+        // a vanished drive reports ready for at most 30s (copy then errors),
+        // a fresh drive waits at most 30s (start-retry loop covers it).
+        private static readonly Func<DriveInfo[]> _defaultDriveProbe = static () => DriveInfo.GetDrives();
+        private static readonly object _driveCacheLock = new();
+        private static List<(string Root, bool Ready)>? _driveCache;
+        private static DateTime _driveCacheAt;
+        private static Func<DriveInfo[]>? _driveCacheProbe;
+
+        private static List<(string Root, bool Ready)> GetCachedDrives(Func<DriveInfo[]>? getDrives)
+        {
+            getDrives ??= _defaultDriveProbe;
+            lock (_driveCacheLock)
+            {
+                if (_driveCache != null && ReferenceEquals(_driveCacheProbe, getDrives)
+                    && DateTime.UtcNow - _driveCacheAt < TimeSpan.FromSeconds(30))
+                    return _driveCache;
+                _driveCache = getDrives()
+                    .Select(d =>
+                    {
+                        bool ready;
+                        try { ready = d.IsReady; } catch { ready = false; }
+                        return (d.RootDirectory.FullName, ready);
+                    })
+                    .ToList();
+                _driveCacheAt = DateTime.UtcNow;
+                _driveCacheProbe = getDrives;
+                return _driveCache;
+            }
+        }
+
+        internal static bool IsDriveReady(string path, Func<DriveInfo[]>? getDrives = null)
         {
             try
             {
                 var fullPath = Path.GetFullPath(path);
-                var mounts = DriveInfo.GetDrives()
-                    .Where(d => d.IsReady && fullPath.StartsWith(d.RootDirectory.FullName, StringComparison.OrdinalIgnoreCase))
-                    .OrderByDescending(d => d.RootDirectory.FullName.Length)
+                var mounts = GetCachedDrives(getDrives)
+                    .Where(d => d.Ready && fullPath.StartsWith(d.Root, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(d => d.Root.Length)
                     .ToList();
                 if (mounts.Count == 0) return false;
-                if (OperatingSystem.IsLinux() && mounts[0].RootDirectory.FullName == "/"
+                if (OperatingSystem.IsLinux() && mounts[0].Root == "/"
                     && (fullPath == "/srv" || fullPath.StartsWith("/srv/", StringComparison.Ordinal)
                         || fullPath == "/mnt" || fullPath.StartsWith("/mnt/", StringComparison.Ordinal)
                         || fullPath == "/media" || fullPath.StartsWith("/media/", StringComparison.Ordinal)
@@ -124,6 +157,7 @@ namespace TicTack
 
         private void Start(bool startWorkers)
         {
+            if (_started) return;
             _cts = new CancellationTokenSource();
             if (!_directoryExists(_config.Path))
             {
@@ -142,6 +176,12 @@ namespace TicTack
 
         void DoStart(bool startWorkers = true)
         {
+            // Start is not re-entrant: a second call would replace the CTS,
+            // double-subscribe the monitor, and launch duplicate workers.
+            // Worse, the duplicate DoStart would block forever in SrcLock
+            // (null retry timeout retries every 5s with no deadline).
+            if (_started) return;
+            _started = true;
             var lockTimeout = _config.Sync != null && _config.Sync.LockHandling == "retry"
                 ? (TimeSpan?)TimeSpan.FromMinutes(_config.Sync.RetryLockMinutes > 0 ? _config.Sync.RetryLockMinutes : 10)
                 : null;
@@ -376,46 +416,16 @@ namespace TicTack
                         }
                         var e = new FileChangedEventArgs(ChangeType.Created, f);
                         var args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
-                        try
-                        {
-                            var archiveResult = await _versioning.ArchivePreviousVersionAsync(dst, token);
-                            if (!archiveResult.Success)
-                            {
-                                _log.Error("Versioning failed: " + dst + ": " + archiveResult.ErrorMessage);
-                                return;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _log.Error("Versioning failed: " + dst, ex);
-                            return;
-                        }
-
-                        ActionResult result;
-                        result = await _copyAction.ExecuteAsync(args, token);
-                        if (!result.Success)
-                        {
-                            _log.Error("Initial sync failed: " + f + ": " + result.ErrorMessage);
-                            return;
-                        }
-
-                        if (!FileSnapshot.TryRead(f, out var freshSnapshot))
-                        {
-                            _log.Error("Initial sync validation FAILED: source disappeared: " + f);
-                            return;
-                        }
-                        var valid = await _validator.ValidateAsync(f, dst, freshSnapshot);
-                        if (!valid)
-                        {
-                            _log.Error("Initial sync validation FAILED: " + f + " -> " + dst);
-                            return;
-                        }
+                        var fresh = await ExecuteCopyAsync(args,
+                            (a, c) => _copyAction.ExecuteAsync(a, c),
+                            "Initial sync failed", "Initial sync validation FAILED", token);
+                        if (fresh == null) return;
 
                         if (_stateDb != null)
                         {
                             lock (stateLock)
                             {
-                                pendingState.Add((rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks));
+                                pendingState.Add((rel, fresh.Value.Length, fresh.Value.LastWriteTimeUtcTicks));
                                 if (pendingState.Count >= 500) FlushState();
                             }
                         }
@@ -443,6 +453,55 @@ namespace TicTack
             catch (Exception ex) { _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message); return false; }
             _log.Info($"Sync complete: {_config.Path} ({scanned} scanned, {copied} copied, {skipped} skipped, {scanned - copied - skipped} failed, {(DateTime.UtcNow - scanStart).TotalSeconds:F0}s)");
             return true;
+        }
+
+        // Shared copy flow for InitialSyncAsync and ProcessEvent: version the
+        // previous destination, copy, re-read the source, validate. Returns the
+        // fresh snapshot on success, null on any failure (already logged with
+        // the caller's labels, so log strings are unchanged by the sharing).
+        private async Task<FileSnapshot?> ExecuteCopyAsync(
+            FileActionArgs args,
+            Func<FileActionArgs, CancellationToken, Task<ActionResult>> copy,
+            string failLabel,
+            string validationLabel,
+            CancellationToken ct)
+        {
+            var src = args.ChangeEvent.FullPath;
+            var dst = args.DestPath;
+            try
+            {
+                var archiveResult = await _versioning.ArchivePreviousVersionAsync(dst, ct);
+                if (!archiveResult.Success)
+                {
+                    _log.Error("Versioning failed: " + dst + ": " + archiveResult.ErrorMessage);
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error("Versioning failed: " + dst, ex);
+                return null;
+            }
+
+            var result = await copy(args, ct);
+            if (!result.Success)
+            {
+                _log.Error(failLabel + ": " + src + ": " + result.ErrorMessage);
+                return null;
+            }
+
+            if (!FileSnapshot.TryRead(src, out var freshSnapshot))
+            {
+                _log.Error(validationLabel + ": source disappeared: " + src);
+                return null;
+            }
+            var valid = await _validator.ValidateAsync(src, dst, freshSnapshot);
+            if (!valid)
+            {
+                _log.Error(validationLabel + ": " + src + " -> " + dst);
+                return null;
+            }
+            return freshSnapshot;
         }
 
         private async Task WaitForSignal(CancellationToken token)
@@ -528,37 +587,19 @@ namespace TicTack
                             }
                             return;
                         }
-                        if (!FileSnapshot.TryRead(e.FullPath, out var sourceSnapshot)) return;
+                        if (!FileSnapshot.TryRead(e.FullPath, out var sourceSnapshot))
+                        {
+                            _log.Warn("Source unreadable, copy skipped: " + e.FullPath);
+                            return;
+                        }
                         args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                         if (_comparer.AreEqual(e.FullPath, args.DestPath, sourceSnapshot)) return;
 
-                        var archiveResult = await _versioning.ArchivePreviousVersionAsync(args.DestPath, ct);
-                        if (!archiveResult.Success)
-                        {
-                            _log.Error("Versioning failed: " + args.DestPath + ": " + archiveResult.ErrorMessage);
-                            return;
-                        }
-
-                        var result = await _retry.ExecuteAsync(
-                            () => _copyAction.ExecuteAsync(args, ct), ct);
-
-                        if (!result.Success)
-                        {
-                            _log.Error("Copy failed: " + e.FullPath + ": " + result.ErrorMessage);
-                            return;
-                        }
-
-                        if (!FileSnapshot.TryRead(e.FullPath, out var freshSnapshot))
-                        {
-                            _log.Error("Validation FAILED: source disappeared: " + e.FullPath);
-                            return;
-                        }
-                        var valid = await _validator.ValidateAsync(e.FullPath, args.DestPath, freshSnapshot);
-                        if (!valid)
-                        {
-                            _log.Error("Validation FAILED: " + e.FullPath + " -> " + args.DestPath);
-                            return;
-                        }
+                        var fresh = await ExecuteCopyAsync(args,
+                            (a, c) => _retry.ExecuteAsync(() => _copyAction.ExecuteAsync(a, c), c),
+                            "Copy failed", "Validation FAILED", ct);
+                        if (fresh == null) return;
+                        var freshSnapshot = fresh.Value;
                         if (_stateDb != null)
                         {
                             try
@@ -581,6 +622,7 @@ namespace TicTack
         public async Task StopAsync()
         {
             if (_disposed) return;
+            _started = false;
             if (_cts != null) _cts.Cancel();
             _monitor.Changed -= OnChanged;
             _monitor.Stop();
