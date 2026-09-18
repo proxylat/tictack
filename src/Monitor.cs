@@ -273,6 +273,8 @@ namespace TicTack
             _timer = new Timer(_ => Poll(), null, _intervalSec * 1000, _intervalSec * 1000);
         }
 
+        internal void PollNow() => Poll();
+
         private void Poll()
         {
             try

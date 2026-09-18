@@ -15,7 +15,7 @@ namespace TicTack
 
         public bool IsHeld { get; private set; }
 
-        public SrcLock(string path, ILogger log, TimeSpan? retryTimeout = null)
+        public SrcLock(string path, ILogger log, TimeSpan? retryTimeout = null, TimeSpan? refreshInterval = null)
         {
             _path = path;
             _identity = Environment.MachineName + ":" + Process.GetCurrentProcess().Id;
@@ -56,11 +56,12 @@ namespace TicTack
                     }
                 }
 
+                var refresh = refreshInterval ?? TimeSpan.FromSeconds(30);
                 _refreshTimer = new Timer(_ =>
                 {
                     try { File.SetLastWriteTimeUtc(_path, DateTime.UtcNow); }
                     catch { }
-                }, null, 30000, 30000);
+                }, null, refresh, refresh);
             }
             catch (Exception ex)
             {
