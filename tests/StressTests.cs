@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 
 namespace TicTack;
 
@@ -8,6 +9,12 @@ public class StressTests
 
     static string TestDir() =>
         Path.Combine(Path.GetTempPath(), Root + "_" + Guid.NewGuid());
+
+    static string Sha256Of(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return Convert.ToHexStringLower(SHA256.HashData(fs));
+    }
 
     static SourceConfig MakeConfig(string src, string dst, double debounce = 0.1) => new()
     {
@@ -148,17 +155,17 @@ public class StressTests
             File.WriteAllText(f2, "two");
 
             var action = new RenameAction();
-            var tasks = new[]
-            {
-                action.ExecuteAsync(new FileActionArgs(
-                    new FileChangedEventArgs(ChangeType.Renamed, target, f1), dst, dst), CancellationToken.None),
-                action.ExecuteAsync(new FileActionArgs(
-                    new FileChangedEventArgs(ChangeType.Renamed, target, f2), dst, dst), CancellationToken.None)
-            };
-            await Task.WhenAll(tasks);
+            var t1 = action.ExecuteAsync(new FileActionArgs(
+                new FileChangedEventArgs(ChangeType.Renamed, target, f1), dst, dst), CancellationToken.None);
+            var t2 = action.ExecuteAsync(new FileActionArgs(
+                new FileChangedEventArgs(ChangeType.Renamed, target, f2), dst, dst), CancellationToken.None);
+            var results = await Task.WhenAll(t1, t2);
 
-            // One should win, no exception
-            Assert.True(File.Exists(target));
+            // Exactly one rename wins and the loser fails without throwing.
+            // A stale pre-existing target must not satisfy this.
+            Assert.Equal(1, results.Count(r => r.Success));
+            var content = File.ReadAllText(target);
+            Assert.True(content == "one" || content == "two", $"unexpected content: {content}");
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -257,7 +264,6 @@ public class StressTests
             File.WriteAllText(Path.Combine(oldDir, "b.txt"), "bbb");
 
             var action = new RenameAction();
-            var srcBase = Path.Combine(dir, "src");
             var dstBase = Path.Combine(dir, "dst");
 
             // Simulate rename of subfolder
@@ -495,6 +501,8 @@ public class StressTests
             var dstFile = Path.Combine(dst, "large.bin");
             Assert.True(File.Exists(dstFile));
             Assert.Equal(new FileInfo(f).Length, new FileInfo(dstFile).Length);
+            // Length alone would pass for a zero-filled file: compare content.
+            Assert.Equal(Sha256Of(f), Sha256Of(dstFile));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -529,10 +537,13 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 16. Power loss: dst exists, StateDb missing entry ──
+    // ── 16. StateDb round-trip for a copy that predates its entry ──
+    // (No pipeline is constructed here: this pins the DB behavior that the
+    // real warm-db skip path depends on. The end-to-end warm skip is covered
+    // by PerfTests.WarmResync_CopiesNothing, which reopens the same DB.)
 
     [Fact]
-    public async Task InitialSync_AfterCrash_RecoversMissingState()
+    public async Task StateDb_MissingEntry_RoundTrip()
     {
         var dir = TestDir();
         var srcDir = Path.Combine(dir, "src");
@@ -549,7 +560,7 @@ public class StressTests
             var statePath = Path.Combine(dstDir, ".tictack.db");
             using (var db = new StateDb(statePath))
             {
-                // Simulate crash AFTER copy but BEFORE StateDb write — no entry
+                // A copy that landed before its StateDb write leaves no entry.
             }
 
             using (var db2 = new StateDb(statePath))
@@ -573,7 +584,9 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 17. Power loss: StateDb WAL crash recovery ──
+    // ── 17. StateDb WAL round-trip after a clean close ──
+    // (The real crash path — kill -9 mid-write, WAL replay on reopen — is
+    // CrashRecoveryTests.KillBeforeCheckpoint_WalReplaysOnReopen.)
 
     [Fact]
     public void StateDb_WalCrashRecovery()
@@ -589,8 +602,6 @@ public class StressTests
                 db.Upsert("b.txt", 200, 2000);
             }
 
-            // Simulate crash by not closing cleanly — just dispose
-            // SQLite WAL will replay on reopen
             using (var db2 = new StateDb(dbPath))
             {
                 var all = db2.LoadAll();

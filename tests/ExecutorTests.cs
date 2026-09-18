@@ -25,7 +25,7 @@ public class ExecutorTests : IDisposable
     string Src(string name) => Path.Combine(_srcDir, name);
     string Dst(string name) => Path.Combine(_dstDir, name);
 
-    FileActionArgs MakeArgs(string srcPath, string relFile) =>
+    FileActionArgs MakeArgs(string srcPath) =>
         new(new FileChangedEventArgs(ChangeType.Created, srcPath), _srcDir, _dstDir);
 
     [Fact]
@@ -35,7 +35,7 @@ public class ExecutorTests : IDisposable
         File.WriteAllText(Src("a.txt"), content);
 
         var action = new CopyAction(_accessor);
-        var args = MakeArgs(Src("a.txt"), "a.txt");
+        var args = MakeArgs(Src("a.txt"));
         var result = await action.ExecuteAsync(args, CancellationToken.None);
 
         Assert.True(result.Success);
@@ -48,19 +48,24 @@ public class ExecutorTests : IDisposable
     {
         File.WriteAllText(Src("a.txt"), "temp rename test");
 
-        var action = new CopyAction(_accessor);
-        var args = MakeArgs(Src("a.txt"), "a.txt");
-        await action.ExecuteAsync(args, CancellationToken.None);
+        var seen = new List<CopyCheckpoint>();
+        var action = new CopyAction(_accessor, true, seen.Add);
+        var args = MakeArgs(Src("a.txt"));
+        var result = await action.ExecuteAsync(args, CancellationToken.None);
 
+        Assert.True(result.Success);
         Assert.True(File.Exists(Dst("a.txt")));
         Assert.False(File.Exists(Dst("a.txt.tictack.tmp")));
+        // Temp-then-rename ordering: data hits the temp file and is flushed
+        // before the atomic commit, never the reverse.
+        Assert.Equal(new[] { CopyCheckpoint.TempCreated, CopyCheckpoint.DataFlushed, CopyCheckpoint.BeforeCommit, CopyCheckpoint.AfterCommit }, seen);
     }
 
     [Fact]
     public async Task CopyAction_MissingSource_ReturnsFail()
     {
         var action = new CopyAction(_accessor);
-        var args = MakeArgs(Src("missing.txt"), "missing.txt");
+        var args = MakeArgs(Src("missing.txt"));
         var result = await action.ExecuteAsync(args, CancellationToken.None);
         Assert.False(result.Success);
         Assert.False(string.IsNullOrEmpty(result.ErrorMessage));
@@ -73,7 +78,7 @@ public class ExecutorTests : IDisposable
         File.WriteAllText(Dst("a.txt"), "old content");
 
         var action = new CopyAction(_accessor);
-        var args = MakeArgs(Src("a.txt"), "a.txt");
+        var args = MakeArgs(Src("a.txt"));
         var result = await action.ExecuteAsync(args, CancellationToken.None);
 
         Assert.True(result.Success);
@@ -89,7 +94,7 @@ public class ExecutorTests : IDisposable
         File.WriteAllText(srcFile, "nested content");
 
         var action = new CopyAction(_accessor);
-        var args = MakeArgs(srcFile, Path.Combine("sub", "deep", "file.txt"));
+        var args = MakeArgs(srcFile);
         var result = await action.ExecuteAsync(args, CancellationToken.None);
 
         Assert.True(result.Success);
@@ -109,7 +114,7 @@ public class ExecutorTests : IDisposable
         try
         {
             var action = new CopyAction(_accessor);
-            var result = await action.ExecuteAsync(MakeArgs(Src("a.txt"), "a.txt"), CancellationToken.None);
+            var result = await action.ExecuteAsync(MakeArgs(Src("a.txt")), CancellationToken.None);
 
             Assert.True(result.Success);
             Assert.Equal("new content", File.ReadAllText(dst));
@@ -129,7 +134,7 @@ public class ExecutorTests : IDisposable
             if (cp == CopyCheckpoint.AfterCommit)
                 Directory.Delete(_dstDir, true);
         });
-        var result = await action.ExecuteAsync(MakeArgs(Src("a.txt"), "a.txt"), CancellationToken.None);
+        var result = await action.ExecuteAsync(MakeArgs(Src("a.txt")), CancellationToken.None);
 
         Assert.False(result.Success);
         Assert.Contains("fsync", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
@@ -144,7 +149,7 @@ public class ExecutorTests : IDisposable
         File.SetLastWriteTimeUtc(Src("a.txt"), writeTime);
 
         var action = new CopyAction(_accessor);
-        var args = MakeArgs(Src("a.txt"), "a.txt");
+        var args = MakeArgs(Src("a.txt"));
         await action.ExecuteAsync(args, CancellationToken.None);
 
         var dstTime = File.GetLastWriteTimeUtc(Dst("a.txt"));
@@ -319,7 +324,7 @@ public class ExecutorTests : IDisposable
         Assert.True((File.GetAttributes(src) & FileAttributes.SparseFile) != 0);
 
         var action = new CopyAction(_accessor);
-        var result = await action.ExecuteAsync(MakeArgs(src, "sparse.bin"), CancellationToken.None);
+        var result = await action.ExecuteAsync(MakeArgs(src), CancellationToken.None);
 
         Assert.True(result.Success);
         var dstInfo = new FileInfo(Dst("sparse.bin"));

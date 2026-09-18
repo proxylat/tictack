@@ -39,7 +39,10 @@ public class VersioningTests : IDisposable
 
         Assert.True(File.Exists(Dst("a.txt")));
         var files = Directory.GetFiles(Path.Combine(_verDir, "Desktop"), "a_*");
-        Assert.NotEmpty(files);
+        // Name contract: a_{yyyyMMdd_HHmmss_fff}_{32-hex-guid}.txt
+        var file = Assert.Single(files);
+        Assert.Matches(@"^a_\d{8}_\d{6}_\d{3}_[0-9a-f]{32}\.txt$", Path.GetFileName(file));
+        Assert.Equal("version 1", File.ReadAllText(file));
     }
 
     [Fact]

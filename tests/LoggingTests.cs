@@ -2,6 +2,13 @@ using System.Text.RegularExpressions;
 
 namespace TicTack;
 
+// Console.SetOut is process-global: serialize against every other collection
+// so a parallel test class cannot write into (or read from) the redirected
+// writer.
+[CollectionDefinition("SerialConsole", DisableParallelization = true)]
+public sealed class SerialConsoleCollection { }
+
+[Collection("SerialConsole")]
 public class LoggingTests
 {
     [Theory]
@@ -154,7 +161,7 @@ public class LoggingTests
     public void MultiLogger_NullLoggers_DoesNotThrow()
     {
         var multi = new MultiLogger(null);
-        multi.Info("no crash");
+        Assert.Null(Record.Exception(() => multi.Info("no crash")));
     }
 
     [Fact]

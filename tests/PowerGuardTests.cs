@@ -96,8 +96,10 @@ public class PowerGuardTests : IDisposable
 
         PowerGuard.Cleanup(cfg, _log);
 
-        Assert.True(File.Exists(Path.Combine(_dstDir, "f1.txt")));
-        Assert.True(File.Exists(Path.Combine(dst2, "f2.txt")));
+        Assert.Equal("data1", File.ReadAllText(Path.Combine(_dstDir, "f1.txt")));
+        Assert.Equal("data2", File.ReadAllText(Path.Combine(dst2, "f2.txt")));
+        Assert.False(File.Exists(tmp1));
+        Assert.False(File.Exists(tmp2));
 
         try { Directory.Delete(dst2, true); } catch { }
     }
@@ -105,7 +107,7 @@ public class PowerGuardTests : IDisposable
     [Fact]
     public void Cleanup_NullConfig_DoesNotThrow()
     {
-        PowerGuard.Cleanup(null, _log);
+        Assert.Null(Record.Exception(() => PowerGuard.Cleanup(null, _log)));
     }
 
     [Fact]
@@ -113,7 +115,7 @@ public class PowerGuardTests : IDisposable
     {
         var cfg = new TicTackConfig();
         cfg.Sources = null!;
-        PowerGuard.Cleanup(cfg, _log);
+        Assert.Null(Record.Exception(() => PowerGuard.Cleanup(cfg, _log)));
     }
 
     [Fact]

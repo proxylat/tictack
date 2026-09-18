@@ -66,26 +66,23 @@ public class FilterTests
     }
 
     [Fact]
-    public void SizeFilter_BlocksLargeFile()
+    public void SizeFilter_BlocksOverLimit_AllowsUnder()
     {
         var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_filter_" + Guid.NewGuid());
         Directory.CreateDirectory(dir);
         try
         {
-            var path = Path.Combine(dir, "large.bin");
-            File.WriteAllBytes(path, new byte[5000]);
-            var filter = new SizeFilter(0); // 0 MB means no limit via ShouldProcess logic
-            Assert.True(filter.ShouldProcess(path));
+            var small = Path.Combine(dir, "small.bin");
+            File.WriteAllBytes(small, new byte[5000]);
+            var large = Path.Combine(dir, "large.bin");
+            File.WriteAllBytes(large, new byte[2 * 1024 * 1024]);
 
-            var blockingFilter = new SizeFilter(1); // 1 MB limit, 5000 bytes is less, so passes
-            Assert.True(blockingFilter.ShouldProcess(path));
+            // 0 MB means no limit.
+            Assert.True(new SizeFilter(0).ShouldProcess(small));
 
-            // Test with actual blocking: make a tiny limit (0.001 MB = ~1048 bytes)
-            // We need to test the internal _maxBytes logic - write a file > limit
-            // SizeFilter takes MB, so 1 MB limit allows 5000 bytes. To block, file must be > limit.
-            var path2 = Path.Combine(dir, "large2.bin");
-            File.WriteAllBytes(path2, new byte[2 * 1024 * 1024]); // 2 MB
-            Assert.False(blockingFilter.ShouldProcess(path2));
+            var oneMb = new SizeFilter(1);
+            Assert.True(oneMb.ShouldProcess(small));
+            Assert.False(oneMb.ShouldProcess(large));
         }
         finally { Directory.Delete(dir, true); }
     }

@@ -20,6 +20,11 @@ public class SrcLockTests : IDisposable
         try { Directory.Delete(_dir, true); } catch { }
     }
 
+    // A foreign holder's identity in the production format (host:pid),
+    // guaranteed not to be this process.
+    static string ForeignIdentity() =>
+        Environment.MachineName + ":" + (Environment.ProcessId + 1);
+
     [Fact]
     public void AcquiresLock()
     {
@@ -40,7 +45,7 @@ public class SrcLockTests : IDisposable
     [Fact]
     public void DetectsStaleLock()
     {
-        File.WriteAllText(_lockPath, "other:12345");
+        File.WriteAllText(_lockPath, ForeignIdentity());
         File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow.AddMinutes(-10));
         using var lockObj = new SrcLock(_lockPath, _log);
         Assert.True(lockObj.IsHeld);
@@ -49,7 +54,7 @@ public class SrcLockTests : IDisposable
     [Fact]
     public void FreshLock_ReturnsImmediately()
     {
-        File.WriteAllText(_lockPath, "other:12345");
+        File.WriteAllText(_lockPath, ForeignIdentity());
         File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow);
 
         var sw = Stopwatch.StartNew();
@@ -68,7 +73,7 @@ public class SrcLockTests : IDisposable
     [Fact]
     public void StaleLock_JustUnderFiveMinutes_IsNotTakenOver()
     {
-        File.WriteAllText(_lockPath, "other:12345");
+        File.WriteAllText(_lockPath, ForeignIdentity());
         File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow.AddMinutes(-5).AddSeconds(1));
 
         using var lockObj = new SrcLock(_lockPath, _log);
@@ -80,7 +85,7 @@ public class SrcLockTests : IDisposable
     [Fact]
     public void StaleLock_JustOverFiveMinutes_IsTakenOver()
     {
-        File.WriteAllText(_lockPath, "other:12345");
+        File.WriteAllText(_lockPath, ForeignIdentity());
         File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow.AddMinutes(-5).AddSeconds(-1));
 
         using var lockObj = new SrcLock(_lockPath, _log);
@@ -91,7 +96,7 @@ public class SrcLockTests : IDisposable
     [Fact]
     public void ContendedLock_WithRetryTimeout_GivesUpAndWarns()
     {
-        File.WriteAllText(_lockPath, "other:12345");
+        File.WriteAllText(_lockPath, ForeignIdentity());
         File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow);
 
         var sw = Stopwatch.StartNew();

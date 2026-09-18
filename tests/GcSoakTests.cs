@@ -65,6 +65,35 @@ public class GcSoakTests
         return synced;
     }
 
+    // Content-based wait: destination files already exist from earlier cycles,
+    // so existence alone would return immediately without proving this cycle
+    // synced. The per-cycle unique prefix proves fresh content arrived.
+    static async Task<bool> WaitForContentAsync(string dst, int n, string prefix, int timeoutSeconds = 60)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        bool synced;
+        do
+        {
+            synced = true;
+            for (int i = 0; i < n; i++)
+            {
+                var p = Path.Combine(dst, $"s{i}.txt");
+                if (!File.Exists(p)) { synced = false; break; }
+                try
+                {
+                    using var s = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    using var r = new StreamReader(s);
+                    var buf = new char[prefix.Length + 1];
+                    var read = await r.ReadAsync(buf, 0, buf.Length);
+                    if (read < prefix.Length || new string(buf, 0, prefix.Length) != prefix) { synced = false; break; }
+                }
+                catch (IOException) { synced = false; break; }
+            }
+            if (!synced) await Task.Delay(250);
+        } while (!synced && DateTime.UtcNow < deadline);
+        return synced;
+    }
+
     // ── 1. Repeated sync cycles must not grow the post-full-GC heap ──
     [Fact]
     public async Task Pipeline_RepeatedCycles_HeapStableAfterFullGC()
@@ -95,7 +124,7 @@ public class GcSoakTests
                 using (var pipeline = MakePipeline(src, dst, new EventMonitor()))
                 {
                     pipeline.Start();
-                    Assert.True(await WaitForFilesAsync(dst, n), $"cycle {c} files not synced");
+                    Assert.True(await WaitForContentAsync(dst, n, $"cycle{c}-"), $"cycle {c} content not synced");
                 }
             }
             var after = FullGcHeapBytes();
