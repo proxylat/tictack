@@ -25,3 +25,4 @@ service/linux/*.so
 service/linux/runtimes/
 service/linux/createdump
 AGENTS.md
+docs/
