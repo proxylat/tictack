@@ -61,6 +61,7 @@ public class ExecutorTests : IDisposable
         var args = MakeArgs(Src("missing.txt"), "missing.txt");
         var result = await action.ExecuteAsync(args, CancellationToken.None);
         Assert.False(result.Success);
+        Assert.False(string.IsNullOrEmpty(result.ErrorMessage));
     }
 
     [Fact]
