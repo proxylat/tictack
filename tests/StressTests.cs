@@ -463,6 +463,71 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
+    // ── 12b. Ready-queue burst drain: 20k events, each exactly once ──
+
+    sealed class CountingAction : IFileAction
+    {
+        public int Count;
+        public ConcurrentBag<string> Paths { get; } = new();
+
+        public Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
+        {
+            Interlocked.Increment(ref Count);
+            Paths.Add(args.ChangeEvent.FullPath);
+            return Task.FromResult(ActionResult.Ok());
+        }
+    }
+
+    [Fact]
+    public async Task Pipeline_ReadyQueue_BurstDrain_ExactlyOnce()
+    {
+        var dir = TestDir();
+        var src = Path.Combine(dir, "src");
+        var dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        try
+        {
+            var monitor = new EventMonitor();
+            var log = new RecordingLogger();
+            var copy = new CountingAction();
+
+            var cfg = MakeConfig(src, dst, 0);
+            cfg.Sync.DrainStrategy = "ready_queue";
+            using var pipeline = new SyncPipeline(
+                cfg,
+                monitor,
+                new DateSizeComparer(),
+                copy,
+                new RenameAction(),
+                new ExponentialBackoffRetry(1, 0, 1),
+                new SizeValidator(),
+                new NoVersioning(),
+                new MirrorDeletion(),
+                log
+            );
+            pipeline.Start();
+            await WaitForAsync(() => log.Messages.Any(m => m.Contains("Sync complete")), "initial sync");
+
+            const int n = 20_000;
+            for (int i = 0; i < n; i++)
+                File.WriteAllText(Path.Combine(src, $"rq{i}.txt"), "x");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < n; i++)
+                monitor.Fire(ChangeType.Created, Path.Combine(src, $"rq{i}.txt"));
+            // Generous bound: per-event fixed costs (stat, sqlite upsert)
+            // dominate; this guards gross pathology (e.g. O(n²) scan ≈ 30s+),
+            // not the clock.
+            await WaitForAsync(() => copy.Count >= n, "ready-queue drain", 180);
+            sw.Stop();
+
+            Assert.Equal(n, copy.Count);
+            Assert.Equal(n, copy.Paths.Distinct().Count());
+            Assert.True(sw.Elapsed < TimeSpan.FromMinutes(2), $"Drain took {sw.Elapsed}");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     // ── 13. SrcLock concurrent creation ──
 
     [Fact]
