@@ -139,7 +139,9 @@ public class SnapshotBenchmarks
 }
 
 [MemoryDiagnoser]
-[ShortRunJob]
+// MediumRun: UpsertBatch error was 37% of mean under ShortRun (N=3);
+// N=15+ shrinks the bars ~3x. Costs ~2 min for this class.
+[MediumRunJob]
 public class StateDbBenchmarks
 {
     private const int Rows = 151_000;
@@ -338,17 +340,22 @@ public class ReadyQueueBenchmarks
         }
     }
 
-    // One ready-queue take: peek expiry, pop, claim via TryRemove.
-    // Mirrors SyncPipeline.TryTakeReadyQueued.
-    [Benchmark]
-    public string PopOne()
+    // Drain-K per invocation: amortizes the per-invocation overhead that
+    // dominated single-pop runs (InvocationCount=1 artifact) and yields a
+    // real per-pop number. Mirrors a burst-drain in production.
+    [Benchmark(OperationsPerInvoke = 100)]
+    public int Drain100()
     {
+        var n = 0;
         lock (_lock)
         {
-            _pq.TryPeek(out var key, out _);
-            _pq.Dequeue();
-            _events.TryRemove(key!, out _);
-            return key!;
+            for (var i = 0; i < 100; i++)
+            {
+                if (!_pq.TryPeek(out var key, out _)) break;
+                _pq.Dequeue();
+                if (_events.TryRemove(key!, out _)) n++;
+            }
         }
+        return n;
     }
 }

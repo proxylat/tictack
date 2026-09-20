@@ -108,36 +108,41 @@ Physical power-cut tests require dedicated hardware or VM infrastructure.
 
 ### Diagnostics & performance
 
-One workflow per OS wraps the `dotnet-*` diagnostic tools and the fixtured copy
-benchmark. Every run writes `diag-out/<timestamp>-<mode>/` with a `SUMMARY.md`
-recording each command and the file it produced.
+One phased workflow per OS wraps the `dotnet-*` diagnostic tools, static
+analysis, the unit suite and the fixtured copy benchmark. Everything lives in
+`benchmarks/`. Every run writes `diag-out/<timestamp>-perf/` (or `-test`) with
+a `SUMMARY.md` recording each command and the file it produced.
 
 ```
-tools\diag.ps1 debug [-Full] [-Dump] [PID|NAME]     # Windows
-tools\diag.ps1 test  [-Filter EXPR]
-tools\diag.ps1 perf  [-Root DIR]
-tools\diag.ps1 static                             # semgrep + ast-grep
+benchmarks\diag.ps1 [-p1] [-p2] [-p3] [-Root DIR] [-Full] [-Dump] [PID|NAME] [-Published] [SCENARIOS...]  # Windows
+benchmarks\diag.ps1 test [-Filter EXPR] [-WindowsOnly] [-Coverage] [-Elevated] [-NoBuild]
 
-tools/diag.sh debug [--full] [--dump] [--io] [--kuni] [PID|NAME]  # Linux
-tools/diag.sh test  [--filter EXPR]
-tools/diag.sh perf  [FIXTURE_ROOT]
-tools/diag.sh static                                # semgrep + ast-grep
+benchmarks/diag.sh [-p1] [-p2] [-p3] [--full] [--dump] [--io] [--kuni] [--published] [PID|NAME] [SCENARIOS...]  # Linux
+benchmarks/diag.sh test [--filter EXPR]
 ```
 
-`debug` escalates cheap to expensive: process identity, thread states and a
+No `-p` flag runs all three phases; `-p1 -p2` runs the first two, `-p1` triage
+only. `PID|NAME` is automated (omitted = running `TicTackSv`); `-Root` defaults
+to `C:\bench` on Windows. Missing tools degrade to a skip-note with the
+install one-liner — a global install works, otherwise the script falls back to
+`dnx` one-shot runs (ships with the .NET 10 SDK, same as CI).
+
+`p1` escalates cheap to expensive: process identity, thread states and a
 CPU-delta read (stuck vs. slow), then `dotnet-counters` (System.Runtime plus
 the in-app `TicTack` provider: files/bytes copied, copy+fsync latency,
 pending events). `-Full` adds `dotnet-gcstats`, `dotnet-pstacks`, two
 `dotnet-gcdump` samples (auto-diffed), `dotnet-dstrings`, `dotnet-trace`
 (plus a Speedscope flame-graph conversion of the `.nettrace`),
-`dotnet-stack`, `dotnet-fullgc` and the
+`dotnet-stack` (+ `symbolicate` when supported), `dotnet-fullgc`, a bounded
+PerfView GC capture when `C:\tools\PerfView.exe` exists, and the
 Windows event log. On Linux the thread snapshot also includes `pidstat`
-per-thread I/O, `debug --io` adds bounded BPF/fs tracing (bpftrace fsync
+per-thread I/O, `-p1 --io` adds bounded BPF/fs tracing (bpftrace fsync
 hist, syncsnoop, fs-specific `*slower`, funclatency, offcputime — needs root plus
-`bcc-tools`/`bpftrace` installed), and `debug --kuni` captures a unified
+`bcc-tools`/`bpftrace` installed), and `-p1 --kuni` captures a unified
 managed+kernel+native trace (`dotnet-trace collect-linux`; needs root,
-kernel ≥ 6.4, tracefs). `static` runs `semgrep --config r/csharp` (`ast-grep scan` over the banked
-`rules/`) — mirrored by the `static` CI job. `-Dump` on Windows falls back
+kernel ≥ 6.4, tracefs). `p2` runs `semgrep --config r/csharp` (`ast-grep scan` over the banked
+`rules/`) — mirrored by the `static` CI job — then the xUnit suite.
+`-Dump` on Windows falls back
 to `procdump -ma` when `dotnet-dump` is not installed. `-Dump` is the only step that
 freezes the target and it asks first — it writes the dump to `/tmp`, analyzes
 it offline (`dotnet-pstacks` / `dotnet-dstrings` / `dotnet-dump analyze` plus
@@ -146,18 +151,32 @@ no root is needed even when ptrace is blocked), then deletes it. Threads stuck
 in `D`-state are a kernel/filesystem problem, so the script reports that
 instead of escalating.
 
-`perf` regenerates the fixture (`benchmarks/create-fixture.sh` /
-`.ps1`), builds Release, warms the page cache, takes an `fio` fsync-latency
-baseline of the fixture filesystem when `fio` is installed, then runs named
+`p3` regenerates the fixture inline (9000 small + 1000×1MB + 10×100MB),
+builds Release (or `dotnet publish` with `-Published` — the ReadyToRun shipped
+artifact, same flags as the install scripts; quote the `-Published` numbers),
+takes a storage fsync-latency
+baseline of the fixture filesystem (`fio` on Linux, `diskspd` on Windows,
+when installed), then runs named
 scenarios — `cold-initial`, `warm-noop`, `hash-verify` and `workers=1|2|4` —
-writing one row per scenario (seconds, MB/s, files/s, load average, diff
+each sampled for native per-process stats (CPU-cycle delta, CPU %, I/O totals
++ amplification, context switches — `TicTackSv` only, no WMI).
+Every non-warm scenario drops the page cache right before its timed pass
+(`RAMMap -Et` on Windows, `drop_caches` on Linux — both need admin/root;
+without them the run stays warm and SUMMARY says so), so scenario order no
+longer confounds the numbers; `warm-noop` intentionally stays warm.
+Each scenario writes
+one row (seconds, MB/s, files/s, cpu%, diff
 verdict) plus a machine-readable `results.json`, with `hyperfine` means when
-`hyperfine` is installed. It diffs those numbers against the checked-in
-`benchmarks/baseline.json` and flags anything >20 % slower. Pass scenario names
+`hyperfine` is installed, then the `BenchmarkDotNet` microbenchmarks
+(`benchmarks/TicTack.Benchmarks.csproj`: filter matching, arg construction,
+hex formatting, `FileSnapshot` equality, StateDb batch ops), and a derived
+verdicts block (cache speedup, worker scaling, CPU- vs I/O-bound call).
+It diffs those numbers against
+`benchmarks/baseline-windows.json` / `baseline-linux.json` (per-OS, git-ignored;
+adopt a quiet run with `cp diag-out/<ts>/p3-results.json benchmarks/baseline-<os>.json`)
+and flags anything >20 % slower. Pass scenario names
 to run a subset. Override with the `DURABILITY` (`rename-only`) environment
-variable. Microbenchmarks (`BenchmarkDotNet`, `benchmarks/TicTack.Benchmarks.csproj`)
-cover the hot paths: filter matching, arg construction, hex formatting,
-`FileSnapshot` equality, StateDb batch ops.
+variable.
 
 Record the load average with every number. A saturated host swamps the
 pipeline: on a 4-core box at 41 % iowait and 7 blocked processes the same
@@ -205,6 +224,7 @@ Unknown or duplicate YAML properties are rejected at startup instead of being ig
 | `destination` | — | Drive+folder to sync into, supports `[VolumeLabel]` |
 | `state_db_path` | `C:\ProgramData\TicTack` / `/var/lib/tictack` | **Directory** for per-source state DBs (`<folder>.db`, SQLite WAL) used to skip unchanged files on startup |
 | `debounce_seconds` | `10` | Wait time (s) after last change before triggering sync |
+| `drain_strategy` | `scan` | Backlog drain order: `scan` = hash-order scan (zero extra memory) / `ready_queue` = earliest-expiry-first heap (bounded drain under watcher-overflow backlogs, transient ~2x backlog memory) |
 | `max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files |
 | `exclude` | `[]` | Case-insensitive glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) |
 | `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |
