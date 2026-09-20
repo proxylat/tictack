@@ -312,12 +312,8 @@ namespace TicTack
         private async Task<bool> InitialSyncAsync()
         {
             if (!_directoryExists(_config.Path)) return false;
-            Dictionary<string, (long size, long mtime)>? cache = null;
-            if (_stateDb != null)
-            {
-                try { cache = await _stateDb.LoadAllAsync(); }
-                catch (Exception ex) { _log.Warn("StateDB load failed, continuing without cache: " + ex.Message); }
-            }
+            // No snapshot: per-file point lookups via TryGetStateAsync keep
+            // startup memory flat no matter how large the state table grows.
             var sourcePaths = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
             var pendingState = new List<(string path, long size, long mtime)>();
             var stateLock = new object();
@@ -371,8 +367,18 @@ namespace TicTack
                             return;
                         }
 
-                        if (cache != null && File.Exists(dst) && cache.TryGetValue(rel, out var s)
-                            && s.size == sourceSnapshot.Length && s.mtime == sourceSnapshot.LastWriteTimeUtcTicks)
+                        var unchanged = false;
+                        if (_stateDb != null && File.Exists(dst))
+                        {
+                            try
+                            {
+                                var s = await _stateDb.TryGetStateAsync(rel);
+                                unchanged = s.HasValue && s.Value.size == sourceSnapshot.Length
+                                    && s.Value.mtime == sourceSnapshot.LastWriteTimeUtcTicks;
+                            }
+                            catch (Exception ex) { _log.Debug("StateDb lookup failed, copying: " + ex.Message); }
+                        }
+                        if (unchanged)
                         {
                             Interlocked.Increment(ref skipped);
                             return;

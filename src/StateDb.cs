@@ -17,6 +17,13 @@ namespace TicTack
         private readonly object _disposeLock = new object();
         private bool _disposed;
 
+        // The separator is concatenated into a LIKE pattern whose ESCAPE
+        // character is '\', so a backslash separator must itself be escaped.
+        // Otherwise 'dir\%' means the literal '%' and no child row matches,
+        // silently skipping the rename on Windows.
+        private static readonly string SepLike =
+            Path.DirectorySeparatorChar == '\\' ? "\\\\" : Path.DirectorySeparatorChar.ToString();
+
         public StateDb(string dbPath, ILogger? log = null)
         {
             _dbPath = dbPath;
@@ -289,7 +296,6 @@ namespace TicTack
         public void UpdatePrefix(string oldPrefix, string newPrefix)
         {
             if (string.IsNullOrEmpty(oldPrefix)) return;
-            var sep = Path.DirectorySeparatorChar;
             Enter();
             try
             {
@@ -302,7 +308,7 @@ namespace TicTack
                     cmd.Parameters.AddWithValue("@old", oldPrefix);
                     cmd.Parameters.AddWithValue("@oldLike", EscapeLike(oldPrefix));
                     cmd.Parameters.AddWithValue("@new", newPrefix);
-                    cmd.Parameters.AddWithValue("@sep", sep.ToString());
+                    cmd.Parameters.AddWithValue("@sep", SepLike);
                     cmd.ExecuteNonQuery();
                 }
             }
@@ -312,7 +318,6 @@ namespace TicTack
         public async Task UpdatePrefixAsync(string oldPrefix, string newPrefix)
         {
             if (string.IsNullOrEmpty(oldPrefix)) return;
-            var sep = Path.DirectorySeparatorChar;
             await EnterAsync().ConfigureAwait(false);
             try
             {
@@ -325,7 +330,7 @@ namespace TicTack
                     cmd.Parameters.AddWithValue("@old", oldPrefix);
                     cmd.Parameters.AddWithValue("@oldLike", EscapeLike(oldPrefix));
                     cmd.Parameters.AddWithValue("@new", newPrefix);
-                    cmd.Parameters.AddWithValue("@sep", sep.ToString());
+                    cmd.Parameters.AddWithValue("@sep", SepLike);
                     await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
                 }
             }
@@ -361,6 +366,26 @@ namespace TicTack
                     cmd.Parameters.AddWithValue("@p", path);
                     var r = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
                     return r == null || r is DBNull ? (long?)null : (long)r;
+                }
+            }
+            finally { _gate.Release(); }
+        }
+
+        public async Task<(long size, long mtime)?> TryGetStateAsync(string path)
+        {
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT size, mtime FROM state WHERE path = @p";
+                    cmd.Parameters.AddWithValue("@p", path);
+                    using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
+                    {
+                        if (!await reader.ReadAsync().ConfigureAwait(false)) return null;
+                        return (reader.GetInt64(0), reader.GetInt64(1));
+                    }
                 }
             }
             finally { _gate.Release(); }

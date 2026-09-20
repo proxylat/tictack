@@ -53,12 +53,15 @@ namespace TicTack
         // benchmark measures the selection without the probe or cache.
         internal static bool SelectReady(string fullPath, IReadOnlyList<(string Root, bool Ready)> drives)
         {
-            var mounts = drives
-                .Where(d => d.Ready && fullPath.StartsWith(d.Root, StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(d => d.Root.Length)
-                .ToList();
-            if (mounts.Count == 0) return false;
-            if (OperatingSystem.IsLinux() && mounts[0].Root == "/"
+            string? best = null;
+            foreach (var d in drives)
+            {
+                if (!d.Ready) continue;
+                if (!fullPath.StartsWith(d.Root, StringComparison.OrdinalIgnoreCase)) continue;
+                if (best == null || d.Root.Length > best.Length) best = d.Root;
+            }
+            if (best == null) return false;
+            if (OperatingSystem.IsLinux() && best == "/"
                 && (fullPath == "/srv" || fullPath.StartsWith("/srv/", StringComparison.Ordinal)
                     || fullPath == "/mnt" || fullPath.StartsWith("/mnt/", StringComparison.Ordinal)
                     || fullPath == "/media" || fullPath.StartsWith("/media/", StringComparison.Ordinal)

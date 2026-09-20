@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
+using System.Threading.Tasks;
 using BenchmarkDotNet.Attributes;
 
 namespace TicTack.Benchmarks;
@@ -26,7 +27,7 @@ public class FilterBenchmarks
     {
         _filter = new PatternFilter(Patterns);
         var paths = new List<string>(7000);
-        const string root = "/home/user/Desktop/Projects/Lab/TicTack";
+        const string root = "/data/repo";
         for (var i = 0; i < 1000; i++)
         {
             paths.Add($"{root}/src/File{i:D4}.cs");
@@ -56,8 +57,8 @@ public class FilterBenchmarks
 [ShortRunJob]
 public class FileActionArgsBenchmarks
 {
-    private const string SourceBase = "/home/user/Desktop";
-    private const string DestBase = "/mnt/pendrive/Sync/Desktop";
+    private const string SourceBase = "/data/src";
+    private const string DestBase = "/data/dst";
     private FileChangedEventArgs[] _events = null!;
 
     [GlobalSetup]
@@ -68,7 +69,7 @@ public class FileActionArgsBenchmarks
         {
             events.Add(new FileChangedEventArgs(
                 ChangeType.Created,
-                $"/home/user/Desktop/Projects/Lab/TicTack/docs/note{i:D4}.md"));
+                $"/data/src/docs/note{i:D4}.md"));
         }
         _events = events.ToArray();
     }
@@ -156,14 +157,14 @@ public class StateDbBenchmarks
         var seed = new List<(string path, long size, long mtime)>(Rows);
         for (var i = 0; i < Rows; i++)
         {
-            seed.Add(($"/home/user/Desktop/file{i:D6}.txt", i * 1024L, 637000000000000000L + i));
+            seed.Add(($"/data/file{i:D6}.txt", i * 1024L, 637000000000000000L + i));
         }
         _db.UpsertBatch(seed);
 
         _batch = new List<(string path, long size, long mtime)>(1000);
         for (var i = 0; i < 1000; i++)
         {
-            _batch.Add(($"/home/user/Desktop/file{i:D6}.txt", i * 2048L, 637000000000000001L + i));
+            _batch.Add(($"/data/file{i:D6}.txt", i * 2048L, 637000000000000001L + i));
         }
     }
 
@@ -178,10 +179,21 @@ public class StateDbBenchmarks
     public int LoadAll() => _db.LoadAll().Count;
 
     [Benchmark]
-    public long Count() => _db.Count();
-
-    [Benchmark]
     public void UpsertBatch1000() => _db.UpsertBatch(_batch);
+
+    // Production initial-sync path: indexed point lookup per file,
+    // 90% hits + 10% misses like a warm restart scan.
+    [Benchmark(OperationsPerInvoke = 1000)]
+    public async Task<int> TryGetHit1000()
+    {
+        var n = 0;
+        for (var i = 0; i < 1000; i++)
+        {
+            var key = i % 10 == 9 ? $"/data/missing{i:D6}.txt" : $"/data/file{i:D6}.txt";
+            if (await _db.TryGetStateAsync(key).ConfigureAwait(false) != null) n++;
+        }
+        return n;
+    }
 }
 
 [MemoryDiagnoser]
