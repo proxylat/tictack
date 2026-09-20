@@ -16,10 +16,58 @@ namespace TicTack
         AfterCommit
     }
 
+    public enum FileDurability
+    {
+        Full,
+        FDataSync,
+        RenameOnly
+    }
+
+    // Amortizes destination-directory fsyncs over a batch (dir_sync=per-batch):
+    // per-file copies record their parent dir, one FlushAll per checkpoint
+    // fsyncs each distinct dir once. State upserts must follow FlushAll,
+    // never precede it — a crash then re-copies (safe) instead of diverging.
+    // Ordinal (never IgnoreCase): two dirs differing only by case on Linux
+    // are different dirs; merging them would skip a real fsync.
+    public sealed class DirSyncBatcher
+    {
+        private readonly HashSet<string> _dirs = new(StringComparer.Ordinal);
+        private readonly object _gate = new();
+
+        public void Record(string? dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return;
+            lock (_gate) _dirs.Add(dir);
+        }
+
+        public bool FlushAll(ILogger? log)
+        {
+            string[] snapshot;
+            lock (_gate)
+            {
+                if (_dirs.Count == 0) return true;
+                snapshot = new string[_dirs.Count];
+                _dirs.CopyTo(snapshot);
+                _dirs.Clear();
+            }
+            foreach (var d in snapshot)
+            {
+                if (CopyAction.FlushDirectory(d)) continue;
+                log?.Warn("Directory fsync failed: " + d);
+                lock (_gate)
+                {
+                    foreach (var rest in snapshot) _dirs.Add(rest);
+                }
+                return false;
+            }
+            return true;
+        }
+    }
+
     public class CopyAction : IFileAction
     {
         private readonly IFileAccessor _accessor;
-        private readonly bool _fullDurability;
+        private readonly FileDurability _durability;
         private readonly Action<CopyCheckpoint>? _checkpoint;
         private readonly ILogger? _log;
 
@@ -28,6 +76,9 @@ namespace TicTack
 
         [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
         static extern int Fsync(int fd);
+
+        [DllImport("libc", EntryPoint = "fdatasync", SetLastError = true)]
+        static extern int Fdatasync(int fd);
 
         [DllImport("libc", EntryPoint = "close", SetLastError = true)]
         static extern int Close(int fd);
@@ -44,17 +95,38 @@ namespace TicTack
         const uint FSCTL_SET_SPARSE = 0x000900C4;
 
         public CopyAction(IFileAccessor accessor, bool fullDurability = true, ILogger? log = null)
-            : this(accessor, fullDurability, null, log)
+            : this(accessor, fullDurability ? FileDurability.Full : FileDurability.RenameOnly, null, log)
+        {
+        }
+
+        public CopyAction(IFileAccessor accessor, FileDurability durability, ILogger? log = null)
+            : this(accessor, durability, null, log)
         {
         }
 
         internal CopyAction(IFileAccessor accessor, bool fullDurability, Action<CopyCheckpoint>? checkpoint, ILogger? log = null)
+            : this(accessor, fullDurability ? FileDurability.Full : FileDurability.RenameOnly, checkpoint, log)
+        {
+        }
+
+        internal CopyAction(IFileAccessor accessor, FileDurability durability, Action<CopyCheckpoint>? checkpoint, ILogger? log = null)
         {
             _accessor = accessor;
-            _fullDurability = fullDurability;
+            if (durability == FileDurability.FDataSync && !OperatingSystem.IsLinux())
+            {
+                log?.Debug("fdatasync is Linux-only, using full durability on " + Environment.OSVersion.Platform);
+                durability = FileDurability.Full;
+            }
+            _durability = durability;
             _checkpoint = checkpoint;
             _log = log;
         }
+
+        // When set (dir_sync=per-batch), per-file directory fsyncs are
+        // skipped; the owner must call FlushAll before upserting state.
+        // Null (default) keeps the per-file fsync. Wired by SyncPipeline
+        // for InitialSync only — the trickle event path stays per-file.
+        public DirSyncBatcher? DirBatch { get; set; }
 
         public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
         {
@@ -102,10 +174,7 @@ namespace TicTack
                     // mid-copy makes Length a lie.
                     bytesCopied = dstStream.Position;
                     Stopwatch? fsw = timed ? Stopwatch.StartNew() : null;
-                    if (_fullDurability)
-                        dstStream.Flush(true);
-                    else
-                        dstStream.Flush();
+                    FlushData(dstStream);
                     if (fsw != null) TicTackEventSource.Log.FsyncCompleted(fsw.Elapsed.TotalMilliseconds);
                     _checkpoint?.Invoke(CopyCheckpoint.DataFlushed);
                     if (sw != null) copyMs = sw.Elapsed.TotalMilliseconds;
@@ -138,7 +207,7 @@ namespace TicTack
                 }
                 _checkpoint?.Invoke(CopyCheckpoint.AfterCommit);
 
-                if (!FlushDirectory(Path.GetDirectoryName(dst)))
+                if (!SyncDirectory(dst))
                     return ActionResult.Fail("Could not fsync destination directory");
 
                 // Count only fully committed copies.
@@ -156,7 +225,40 @@ namespace TicTack
             catch (Win32Exception ex) { return ActionResult.Fail(ex.Message, retryable: true); }
         }
 
-        static bool FlushDirectory(string? path)
+        private void FlushData(FileStream s)
+        {
+            switch (_durability)
+            {
+                // File data + size durable, mtime may roll back on crash
+                // (safe direction: the next comparison re-copies). Linux-only;
+                // the ctor already normalized other OSes to Full.
+                case FileDurability.FDataSync:
+                    var fd = (int)s.SafeFileHandle.DangerousGetHandle();
+                    if (Fdatasync(fd) != 0)
+                        throw new IOException("fdatasync failed, errno " + Marshal.GetLastPInvokeError());
+                    break;
+                case FileDurability.RenameOnly:
+                    s.Flush();
+                    break;
+                default:
+                    s.Flush(true);
+                    break;
+            }
+        }
+
+        private bool SyncDirectory(string dst)
+        {
+            var parent = Path.GetDirectoryName(dst);
+            var batch = DirBatch;
+            if (batch != null)
+            {
+                batch.Record(parent);
+                return true;
+            }
+            return FlushDirectory(parent);
+        }
+
+        internal static bool FlushDirectory(string? path)
         {
             if (!OperatingSystem.IsLinux() || string.IsNullOrEmpty(path)) return true;
             var fd = OpenDirectory(path, O_RDONLY | O_DIRECTORY);

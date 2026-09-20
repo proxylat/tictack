@@ -91,6 +91,38 @@ public sealed class PerfTests
     }
 
     [Fact]
+    public async Task InitialSync_PerBatchDirSync_CopiesAndUpsertsState()
+    {
+        var dir = TestDir();
+        var src = Path.Combine(dir, "src");
+        var dst = Path.Combine(dir, "dst");
+        try
+        {
+            WriteFiles(src, 50, 512, ".txt");
+            var cfg = MakeConfig(src, dst);
+            cfg.Sync.DirSync = "per-batch";
+            var statePath = Path.Combine(dir, "state.db");
+
+            // Raw CopyAction (not RecordingAction): the batcher wires onto
+            // CopyAction itself; wrappers keep the per-file safe default.
+            using (var db = new StateDb(statePath))
+            using (var pipeline = MakePipeline(cfg, new EventMonitor(),
+                new DateSizeComparer(), new SizeValidator(), new CopyAction(new FileAccessor()), new RecordingLogger(), db))
+            {
+                Assert.True(await pipeline.RunOnceAsync());
+            }
+            for (int i = 0; i < 50; i++)
+                Assert.True(File.Exists(Path.Combine(dst, $"file{i:D5}.txt")));
+            using (var db = new StateDb(statePath))
+            {
+                var s = await db.TryGetStateAsync("file00000.txt");
+                Assert.True(s.HasValue);
+            }
+        }
+        finally { TryDelete(dir); }
+    }
+
+    [Fact]
     public async Task InitialSync_LogsProgressAndSummaryCounts()
     {
         var dir = TestDir();
