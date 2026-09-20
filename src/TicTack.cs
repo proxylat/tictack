@@ -394,7 +394,13 @@ namespace TicTack
             var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, src.Destination);
             var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, src.Destination);
 
-            var copyAction = new CopyAction(accessor, src.Sync == null || !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase), log);
+            var durability = FileDurability.Full;
+            if (src.Sync != null)
+            {
+                if (string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.RenameOnly;
+                else if (string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.FDataSync;
+            }
+            var copyAction = new CopyAction(accessor, durability, log);
             var renameAction = new RenameAction(deletion, log);
 
             StateDb? stateDb = null;

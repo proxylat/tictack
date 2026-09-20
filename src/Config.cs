@@ -72,6 +72,7 @@ namespace TicTack
         public string? Verification { get; set; }
         public string Durability { get; set; }
         public string DrainStrategy { get; set; }
+        public string DirSync { get; set; }
         public int InitialSyncWorkers { get; set; }
         public RetryConfig Retry { get; set; }
         public string? LockHandling { get; set; }
@@ -88,6 +89,7 @@ namespace TicTack
             Verification = "date_and_size";
             Durability = "full";
             DrainStrategy = "scan";
+            DirSync = "per-file";
             InitialSyncWorkers = 2;
             Retry = new RetryConfig();
             LockHandling = "retry";
@@ -285,15 +287,22 @@ namespace TicTack
                     }
                 }
                 if (src.Sync != null && !string.Equals(src.Sync.Durability, "full", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)
                     && !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase))
                 {
-                    log.Error("Durability must be 'full' or 'rename-only' for source: " + src.Path);
+                    log.Error("Durability must be 'full', 'fdatasync', or 'rename-only' for source: " + src.Path);
                     valid = false;
                 }
                 if (src.Sync != null && !string.Equals(src.Sync.DrainStrategy, "scan", StringComparison.OrdinalIgnoreCase)
                     && !string.Equals(src.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase))
                 {
                     log.Error("DrainStrategy must be 'scan' or 'ready_queue' for source: " + src.Path);
+                    valid = false;
+                }
+                if (src.Sync != null && !string.Equals(src.Sync.DirSync, "per-file", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(src.Sync.DirSync, "per-batch", StringComparison.OrdinalIgnoreCase))
+                {
+                    log.Error("DirSync must be 'per-file' or 'per-batch' for source: " + src.Path);
                     valid = false;
                 }
                 if (src.Sync != null && !IsValidVerification(src.Sync.Verification))

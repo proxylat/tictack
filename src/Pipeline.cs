@@ -376,6 +376,15 @@ namespace TicTack
             var stateLock = new object();
             var scanFailed = 0;
             long scanned = 0, copied = 0, skipped = 0;
+            // dir_sync=per-batch: one dir fsync per distinct parent per
+            // 500-file checkpoint instead of per file. Wired onto the shared
+            // CopyAction (cast: wrappers like RecordingAction keep per-file,
+            // the safe default) and cleared in finally below so the trickle
+            // event path never inherits it.
+            var dirBatch = _config.Sync != null
+                && string.Equals(_config.Sync.DirSync, "per-batch", StringComparison.OrdinalIgnoreCase)
+                ? new DirSyncBatcher() : null;
+            if (_copyAction is CopyAction batchCopy) batchCopy.DirBatch = dirBatch;
             var scanStart = DateTime.UtcNow;
             _log.Info("Initial sync scan starting: " + _config.Path);
 
@@ -386,6 +395,17 @@ namespace TicTack
                 {
                     try
                     {
+                        // Crash invariant: directory entries durable BEFORE
+                        // state claims the files copied. A failed dir fsync
+                        // drops the batch (next run re-copies, safe) instead
+                        // of upserting ahead of durability (divergence).
+                        if (dirBatch != null && !dirBatch.FlushAll(_log))
+                        {
+                            Interlocked.Exchange(ref scanFailed, 1);
+                            _log.Warn("Directory fsync failed, state batch dropped (will re-copy): " + _config.Path);
+                            pendingState.Clear();
+                            return;
+                        }
                         _stateDb.UpsertBatch(pendingState);
                         pendingState.Clear();
                     }
@@ -483,6 +503,7 @@ namespace TicTack
             catch (PathTooLongException) { _log.Warn("Path too long scanning " + _config.Path); return false; }
             catch (OperationCanceledException) { return false; }
             catch (Exception ex) { _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message); return false; }
+            finally { if (_copyAction is CopyAction doneCopy) doneCopy.DirBatch = null; }
             _log.Info($"Sync complete: {_config.Path} ({scanned} scanned, {copied} copied, {skipped} skipped, {scanned - copied - skipped} failed, {(DateTime.UtcNow - scanStart).TotalSeconds:F0}s)");
             return true;
         }

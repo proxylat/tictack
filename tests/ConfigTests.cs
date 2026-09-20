@@ -83,6 +83,32 @@ public class ConfigTests
         Assert.Contains(log.Messages, m => m.Contains("DrainStrategy"));
     }
 
+    [Fact]
+    public void Validate_AllowsFdatasyncDurability()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { Durability = "fdatasync" } });
+        Assert.True(Config.Validate(cfg, new RecordingLogger()));
+    }
+
+    [Fact]
+    public void Validate_AllowsPerBatchDirSync()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { DirSync = "per-batch" } });
+        Assert.True(Config.Validate(cfg, new RecordingLogger()));
+    }
+
+    [Fact]
+    public void Validate_RejectsUnknownDirSync()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { DirSync = "hourly" } });
+        var log = new RecordingLogger();
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("DirSync"));
+    }
+
     [Theory]
     [InlineData("hashh")]
     [InlineData("md5")]

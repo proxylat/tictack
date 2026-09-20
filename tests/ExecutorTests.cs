@@ -44,6 +44,50 @@ public class ExecutorTests : IDisposable
     }
 
     [Fact]
+    public async Task CopyAction_FdatasyncDurability_CopiesFileCorrectly()
+    {
+        var content = "fdatasync durability test";
+        File.WriteAllText(Src("b.txt"), content);
+
+        var action = new CopyAction(_accessor, FileDurability.FDataSync);
+        var args = MakeArgs(Src("b.txt"));
+        var result = await action.ExecuteAsync(args, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.True(File.Exists(Dst("b.txt")));
+        Assert.Equal(content, File.ReadAllText(Dst("b.txt")));
+    }
+
+    [Fact]
+    public async Task CopyAction_DirBatch_RecordsInsteadOfFlushing()
+    {
+        File.WriteAllText(Src("c.txt"), "batch test");
+        var batcher = new DirSyncBatcher();
+
+        var action = new CopyAction(_accessor) { DirBatch = batcher };
+        var args = MakeArgs(Src("c.txt"));
+        var result = await action.ExecuteAsync(args, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.True(File.Exists(Dst("c.txt")));
+        var log = new RecordingLogger();
+        Assert.True(batcher.FlushAll(log));
+    }
+
+    [Fact]
+    public void DirSyncBatcher_DedupesAndFlushesEmpty()
+    {
+        var batcher = new DirSyncBatcher();
+        Assert.True(batcher.FlushAll(new RecordingLogger()));
+        batcher.Record(_dstDir);
+        batcher.Record(_dstDir);
+        batcher.Record((string?)null);
+        batcher.Record("");
+        Assert.True(batcher.FlushAll(new RecordingLogger()));
+        Assert.True(batcher.FlushAll(new RecordingLogger()));
+    }
+
+    [Fact]
     public async Task CopyAction_UsesTempThenRename()
     {
         File.WriteAllText(Src("a.txt"), "temp rename test");
