@@ -8,6 +8,7 @@ sources:
     destination: '[TicTack]\Sync'
     state_db_path: 'C:\ProgramData\TicTack'
     debounce_seconds: 20
+    drain_strategy: scan
     filter:
       max_file_size_mb: no-limit
       exclude:
