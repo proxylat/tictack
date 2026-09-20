@@ -9,6 +9,7 @@ sources:
     state_db_path: '/var/lib/tictack'
     debounce_seconds: 20
     drain_strategy: scan
+    dir_sync: per-file
     filter:
       max_file_size_mb: no-limit
       exclude:
