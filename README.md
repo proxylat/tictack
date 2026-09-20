@@ -225,10 +225,11 @@ Unknown or duplicate YAML properties are rejected at startup instead of being ig
 | `state_db_path` | `C:\ProgramData\TicTack` / `/var/lib/tictack` | **Directory** for per-source state DBs (`<folder>.db`, SQLite WAL) used to skip unchanged files on startup |
 | `debounce_seconds` | `10` | Wait time (s) after last change before triggering sync |
 | `drain_strategy` | `scan` | Backlog drain order: `scan` = hash-order scan (zero extra memory) / `ready_queue` = earliest-expiry-first heap (bounded drain under watcher-overflow backlogs, transient ~2x backlog memory) |
+| `dir_sync` | `per-file` | Directory-entry durability after each rename: `per-file` = fsync each file's parent dir / `per-batch` = collect dirs and fsync once per state checkpoint (fewer syncs on initial sync, larger crash window: files already renamed but not yet dir-synced may need a re-copy) |
 | `max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files |
 | `exclude` | `[]` | Case-insensitive glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) |
 | `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |
-| `durability` | `full` | `full` fsyncs each temporary file before rename; `rename-only` skips per-file disk flush and fsyncs the destination directory instead, trading a power-loss window for speed |
+| `durability` | `full` | `full` fsyncs each temporary file before rename; `fdatasync` (Linux) flushes file data but not metadata-only changes; `rename-only` skips per-file disk flush and fsyncs the destination directory instead, trading a power-loss window for speed |
 | `initial_sync_workers` | `2` | Bounded parallel workers for initial sync only; copying remains complete before parity/deletion cleanup |
 | `max_attempts` | `5` | Max retries on failed copy |
 | `delay_ms` | `1000` | Initial retry delay (ms) |
@@ -246,7 +247,7 @@ Unknown or duplicate YAML properties are rejected at startup instead of being ig
 
 **Path mirroring:** archived and versioned files keep their real folder structure. With a shared `.archive` / `.versions` next to the sync root, deleting `Desktop\foo.txt` lands in `.archive\Desktop\foo_ts.txt` — not in the archive root.
 
-**Durability warning:** `rename-only` preserves atomic temp+rename behavior but does not force each file's data to stable storage before the rename. Use the default `full` setting when power-loss durability matters more than initial-sync speed.
+**Durability warning:** `rename-only` preserves atomic temp+rename behavior but does not force each file's data to stable storage before the rename. `fdatasync` (Linux only) flushes file contents but may skip metadata updates, so a freshly extended file can lose its size fix-up on power loss; on Windows it falls back to `full`. Use the default `full` setting when power-loss durability matters more than initial-sync speed.
 
 **Delete-threshold guard:** if one deletion burst exceeds `delete_threshold_count`, `delete_threshold_size_gb`, or `delete_threshold_percent` of known files, it is deferred to `tictack-deferred-<folder>.json` (next to the log file). After `delete_hold_days`, remaining files are synced; warnings are logged daily with the first 20 paths + full list location.
 
