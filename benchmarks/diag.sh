@@ -159,6 +159,18 @@ cmd_p1() {
     } >"$summary"
     hr "p1 live triage, pid $pid"
 
+    # B4: EventPipe preflight. Every dotnet-* tool except pstacks/dstrings
+    # needs the target's diagnostics IPC socket; without it they fail with
+    # misleading errors (seen live: 6 cascading FAILs against a socketless
+    # target). Detect once, skip honestly, keep the tools that still work.
+    local no_ipc=0
+    if ! ls -d /tmp/dotnet-diagnostic-"$pid"-* >/dev/null 2>&1; then
+        no_ipc=1
+        note "no diagnostics IPC socket (/tmp/dotnet-diagnostic-$pid-*) — EventPipe tools skipped"
+        note "     the runtime never created it (target-side). Restart the service"
+        note "     (sudo systemctl restart tictack) and re-run; pstacks/dstrings below still work"
+    fi
+
     local pfx="" sudo_missing=0
     if [ "$(id -u)" -ne 0 ] && { [ ! -r "/proc/$pid/stat" ] || attach_blocked; }; then
         if sudo -n true 2>/dev/null; then pfx="sudo -n"; else sudo_missing=1; fi
@@ -242,7 +254,9 @@ cmd_p1() {
                 note "counters: no TicTack/* series — target binary predates the in-app EventSource (rebuild/redeploy), or the provider is off"
         fi
     }
-    if is_dotnet "$pid"; then
+    if [ "$no_ipc" = 1 ]; then
+        note "counters: skipped (no IPC socket — see above)"
+    elif is_dotnet "$pid"; then
         need dotnet-counters "$T_COUNTERS" && run_counters
     elif ! head -c1 "/proc/$pid/maps" >/dev/null 2>&1; then
         # maps unreadable (another user?) — cannot confirm CoreCLR, but
@@ -261,7 +275,9 @@ cmd_p1() {
             note "      /proc/sys/kernel/yama/ptrace_scope is $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
             note "      so they need root — the sudo lines are recorded in SUMMARY.md"
         fi
-        if need dotnet-gcstats "$T_GCSTATS"; then
+        if [ "$no_ipc" = 1 ]; then
+            note "gcstats: skipped (no IPC socket — EventPipe-based)"
+        elif need dotnet-gcstats "$T_GCSTATS"; then
             # gcstats logs one block per GC event and runs until interrupted.
             # Bound it with timeout; --kill-after is the backstop because a
             # stuck gcstats can ignore INT (seen live: timeout waited forever).
@@ -290,8 +306,10 @@ cmd_p1() {
         if need dotnet-pstacks "$T_PSTACKS"; then
             priv "$out/p1-pstacks.txt" "dotnet-pstacks" "$T_PSTACKS -p $pid > '$out/p1-pstacks.txt'"
         fi
-        # gcdump uses EventPipe, so it works without root.
-        if need dotnet-gcdump "$T_GCDUMP"; then
+        # gcdump uses EventPipe, so it works without root — but not without the socket.
+        if [ "$no_ipc" = 1 ]; then
+            note "gcdump: skipped (no IPC socket)"
+        elif need dotnet-gcdump "$T_GCDUMP"; then
             record "$out/p1-gcdump-baseline.gcdump" "gcdump baseline" \
                 "$T_GCDUMP collect -p $pid -o '$out/p1-gcdump-baseline.gcdump'"
             sleep 10
@@ -321,8 +339,10 @@ cmd_p1() {
                 note "dstrings empty — retry with '$T_DSTRINGS -p $pid -c 32 -s 10'"
         fi
 
-        # EventPipe / diagnostics-IPC tools — no ptrace, so no root needed.
-        if need dotnet-trace "$T_TRACE"; then
+        # EventPipe / diagnostics-IPC tools — no ptrace, so no root needed (socket still needed).
+        if [ "$no_ipc" = 1 ]; then
+            note "trace: skipped (no IPC socket)"
+        elif need dotnet-trace "$T_TRACE"; then
             record "$out/p1-trace.nettrace" "dotnet-trace 30s" \
                 "$T_TRACE collect -p $pid --duration 00:00:30 -o '$out/p1-trace.nettrace'"
             # A failed collect still leaves a non-empty file (record's log
@@ -337,7 +357,9 @@ cmd_p1() {
                 note "trace: no valid .nettrace collected — skipping Speedscope conversion"
             fi
         fi
-        if need dotnet-stack "$T_STACK"; then
+        if [ "$no_ipc" = 1 ]; then
+            note "stack: skipped (no IPC socket)"
+        elif need dotnet-stack "$T_STACK"; then
             record "$out/p1-stack.txt" "dotnet-stack report" \
                 "$T_STACK report -p $pid"
             [ -s "$out/p1-stack.txt" ] && \
@@ -357,7 +379,9 @@ cmd_p1() {
             fi
         fi
         # dotnet-fullgc v1.2.0 crashes without -csn (IndexOutOfRange in its arg parsing).
-        if need dotnet-fullgc "$T_FULLGC"; then
+        if [ "$no_ipc" = 1 ]; then
+            note "fullgc: skipped (no IPC socket)"
+        elif need dotnet-fullgc "$T_FULLGC"; then
             record "$out/p1-fullgc.txt" "dotnet-fullgc" \
                 "$T_FULLGC $pid -csn 0"
             [ -s "$out/p1-fullgc.txt" ] && \
@@ -465,7 +489,9 @@ BT
     # Preview-format .nettrace: PerfView reads it, other viewers may lag.
     if [ "$kuni" = 1 ]; then
         krel=$(uname -r); kmaj=${krel%%.*}; kmin=${krel#*.}; kmin=${kmin%%.*}
-        if { [ "$kmaj" -gt 6 ] || { [ "$kmaj" -eq 6 ] && [ "$kmin" -ge 4 ]; }; } && [ -d /sys/kernel/tracing ]; then
+        if [ "$no_ipc" = 1 ]; then
+            note "kuni: skipped (collect-linux needs the IPC socket)"
+        elif { [ "$kmaj" -gt 6 ] || { [ "$kmaj" -eq 6 ] && [ "$kmin" -ge 4 ]; }; } && [ -d /sys/kernel/tracing ]; then
             if need dotnet-trace "$T_TRACE"; then
                 priv "$out/p1-trace-kuni.nettrace" "dotnet-trace collect-linux 30s" \
                     "$T_TRACE collect-linux -p $pid --duration 00:00:30 -o '$out/p1-trace-kuni.nettrace'"
