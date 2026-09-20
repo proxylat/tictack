@@ -305,16 +305,17 @@ function Run-P1 {
                 Start-Sleep -Seconds 10
                 Invoke-Expression ("{0}collect -p {1} -o {2}" -f $P['dotnet-gcdump'], $pid2, $after)
             }
-            # A real .gcdump is a FastSerialization binary ($FastSerialization.1
-            # magic at offset 0), NOT text — a failed collect leaves stderr
-            # in a non-empty file, so gate the report on the magic bytes.
+            # A real .gcdump is a FastSerialization binary: length-prefixed
+            # '!FastSerialization.1' at offset 4 (od-proofed on real dumps).
+            # A failed collect leaves stderr text in a non-empty file, so
+            # gate the report on the plain token (no sigil — it is '!', not '$').
             $gcdumpsValid = $true
             foreach ($f in @($base, $after)) {
                 $ok = $false
                 if (Test-Path -LiteralPath $f) {
                     $bytes = [System.IO.File]::ReadAllBytes($f)
-                    $n = [Math]::Min(20, $bytes.Length)
-                    $ok = [System.Text.Encoding]::ASCII.GetString($bytes, 0, $n).StartsWith('$FastSerialization')
+                    $n = [Math]::Min(64, $bytes.Length)
+                    $ok = [System.Text.Encoding]::ASCII.GetString($bytes, 0, $n).Contains('FastSerialization')
                 }
                 if (-not $ok) { $gcdumpsValid = $false }
             }

@@ -317,11 +317,12 @@ cmd_p1() {
                 "$T_GCDUMP collect -p $pid -o '$out/p1-gcdump-after.gcdump'"
             # Same size-gate trap as trace above: a failed collect leaves
             # stderr text in a non-empty .gcdump. A real .gcdump is a
-            # FastSerialization binary ($FastSerialization.1 magic at
-            # offset 0), NOT JSON — gate on the magic bytes, coreutils only.
+            # FastSerialization binary: length-prefixed '!FastSerialization.1'
+            # at offset 4 (od-proofed on real dumps) — gate on the plain
+            # token, coreutils only. No sigil: the prefix byte is '!', not '$'.
             gcdumps_valid=0
-            if head -c 20 "$out/p1-gcdump-baseline.gcdump" 2>/dev/null | grep -qF '$FastSerialization' \
-            && head -c 20 "$out/p1-gcdump-after.gcdump" 2>/dev/null | grep -qF '$FastSerialization'; then
+            if head -c 64 "$out/p1-gcdump-baseline.gcdump" 2>/dev/null | grep -qF 'FastSerialization' \
+            && head -c 64 "$out/p1-gcdump-after.gcdump" 2>/dev/null | grep -qF 'FastSerialization'; then
                 gcdumps_valid=1
             fi
             if [ "$gcdumps_valid" = 1 ]; then
@@ -463,7 +464,7 @@ cmd_p1() {
                     cat >"$out/offcpu.bt" <<'BT'
 tracepoint:sched:sched_switch
 {
-    if (args->prev_pid == strtoll($1)) {
+    if (args->prev_pid == $1) {
         @start[args->prev_pid] = nsecs;
     }
     $blocked = @start[args->next_pid];
