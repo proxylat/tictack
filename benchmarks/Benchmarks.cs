@@ -9,7 +9,9 @@ using BenchmarkDotNet.Attributes;
 namespace TicTack.Benchmarks;
 
 [MemoryDiagnoser]
-[ShortRunJob]
+// MediumRun: ShortRun error was 79% of mean on this hot path; the filter
+// runs per path per event, so a stable number is worth ~1 min.
+[MediumRunJob]
 public class FilterBenchmarks
 {
     private static readonly string[] Patterns =
@@ -101,41 +103,6 @@ public class HashBenchmarks
 
     [Benchmark]
     public string HexStringLower() => Convert.ToHexStringLower(_hash);
-}
-
-[MemoryDiagnoser]
-[ShortRunJob]
-public class SnapshotBenchmarks
-{
-    private const int Count = 10_000;
-
-    private FileSnapshot[] _prev = null!;
-    private FileSnapshot[] _cur = null!;
-
-    [GlobalSetup]
-    public void Setup()
-    {
-        _prev = new FileSnapshot[Count];
-        _cur = new FileSnapshot[Count];
-        for (var i = 0; i < Count; i++)
-        {
-            _prev[i] = new FileSnapshot(i * 1024L, 637000000000000000L + i);
-            // 1% changed, like a quiet poll scan.
-            _cur[i] = new FileSnapshot(i * 1024L, 637000000000000000L + i + (i % 100 == 0 ? 1 : 0));
-        }
-    }
-
-    // The PollingMonitor hot path: one Equals per file per scan.
-    [Benchmark(OperationsPerInvoke = Count)]
-    public int ScanChanged()
-    {
-        var n = 0;
-        for (var i = 0; i < Count; i++)
-        {
-            if (!_prev[i].Equals(_cur[i])) n++;
-        }
-        return n;
-    }
 }
 
 [MemoryDiagnoser]
@@ -313,7 +280,9 @@ public class PendingDrainBenchmarks
 }
 
 [MemoryDiagnoser]
-[ShortRunJob]
+// MediumRun: Drain100 error was 294% of mean under ShortRun (N=3); the
+// 1k-vs-100k row is the evidence that heap takes stay O(log n).
+[MediumRunJob]
 public class ReadyQueueBenchmarks
 {
     private readonly object _lock = new();
