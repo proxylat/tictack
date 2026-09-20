@@ -316,13 +316,12 @@ cmd_p1() {
             record "$out/p1-gcdump-after.gcdump" "gcdump after 10s" \
                 "$T_GCDUMP collect -p $pid -o '$out/p1-gcdump-after.gcdump'"
             # Same size-gate trap as trace above: a failed collect leaves
-            # stderr text in a non-empty .gcdump. Gate on JSON validity
-            # (python3 is already a hard p3 dependency for the fio parse).
+            # stderr text in a non-empty .gcdump. A real .gcdump is a
+            # FastSerialization binary ($FastSerialization.1 magic at
+            # offset 0), NOT JSON — gate on the magic bytes, coreutils only.
             gcdumps_valid=0
-            if have python3; then
-                python3 -c "import json,sys;[json.load(open(f)) for f in sys.argv[1:]]" \
-                    "$out/p1-gcdump-baseline.gcdump" "$out/p1-gcdump-after.gcdump" 2>/dev/null && gcdumps_valid=1
-            elif [ -s "$out/p1-gcdump-baseline.gcdump" ] && [ -s "$out/p1-gcdump-after.gcdump" ]; then
+            if head -c 20 "$out/p1-gcdump-baseline.gcdump" 2>/dev/null | grep -qF '$FastSerialization' \
+            && head -c 20 "$out/p1-gcdump-after.gcdump" 2>/dev/null | grep -qF '$FastSerialization'; then
                 gcdumps_valid=1
             fi
             if [ "$gcdumps_valid" = 1 ]; then
@@ -453,14 +452,20 @@ cmd_p1() {
                     # kprobe:finish_task_switch: the kprobe needs struct
                     # task_struct field access that breaks across kernels
                     # (untraceable on this Arch 6.x box), while the
-                    # tracepoint ABI is stable. Aggregation is keyed by comm,
-                    # so our rows are grepped out at read time instead of
-                    # filtered in-probe — capture is system-wide for 20s,
-                    # same as syncsnoop above.
+                    # tracepoint ABI is stable. Scoped to the target PID via
+                    # $1: only the target's switch-out timestamps are stored,
+                    # so kstack+ustack resolution (the fd-hungry part — one
+                    # /proc/PID/root handle per sym lookup under sudo's
+                    # 1024-fd limit) happens for our rows only instead of
+                    # system-wide. Wakeup accounting still fires: it reads
+                    # @start[next_pid], which is non-zero only for the
+                    # recorded target.
                     cat >"$out/offcpu.bt" <<'BT'
 tracepoint:sched:sched_switch
 {
-    @start[args->prev_pid] = nsecs;
+    if (args->prev_pid == strtoll($1)) {
+        @start[args->prev_pid] = nsecs;
+    }
     $blocked = @start[args->next_pid];
     if ($blocked != 0) {
         @[kstack, ustack, args->next_comm] = sum(nsecs - $blocked);
@@ -469,7 +474,7 @@ tracepoint:sched:sched_switch
 }
 BT
                     priv "$out/p1-offcpu-bpftrace.txt" "bpftrace off-CPU stacks (20s)" \
-                        "timeout --preserve-status -s INT --kill-after=5 20 bpftrace '$out/offcpu.bt'"
+                        "timeout --preserve-status -s INT --kill-after=5 20 bpftrace '$out/offcpu.bt' '$pid'"
                     grep -q 'TicTackSv' "$out/p1-offcpu-bpftrace.txt" || \
                         note "off-CPU fallback: no blocked TicTackSv stacks captured (idle target, or see the log for a bpftrace error)"
                 else
