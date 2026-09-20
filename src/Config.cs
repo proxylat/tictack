@@ -71,6 +71,7 @@ namespace TicTack
 
         public string? Verification { get; set; }
         public string Durability { get; set; }
+        public string DrainStrategy { get; set; }
         public int InitialSyncWorkers { get; set; }
         public RetryConfig Retry { get; set; }
         public string? LockHandling { get; set; }
@@ -86,6 +87,7 @@ namespace TicTack
         {
             Verification = "date_and_size";
             Durability = "full";
+            DrainStrategy = "scan";
             InitialSyncWorkers = 2;
             Retry = new RetryConfig();
             LockHandling = "retry";
@@ -286,6 +288,12 @@ namespace TicTack
                     && !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase))
                 {
                     log.Error("Durability must be 'full' or 'rename-only' for source: " + src.Path);
+                    valid = false;
+                }
+                if (src.Sync != null && !string.Equals(src.Sync.DrainStrategy, "scan", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(src.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase))
+                {
+                    log.Error("DrainStrategy must be 'scan' or 'ready_queue' for source: " + src.Path);
                     valid = false;
                 }
                 if (src.Sync != null && !IsValidVerification(src.Sync.Verification))

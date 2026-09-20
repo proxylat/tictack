@@ -65,6 +65,24 @@ public class ConfigTests
         Assert.Contains(log.Messages, m => m.Contains("Durability"));
     }
 
+    [Fact]
+    public void Validate_AllowsReadyQueueDrainStrategy()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { DrainStrategy = "ready_queue" } });
+        Assert.True(Config.Validate(cfg, new RecordingLogger()));
+    }
+
+    [Fact]
+    public void Validate_RejectsUnknownDrainStrategy()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { DrainStrategy = "heap" } });
+        var log = new RecordingLogger();
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("DrainStrategy"));
+    }
+
     [Theory]
     [InlineData("hashh")]
     [InlineData("md5")]
