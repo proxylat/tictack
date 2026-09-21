@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
@@ -214,6 +215,14 @@ namespace TicTack
 
     public static class Config
     {
+        // YamlDotNet's reflection deserializer carries RequiresDynamicCode, but
+        // the 16.3.0 build contains no runtime codegen (no Reflection.Emit,
+        // DynamicMethod, or Expression.Compile — verified by inspection): it is
+        // reflection-invoke only, which works under AOT while the model types
+        // are preserved. The Aot publish profile roots TicTackSv + YamlDotNet
+        // for trimming (see Properties/PublishProfiles/Aot.pubxml), so this
+        // suppression documents that pairing instead of hiding a real risk.
+        [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Reflection-only deserializer; model assemblies are trim-rooted in the Aot publish profile.")]
         public static TicTackConfig? Load(string path)
         {
             if (!File.Exists(path)) return null;

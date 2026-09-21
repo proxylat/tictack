@@ -15,6 +15,11 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <IsAotCompatible>true</IsAotCompatible>
+    <!-- AOT/trim analyzers as a permanent guardrail: every build proves new
+         code stays publish-ready. Known single IL3050 at Config.Load is
+         suppressed with justification (trim-rooted in Aot.pubxml). Full
+         NativeAOT link is Windows-only (cross-OS AOT publish unsupported). -->
   </PropertyGroup>
   <ItemGroup>
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
