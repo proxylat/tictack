@@ -148,9 +148,13 @@ namespace TicTack
                 long bytesCopied = 0;
                 double copyMs = -1;
 
-                var isSparse = false;
-                try { isSparse = (File.GetAttributes(src) & FileAttributes.SparseFile) == FileAttributes.SparseFile; }
-                catch (Exception ex) { _log?.Debug("Sparse attribute probe failed for " + src + ": " + ex.Message); }
+                // Snapshot-first: the caller usually statted the source already,
+                // so this costs zero syscalls; the re-read fallback replaces
+                // the old standalone GetAttributes call 1:1 on the cold path.
+                var srcAttributes = args.SourceSnapshot?.Attributes;
+                if (!srcAttributes.HasValue && FileSnapshot.TryRead(src, out var currentSnap))
+                    srcAttributes = currentSnap.Attributes;
+                var isSparse = (srcAttributes.GetValueOrDefault() & FileAttributes.SparseFile) == FileAttributes.SparseFile;
 
                 using (var srcStream = _accessor.OpenRead(src))
                 using (var dstStream = File.Create(tmp))

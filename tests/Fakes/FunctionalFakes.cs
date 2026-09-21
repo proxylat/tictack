@@ -78,6 +78,8 @@ public sealed class CountingComparer : IFileComparer
 
     public CountingComparer(IFileComparer inner) => _inner = inner;
 
+    public bool RequiresContentRead => _inner.RequiresContentRead;
+
     public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
     {
         Calls++;

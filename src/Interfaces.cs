@@ -78,11 +78,16 @@ namespace TicTack
         public long Length { get; }
         public long LastWriteTimeUtcTicks { get; }
         public DateTime LastWriteTimeUtc => new DateTime(LastWriteTimeUtcTicks, DateTimeKind.Utc);
+        // Informational only: populated from the same stat as Length/mtime,
+        // deliberately excluded from Equals so change detection stays
+        // content-based (attribute-only changes are not data changes).
+        public FileAttributes Attributes { get; }
 
-        public FileSnapshot(long length, long lastWriteTimeUtcTicks)
+        public FileSnapshot(long length, long lastWriteTimeUtcTicks, FileAttributes attributes = default)
         {
             Length = length;
             LastWriteTimeUtcTicks = lastWriteTimeUtcTicks;
+            Attributes = attributes;
         }
 
         public bool Equals(FileSnapshot other) =>
@@ -103,7 +108,7 @@ namespace TicTack
                     return false;
                 }
 
-                snapshot = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks);
+                snapshot = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks, info.Attributes);
                 return true;
             }
             catch
@@ -138,6 +143,11 @@ namespace TicTack
 
     public interface IFileComparer
     {
+        // True when AreEqual may read full file contents (hash/full).
+        // Lets callers keep a cheap existence gate so warm runs never
+        // pay content reads; metadata comparers stat dst themselves,
+        // so no extra gate is needed for them.
+        bool RequiresContentRead { get; }
         bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null);
     }
 

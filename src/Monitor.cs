@@ -361,7 +361,7 @@ namespace TicTack
                 try
                 {
                     var info = new FileInfo(f);
-                    result[key] = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks);
+                    result[key] = new FileSnapshot(info.Length, info.LastWriteTimeUtc.Ticks, info.Attributes);
                 }
                 catch
                 {

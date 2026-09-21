@@ -50,6 +50,9 @@ namespace TicTack
 
     public class SizeComparer : IFileComparer
     {
+        // Metadata-only: never reads file contents.
+        public bool RequiresContentRead => false;
+
         public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
@@ -69,6 +72,9 @@ namespace TicTack
 
     public class DateSizeComparer : IFileComparer
     {
+        // Metadata-only: never reads file contents.
+        public bool RequiresContentRead => false;
+
         public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
@@ -93,6 +99,9 @@ namespace TicTack
         private readonly IFileAccessor? _accessor;
         public HashComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
 
+        // Reads both files end to end when metadata matches.
+        public bool RequiresContentRead => true;
+
         public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {
             try
@@ -116,6 +125,9 @@ namespace TicTack
     {
         private readonly HashComparer _hash;
         public FullComparer(IFileAccessor? accessor = null) { _hash = new HashComparer(accessor); }
+
+        // Delegates to HashComparer when metadata matches.
+        public bool RequiresContentRead => true;
 
         public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
         {

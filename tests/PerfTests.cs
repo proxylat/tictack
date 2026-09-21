@@ -84,7 +84,10 @@ public sealed class PerfTests
             var alloc = GC.GetTotalAllocatedBytes(true) - allocBefore;
 
             Assert.Equal(200, copy.Calls.Count);
-            Assert.Equal(coldComparerCalls, comparer.Calls);
+            // Warm run re-verifies each file through the comparer (one dst
+            // stat per file — deletion detection) but copies nothing: the
+            // state hit skips the copy, not the dst check.
+            Assert.Equal(coldComparerCalls + 200, comparer.Calls);
             Assert.True(alloc < 12 * 1024 * 1024, $"Warm resync allocated {alloc} bytes");
         }
         finally { TryDelete(dir); }
