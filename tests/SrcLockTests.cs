@@ -106,6 +106,8 @@ public class SrcLockTests : IDisposable
         Assert.False(lockObj.IsHeld);
         // One 5 s retry sleep must elapse: a zero sleep would return at ~300 ms.
         Assert.True(sw.ElapsedMilliseconds >= 4000);
+        // The wait must be visible at info level, not buried in debug.
+        Assert.Contains(_log.Messages, m => m.StartsWith("INF:") && m.Contains("Waiting for lock held by"));
         Assert.Contains(_log.Messages, m => m.Contains("lock acquisition failed"));
         lockObj.Dispose();
         Assert.True(File.Exists(_lockPath));

@@ -67,7 +67,7 @@ namespace TicTack
             var log = LoggerFactory.Create(
                 cfg.Logging,
                 baseDir,
-                console: isCli || isOnce || isValidate || cfg.Logging.Console,
+                console: isCli || isOnce || isValidate || isRebuild || cfg.Logging.Console,
                 eventLog: OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive));
             rootLogger = log;
 

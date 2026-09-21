@@ -1,7 +1,6 @@
 [Unit]
 Description=TicTack File Sync
 After=local-fs.target
-RequiresMountsFor=/srv/tictack
 
 [Service]
 Type=simple

@@ -26,6 +26,7 @@ namespace TicTack
             // Stale threshold must exceed the refresh cadence, or a live holder
             // whose refreshInterval is set above 5 minutes looks stale.
             var staleAfter = TimeSpan.FromTicks(Math.Max(TimeSpan.FromMinutes(5).Ticks, refresh.Ticks * 10));
+            var waited = false;
 
             try
             {
@@ -56,10 +57,19 @@ namespace TicTack
                         }
                         if (DateTime.UtcNow >= deadline)
                         {
-                            log.Warn("Lock held by " + content + " — lock acquisition failed");
+                            var waitedFor = retryTimeout.HasValue ? $" after {retryTimeout.Value.TotalMinutes:F0} min" : "";
+                            log.Warn("Lock held by " + content + " — lock acquisition failed" + waitedFor
+                                     + "; stop the other TicTack instance or raise retry_lock_minutes");
                             return;
                         }
-                        log.Debug("Lock held by " + content + " — retrying...");
+                        if (!waited)
+                        {
+                            waited = true;
+                            var budget = retryTimeout.HasValue ? $" for up to {retryTimeout.Value.TotalMinutes:F0} min" : "";
+                            log.Info("Waiting for lock held by " + content + " — retrying every 5s" + budget
+                                     + "; stop the running instance to proceed immediately");
+                        }
+                        else log.Debug("Lock held by " + content + " — retrying...");
                         Thread.Sleep(5000);
                     }
                 }
