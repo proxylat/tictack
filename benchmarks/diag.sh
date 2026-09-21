@@ -130,6 +130,77 @@ attach_blocked() {
     [ "${s:-0}" != 0 ]
 }
 
+# Start a transient TicTack watcher when p1 has no resident target: throwaway
+# config + throwaway dirs under $out/p1-target (never real folders); an idle
+# watcher is the triage shape. Sets target + auto_p1 + auto_note on success,
+# 1 with a stderr message otherwise (the SUMMARY header is written after
+# target resolution, so notes here would be truncated away — the success note
+# is deferred via auto_note). Default-miss only; explicit-target misses keep
+# their exit-2. Lock-safe by construction: the transient source is its own
+# dir, so it never contends with a real service's lock.
+ensure_p1_target() {
+    local dll="$repo_root/src/bin/Release/net10.0-windows/TicTackSv.dll" troot="$out/p1-target"
+    local tcfg="$troot/config.yaml" child i
+    if [ ! -f "$dll" ]; then
+        "$DOTNET" build "$repo_root/src/TicTack.csproj" -c Release -v q --nologo \
+            >"$out/p1-target-build.log" 2>&1
+        if grep -Eq 'Build FAILED|error CS|error MSB' "$out/p1-target-build.log"; then
+            echo "No TicTackSv process and Release build failed; pass a PID or name." >&2
+            return 1
+        fi
+    fi
+    mkdir -p "$troot/src" "$troot/dst" "$troot/state"
+    cat >"$tcfg" <<EOF
+sources:
+  - paths:
+      - $troot/src
+    destination: $troot/dst
+    state_db_path: $troot/state
+    debounce_seconds: 20
+    filter:
+      max_file_size_mb: no-limit
+      exclude: []
+    sync:
+      verification: date_and_size
+      durability: full
+      drain_strategy: scan
+      dir_sync: per-file
+      complete_mode: inline
+      initial_sync_workers: 2
+      lock_handling: retry
+      retry_lock_minutes: 10
+      versioning:
+        max_versions: 10
+        path: $troot/versions
+      deletion:
+        mode: archive
+        path: $troot/archive
+monitor:
+  type: watcher
+logging:
+  level: warning
+  path: $troot/tictack.log
+  console: false
+watchdog:
+  enabled: false
+EOF
+    if ! "$DOTNET" "$dll" --validate --config "$tcfg" >"$troot/validate.log" 2>&1; then
+        echo "Transient p1 config rejected (--validate failed); pass a PID or name." >&2
+        return 1
+    fi
+    "$DOTNET" "$dll" --cli --config "$tcfg" >"$troot/stdout.log" 2>&1 &
+    child=$!
+    for i in $(seq 1 10); do [ -d "/proc/$child" ] && break; sleep 1; done
+    if [ ! -d "/proc/$child" ]; then
+        echo "Transient p1 target exited during startup (see p1-target/stdout.log); pass a PID or name." >&2
+        return 1
+    fi
+    target=$child
+    auto_p1=$child
+    auto_note="p1: no resident TicTackSv — auto-started transient watcher (pid $child, cleaned up at end)"
+    return 0
+}
+
 # ------------------------------------------------------------------ p1 ------
 cmd_p1() {
     local T_COUNTERS T_GCSTATS T_PSTACKS T_GCDUMP T_DSTRINGS T_TRACE T_STACK T_FULLGC T_DUMP
@@ -145,7 +216,7 @@ cmd_p1() {
         # that launched it. Newest match wins when several are running.
         target=$(for p in $(pgrep -f TicTackSv); do is_dotnet "$p" && echo "$p"; done | tail -1)
         [ -z "$target" ] && target=$(pgrep -f TicTackSv | tail -1)
-        [ -z "$target" ] && { echo "No TicTackSv process found; pass a PID or name." >&2; exit 2; }
+        [ -z "$target" ] && { ensure_p1_target || exit 2; }
     fi
     local pid
     if [[ "$target" =~ ^[0-9]+$ ]]; then pid=$target
@@ -157,6 +228,9 @@ cmd_p1() {
         printf -- '- host: `%s`\n- pid: `%s`\n- target: `%s`\n- phase: p1 live triage%s%s\n' \
             "$(uname -srm)" "$pid" "$target" "$([ $full = 1 ] && echo ' --full')" "$([ $dump = 1 ] && echo ' --dump')"
     } >"$summary"
+    # ensure_p1_target cannot note() (header did not exist yet when it ran);
+    # flush its deferred success note now that the summary is open.
+    [ -n "${auto_note:-}" ] && note "$auto_note"
     hr "p1 live triage, pid $pid"
 
     # B4: EventPipe preflight. Every dotnet-* tool except pstacks/dstrings
@@ -568,12 +642,42 @@ BT
             fi
         fi
     fi
+    # Transient p1 target (started by ensure_p1_target): SIGINT, wait up to
+    # 10s for a clean exit, SIGKILL if it lingers, then remove the transient
+    # tree. Never touches a user-supplied target.
+    if [ -n "${auto_p1:-}" ]; then
+        kill -INT "$auto_p1" 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            [ -d "/proc/$auto_p1" ] || break
+            sleep 1
+        done
+        if [ -d "/proc/$auto_p1" ]; then
+            kill -KILL "$auto_p1" 2>/dev/null || true
+            note "p1: transient target $auto_p1 did not stop on SIGINT — killed"
+        else
+            note "p1: transient target $auto_p1 stopped"
+        fi
+        rm -rf "$out/p1-target"
+        auto_p1=""
+    fi
 }
 
 # ------------------------------------------------- p2: static + tests ------
 cmd_p2() {
     { printf '\n## p2 static analysis\n'; } >>"$summary"
     hr "p2 static analysis"
+    if ! have semgrep; then
+        # Auto-install (mirrors diag.ps1, which uses `py -m pip install semgrep`).
+        note "semgrep not found — installing via python3 -m pip install --user semgrep"
+        python3 -m pip install --user --quiet semgrep >"$out/p2-semgrep-install.log" 2>&1 || true
+        # pip --user drops the binary in ~/.local/bin, which may not be on PATH.
+        case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
+        if have semgrep; then
+            note "semgrep auto-installed (python3 -m pip install --user semgrep)"
+        else
+            note "semgrep: install failed — skipping semgrep r/csharp"
+        fi
+    fi
     if have semgrep; then
         # -o writes pure JSON, so run it directly: record() would prepend a
         # header into the file and break JSON parsing.
@@ -586,8 +690,6 @@ cmd_p2() {
             count=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1])).get('results',[])))" \
                 "$out/p2-semgrep.json" 2>/dev/null || count="?")
         note "semgrep: $count findings (r/csharp, exit $rc) -> ${out#"$repo_root"/}/p2-semgrep.json"
-    else
-        note "semgrep not found (pipx install semgrep) — skipping semgrep r/csharp"
     fi
     if have ast-grep; then
         record "$out/p2-ast-grep.txt" "ast-grep scan (rules/ bank)" \
