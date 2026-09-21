@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -129,6 +130,12 @@ namespace TicTack
         // for InitialSync only — the trickle event path stays per-file.
         public DirSyncBatcher? DirBatch { get; set; }
 
+        // Off by default. When on, the copy loop feeds an IncrementalHash
+        // and the returned ActionResult carries the source digest, so a hash
+        // validator can skip re-reading the source. SyncPipeline enables it
+        // only when the validator is a HashValidator.
+        public bool ComputeSourceHash { get; set; }
+
         public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
         {
             try
@@ -147,6 +154,7 @@ namespace TicTack
 
                 long bytesCopied = 0;
                 double copyMs = -1;
+                string? sourceHash = null;
 
                 // Snapshot-first: the caller usually statted the source already,
                 // so this costs zero syscalls; the re-read fallback replaces
@@ -174,7 +182,25 @@ namespace TicTack
                     {
                         dstStream.SetLength(srcStream.Length);
                     }
-                    await srcStream.CopyToAsync(dstStream, 81920, ct);
+                    if (ComputeSourceHash)
+                    {
+                        // Hash the bytes as streamed: one pass serves both
+                        // the copy and a hash validator. Same buffer size as
+                        // CopyToAsync's default so throughput is unchanged.
+                        using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                        var buffer = new byte[81920];
+                        int read;
+                        while ((read = await srcStream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
+                        {
+                            hasher.AppendData(buffer, 0, read);
+                            await dstStream.WriteAsync(buffer, 0, read, ct);
+                        }
+                        sourceHash = Convert.ToHexStringLower(hasher.GetHashAndReset());
+                    }
+                    else
+                    {
+                        await srcStream.CopyToAsync(dstStream, 81920, ct);
+                    }
                     // Prefer the bytes actually written: a source appended
                     // mid-copy makes Length a lie.
                     bytesCopied = dstStream.Position;
@@ -218,7 +244,7 @@ namespace TicTack
                 // Count only fully committed copies.
                 if (copyMs >= 0) TicTackEventSource.Log.CopyCompleted(copyMs);
                 TicTackEventSource.Log.FileCopied(bytesCopied);
-                return ActionResult.Ok();
+                return new ActionResult { Success = true, SourceHash = sourceHash };
             }
             catch (UnauthorizedAccessException ex) { return ActionResult.Fail(ex.Message); }
             catch (DirectoryNotFoundException ex) { return ActionResult.Fail(ex.Message); }

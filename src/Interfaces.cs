@@ -126,6 +126,10 @@ namespace TicTack
         // True for failures that a retry may clear (sharing violations,
         // transient IO). Pipeline unwraps these into the retry wrapper.
         public bool Retryable { get; set; }
+        // Lowercase hex SHA-256 of the source bytes as streamed during copy,
+        // set only when CopyAction.ComputeSourceHash is on. Null means no
+        // copy-time hash is available; validators must do full reads.
+        public string? SourceHash { get; set; }
         public static ActionResult Ok() { return new ActionResult { Success = true }; }
         public static ActionResult Fail(string msg, bool retryable = false) =>
             new ActionResult { Success = false, ErrorMessage = msg, Retryable = retryable };

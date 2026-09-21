@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 
 namespace TicTack;
 
@@ -340,6 +341,33 @@ public class ExecutorTests : IDisposable
 
         Assert.False(result.Success);
         Assert.True(File.Exists(Path.Combine(Dst("old"), "keep.txt")));
+    }
+
+    static string Sha256Hex(byte[] bytes) =>
+        Convert.ToHexStringLower(SHA256.HashData(bytes));
+
+    [Fact]
+    public async Task CopyAction_ComputeSourceHash_ReturnsMatchingHash()
+    {
+        File.WriteAllText(Src("h.txt"), "hash me during copy");
+
+        var action = new CopyAction(_accessor) { ComputeSourceHash = true };
+        var result = await action.ExecuteAsync(MakeArgs(Src("h.txt")), CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal(Sha256Hex(await File.ReadAllBytesAsync(Dst("h.txt"))), result.SourceHash);
+    }
+
+    [Fact]
+    public async Task CopyAction_SourceHashNull_WhenFlagOff()
+    {
+        File.WriteAllText(Src("n.txt"), "no hash please");
+
+        var action = new CopyAction(_accessor);
+        var result = await action.ExecuteAsync(MakeArgs(Src("n.txt")), CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Null(result.SourceHash);
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
