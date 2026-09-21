@@ -28,6 +28,7 @@
     <Compile Include="../../src/Pipeline.cs" Link="src/Pipeline.cs" />
     <Compile Include="../../src/ReadyDrain.cs" Link="src/ReadyDrain.cs" />
     <Compile Include="../../src/DeletionGuard.cs" Link="src/DeletionGuard.cs" />
+    <Compile Include="../../src/Completer.cs" Link="src/Completer.cs" />
     <Compile Include="../../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
     <Compile Include="../../src/Metrics.cs" Link="src/Metrics.cs" />
     <Compile Include="../../src/DriveGuard.cs" Link="src/DriveGuard.cs" />

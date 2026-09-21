@@ -49,6 +49,7 @@ namespace TicTack
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateDirectories;
         private readonly Func<string, bool> _driveReady;
         private readonly DeletionGuard _deletions;
+        private readonly FileCompleter? _completer;
         private Timer? _parityTimer;
         private EventHandler<MonitorErrorEventArgs>? _monitorErrorHandler;
         private volatile bool _parityRequested;
@@ -94,6 +95,16 @@ namespace TicTack
             // can produce a trusted copy-time hash. Test wrappers (RecordingAction)
             // leave the flag off and take the classic double-read fallback below.
             if (copyAction is CopyAction copy && validator is HashValidator) copy.ComputeSourceHash = true;
+            // Pipelined completion: the completer owns flush -> rename ->
+            // validate -> upsert on one thread; workers only copy. Capacity
+            // is derived from the worker count (2x) for backpressure. Test
+            // wrappers (RecordingAction) stay inline — same fallback shape
+            // as the hash flag above.
+            _completer = _config.Sync != null
+                && string.Equals(_config.Sync.CompleteMode, "pipelined", StringComparison.OrdinalIgnoreCase)
+                && copyAction is CopyAction realCopy
+                ? new FileCompleter(realCopy, validator, log, 2 * Math.Max(1, _config.Sync.InitialSyncWorkers))
+                : null;
             // Capture the queue itself, not `this`: a constructor that throws
             // after this point would otherwise leak the whole pipeline through
             // the static EventSource's counter callback.
@@ -172,6 +183,9 @@ namespace TicTack
 
         private void StartWorkers()
         {
+            // Completer first: it must be listening before any copy
+            // worker can enqueue.
+            _completer?.Start(_cts!.Token);
             _initialSync = Task.Run(() => InitialSyncAsync());
             _processor = Task.Run(() => ProcessLoop());
             // Arm the hourly deferred-deletion recheck only when something is
@@ -399,12 +413,25 @@ namespace TicTack
                         }
                         var e = new FileChangedEventArgs(ChangeType.Created, f);
                         var args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
+                        // Pipelined upsert: the completer owns the batch add
+                        // (plus the 500-file FlushState) under the same lock,
+                        // so the checkpoint cadence is unchanged.
+                        Func<FileSnapshot, CancellationToken, Task> batchUpsert = (snap, _) =>
+                        {
+                            if (_stateDb == null) return Task.CompletedTask;
+                            lock (stateLock)
+                            {
+                                pendingState.Add((rel, snap.Length, snap.LastWriteTimeUtcTicks));
+                                if (pendingState.Count >= 500) FlushState();
+                            }
+                            return Task.CompletedTask;
+                        };
                         var fresh = await ExecuteCopyAsync(args,
                             CopyWithRetryAsync,
-                            "Initial sync failed", "Initial sync validation FAILED", token);
+                            "Initial sync failed", "Initial sync validation FAILED", token, batchUpsert);
                         if (fresh == null) return;
 
-                        if (_stateDb != null)
+                        if (!UsePipelined(batchUpsert) && _stateDb != null)
                         {
                             lock (stateLock)
                             {
@@ -448,7 +475,8 @@ namespace TicTack
             Func<FileActionArgs, CancellationToken, Task<ActionResult>> copy,
             string failLabel,
             string validationLabel,
-            CancellationToken ct)
+            CancellationToken ct,
+            Func<FileSnapshot, CancellationToken, Task>? pipelinedUpsert = null)
         {
             var src = args.ChangeEvent.FullPath;
             var dst = args.DestPath;
@@ -466,6 +494,13 @@ namespace TicTack
                 _log.Error("Versioning failed: " + dst, ex);
                 return null;
             }
+
+            // Pipelined mode: copy on this worker, complete (flush -> rename
+            // -> validate -> upsert) on the completer thread. The upsert
+            // delegate already ran when fresh returns non-null, so callers
+            // skip their own upsert via UsePipelined below.
+            if (UsePipelined(pipelinedUpsert))
+                return await ExecutePipelinedAsync(args, pipelinedUpsert!, failLabel, validationLabel, ct);
 
             ActionResult result;
             try
@@ -520,6 +555,54 @@ namespace TicTack
                 if (!copyResult.Success && copyResult.Retryable)
                     throw new IOException(copyResult.ErrorMessage);
                 return copyResult;
+            }, ct);
+
+        private bool UsePipelined(Func<FileSnapshot, CancellationToken, Task>? upsert) =>
+            upsert != null && _completer != null && _copyAction is CopyAction;
+
+        private async Task<FileSnapshot?> ExecutePipelinedAsync(
+            FileActionArgs args,
+            Func<FileSnapshot, CancellationToken, Task> upsert,
+            string failLabel,
+            string validationLabel,
+            CancellationToken ct)
+        {
+            var src = args.ChangeEvent.FullPath;
+            TempCopyResult tmp;
+            try
+            {
+                tmp = await CopyTempWithRetryAsync(args, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _log.Error(failLabel + ": " + src + ": " + ex.Message);
+                return null;
+            }
+            if (!tmp.Success)
+            {
+                _log.Error(failLabel + ": " + src + ": " + tmp.ErrorMessage);
+                return null;
+            }
+            try
+            {
+                return await _completer!.EnqueueAsync(args, tmp, failLabel, validationLabel, upsert, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _log.Error(failLabel + ": " + src + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        private Task<TempCopyResult> CopyTempWithRetryAsync(FileActionArgs args, CancellationToken ct) =>
+            _retry.ExecuteAsync(async () =>
+            {
+                var tmp = await ((CopyAction)_copyAction).CopyToTempAsync(args, ct);
+                if (!tmp.Success && tmp.Retryable)
+                    throw new IOException(tmp.ErrorMessage);
+                return tmp;
             }, ct);
 
         private async Task WaitForSignal(CancellationToken token)
@@ -623,12 +706,26 @@ namespace TicTack
                         args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                         if (_comparer.AreEqual(e.FullPath, args.DestPath, sourceSnapshot)) return;
 
+                        // Pipelined upsert: mirrors the single-row update
+                        // below; the completer runs it after durable rename.
+                        Func<FileSnapshot, CancellationToken, Task> singleUpsert = async (snap, _) =>
+                        {
+                            if (_stateDb != null)
+                            {
+                                try
+                                {
+                                    var rel = PathUtil.Relative(e.FullPath, _config.Path);
+                                    await _stateDb.UpsertAsync(rel, snap.Length, snap.LastWriteTimeUtcTicks);
+                                }
+                                catch (Exception ex) { _log.Debug("StateDb update skipped: " + ex.Message); }
+                            }
+                        };
                         var fresh = await ExecuteCopyAsync(args,
                             CopyWithRetryAsync,
-                            "Copy failed", "Validation FAILED", ct);
+                            "Copy failed", "Validation FAILED", ct, singleUpsert);
                         if (fresh == null) return;
                         var freshSnapshot = fresh.Value;
-                        if (_stateDb != null)
+                        if (!UsePipelined(singleUpsert) && _stateDb != null)
                         {
                             try
                             {
@@ -666,6 +763,11 @@ namespace TicTack
             var tasks = new List<Task>();
             if (_processor != null) tasks.Add(_processor);
             if (_initialSync != null) tasks.Add(_initialSync);
+            // Abandon queued completions first: orphan tmps go to PowerGuard,
+            // and outstanding funnels release via the cancellation above.
+            // Completed-then-upserted items keep the crash invariant even here.
+            _completer?.Complete();
+            if (_completer != null) tasks.Add(_completer.LoopTask);
             lock (_taskLock) tasks.AddRange(_deferredTasks);
             try { await Task.WhenAll(tasks); }
             catch (OperationCanceledException) { }

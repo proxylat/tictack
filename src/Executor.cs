@@ -66,6 +66,24 @@ namespace TicTack
         }
     }
 
+    // Copy-phase output for the pipelined completer (complete_mode=pipelined):
+    // everything the complete phase needs after the streams are closed.
+    // Internal: same-assembly only (SyncPipeline + FileCompleter).
+    internal sealed class TempCopyResult
+    {
+        public bool Success { get; set; }
+        public string? ErrorMessage { get; set; }
+        public bool Retryable { get; set; }
+        public string Dst { get; set; } = "";
+        public string Tmp { get; set; } = "";
+        public string? SourceHash { get; set; }
+        public long BytesCopied { get; set; }
+        public double CopyMs { get; set; } = -1;
+
+        public static TempCopyResult Fail(string message, bool retryable = false) =>
+            new TempCopyResult { Success = false, ErrorMessage = message, Retryable = retryable };
+    }
+
     public class CopyAction : IFileAction
     {
         private readonly IFileAccessor _accessor;
@@ -138,6 +156,19 @@ namespace TicTack
 
         public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
         {
+            // Inline mode: copy then complete on this thread — same order,
+            // checkpoints, and errors as the split phases below.
+            var tmp = await CopyToTempAsync(args, ct);
+            if (!tmp.Success)
+                return ActionResult.Fail(tmp.ErrorMessage ?? "Copy failed", tmp.Retryable);
+            return CompleteTemp(tmp, ct);
+        }
+
+        // Copy phase: probe, stream bytes to .tictack.tmp, stamp the source
+        // mtime. Claims no durability: no flush, rename, or dir sync here.
+        // Fires TempCreated only; the complete phase fires the rest in order.
+        internal async Task<TempCopyResult> CopyToTempAsync(FileActionArgs args, CancellationToken ct)
+        {
             try
             {
                 var src = args.ChangeEvent.FullPath;
@@ -204,12 +235,9 @@ namespace TicTack
                     // Prefer the bytes actually written: a source appended
                     // mid-copy makes Length a lie.
                     bytesCopied = dstStream.Position;
-                    Stopwatch? fsw = timed ? Stopwatch.StartNew() : null;
-                    FlushData(dstStream);
-                    if (fsw != null) TicTackEventSource.Log.FsyncCompleted(fsw.Elapsed.TotalMilliseconds);
-                    _checkpoint?.Invoke(CopyCheckpoint.DataFlushed);
                     if (sw != null) copyMs = sw.Elapsed.TotalMilliseconds;
                 }
+                // No flush here: durability is the complete phase's job.
 
                 try
                 {
@@ -226,15 +254,56 @@ namespace TicTack
                     _log?.Warn("Could not preserve source timestamp on " + dst + ": " + ex.Message);
                 }
 
+                return new TempCopyResult
+                {
+                    Success = true,
+                    Dst = dst,
+                    Tmp = tmp,
+                    SourceHash = sourceHash,
+                    BytesCopied = bytesCopied,
+                    CopyMs = copyMs
+                };
+            }
+            catch (UnauthorizedAccessException ex) { return TempCopyResult.Fail(ex.Message); }
+            catch (DirectoryNotFoundException ex) { return TempCopyResult.Fail(ex.Message); }
+            catch (PathTooLongException ex) { return TempCopyResult.Fail(ex.Message); }
+            catch (NotSupportedException ex) { return TempCopyResult.Fail(ex.Message); }
+            // Retryable: sharing violations and transient IO. Pipeline unwraps
+            // these into ExponentialBackoffRetry.
+            catch (IOException ex) { return TempCopyResult.Fail(ex.Message, retryable: true); }
+            catch (Win32Exception ex) { return TempCopyResult.Fail(ex.Message, retryable: true); }
+        }
+
+        // Complete phase: flush, atomic rename, directory sync. Fires
+        // DataFlushed, BeforeCommit, AfterCommit in the same order the inline
+        // path always has (ExecutorTests pins it). The tmp is reopened — one
+        // extra open per file — so no handle crosses the thread boundary to
+        // the completer. Synchronous: every step inside is sync I/O.
+        internal ActionResult CompleteTemp(TempCopyResult tmp, CancellationToken ct)
+        {
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                var dst = tmp.Dst;
+                var timed = TicTackEventSource.Log.IsEnabled();
+                using (var s = File.Open(tmp.Tmp, FileMode.Open, FileAccess.ReadWrite,
+                    FileShare.ReadWrite | FileShare.Delete))
+                {
+                    var fsw = timed ? Stopwatch.StartNew() : null;
+                    FlushData(s);
+                    if (fsw != null) TicTackEventSource.Log.FsyncCompleted(fsw.Elapsed.TotalMilliseconds);
+                    _checkpoint?.Invoke(CopyCheckpoint.DataFlushed);
+                }
+
                 _checkpoint?.Invoke(CopyCheckpoint.BeforeCommit);
                 if (File.Exists(dst))
                 {
                     File.SetAttributes(dst, FileAttributes.Normal);
-                    File.Replace(tmp, dst, null);
+                    File.Replace(tmp.Tmp, dst, null);
                 }
                 else
                 {
-                    File.Move(tmp, dst);
+                    File.Move(tmp.Tmp, dst);
                 }
                 _checkpoint?.Invoke(CopyCheckpoint.AfterCommit);
 
@@ -242,16 +311,16 @@ namespace TicTack
                     return ActionResult.Fail("Could not fsync destination directory");
 
                 // Count only fully committed copies.
-                if (copyMs >= 0) TicTackEventSource.Log.CopyCompleted(copyMs);
-                TicTackEventSource.Log.FileCopied(bytesCopied);
-                return new ActionResult { Success = true, SourceHash = sourceHash };
+                if (tmp.CopyMs >= 0) TicTackEventSource.Log.CopyCompleted(tmp.CopyMs);
+                TicTackEventSource.Log.FileCopied(tmp.BytesCopied);
+                // The hash covers the bytes the copy loop wrote; rename and
+                // dir sync don't touch content, so it stays valid here.
+                return new ActionResult { Success = true, SourceHash = tmp.SourceHash };
             }
             catch (UnauthorizedAccessException ex) { return ActionResult.Fail(ex.Message); }
             catch (DirectoryNotFoundException ex) { return ActionResult.Fail(ex.Message); }
             catch (PathTooLongException ex) { return ActionResult.Fail(ex.Message); }
             catch (NotSupportedException ex) { return ActionResult.Fail(ex.Message); }
-            // Retryable: sharing violations and transient IO. Pipeline unwraps
-            // these into ExponentialBackoffRetry.
             catch (IOException ex) { return ActionResult.Fail(ex.Message, retryable: true); }
             catch (Win32Exception ex) { return ActionResult.Fail(ex.Message, retryable: true); }
         }

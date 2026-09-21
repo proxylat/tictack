@@ -10,6 +10,7 @@ sources:
     debounce_seconds: 20
     drain_strategy: scan
     dir_sync: per-file  # pair with durability: rename-only for the fast cold-sync combo (measured 3.5x); neutral under full
+    complete_mode: inline  # inline = fsync on the copy worker; pipelined = one completer thread owns flush->rename->validate->upsert
     filter:
       max_file_size_mb: no-limit
       exclude:

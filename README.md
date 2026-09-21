@@ -226,6 +226,7 @@ Unknown or duplicate YAML properties are rejected at startup instead of being ig
 | `debounce_seconds` | `10` | Wait time (s) after last change before triggering sync |
 | `drain_strategy` | `scan` | Backlog drain order: `scan` = hash-order scan (zero extra memory) / `ready_queue` = earliest-expiry-first heap (bounded drain under watcher-overflow backlogs, transient ~2x backlog memory) |
 | `dir_sync` | `per-file` | Directory-entry durability after each rename: `per-file` = fsync each file's parent dir / `per-batch` = collect dirs and fsync once per state checkpoint (fewer syncs on initial sync, larger crash window: files already renamed but not yet dir-synced may need a re-copy). Measured: neutral under `full`, but 3.5x faster cold initial sync when combined with `rename-only` (24.7s → 7.0s, 10k files / 2GB) |
+| `complete_mode` | `inline` | Copy pipeline shape: `inline` = copy → fsync → rename on the worker thread / `pipelined` = workers copy to temp and one completer thread owns flush → rename → validate → upsert in order (bounded queue of 2x workers for backpressure; crash-safe: state is still claimed only after durable rename, orphan tmps go to PowerGuard) |
 | `max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files |
 | `exclude` | `[]` | Case-insensitive glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) |
 | `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |

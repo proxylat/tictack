@@ -109,6 +109,24 @@ public class ConfigTests
         Assert.Contains(log.Messages, m => m.Contains("DirSync"));
     }
 
+    [Fact]
+    public void Validate_AllowsPipelinedCompleteMode()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { CompleteMode = "pipelined" } });
+        Assert.True(Config.Validate(cfg, new RecordingLogger()));
+    }
+
+    [Fact]
+    public void Validate_RejectsUnknownCompleteMode()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = @"C:\src", Destination = @"D:\dst", Sync = new SyncConfig { CompleteMode = "parallel" } });
+        var log = new RecordingLogger();
+        Assert.False(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("CompleteMode"));
+    }
+
     [Theory]
     [InlineData("hashh")]
     [InlineData("md5")]

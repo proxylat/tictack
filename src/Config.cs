@@ -73,6 +73,7 @@ namespace TicTack
         public string Durability { get; set; }
         public string DrainStrategy { get; set; }
         public string DirSync { get; set; }
+        public string CompleteMode { get; set; }
         public int InitialSyncWorkers { get; set; }
         public RetryConfig Retry { get; set; }
         public string? LockHandling { get; set; }
@@ -90,6 +91,7 @@ namespace TicTack
             Durability = "full";
             DrainStrategy = "scan";
             DirSync = "per-file";
+            CompleteMode = "inline";
             InitialSyncWorkers = 2;
             Retry = new RetryConfig();
             LockHandling = "retry";
@@ -303,6 +305,12 @@ namespace TicTack
                     && !string.Equals(src.Sync.DirSync, "per-batch", StringComparison.OrdinalIgnoreCase))
                 {
                     log.Error("DirSync must be 'per-file' or 'per-batch' for source: " + src.Path);
+                    valid = false;
+                }
+                if (src.Sync != null && !string.Equals(src.Sync.CompleteMode, "inline", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(src.Sync.CompleteMode, "pipelined", StringComparison.OrdinalIgnoreCase))
+                {
+                    log.Error("CompleteMode must be 'inline' or 'pipelined' for source: " + src.Path);
                     valid = false;
                 }
                 if (src.Sync != null && !IsValidVerification(src.Sync.Verification))
