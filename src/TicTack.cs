@@ -395,7 +395,7 @@ namespace TicTack
 
         internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log)
         {
-            var accessor = new FileAccessor();
+            var accessor = CreateAccessorOrFallback(src, log);
             var level = Config.ParseVerification(src.Sync != null ? src.Sync.Verification : null);
             var comparer = ComparerFactory.Create(level, accessor);
             var validator = ValidatorFactory.Create(level, accessor);
@@ -427,13 +427,56 @@ namespace TicTack
 
             IFileMonitor monitor;
             var monitorConfig = cfg.Monitor ?? new MonitorConfig();
+            IFileAccessor CreateAccessorOrFallback(SourceConfig s, ILogger l)
+            {
+                if (!string.Equals(s.Sync != null ? s.Sync.FileAccess : null, "vss", StringComparison.OrdinalIgnoreCase))
+                    return new FileAccessor();
+                if (!OperatingSystem.IsWindows())
+                {
+                    l.Warn("sync.file_access 'vss' is Windows-only; using direct access.");
+                    return new FileAccessor();
+                }
+                try
+                {
+                    var a = new VssFileAccessor(l);
+                    a.Probe();
+                    return a;
+                }
+                catch (Exception ex)
+                {
+                    l.Warn("VSS unavailable (" + ex.Message + "); using direct access.");
+                    return new FileAccessor();
+                }
+            }
             IFileMonitor CreateWatcher() => OperatingSystem.IsWindows()
                 ? new FileWatcherMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds)
                 : new FsWatchMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds);
+            IFileMonitor CreateUsnOrFallback()
+            {
+                if (!OperatingSystem.IsWindows())
+                {
+                    log.Warn("monitor.type 'usn' is Windows-only; falling back to watcher.");
+                    return CreateWatcher();
+                }
+                try
+                {
+                    var m = new UsnJournalMonitor(src.Path, monitorConfig.RestartDelaySeconds);
+                    m.ProbeVolume();
+                    return m;
+                }
+                catch (Exception ex)
+                {
+                    log.Warn("USN journal unavailable (" + ex.Message + "); falling back to watcher.");
+                    return CreateWatcher();
+                }
+            }
             switch (monitorConfig.Type != null ? monitorConfig.Type.ToLowerInvariant() : "")
             {
                 case "watcher":
                     monitor = CreateWatcher();
+                    break;
+                case "usn":
+                    monitor = CreateUsnOrFallback();
                     break;
                 case "polling":
                     monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
