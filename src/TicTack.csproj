@@ -8,6 +8,11 @@
     <AssemblyName>TicTackSv</AssemblyName>
     <RootNamespace>TicTack</RootNamespace>
     <NoWarn>$(NoWarn);NU1903</NoWarn>
+    <!-- IL2104/IL3053 are assembly-level advisories from YamlDotNet (no source
+         generator upstream). Benign here: TicTackSv+YAML are rooted via
+         TrimmerRootAssembly in the Aot publish profile, and the analyzer
+         spike verified YamlDotNet emits no runtime codegen. -->
+    <NoWarn>$(NoWarn);IL2104;IL3053</NoWarn>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <TieredCompilation>false</TieredCompilation>
     <PublishReadyToRun>true</PublishReadyToRun>
@@ -15,6 +20,9 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Required by [GeneratedComInterface] (VssFileAccessor): the COM
+         source generator emits unsafe code. No unsafe code is handwritten. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsAotCompatible>true</IsAotCompatible>
     <!-- AOT/trim analyzers as a permanent guardrail: every build proves new
          code stays publish-ready. Known single IL3050 at Config.Load is

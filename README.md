@@ -22,7 +22,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | Change monitoring | `FileWatcherMonitor`, `PollingMonitor`, `CompositeMonitor` — pluggable via `IFileMonitor` |
 | Comparison (date/size/hash) | `IFileComparer` — `SizeComparer`, `DateSizeComparer`, `HashComparer`, `FullComparer` |
 | Locked file handling | `FileAccessor` opens with `FileShare.ReadWrite|Delete` + `FILE_FLAG_BACKUP_SEMANTICS` (SYSTEM bypass); retry backoff |
-| VSS support | Designed via `IFileAccessor` — swap in VSS-based accessor without pipeline changes |
+| VSS support | `VssFileAccessor` (`sync.file_access: vss`, Windows-only, needs elevation) — direct open fast path, on-demand per-volume snapshot only on lock failure, no writer coordination |
 | Retry logic | `ExponentialBackoffRetry` — configurable attempts, delay, backoff multiplier |
 | Logging | `FileLogger` (rotating), `BufferedLogger` (async channel, flushes on shutdown), `ConsoleLogger` (color), `DesktopAlertLogger`, `EventLogLogger`, `MultiLogger` |
 | Rename detection | `RenameAction` + `FileChangedEventArgs.OldFullPath` |
@@ -50,7 +50,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 ## Architecture
 
 ```
-FileWatcherMonitor (Windows) / FsWatchMonitor (Linux) + PollingMonitor (composite mode)
+FileWatcherMonitor / UsnJournalMonitor (Windows) / FsWatchMonitor (Linux) + PollingMonitor (composite mode)
         │
         ▼
    Debounce Queue (per-file timer, configurable debounce_seconds)
@@ -229,6 +229,7 @@ Fields from `verification` down live under the nested `sync:` key (`retry:`, `ve
 | `drain_strategy` | `scan` | Backlog drain order: `scan` = hash-order scan (zero extra memory) / `ready_queue` = earliest-expiry-first heap (bounded drain under watcher-overflow backlogs, transient ~2x backlog memory) |
 | `dir_sync` | `per-file` | Directory-entry durability after each rename: `per-file` = fsync each file's parent dir / `per-batch` = collect dirs and fsync once per state checkpoint (fewer syncs on initial sync, larger crash window: files already renamed but not yet dir-synced may need a re-copy). Measured: neutral under `full`, but 3.5x faster cold initial sync when combined with `rename-only` (24.7s → 7.0s, 10k files / 2GB) |
 | `complete_mode` | `inline` | Copy pipeline shape: `inline` = copy → fsync → rename on the worker thread / `pipelined` = workers copy to temp and one completer thread owns flush → rename → validate → upsert in order (bounded queue of 2x workers for backpressure; crash-safe: state is still claimed only after durable rename, orphan tmps go to PowerGuard) |
+| `file_access` | `direct` | File read path: `direct` = open source files directly / `vss` = read locked files via on-demand VSS snapshots (Windows-only, needs elevation; falls back to `direct` with a warning otherwise) — snapshot created per volume only on lock failure, cached 10 min, no writer coordination (file-level reads, not app-consistent quiesce) |
 | `max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files |
 | `exclude` | `[]` | Case-insensitive glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) |
 | `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |
@@ -258,7 +259,7 @@ Fields from `verification` down live under the nested `sync:` key (`retry:`, `ve
 
 | Field | Default | Description |
 |---|---|---|
-| `type` | `watcher` | `watcher` = instant OS events, zero CPU idle (`ReadDirectoryChangesW` P/Invoke on Windows, `FileSystemWatcher` on Linux). `polling` = periodic dir scan (no missed events). `composite` = both (watcher for speed, polling as safety net) |
+| `type` | `watcher` | `watcher` = instant OS events, zero CPU idle (`ReadDirectoryChangesW` P/Invoke on Windows, `FileSystemWatcher` on Linux). `usn` = NTFS USN-journal cursor (Windows-only, needs elevation; falls back to `watcher` with a warning otherwise) — miss-proof while running, no buffer overruns. `polling` = periodic dir scan (no missed events). `composite` = both (watcher for speed, polling as safety net) |
 | `watcher_buffer_kb` | `64` | Watcher buffer in KB (NTFS on Windows, inotify on Linux). **Larger = survives bursts (git clone, npm install, unzip) without event loss.** Use 512+ for heavy churn |
 | `polling_interval_seconds` | `3600` | Full directory scan interval (s) for polling fallback. Min 10 |
 | `restart_delay_seconds` | `10` | Wait before restarting watcher after error |

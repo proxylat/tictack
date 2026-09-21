@@ -182,6 +182,6 @@ public sealed class CompleterTests : IDisposable
         Assert.True(File.Exists(Path.Combine(dst, "file00000.bin")));
         Assert.False(File.Exists(Path.Combine(dst, "file00001.bin")));
         // Item 2's tmp stays orphaned for PowerGuard recovery.
-        Assert.Equal(1, Directory.GetFiles(dst, "*.tictack.tmp").Length);
+        Assert.Single(Directory.GetFiles(dst, "*.tictack.tmp"));
     }
 }

@@ -78,6 +78,7 @@ namespace TicTack
         public int InitialSyncWorkers { get; set; }
         public RetryConfig Retry { get; set; }
         public string? LockHandling { get; set; }
+        public string FileAccess { get; set; }
         public int RetryLockMinutes { get; set; }
         public int DeleteThresholdCount { get; set; }
         public long? DeleteThresholdSizeGb { get; set; }
@@ -96,6 +97,7 @@ namespace TicTack
             InitialSyncWorkers = 2;
             Retry = new RetryConfig();
             LockHandling = "retry";
+            FileAccess = "direct";
             RetryLockMinutes = 10;
             DeleteThresholdCount = 1000;
             DeleteThresholdSizeGb = 50;
@@ -258,7 +260,7 @@ namespace TicTack
             }
             if (cfg.Monitor != null && !IsValidMonitorType(cfg.Monitor.Type))
             {
-                log.Error("monitor.type must be 'watcher', 'polling', or 'composite' (got: " + (cfg.Monitor.Type ?? "null") + ")");
+                log.Error("monitor.type must be 'watcher', 'usn', 'polling', or 'composite' (got: " + (cfg.Monitor.Type ?? "null") + ")");
                 valid = false;
             }
             var destinations = new Dictionary<string, string>(PathComparer);
@@ -327,6 +329,12 @@ namespace TicTack
                     log.Error("Verification must be 'size', 'date_and_size', 'hash', or 'full' for source: " + src.Path);
                     valid = false;
                 }
+                if (src.Sync != null && !string.Equals(src.Sync.FileAccess, "direct", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(src.Sync.FileAccess, "vss", StringComparison.OrdinalIgnoreCase))
+                {
+                    log.Error("FileAccess must be 'direct' or 'vss' for source: " + src.Path);
+                    valid = false;
+                }
                 if (src.Filter != null && !IsValidFileSizeLimit(src.Filter.MaxFileSizeMb))
                 {
                     log.Error("max_file_size_mb must be a number, 'no-limit', or 'none' for source: " + src.Path);
@@ -364,7 +372,7 @@ namespace TicTack
         {
             if (string.IsNullOrEmpty(type)) return false;
             var t = type.ToLowerInvariant();
-            return t == "watcher" || t == "polling" || t == "composite";
+            return t == "watcher" || t == "usn" || t == "polling" || t == "composite";
         }
 
         public static long? ParseFileSizeLimit(object? val) =>
