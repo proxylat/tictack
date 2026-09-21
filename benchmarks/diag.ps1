@@ -498,10 +498,16 @@ function Run-P1 {
             Note '         the .nettrace above still opens in PerfView by hand'
         }
 
-        Step (Join-Path $out 'p1-eventlog.txt') 'Application event log (TicTackSv)' `
-            "Get-WinEvent -LogName Application -ProviderName TicTackSv -MaxEvents 20" {
-            Get-WinEvent -LogName Application -ProviderName TicTackSv -MaxEvents 20 -ErrorAction SilentlyContinue |
-                Select-Object TimeCreated, LevelDisplayName, Message | Format-List
+        $logSource = $false
+        try { $logSource = [System.Diagnostics.EventLog]::SourceExists('TicTackSv') } catch { $logSource = $true }
+        if ($logSource) {
+            Step (Join-Path $out 'p1-eventlog.txt') 'Application event log (TicTackSv)' `
+                "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='TicTackSv'} -MaxEvents 20" {
+                Get-WinEvent -FilterHashtable @{LogName = 'Application'; ProviderName = 'TicTackSv'} -MaxEvents 20 -ErrorAction SilentlyContinue |
+                    Select-Object TimeCreated, LevelDisplayName, Message | Format-List
+            }
+        } else {
+            Note 'event log: TicTackSv source not registered (service never installed here) — skipping event log read'
         }
         Note "long real-time stalls: check Defender (MsMpEng.exe) scanning the destination"
         Note "and .tictack.tmp before blaming the pipeline. Windows GC deep-dive: docs\windows-perf.md"
