@@ -201,7 +201,16 @@ function Get-IoCounters([IntPtr]$Handle) {
 function Run-P1 {
     $target = $Target
     if (-not $target) { $target = 'TicTackSv' }
-    $proc = Get-Target $target
+    try { $proc = Get-Target $target }
+    catch {
+        # No resident process: p1 has nothing to triage. A skip note beats a
+        # Get-Process stack trace; -p1 alone exits (nothing else to do).
+        $msg = "p1 skipped: no '$target' process (start the TicTack service or pass -Target PID)"
+        if ($runP2 -or $runP3) { Note $msg; return }
+        Write-Host "  $msg"
+        Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+        exit 2
+    }
     $pid2 = $proc.Id
 
     ("# TicTack diagnostic summary — {0}`n`n- host: {1}`n- pid: {2}`n- target: {3}`n- phase: p1 live triage{4}{5}`n" -f `
@@ -723,8 +732,10 @@ logging:
     $c1 = $null; $cpu1 = $null; $io1 = $null
     $endThreads = 0; $endHandles = 0; $endPriv = 0; $endWs = 0
     try { $cpu1 = $proc.TotalProcessorTime } catch { }
-    try { $endThreads = $proc.Threads.Count } catch { }
-    try { $endHandles = $proc.HandleCount } catch { }
+    # Post-mortem thread/handle reads usually fail (process exited) — fall
+    # back to the live peaks tracked above, which is what gets reported.
+    try { $endThreads = $proc.Threads.Count } catch { $endThreads = $peakThreads }
+    try { $endHandles = $proc.HandleCount } catch { $endHandles = $peakHandles }
     try { $endPriv = $proc.PrivateMemorySize64 } catch { }
     try { $endWs = $proc.WorkingSet64 } catch { }
     if ($nativeOk) {
@@ -785,6 +796,8 @@ logging:
         # extra read/write pass (validation re-read, hash double-read, temp+rename).
         $ampl = if (($bytes -gt 0) -and ($copied -gt 0)) { '{0:N2}' -f ($ioBytes / $bytes) } else { 'n/a' }
     } else { $ioBytes = $null; $ioRate = 'n/a'; $ampl = 'n/a' }
+    # Numeric amplifications carry the x suffix; n/a must not print as "n/ax".
+    $amplS = if ($ampl -eq 'n/a') { 'n/a' } else { $ampl + 'x' }
     $ctxS = if ($null -ne $ctxDelta) { "$ctxDelta" } else { 'n/a' }
     $ctxPerFile = if (($null -ne $ctxDelta) -and ($files -gt 0)) { '{0:N1}' -f ($ctxDelta / $files) } else { 'n/a' }
 
@@ -793,9 +806,9 @@ logging:
     $diffv = if ($mismatch) { 'mismatch' } else { 'match' }
 
     Note ("{0}: {1:N3}s, {2} files, {3} MB/s, {4} files/s, cpu {5}% (1 core) / {6}% (all), {7}" -f $Name, $secs, $files, $mbps, $fps, $cpuOneS, $cpuAllS, $diffv)
-    Note ("  cycles/file {0}, io {1} MB/s total, amplification {2}x, ctx {3} ({4}/file), machine {5}%, handles {6}, threads {7}, peak RSS {8:N1} MB" -f $cyclesPerFile, $ioRate, $ampl, $ctxS, $ctxPerFile, $machPctS, $endHandles, $endThreads, ($peakWs / 1MB))
+    Note ("  cycles/file {0}, io {1} MB/s total, amplification {2}, ctx {3} ({4}/file), machine {5}%, handles {6}, threads {7}, peak RSS {8:N1} MB" -f $cyclesPerFile, $ioRate, $amplS, $ctxS, $ctxPerFile, $machPctS, $endHandles, $endThreads, ($peakWs / 1MB))
     Add-Content -LiteralPath $summary -Value ("| {0} | {1:N3} | {2} | {3} | {4} | {5} / {6} | {7} |" -f $Name, $secs, $files, $mbps, $fps, $cpuOneS, $cpuAllS, $diffv)
-    Add-Content -LiteralPath $summary -Value ("| {0} stats | cycles/file {1} | io {2} MB/s | ampl {3}x | ctx/file {4} | handles {5} | threads {6} |" -f $Name, $cyclesPerFile, $ioRate, $ampl, $ctxPerFile, $endHandles, $endThreads)
+    Add-Content -LiteralPath $summary -Value ("| {0} stats | cycles/file {1} | io {2} MB/s | ampl {3} | ctx/file {4} | handles {5} | threads {6} |" -f $Name, $cyclesPerFile, $ioRate, $amplS, $ctxPerFile, $endHandles, $endThreads)
 
     # hyperfine: statistically rigorous repeats. Additive — the sampled run above
     # stays the baseline input. JSON straight to its own file: Step appends
