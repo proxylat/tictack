@@ -198,18 +198,105 @@ function Get-IoCounters([IntPtr]$Handle) {
 }
 
 # ------------------------------------------------------------------ p1 ------
+# Starts a transient TicTack watcher under $out when p1 has no resident
+# target (default miss only — an explicit -Target miss stays skip-and-name).
+# Returns the Process, or $null when no target could be started. The caller
+# owns the process afterwards: stop it at the end of p1 and delete $tRoot.
+# Everything lives under $out/p1-target — never a real watched folder.
+function Ensure-P1Target {
+    $exe = Join-Path $repoRoot 'src\bin\Release\net10.0-windows\TicTackSv.exe'
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Step (Join-Path $out 'p1-build.txt') 'build Release (p1 needs a live target)' 'dotnet build src\TicTack.csproj -c Release' {
+            & dotnet build (Join-Path $repoRoot 'src\TicTack.csproj') -c Release --nologo -v q
+        }
+    }
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Note 'p1: build produced no TicTackSv.exe — skipping live triage'
+        return $null
+    }
+    $tRoot = Join-Path $out 'p1-target'
+    $tSrc = Join-Path $tRoot 'src'
+    $tDst = Join-Path $tRoot 'dst'
+    New-Item -ItemType Directory -Force -Path $tSrc, $tDst | Out-Null
+    $tCfg = Join-Path $tRoot 'config.yaml'
+    $q = { param($p) return "'$($p.Replace('\', '/'))'" }
+    $cfg = @"
+sources:
+  - paths:
+      - $($q.Invoke($tSrc))
+    destination: $($q.Invoke($tDst))
+    state_db_path: $($q.Invoke((Join-Path $tRoot 'state')))
+    debounce_seconds: 20
+    filter:
+      max_file_size_mb: no-limit
+      exclude: []
+    sync:
+      verification: date_and_size
+      durability: full
+      drain_strategy: scan
+      dir_sync: per-file
+      complete_mode: inline
+      initial_sync_workers: 2
+      lock_handling: retry
+      retry_lock_minutes: 10
+      delete_threshold_count: 1000
+      delete_threshold_size_gb: 50
+      delete_threshold_percent: 50
+      delete_hold_days: 7
+      versioning:
+        max_versions: 10
+      deletion:
+        mode: archive
+monitor:
+  type: watcher
+logging:
+  level: warning
+  path: $($q.Invoke((Join-Path $tRoot 'tictack.log')))
+watchdog:
+  enabled: false
+"@
+    Set-Content -LiteralPath $tCfg -Value $cfg -Encoding UTF8
+    & $exe --validate --config $tCfg > (Join-Path $out 'p1-target-validate.log') 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Note 'p1: transient config failed --validate — skipping live triage'
+        return $null
+    }
+    $tp = Start-Process -FilePath $exe -ArgumentList @('--cli', '--config', $tCfg) -PassThru -WindowStyle Hidden
+    $alive = $false
+    for ($i = 0; $i -lt 50 -and -not $alive; $i++) {
+        Start-Sleep -Milliseconds 200
+        try { $tp.Refresh(); $alive = -not $tp.HasExited } catch { break }
+    }
+    if (-not $alive) {
+        Note 'p1: transient target exited during startup — skipping live triage'
+        return $null
+    }
+    Note ("p1: no resident target — auto-started transient watcher (pid {0}, cleaned up at end)" -f $tp.Id)
+    return $tp
+}
 function Run-P1 {
     $target = $Target
     if (-not $target) { $target = 'TicTackSv' }
     try { $proc = Get-Target $target }
     catch {
-        # No resident process: p1 has nothing to triage. A skip note beats a
-        # Get-Process stack trace; -p1 alone exits (nothing else to do).
-        $msg = "p1 skipped: no '$target' process (start the TicTack service or pass -Target PID)"
-        if ($runP2 -or $runP3) { Note $msg; return }
-        Write-Host "  $msg"
-        Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
-        exit 2
+        if ($Target) {
+            # Explicit -Target miss: name it and skip — never substitute silently.
+            $msg = "p1 skipped: no '$target' process (check the PID/name and retry)"
+            if ($runP2 -or $runP3) { Note $msg; return }
+            Write-Host "  $msg"
+            Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+            exit 2
+        }
+        # Default miss: auto-start a transient watcher so p1 always has a target.
+        $script:autoP1 = Ensure-P1Target
+        if ($null -eq $script:autoP1) {
+            $msg = "p1 skipped: no 'TicTackSv' process and no transient target could be started"
+            if ($runP2 -or $runP3) { Note $msg; return }
+            Write-Host "  $msg"
+            Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+            exit 2
+        }
+        $proc = $script:autoP1
     }
     $pid2 = $proc.Id
 
@@ -499,13 +586,53 @@ function Run-P1 {
             }
         }
     }
+    if ($script:autoP1) {
+        try { Stop-Process -Id $script:autoP1.Id -Force -ErrorAction Stop } catch { }
+        Note ("p1: transient target (pid {0}) stopped and removed" -f $script:autoP1.Id)
+        Remove-Item -LiteralPath (Join-Path $out 'p1-target') -Recurse -Force -ErrorAction SilentlyContinue
+        $script:autoP1 = $null
+    }
 }
 
 # ------------------------------------------------- p2: static + tests ------
+# Returns $true when a semgrep run should proceed. Auto-installs via
+# `py -m pip install semgrep` when missing, and ensures the afunix driver
+# is running (semgrep-core opens its scan RPC over an AF_UNIX socketpair,
+# which dies with WinError 10050 when afunix.sys is stopped). Every skip
+# path writes its own Note; callers need no else branch.
+function Ensure-Semgrep {
+    if (-not (Get-Command semgrep -ErrorAction SilentlyContinue)) {
+        Note 'semgrep not found — installing via py -m pip install semgrep'
+        try {
+            & py -m pip install semgrep --quiet > (Join-Path $out 'p2-semgrep-install.log') 2>&1
+            $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        } catch { Note "semgrep: pip install failed ($_)" }
+        if (-not (Get-Command semgrep -ErrorAction SilentlyContinue)) {
+            Note 'semgrep: install failed — skipping semgrep r/csharp'
+            return $false
+        }
+        Note 'semgrep auto-installed (py -m pip install semgrep)'
+    }
+    $afunixRunning = ((sc.exe query afunix) | Select-String 'STATE') -match 'RUNNING'
+    if (-not $afunixRunning) {
+        $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($admin) {
+            sc.exe config afunix start= demand > $null
+            sc.exe start afunix > (Join-Path $out 'p2-afunix-start.log') 2>&1
+            $afunixRunning = ((sc.exe query afunix) | Select-String 'STATE') -match 'RUNNING'
+            if ($afunixRunning) { Note 'afunix driver was stopped — started it (was blocking semgrep)' }
+        }
+    }
+    if (-not $afunixRunning) {
+        Note 'semgrep: afunix driver not running (needs admin to start it) — skipping semgrep r/csharp'
+        return $false
+    }
+    return $true
+}
 function Run-StaticBody {
     Add-Content -LiteralPath $summary -Value "`n## p2 static analysis`n"
     Write-Host '=== p2 static analysis'
-    if (Get-Command semgrep -ErrorAction SilentlyContinue) {
+    if (Ensure-Semgrep) {
         # -o writes pure JSON, so run it directly: Step() would prepend a
         # header into the file and break JSON parsing.
         $jsonFile = Join-Path $out 'p2-semgrep.json'
@@ -515,8 +642,6 @@ function Run-StaticBody {
             $n = (Get-Content -Raw -LiteralPath $jsonFile | ConvertFrom-Json).results.Count
             Note ("semgrep: {0} findings (r/csharp) -> {1}" -f $n, [IO.Path]::GetFileName($jsonFile))
         } catch { Note "semgrep: ERROR $_" }
-    } else {
-        Note 'semgrep not found (pipx install semgrep) — skipping semgrep r/csharp'
     }
     if (Get-Command ast-grep -ErrorAction SilentlyContinue) {
         Step (Join-Path $out 'p2-ast-grep.txt') 'ast-grep scan (rules/ bank)' 'cd <repo> ; ast-grep scan' {

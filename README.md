@@ -212,11 +212,13 @@ dotnet-fullgc` — or skip the install and run them one-shot with `dnx`
 ## Configuration
 
 All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`) — resolves to the actual drive letter at startup.
-Unknown or duplicate YAML properties are rejected at startup instead of being ignored.
+Duplicate YAML keys are rejected at startup; unknown properties are ignored.
 
 **Do not use environment variables like `%USERPROFILE%` or `%HOME%`.** The Windows service runs as `LocalSystem`, so `%USERPROFILE%` resolves to `C:\WINDOWS\system32\config\systemprofile`, not your profile — same for `%HOME%` under systemd (root). Always write the full path (`C:\Users\User\Desktop`).
 
 ### sources
+
+Fields from `verification` down live under the nested `sync:` key (`retry:`, `versioning:`, `deletion:` are sub-blocks of it) — at source level they are silently ignored.
 
 | Field | Default | Description |
 |---|---|---|
