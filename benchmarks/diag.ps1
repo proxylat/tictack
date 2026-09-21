@@ -64,6 +64,10 @@ foreach ($t in $tokens) {
     elseif (-not $posTarget) { $posTarget = $t }
 }
 if (-not $Target) { $Target = $posTarget }
+# Snapshot while still at script scope: only a target the user actually typed
+# (via -Target or positionally) counts as explicit. Run-P1 must not test
+# $Target itself — routing has filled it by the time the catch runs.
+$script:explicitTarget = $PSBoundParameters.ContainsKey('Target') -or [bool]$posTarget
 if (-not $scenarioFilter.Count) {
     $scenarioFilter = @('cold-initial', 'warm-noop', 'hash-verify', 'workers=1', 'workers=2', 'workers=4')
 }
@@ -279,9 +283,11 @@ function Run-P1 {
     if (-not $target) { $target = 'TicTackSv' }
     try { $proc = Get-Target $target }
     catch {
-        if ($Target) {
-            # Explicit -Target miss: name it and skip — never substitute silently.
-            $msg = "p1 skipped: no '$target' process (check the PID/name and retry)"
+        # $script:explicitTarget (snapshot at script scope) decides the branch:
+        # only a target the user actually typed counts as explicit.
+        if ($script:explicitTarget) {
+            # Explicit -Target miss: say what was passed and skip — never substitute silently.
+            $msg = "p1 skipped: no '$target' process (you passed -Target '$Target'; check the PID/name and retry)"
             if ($runP2 -or $runP3) { Note $msg; return }
             Write-Host "  $msg"
             Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
