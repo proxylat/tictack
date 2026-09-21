@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
 using BenchmarkDotNet.Attributes;
@@ -234,6 +235,15 @@ public class WarmPathBenchmarks
         foreach (var (s, d, snap) in _files)
             if (c.AreEqual(s, d, snap)) n++;
         return n;
+    }
+
+    // Proof for the chunked bulk-fetch: one GetStatesAsync over all N keys
+    // vs N point lookups in TryGetLoop. Same per-file math via N.
+    [Benchmark(OperationsPerInvoke = N)]
+    public async Task<int> GetStatesBatch()
+    {
+        var dict = await _db.GetStatesAsync(_files.Select(x => x.Src)).ConfigureAwait(false);
+        return dict.Count;
     }
 }
 
