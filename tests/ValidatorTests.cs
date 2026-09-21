@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+
 namespace TicTack;
 
 public class ValidatorTests : IDisposable
@@ -69,6 +71,52 @@ public class ValidatorTests : IDisposable
         File.WriteAllText(Src("a.txt"), "short");
         File.WriteAllText(Dst("a.txt"), "much longer content here");
         Assert.False(await new HashValidator(_accessor).ValidateAsync(Src("a.txt"), Dst("a.txt")));
+    }
+
+    static string Sha256Hex(byte[] bytes) =>
+        Convert.ToHexStringLower(SHA256.HashData(bytes));
+
+    [Fact]
+    public async Task HashValidator_AcceptsMatchingSourceHash_WithoutReadingSource()
+    {
+        File.WriteAllText(Src("a.txt"), "copy-time hash fast path content");
+        var expected = Sha256Hex(await File.ReadAllBytesAsync(Src("a.txt")));
+        Assert.True(FileSnapshot.TryRead(Src("a.txt"), out var snap));
+        File.WriteAllText(Dst("a.txt"), "copy-time hash fast path content");
+        File.Delete(Src("a.txt")); // fast path must never open src
+
+        Assert.True(await new HashValidator(_accessor).ValidateWithSourceHashAsync(Dst("a.txt"), expected, snap));
+    }
+
+    [Fact]
+    public async Task HashValidator_RejectsWrongSourceHash()
+    {
+        File.WriteAllText(Src("a.txt"), "content a");
+        File.WriteAllText(Dst("a.txt"), "content a");
+        Assert.True(FileSnapshot.TryRead(Src("a.txt"), out var snap));
+
+        Assert.False(await new HashValidator(_accessor).ValidateWithSourceHashAsync(Dst("a.txt"), new string('0', 64), snap));
+    }
+
+    [Fact]
+    public async Task HashValidator_SourceHash_ReturnsFalse_OnMissingDest()
+    {
+        File.WriteAllText(Src("a.txt"), "hello");
+        var expected = Sha256Hex(await File.ReadAllBytesAsync(Src("a.txt")));
+        Assert.True(FileSnapshot.TryRead(Src("a.txt"), out var snap));
+
+        Assert.False(await new HashValidator(_accessor).ValidateWithSourceHashAsync(Dst("missing.txt"), expected, snap));
+    }
+
+    [Fact]
+    public async Task HashValidator_SourceHash_ReturnsFalse_OnLengthMismatch()
+    {
+        File.WriteAllText(Src("a.txt"), "short");
+        File.WriteAllText(Dst("a.txt"), "much longer content here");
+        var expected = Sha256Hex(await File.ReadAllBytesAsync(Src("a.txt")));
+        Assert.True(FileSnapshot.TryRead(Src("a.txt"), out var snap));
+
+        Assert.False(await new HashValidator(_accessor).ValidateWithSourceHashAsync(Dst("a.txt"), expected, snap));
     }
 
     [Theory]

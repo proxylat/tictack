@@ -343,4 +343,73 @@ public sealed class PerfTests
         }
         finally { TryDelete(dir); }
     }
+
+    sealed class CountingAccessor : IFileAccessor
+    {
+        public int SrcOpens;
+        readonly string _srcPrefix;
+        public CountingAccessor(string srcPrefix) => _srcPrefix = srcPrefix;
+        public Stream OpenRead(string path)
+        {
+            if (path.StartsWith(_srcPrefix, StringComparison.Ordinal))
+                Interlocked.Increment(ref SrcOpens);
+            return File.OpenRead(path);
+        }
+    }
+
+    [Fact]
+    public async Task InitialSync_HashFastPath_SkipsSourceRehash()
+    {
+        var dir = TestDir();
+        var src = Path.Combine(dir, "src");
+        var dst = Path.Combine(dir, "dst");
+        const int files = 10;
+        try
+        {
+            WriteFiles(src, files, 512, ".txt");
+            var accessor = new CountingAccessor(src);
+            using var db = new StateDb(Path.Combine(dir, "state.db"));
+            using var pipeline = MakePipeline(MakeConfig(src, dst), new EventMonitor(),
+                new HashComparer(accessor), new HashValidator(accessor),
+                new CopyAction(accessor), new RecordingLogger(), db);
+
+            Assert.True(await pipeline.RunOnceAsync());
+
+            for (int i = 0; i < files; i++)
+                Assert.True(File.Exists(Path.Combine(dst, $"file{i:D5}.txt")),
+                    $"file{i:D5}.txt was not copied");
+            // Fast path engaged: probe + copy per file, no validator src re-read.
+            Assert.Equal(2 * files, accessor.SrcOpens);
+        }
+        finally { TryDelete(dir); }
+    }
+
+    [Fact]
+    public async Task InitialSync_HashFallback_WhenCopyWrapped_CopiesAndRehashes()
+    {
+        var dir = TestDir();
+        var src = Path.Combine(dir, "src");
+        var dst = Path.Combine(dir, "dst");
+        const int files = 10;
+        try
+        {
+            WriteFiles(src, files, 512, ".txt");
+            var accessor = new CountingAccessor(src);
+            var copy = new RecordingAction(new CopyAction(accessor));
+            using var db = new StateDb(Path.Combine(dir, "state.db"));
+            using var pipeline = MakePipeline(MakeConfig(src, dst), new EventMonitor(),
+                new HashComparer(accessor), new HashValidator(accessor),
+                copy, new RecordingLogger(), db);
+
+            Assert.True(await pipeline.RunOnceAsync());
+
+            for (int i = 0; i < files; i++)
+                Assert.True(File.Exists(Path.Combine(dst, $"file{i:D5}.txt")),
+                    $"file{i:D5}.txt was not copied");
+            Assert.Equal(files, copy.Calls.Count);
+            // Fallback path: probe + copy + classic validator src re-read.
+            Assert.Equal(3 * files, accessor.SrcOpens);
+        }
+        finally { TryDelete(dir); }
+    }
 }

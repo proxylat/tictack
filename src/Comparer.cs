@@ -99,6 +99,9 @@ namespace TicTack
         private readonly IFileAccessor? _accessor;
         public HashComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
 
+        // Single-file hash for the copy-time validation fast path (hashes only this path).
+        internal string HashFile(string path) => FileHasher.ComputeHex(path, _accessor);
+
         // Reads both files end to end when metadata matches.
         public bool RequiresContentRead => true;
 

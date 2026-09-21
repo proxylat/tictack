@@ -96,6 +96,10 @@ namespace TicTack
             _driveReady = driveReady ?? (path => DriveGuard.IsReady(path));
             _useReadyQueue = _config.Sync != null
                 && string.Equals(_config.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase);
+            // Hash-during-copy: only the real CopyAction paired with a HashValidator
+            // can produce a trusted copy-time hash. Test wrappers (RecordingAction)
+            // leave the flag off and take the classic double-read fallback below.
+            if (copyAction is CopyAction copy && validator is HashValidator) copy.ComputeSourceHash = true;
             // Capture the queue itself, not `this`: a constructor that throws
             // after this point would otherwise leak the whole pipeline through
             // the static EventSource's counter callback.
@@ -566,7 +570,20 @@ namespace TicTack
                 _log.Error(validationLabel + ": source disappeared: " + src);
                 return null;
             }
-            var valid = await _validator.ValidateAsync(src, dst, freshSnapshot);
+            // Fast path: the copy loop already hashed the source bytes. Trusted only
+            // when the source is byte-identical to the pre-copy snapshot (mid-copy
+            // changes force fresh != pre and fall back to the double-read below).
+            bool valid;
+            if (result.SourceHash != null && args.SourceSnapshot.HasValue
+                && freshSnapshot.Equals(args.SourceSnapshot.Value)
+                && _validator is HashValidator hashValidator)
+            {
+                valid = await hashValidator.ValidateWithSourceHashAsync(dst, result.SourceHash, freshSnapshot);
+            }
+            else
+            {
+                valid = await _validator.ValidateAsync(src, dst, freshSnapshot);
+            }
             if (!valid)
             {
                 _log.Error(validationLabel + ": " + src + " -> " + dst);
