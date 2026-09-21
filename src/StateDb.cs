@@ -422,6 +422,9 @@ namespace TicTack
                     names[i] = "@p" + i;
                     cmd.Parameters.AddWithValue(names[i], batch[i]);
                 }
+                // Only generated @pN placeholder names are concatenated; every value
+                // is bound via AddWithValue above, so no user input reaches SQL.
+                // nosemgrep: csharp-sqli
                 cmd.CommandText = "SELECT path, size, mtime FROM state WHERE path IN (" + string.Join(",", names) + ")";
                 using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
                 {
