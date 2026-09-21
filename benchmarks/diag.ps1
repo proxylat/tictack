@@ -278,7 +278,26 @@ watchdog:
     Note ("p1: no resident target — auto-started transient watcher (pid {0}, cleaned up at end)" -f $tp.Id)
     return $tp
 }
+# Stops the transient p1 target (if any) and deletes its dir. Safe to call
+# twice; tolerates an already-dead process and locked files (notes residue).
+function Remove-P1Target {
+    if (-not $script:autoP1) { return }
+    $id = $script:autoP1.Id
+    try { Stop-Process -Id $id -Force -ErrorAction Stop } catch { }
+    Start-Sleep -Seconds 1
+    $tRoot = Join-Path $out 'p1-target'
+    Remove-Item -LiteralPath $tRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $tRoot) {
+        Note ("p1: transient target (pid {0}) stopped but {1} could not be fully removed (locked files?) — remove it by hand" -f $id, $tRoot)
+    } else {
+        Note ("p1: transient target (pid {0}) stopped and removed" -f $id)
+    }
+    $script:autoP1 = $null
+}
 function Run-P1 {
+    # A terminating error anywhere below (or Ctrl+C) must not orphan the
+    # transient target: clean up, then rethrow (break) so the failure stays visible.
+    trap { Remove-P1Target; break }
     $target = $Target
     if (-not $target) { $target = 'TicTackSv' }
     try { $proc = Get-Target $target }
@@ -598,12 +617,7 @@ function Run-P1 {
             }
         }
     }
-    if ($script:autoP1) {
-        try { Stop-Process -Id $script:autoP1.Id -Force -ErrorAction Stop } catch { }
-        Note ("p1: transient target (pid {0}) stopped and removed" -f $script:autoP1.Id)
-        Remove-Item -LiteralPath (Join-Path $out 'p1-target') -Recurse -Force -ErrorAction SilentlyContinue
-        $script:autoP1 = $null
-    }
+    Remove-P1Target
 }
 
 # ------------------------------------------------- p2: static + tests ------
@@ -873,6 +887,10 @@ logging:
     # back to the live peaks tracked above, which is what gets reported.
     try { $endThreads = $proc.Threads.Count } catch { $endThreads = $peakThreads }
     try { $endHandles = $proc.HandleCount } catch { $endHandles = $peakHandles }
+    # Post-mortem reads on an exited process object yield 0/$null WITHOUT
+    # throwing, so the catch fallback above never engages. Force peaks back.
+    if (-not $endThreads) { $endThreads = $peakThreads }
+    if (-not $endHandles) { $endHandles = $peakHandles }
     try { $endPriv = $proc.PrivateMemorySize64 } catch { }
     try { $endWs = $proc.WorkingSet64 } catch { }
     if ($nativeOk) {
@@ -1004,7 +1022,7 @@ function Run-P3 {
     $binaryKind = if ($Published) { 'publish (ReadyToRun, shipped artifact)' } else { 'build (JIT)' }
 
     ("# TicTack perf run — {0}`n`n- fixture: {1}`n- durability: {2}`n- binary: {3}`n- scenarios: {4}`n" -f (Get-Date -Format o), $Root, $dur, $binaryKind, ($scenarioFilter -join ', ')) |
-        Set-Content -LiteralPath $summary
+        Add-Content -LiteralPath $summary
     Write-Host "=== p3 perf @ $Root (durability=$dur, binary=$binaryKind)"
 
     try {
