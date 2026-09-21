@@ -56,6 +56,8 @@
     <Compile Include="../src/TicTack.cs" Link="src/TicTack.cs" />
     <Compile Include="../src/Monitor.cs" Link="src/Monitor.cs" />
     <Compile Include="../src/Pipeline.cs" Link="src/Pipeline.cs" />
+    <Compile Include="../src/ReadyDrain.cs" Link="src/ReadyDrain.cs" />
+    <Compile Include="../src/DeletionGuard.cs" Link="src/DeletionGuard.cs" />
     <Compile Include="../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
     <Compile Include="../src/Scheduler.cs" Link="src/Scheduler.cs" />
     <Compile Include="../src/JobState.cs" Link="src/JobState.cs" />
