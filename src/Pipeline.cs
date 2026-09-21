@@ -29,13 +29,7 @@ namespace TicTack
 
         private readonly ConcurrentDictionary<string, FileChangedEventArgs> _pendingEvents = new ConcurrentDictionary<string, FileChangedEventArgs>(PathComparer);
         private readonly ConcurrentDictionary<string, DateTime> _debounce = new ConcurrentDictionary<string, DateTime>(PathComparer);
-        // Ready-queue accelerator for drain_strategy=ready_queue: expiry heap so a
-        // take is O(log n) instead of an O(pending) scan. Best-effort hints only —
-        // _pendingEvents.TryRemove stays the exactly-once claim, so duplicates and
-        // stale entries are skipped, never double-processed.
-        private readonly PriorityQueue<string, DateTime> _readyQueue = new PriorityQueue<string, DateTime>();
-        private readonly object _readyLock = new object();
-        private readonly bool _useReadyQueue;
+        private readonly ReadyDrain _drain;
         private readonly SemaphoreSlim _signal = new SemaphoreSlim(0);
         private CancellationTokenSource? _cts;
         private bool _started;
@@ -54,7 +48,7 @@ namespace TicTack
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateFiles;
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateDirectories;
         private readonly Func<string, bool> _driveReady;
-        private readonly List<PendingDeletion> _pendingDeletions = new List<PendingDeletion>();
+        private readonly DeletionGuard _deletions;
         private Timer? _parityTimer;
         private EventHandler<MonitorErrorEventArgs>? _monitorErrorHandler;
         private volatile bool _parityRequested;
@@ -94,8 +88,8 @@ namespace TicTack
             _enumerateFiles = enumerateFiles ?? ((path, option) => Directory.EnumerateFiles(path, "*", option));
             _enumerateDirectories = enumerateDirectories ?? ((path, option) => Directory.EnumerateDirectories(path, "*", option));
             _driveReady = driveReady ?? (path => DriveGuard.IsReady(path));
-            _useReadyQueue = _config.Sync != null
-                && string.Equals(_config.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase);
+            _drain = new ReadyDrain(_config.Sync != null
+                && string.Equals(_config.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase));
             // Hash-during-copy: only the real CopyAction paired with a HashValidator
             // can produce a trusted copy-time hash. Test wrappers (RecordingAction)
             // leave the flag off and take the classic double-read fallback below.
@@ -120,6 +114,7 @@ namespace TicTack
             _filter = filters.Count > 0 ? new CompositeFilter(filters) : null;
             _deleter = new TrackedDeleter(_deletion, _stateDb, _log);
             _parityScanner = new ParityScanner(_config, _filter, _directoryExists, _enumerateFiles, _enumerateDirectories, _deleter, _log);
+            _deletions = new DeletionGuard(_config, stateDb, _deleter, _deferred, log, ArmDeferredCheckTimer);
         }
 
         public void Start()
@@ -234,11 +229,7 @@ namespace TicTack
         {
             _debounce[e.FullPath] = DateTime.UtcNow.AddSeconds(_config.DebounceSeconds);
             _pendingEvents[e.FullPath] = e;
-            if (_useReadyQueue)
-            {
-                lock (_readyLock)
-                    _readyQueue.Enqueue(e.FullPath, _debounce[e.FullPath]);
-            }
+            _drain.Signal(e.FullPath, _debounce[e.FullPath]);
             _signal.Release();
         }
 
@@ -253,7 +244,7 @@ namespace TicTack
             while (!token.IsCancellationRequested)
             {
                 FileChangedEventArgs e;
-                if (TryTakeReadyEvent(out e, out var wait))
+                if (_drain.TryTake(DateTime.UtcNow, _pendingEvents, _debounce, out e, out var wait))
                 {
                     await ProcessEvent(e, token);
                 }
@@ -273,79 +264,9 @@ namespace TicTack
                         continue;
                     }
                     SweepDebounced();
-                    await FlushPendingDeletions(token);
+                    await _deletions.FlushAsync(token);
                     await WaitForSignal(token);
                 }
-            }
-        }
-
-        private bool TryTakeReadyEvent(out FileChangedEventArgs result, out TimeSpan? wait)
-        {
-            result = null!;
-            wait = null;
-            var now = DateTime.UtcNow;
-            DateTime? next = null;
-            if (_useReadyQueue && TryTakeReadyQueued(now, out result, out wait))
-                return true;
-            foreach (var item in _pendingEvents)
-            {
-                if (!_debounce.TryGetValue(item.Key, out var until) || until <= now)
-                {
-                    if (_pendingEvents.TryRemove(item.Key, out var candidate))
-                    {
-                        result = candidate;
-                        _debounce.TryRemove(item.Key, out _);
-                        return true;
-                    }
-                }
-                else if (!next.HasValue || until < next.Value)
-                {
-                    next = until;
-                }
-            }
-            if (next.HasValue)
-                wait = next.Value - now;
-            return false;
-        }
-
-        // Heap-first take for drain_strategy=ready_queue. Pops the earliest
-        // expiry; stale entries (already claimed, or re-signalled with a newer
-        // debounce) are skipped or re-queued, never processed twice. Returns
-        // false when the heap is empty or nothing in it is expired yet — the
-        // caller falls back to the scan, which also covers entries
-        // SweepDebounced re-drives straight into _pendingEvents.
-        private bool TryTakeReadyQueued(DateTime now, out FileChangedEventArgs result, out TimeSpan? wait)
-        {
-            result = null!;
-            wait = null;
-            while (true)
-            {
-                string key = string.Empty;
-                lock (_readyLock)
-                {
-                    if (_readyQueue.Count == 0)
-                        return false;
-                    _readyQueue.TryPeek(out key!, out var until);
-                    if (until > now)
-                    {
-                        wait = until - now;
-                        return false;
-                    }
-                    _readyQueue.Dequeue();
-                }
-                if (!_pendingEvents.TryRemove(key, out var candidate))
-                    continue;
-                if (_debounce.TryGetValue(key, out var current) && current > now)
-                {
-                    _pendingEvents.TryAdd(key, candidate);
-                    lock (_readyLock)
-                        _readyQueue.Enqueue(key, current);
-                    wait = current - now;
-                    return false;
-                }
-                _debounce.TryRemove(key, out _);
-                result = candidate;
-                return true;
             }
         }
 
@@ -636,11 +557,11 @@ namespace TicTack
                             try { size = await _stateDb.GetSizeAsync(delRel) ?? 0; }
                             catch (Exception ex) { _log.Warn("StateDb size lookup failed, using destination size: " + ex.Message); }
                         }
-                        _pendingDeletions.Add(new PendingDeletion { Path = e.FullPath, DestPath = args.DestPath, SizeBytes = size });
+                        _deletions.Add(new DeletionGuard.PendingDeletion { Path = e.FullPath, DestPath = args.DestPath, SizeBytes = size });
                         break;
 
                     case ChangeType.Renamed:
-                        await FlushPendingDeletions(ct);
+                        await _deletions.FlushAsync(ct);
                         if (args.OldDestPath != null && (File.Exists(args.OldDestPath) || _directoryExists(args.OldDestPath)))
                         {
                             await _retry.ExecuteAsync(async () =>
@@ -680,7 +601,7 @@ namespace TicTack
 
                     case ChangeType.Created:
                     case ChangeType.Modified:
-                        await FlushPendingDeletions(ct);
+                        await _deletions.FlushAsync(ct);
                         if (!File.Exists(e.FullPath))
                         {
                             if (_directoryExists(e.FullPath))
@@ -772,87 +693,6 @@ namespace TicTack
             if (_lock != null) _lock.Dispose();
         }
 
-        private async Task FlushPendingDeletions(CancellationToken ct)
-        {
-            if (_pendingDeletions.Count == 0) return;
-
-            var batch = new List<PendingDeletion>(_pendingDeletions);
-            _pendingDeletions.Clear();
-
-            int totalCount = batch.Count;
-            long totalSize = 0;
-            foreach (var d in batch)
-            {
-                // The state lookup can be unavailable; the destination file
-                // still has the size the guard needs.
-                if (d.SizeBytes == 0)
-                {
-                    try
-                    {
-                        var fi = new FileInfo(PathUtil.EnsureExtended(d.DestPath));
-                        if (fi.Exists) d.SizeBytes = fi.Length;
-                    }
-                    catch (Exception ex) { _log.Debug("Delete size probe failed for " + d.DestPath + ": " + ex.Message); }
-                }
-                totalSize += d.SizeBytes;
-            }
-
-            long stateCount = 0;
-            var countKnown = true;
-            if (_stateDb != null)
-            {
-                try { stateCount = await _stateDb.CountAsync(); }
-                catch (Exception ex)
-                {
-                    countKnown = false;
-                    _log.Error("StateDb count failed, percent delete guard cannot be evaluated: " + ex.Message);
-                }
-            }
-            bool blocked = false;
-            string? reason = null;
-
-            if (_config.Sync != null && _config.Sync.DeleteThresholdCount > 0 && totalCount >= _config.Sync.DeleteThresholdCount)
-            {
-                blocked = true;
-                reason = totalCount + " deletions >= threshold " + _config.Sync.DeleteThresholdCount;
-            }
-            else if (_config.Sync != null && _config.Sync.DeleteThresholdSizeGb.HasValue && _config.Sync.DeleteThresholdSizeGb.Value > 0
-                && totalSize >= _config.Sync.DeleteThresholdSizeGb.Value * 1024L * 1024L * 1024L)
-            {
-                blocked = true;
-                reason = (totalSize / (1024L * 1024L)) + " MB deleted >= threshold " + _config.Sync.DeleteThresholdSizeGb.Value + " GB";
-            }
-            else if (_config.Sync != null && _config.Sync.DeleteThresholdPercent > 0 && !countKnown)
-            {
-                // Fail closed: without a baseline the percent guard cannot be
-                // evaluated, so the batch is held instead of deleted.
-                blocked = true;
-                reason = "StateDb count unavailable, percent guard cannot be evaluated";
-            }
-            else if (_config.Sync != null && _config.Sync.DeleteThresholdPercent > 0 && stateCount > 50
-                && (double)totalCount / stateCount * 100 >= _config.Sync.DeleteThresholdPercent)
-            {
-                blocked = true;
-                var percent = (double)totalCount / stateCount * 100;
-                reason = percent.ToString("F1") + "% of " + stateCount + " files >= " + _config.Sync.DeleteThresholdPercent + "%";
-            }
-
-            if (blocked)
-            {
-                _log.Error("Delete guard: " + reason + ". Deferring.");
-                var files = batch.ConvertAll(d => d.Path);
-                _deferred.RecordPending(files, _config.Path);
-                ArmDeferredCheckTimer();
-                return;
-            }
-
-            foreach (var d in batch)
-            {
-                await _deleter.DeleteAsync(d.Path, d.DestPath, PathUtil.Relative(d.Path, _config.Path), "Deletion failed", ct);
-            }
-            _log.Debug("Deleted: " + batch.Count + " files");
-        }
-
         private void QueueParityCheck()
         {
             if (_disposed || _cts == null || _cts.IsCancellationRequested) return;
@@ -893,11 +733,5 @@ namespace TicTack
             }
         }
 
-        private class PendingDeletion
-        {
-            public string Path { get; set; } = string.Empty;
-            public string DestPath { get; set; } = string.Empty;
-            public long SizeBytes { get; set; }
-        }
     }
 }
