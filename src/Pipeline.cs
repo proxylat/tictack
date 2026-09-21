@@ -445,7 +445,7 @@ namespace TicTack
                         }
 
                         var unchanged = false;
-                        if (_stateDb != null && File.Exists(dst))
+                        if (_stateDb != null)
                         {
                             try
                             {
@@ -455,8 +455,14 @@ namespace TicTack
                             }
                             catch (Exception ex) { _log.Debug("StateDb lookup failed, copying: " + ex.Message); }
                         }
-                        if (unchanged)
+                        if (unchanged && _comparer.RequiresContentRead && File.Exists(dst))
                         {
+                            // State hit under a content comparer: skip without
+                            // re-hashing. The Exists gate stays here because the
+                            // comparer below would otherwise re-read both files
+                            // on every warm run; metadata comparers stat dst
+                            // themselves, so they fall through and the extra
+                            // Exists stat is gone on every path.
                             Interlocked.Increment(ref skipped);
                             return;
                         }

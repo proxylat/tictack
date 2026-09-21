@@ -186,6 +186,7 @@ internal sealed class TraceComparer : IFileComparer
 {
     private readonly IFileComparer _inner;
     public TraceComparer(IFileComparer inner) { _inner = inner; }
+    public bool RequiresContentRead => _inner.RequiresContentRead;
     public bool AreEqual(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null)
     {
         Repro.Trace("enter comparer");
