@@ -391,6 +391,46 @@ namespace TicTack
             finally { _gate.Release(); }
         }
 
+        public async Task<Dictionary<string, (long size, long mtime)>> GetStatesAsync(IEnumerable<string> paths)
+        {
+            var result = new Dictionary<string, (long size, long mtime)>(StringComparer.OrdinalIgnoreCase);
+            var batch = new List<string>(500);
+            await EnterAsync().ConfigureAwait(false);
+            try
+            {
+                await EnsureConnectedAsync().ConfigureAwait(false);
+                foreach (var path in paths)
+                {
+                    batch.Add(path);
+                    if (batch.Count < 500) continue;
+                    await ReadStateBatchAsync(batch, result).ConfigureAwait(false);
+                    batch.Clear();
+                }
+                if (batch.Count > 0) await ReadStateBatchAsync(batch, result).ConfigureAwait(false);
+            }
+            finally { _gate.Release(); }
+            return result;
+        }
+
+        private async Task ReadStateBatchAsync(List<string> batch, Dictionary<string, (long size, long mtime)> result)
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                var names = new string[batch.Count];
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    names[i] = "@p" + i;
+                    cmd.Parameters.AddWithValue(names[i], batch[i]);
+                }
+                cmd.CommandText = "SELECT path, size, mtime FROM state WHERE path IN (" + string.Join(",", names) + ")";
+                using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
+                {
+                    while (await reader.ReadAsync().ConfigureAwait(false))
+                        result[reader.GetString(0)] = (reader.GetInt64(1), reader.GetInt64(2));
+                }
+            }
+        }
+
         public long Count()
         {
             Enter();

@@ -361,8 +361,36 @@ namespace TicTack
                     CancellationToken = _cts!.Token,
                     MaxDegreeOfParallelism = Math.Max(1, _config.Sync != null ? _config.Sync.InitialSyncWorkers : 2)
                 };
-                await Parallel.ForEachAsync(files, options, async (f, token) =>
+                // Chunked bulk-fetch: state rows for a bounded file chunk are
+                // read with a few IN-queries under one gate hold instead of one
+                // point lookup per file. Memory stays bounded (chunk-sized list
+                // plus dict); a failed fetch degrades to copy-everything, the
+                // same decision the old per-file catch made.
+                var chunk = new List<(string f, string rel)>(2000);
+                foreach (var path in files)
                 {
+                    chunk.Add((path, PathUtil.Relative(path, _config.Path)));
+                    if (chunk.Count < 2000) continue;
+                    await ProcessChunkAsync(chunk, options);
+                    chunk.Clear();
+                }
+                if (chunk.Count > 0) await ProcessChunkAsync(chunk, options);
+
+                async Task ProcessChunkAsync(List<(string f, string rel)> batch, ParallelOptions opts)
+                {
+                    _cts!.Token.ThrowIfCancellationRequested();
+                    var states = new Dictionary<string, (long size, long mtime)>(StringComparer.OrdinalIgnoreCase);
+                    if (_stateDb != null)
+                    {
+                        try { states = await _stateDb.GetStatesAsync(batch.Select(x => x.rel)); }
+                        catch (Exception ex) { _log.Debug("StateDb bulk lookup failed, copying: " + ex.Message); }
+                    }
+                    await Parallel.ForEachAsync(batch, opts, async (item, token) => await ProcessFileAsync(item, states, token));
+                }
+
+                async Task ProcessFileAsync((string f, string rel) item, Dictionary<string, (long size, long mtime)> states, CancellationToken token)
+                {
+                    var (f, rel) = item;
                     try
                     {
                         var n = Interlocked.Increment(ref scanned);
@@ -373,7 +401,6 @@ namespace TicTack
                             Interlocked.Exchange(ref scanFailed, 1);
                             return;
                         }
-                        var rel = PathUtil.Relative(f, _config.Path);
                         sourcePaths.TryAdd(rel, 0);
                         var dst = Path.Combine(_config.Destination, rel);
 
@@ -383,17 +410,9 @@ namespace TicTack
                             return;
                         }
 
-                        var unchanged = false;
-                        if (_stateDb != null)
-                        {
-                            try
-                            {
-                                var s = await _stateDb.TryGetStateAsync(rel);
-                                unchanged = s.HasValue && s.Value.size == sourceSnapshot.Length
-                                    && s.Value.mtime == sourceSnapshot.LastWriteTimeUtcTicks;
-                            }
-                            catch (Exception ex) { _log.Debug("StateDb lookup failed, copying: " + ex.Message); }
-                        }
+                        var unchanged = states.TryGetValue(rel, out var s)
+                            && s.size == sourceSnapshot.Length
+                            && s.mtime == sourceSnapshot.LastWriteTimeUtcTicks;
                         if (unchanged && _comparer.RequiresContentRead && File.Exists(dst))
                         {
                             // State hit under a content comparer: skip without
@@ -447,7 +466,7 @@ namespace TicTack
                         Interlocked.Exchange(ref scanFailed, 1);
                         _log.Error("Initial sync failed: " + f, ex);
                     }
-                });
+                }
 
                 FlushState();
                 if (scanFailed != 0)
