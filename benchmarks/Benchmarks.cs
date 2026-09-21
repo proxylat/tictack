@@ -163,6 +163,81 @@ public class StateDbBenchmarks
 }
 
 [MemoryDiagnoser]
+[MediumRunJob]
+// Warm-noop path decomposition, per file: src stat (TryRead) vs state
+// point lookup (TryGetStateAsync) vs skip check (AreEqual with the
+// production date_and_size comparer). Sum ~= warm per-file cost. Run on
+// the Windows box to settle SQLite-vs-file-stat before batching lookups:
+// implement chunked IN-queries ONLY if TryGet dominates TryRead+AreEqual.
+public class WarmPathBenchmarks
+{
+    private const int N = 1000;
+    private string _dir = null!;
+    private StateDb _db = null!;
+    private List<(string Src, string Dst, FileSnapshot Snap)> _files = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _dir = Path.Combine(Path.GetTempPath(), "tictack-warm-" + Guid.NewGuid().ToString("N"));
+        var src = Path.Combine(_dir, "src");
+        var dst = Path.Combine(_dir, "dst");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        var buf = new byte[512];
+        var batch = new List<(string, long, long)>(N);
+        _files = new List<(string, string, FileSnapshot)>(N);
+        for (var i = 0; i < N; i++)
+        {
+            var s = Path.Combine(src, $"f{i:D5}.bin");
+            var d = Path.Combine(dst, $"f{i:D5}.bin");
+            File.WriteAllBytes(s, buf);
+            File.Copy(s, d);
+            FileSnapshot.TryRead(s, out var snap);
+            batch.Add((s, snap.Length, snap.LastWriteTimeUtcTicks));
+            _files.Add((s, d, snap));
+        }
+        _db = new StateDb(Path.Combine(_dir, "state.db"));
+        _db.UpsertBatch(batch);
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _db?.Dispose();
+        try { Directory.Delete(_dir, true); } catch { }
+    }
+
+    [Benchmark(OperationsPerInvoke = N)]
+    public int TryReadLoop()
+    {
+        var n = 0;
+        foreach (var (s, _, _) in _files)
+            if (FileSnapshot.TryRead(s, out _)) n++;
+        return n;
+    }
+
+    [Benchmark(OperationsPerInvoke = N)]
+    public async Task<int> TryGetLoop()
+    {
+        var n = 0;
+        foreach (var (s, _, _) in _files)
+            if (await _db.TryGetStateAsync(s).ConfigureAwait(false) != null) n++;
+        return n;
+    }
+
+    [Benchmark(OperationsPerInvoke = N)]
+    public int AreEqualLoop()
+    {
+        var c = new DateSizeComparer();
+        var n = 0;
+        foreach (var (s, d, snap) in _files)
+            if (c.AreEqual(s, d, snap)) n++;
+        return n;
+    }
+}
+
+[MemoryDiagnoser]
 [ShortRunJob]
 public class DriveGuardBenchmarks
 {
