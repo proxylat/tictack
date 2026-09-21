@@ -965,8 +965,9 @@ logging:
     Add-Content -LiteralPath $summary -Value ("| {0} | {1:N3} | {2} | {3} | {4} | {5} / {6} | {7} |" -f $Name, $secs, $files, $mbps, $fps, $cpuOneS, $cpuAllS, $diffv)
     Add-Content -LiteralPath $summary -Value ("| {0} stats | cycles/file {1} | io {2} MB/s | ampl {3} | ctx/file {4} | handles {5} | threads {6} |" -f $Name, $cyclesPerFile, $ioRate, $amplS, $ctxPerFile, $endHandles, $endThreads)
 
-    # hyperfine: statistically rigorous repeats. Additive — the sampled run above
-    # stays the baseline input. JSON straight to its own file: Step appends
+    # hyperfine: statistically rigorous repeats. Additive — its mean is the
+    # baseline input when present (the sampled run above is the fallback).
+    # JSON straight to its own file: Step appends
     # action output to its log file, which would corrupt JSON parsing.
     # warm-noop runs WITHOUT --prepare: wiping dst+state makes every repeat cold.
     if (Get-Command hyperfine -ErrorAction SilentlyContinue) {
@@ -1014,6 +1015,7 @@ logging:
         handles      = $endHandles
         threads      = $endThreads
         diff         = $diffv
+        hf_mean      = if ($hm -gt 0) { [math]::Round($hm, 3) } else { $null }
     }
 }
 
@@ -1098,9 +1100,13 @@ function Run-P3 {
 
         if ($baseline) {
             $b = $baseline | Where-Object { $_.scenario -eq $r.scenario } | Select-Object -First 1
-            if ($b -and $b.seconds -gt 0) {
-                $d = ($r.seconds - $b.seconds) / $b.seconds * 100
-                if ($d -gt $RegressionPct) { Note ("REGRESSION: {0} is {1:N0}% slower than baseline ({2:N3}s -> {3:N3}s)" -f $r.scenario, $d, $b.seconds, $r.seconds) }
+            # Prefer hyperfine means (stable) over single timed runs (noisy);
+            # either side falls back to timed seconds when no mean is present.
+            $bSec = if ($b.hf_mean -gt 0) { $b.hf_mean } else { $b.seconds }
+            $rSec = if ($r.hf_mean -gt 0) { $r.hf_mean } else { $r.seconds }
+            if ($b -and $bSec -gt 0 -and $rSec -gt 0) {
+                $d = ($rSec - $bSec) / $bSec * 100
+                if ($d -gt $RegressionPct) { Note ("REGRESSION: {0} is {1:N0}% slower than baseline ({2:N3}s -> {3:N3}s)" -f $r.scenario, $d, $bSec, $rSec) }
             } elseif (-not $b) {
                 Note ("no baseline entry for {0} — comparison skipped" -f $r.scenario)
             }
