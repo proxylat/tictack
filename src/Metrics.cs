@@ -8,7 +8,7 @@ namespace TicTack
     // In-process performance counters, consumed out-of-proc with zero new tools:
     //   dotnet-counters monitor -p <pid> --counters TicTack
     //   dotnet-counters collect -p <pid> --counters TicTack --format json -o counters.json
-    // (add the TicTack provider to the diag.sh tier-1 counters line for a
+    // (add the TicTack provider to the benchmarks/diag.sh p1 counters line for a
     // permanent record). Always-on updates are a few Interlocked ops per file;
     // Stopwatch timing only runs while a listener is attached (IsEnabled), so
     // unobserved sync stays at zero overhead.

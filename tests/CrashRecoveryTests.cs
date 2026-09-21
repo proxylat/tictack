@@ -32,8 +32,13 @@ public class CrashRecoveryTests
 
             var cfg = new TicTackConfig();
             cfg.Sources.Add(new SourceConfig { Path = source, Destination = destination });
-            PowerGuard.Cleanup(cfg, new RecordingLogger());
+            var log = new RecordingLogger();
+            PowerGuard.Cleanup(cfg, log);
 
+            // Pin the recovery path, not just the end state: a validated temp
+            // that is deleted instead of moved still leaves no file, and the
+            // logged line says which happened.
+            Assert.Contains(log.Messages, m => m.Contains("from validated temp"));
             Assert.Equal(File.ReadAllText(sourceFile), File.ReadAllText(destinationFile));
             Assert.False(File.Exists(destinationFile + ".tictack.tmp"));
         }

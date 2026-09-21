@@ -10,16 +10,27 @@ if [ ! -f "$DIR/config.yaml" ]; then
 fi
 
 DOTNET="$(command -v dotnet || true)"
-if [ -z "$DOTNET" ] && [ -x "$ROOT/.dotnet/dotnet" ]; then
+# A user-local SDK (e.g. ~/.dotnet) is visible to this shell but NOT to the
+# root-run systemd service, so publishing framework-dependent against it
+# produces an install that cannot start. Only trust a system-wide runtime.
+SELF_CONTAINED=1
+if [ -n "$DOTNET" ]; then
+  DOTNET_REAL="$(readlink -f "$DOTNET" 2>/dev/null || echo "$DOTNET")"
+  case "$DOTNET_REAL" in
+    /usr/*|/opt/*|/snap/*) SELF_CONTAINED=0 ;;
+  esac
+fi
+if [ -z "$DOTNET" ]; then
   DOTNET="$ROOT/.dotnet/dotnet"
   export DOTNET_ROOT="$ROOT/.dotnet"
   export DOTNET_CLI_TELEMETRY_OPTOUT=1
+  [ -x "$DOTNET" ] || { echo "ERROR: no dotnet found — install one or add the repo-local SDK."; exit 1; }
 fi
-if [ -n "$(command -v dotnet || true)" ]; then
-  "$DOTNET" publish "$ROOT/src/TicTack.csproj" -c Release -o "$DIR/"
-else
-  echo "No system .NET runtime found; publishing self-contained."
+if [ "$SELF_CONTAINED" = 1 ]; then
+  echo "Publishing self-contained (no service-visible system .NET runtime at '$DOTNET')."
   "$DOTNET" publish "$ROOT/src/TicTack.csproj" -c Release -r linux-x64 --self-contained true -o "$DIR/"
+else
+  "$DOTNET" publish "$ROOT/src/TicTack.csproj" -c Release -o "$DIR/"
 fi
 
 sudo systemctl stop tictack 2>/dev/null || true

@@ -4,7 +4,7 @@ using System.Diagnostics.Eventing.Reader;
 namespace TicTack;
 
 // Admin-gated Windows tests. They are skipped unless TICTACK_ELEVATED_TESTS=1
-// (set by tools/test-windows.ps1 -Elevated) AND the shell is elevated AND the
+// (set by benchmarks/diag.ps1 test -Elevated, or -p2 -Elevated) AND the shell is elevated AND the
 // TicTackSv EventLog source has been registered (the installer does this).
 // They also need the Application channel to be readable: reading via the
 // legacy EventLog.Entries enumerator uses the legacy RPC path and throws

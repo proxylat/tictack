@@ -155,17 +155,20 @@ public class StateDbTests : IDisposable
     [Fact]
     public void UpdatePrefix_RenamesSubtreeOnly()
     {
-        _db.Upsert("old/a.txt", 1, 10);
-        _db.Upsert("old/sub/b.txt", 2, 20);
-        _db.Upsert("other/c.txt", 3, 30);
+        // Relative paths carry the platform separator in production
+        // (PathUtil.Relative), so these fixtures must too.
+        var S = Path.DirectorySeparatorChar;
+        _db.Upsert($"old{S}a.txt", 1, 10);
+        _db.Upsert($"old{S}sub{S}b.txt", 2, 20);
+        _db.Upsert($"other{S}c.txt", 3, 30);
 
         _db.UpdatePrefix("old", "new");
 
         var all = _db.LoadAll();
         Assert.Equal(3, all.Count);
-        Assert.Equal((1L, 10L), all["new/a.txt"]);
-        Assert.Equal((2L, 20L), all["new/sub/b.txt"]);
-        Assert.Equal((3L, 30L), all["other/c.txt"]);
+        Assert.Equal((1L, 10L), all[$"new{S}a.txt"]);
+        Assert.Equal((2L, 20L), all[$"new{S}sub{S}b.txt"]);
+        Assert.Equal((3L, 30L), all[$"other{S}c.txt"]);
     }
 
     [Fact]
@@ -182,26 +185,28 @@ public class StateDbTests : IDisposable
     [Fact]
     public async Task UpdatePrefixAsync_RenamesSubtreeOnly()
     {
-        await _db.UpsertAsync("old/a.txt", 1, 10);
-        await _db.UpsertAsync("old/sub/b.txt", 2, 20);
-        await _db.UpsertAsync("other/c.txt", 3, 30);
+        var S = Path.DirectorySeparatorChar;
+        await _db.UpsertAsync($"old{S}a.txt", 1, 10);
+        await _db.UpsertAsync($"old{S}sub{S}b.txt", 2, 20);
+        await _db.UpsertAsync($"other{S}c.txt", 3, 30);
 
         await _db.UpdatePrefixAsync("old", "new");
 
         var all = await _db.LoadAllAsync();
         Assert.Equal(3, all.Count);
-        Assert.Equal((1L, 10L), all["new/a.txt"]);
-        Assert.Equal((2L, 20L), all["new/sub/b.txt"]);
-        Assert.Equal((3L, 30L), all["other/c.txt"]);
+        Assert.Equal((1L, 10L), all[$"new{S}a.txt"]);
+        Assert.Equal((2L, 20L), all[$"new{S}sub{S}b.txt"]);
+        Assert.Equal((3L, 30L), all[$"other{S}c.txt"]);
     }
 
     [Fact]
     public void UpdatePrefix_WildcardChars_DoNotMatchUnrelatedRows()
     {
-        _db.Upsert("a_b/keep.txt", 1, 10);
-        _db.Upsert("aXb/keep.txt", 2, 20);
-        _db.Upsert("a%b/keep.txt", 3, 30);
-        _db.Upsert("aZZb/keep.txt", 4, 40);
+        var S = Path.DirectorySeparatorChar;
+        _db.Upsert($"a_b{S}keep.txt", 1, 10);
+        _db.Upsert($"aXb{S}keep.txt", 2, 20);
+        _db.Upsert($"a%b{S}keep.txt", 3, 30);
+        _db.Upsert($"aZZb{S}keep.txt", 4, 40);
 
         _db.UpdatePrefix("a_b", "new_under");
         _db.UpdatePrefix("a%b", "new_pct");
@@ -209,23 +214,24 @@ public class StateDbTests : IDisposable
         var all = _db.LoadAll();
         // '_' and '%' are LIKE metacharacters: without ESCAPE this rewrites
         // aXb/aZZb too (and can collide into a UNIQUE constraint failure).
-        Assert.Equal((1L, 10L), all["new_under/keep.txt"]);
-        Assert.Equal((3L, 30L), all["new_pct/keep.txt"]);
-        Assert.Equal((2L, 20L), all["aXb/keep.txt"]);
-        Assert.Equal((4L, 40L), all["aZZb/keep.txt"]);
+        Assert.Equal((1L, 10L), all[$"new_under{S}keep.txt"]);
+        Assert.Equal((3L, 30L), all[$"new_pct{S}keep.txt"]);
+        Assert.Equal((2L, 20L), all[$"aXb{S}keep.txt"]);
+        Assert.Equal((4L, 40L), all[$"aZZb{S}keep.txt"]);
     }
 
     [Fact]
     public async Task UpdatePrefixAsync_WildcardChars_DoNotMatchUnrelatedRows()
     {
-        await _db.UpsertAsync("a_b/keep.txt", 1, 10);
-        await _db.UpsertAsync("aXb/keep.txt", 2, 20);
+        var S = Path.DirectorySeparatorChar;
+        await _db.UpsertAsync($"a_b{S}keep.txt", 1, 10);
+        await _db.UpsertAsync($"aXb{S}keep.txt", 2, 20);
 
         await _db.UpdatePrefixAsync("a_b", "new");
 
         var all = await _db.LoadAllAsync();
-        Assert.Equal((1L, 10L), all["new/keep.txt"]);
-        Assert.Equal((2L, 20L), all["aXb/keep.txt"]);
+        Assert.Equal((1L, 10L), all[$"new{S}keep.txt"]);
+        Assert.Equal((2L, 20L), all[$"aXb{S}keep.txt"]);
     }
 
     private void BreakConnection()

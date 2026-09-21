@@ -1,6 +1,6 @@
 # ast-grep project config for TicTack. Banked rules live in rules/ (one file
 # per rule); run `ast-grep scan` from the repo root, or
-# `tools/diag.sh static` / `tools/diag.ps1 static`.
+# `benchmarks/diag.sh -p2` / `benchmarks/diag.ps1 -p2`.
 # NOTE: ast-grep 0.45.x `scan` loads project rules from ruleDirs only —
 # top-level inline `rules:` in this file are silently ignored. Keep rules in
 # rules/ so the CI gate actually fires (verified with a probe violation).
