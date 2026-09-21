@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.ServiceProcess;
 using System.Threading;
@@ -13,11 +15,20 @@ namespace TicTack
 {
     static class Program
     {
+        // The resolve hook only runs under JIT (guarded below): in
+        // framework-dependent deployments the two assemblies ship beside the
+        // exe; under AOT single-file they are bundled and resolve normally.
+        [UnconditionalSuppressMessage("Trimming", "IL2026",
+            Justification = "Hook body never executes under AOT (early return above); in JIT deployments the targets ship untrimmed beside the exe.")]
         static Program()
         {
             // .NET 10 SDK marks these as "type: platform" in deps.json
             // but the shared framework doesn't ship them yet. Use assembly-resolve
             // to load from app directory when the runtime can't find them.
+            // Skipped under NativeAOT: single-file publish bundles them, so the
+            // runtime resolves them without help (and dynamic load is trimmed).
+            if (!RuntimeFeature.IsDynamicCodeSupported)
+                return;
             AssemblyLoadContext.Default.Resolving += (context, name) =>
             {
                 var n = name.Name;

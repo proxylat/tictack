@@ -3,9 +3,17 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace TicTack
 {
+    // Source-generated JSON metadata: no runtime reflection or codegen,
+    // so deferred-state persistence works under NativeAOT/trimming.
+    [JsonSerializable(typeof(DeferredDeletion.DeferredState))]
+    internal sealed partial class DeferredDeletionJsonContext : JsonSerializerContext
+    {
+    }
+
     public sealed class DeferredDeletion
     {
         private readonly string _dbPath;
@@ -148,7 +156,7 @@ namespace TicTack
                 if (File.Exists(_dbPath))
                 {
                     var json = File.ReadAllText(_dbPath);
-                    _state = JsonSerializer.Deserialize<DeferredState>(json);
+                    _state = JsonSerializer.Deserialize(json, DeferredDeletionJsonContext.Default.DeferredState);
                 }
             }
             catch { _log.Warn("Deferred deletion state could not be loaded; preserving it for recovery: " + _dbPath); }
@@ -161,12 +169,11 @@ namespace TicTack
                 var dir = Path.GetDirectoryName(_dbPath);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
-                var json = JsonSerializer.Serialize(_state ?? new DeferredState(), new JsonSerializerOptions { WriteIndented = true });
                 var temp = _dbPath + ".tictack.tmp";
                 using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
-                using (var writer = new StreamWriter(stream))
+                using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
                 {
-                    writer.Write(json);
+                    JsonSerializer.Serialize(writer, _state ?? new DeferredState(), DeferredDeletionJsonContext.Default.DeferredState);
                     writer.Flush();
                     stream.Flush(true);
                 }
@@ -175,7 +182,7 @@ namespace TicTack
             catch (Exception ex) { _log.Warn("Deferred deletion state could not be saved: " + _dbPath + " (" + ex.Message + ")"); }
         }
 
-        private class DeferredState
+        internal class DeferredState
         {
             public DateTime BlockedAt { get; set; }
             public DateTime LastWarningAt { get; set; }
