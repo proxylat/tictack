@@ -84,6 +84,7 @@ Requires: .NET 10 SDK. Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sql
 
 1. Copy `service\win\config_win.yaml.example` to `service\win\config.yaml` and edit your source/destination paths.
 2. Run `service\win\install-service.bat` as Administrator — compiles (`dotnet publish`), registers the `TicTackSv` Windows service, and starts it.
+   AOT alternative: `service\win\install-service-aot.bat` — same flow, publishes a self-contained NativeAOT exe (~8 MB, no .NET runtime needed; requires VS Build Tools with MSVC).
 3. `sc stop TicTackSv` / `sc start TicTackSv` to restart after config changes.
 
 Or run manually: `service\win\TicTackSv.exe --cli` (interactive) or `service\win\TicTackSv.exe --once` (single pass).
