@@ -24,6 +24,7 @@ jobs:
       - name: Build application
         run: dotnet build src/TicTack.csproj --configuration Release --no-restore
       - name: Run tests
+        shell: bash
         run: |
           # Windows-gated tests early-return on Linux and would report false
           # passes; exclude them on ubuntu so they report skipped instead.
