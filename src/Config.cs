@@ -148,6 +148,10 @@ namespace TicTack
         public int WatcherBufferKb { get; set; }
         public int PollingIntervalSeconds { get; set; }
         public int RestartDelaySeconds { get; set; }
+        // Composite-only: also tap the NTFS USN journal as a third member.
+        // Ignored for watcher/usn/polling types. Windows-only; on other
+        // platforms or without elevation the member probe-skips with a warn.
+        public bool Usn { get; set; }
 
         public MonitorConfig()
         {
@@ -155,6 +159,7 @@ namespace TicTack
             WatcherBufferKb = 64;
             PollingIntervalSeconds = 3600;
             RestartDelaySeconds = 10;
+            Usn = false;
         }
     }
 
@@ -263,6 +268,9 @@ namespace TicTack
                 log.Error("monitor.type must be 'watcher', 'usn', 'polling', or 'composite' (got: " + (cfg.Monitor.Type ?? "null") + ")");
                 valid = false;
             }
+            if (cfg.Monitor != null && cfg.Monitor.Usn
+                && !string.Equals(cfg.Monitor.Type, "composite", StringComparison.OrdinalIgnoreCase))
+                log.Warn("monitor.usn only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'.");
             var destinations = new Dictionary<string, string>(PathComparer);
             foreach (var src in cfg.Sources)
             {

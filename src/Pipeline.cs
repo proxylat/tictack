@@ -53,6 +53,8 @@ namespace TicTack
         private Timer? _parityTimer;
         private EventHandler<MonitorErrorEventArgs>? _monitorErrorHandler;
         private volatile bool _parityRequested;
+        private long _completedItems;
+        private DateTime _lastProgressUtc;
         private bool _disposed;
 
         public SyncPipeline(
@@ -137,6 +139,7 @@ namespace TicTack
         {
             if (_started) return;
             _cts = new CancellationTokenSource();
+            _lastProgressUtc = DateTime.UtcNow;
             if (!_directoryExists(_config.Path))
             {
                 _log.Warn("Source directory not found, will retry: " + _config.Path);
@@ -261,6 +264,11 @@ namespace TicTack
                 if (_drain.TryTake(DateTime.UtcNow, _pendingEvents, _debounce, out e, out var wait))
                 {
                     await ProcessEvent(e, token);
+                    // Progress = the loop is alive and working. Updated even
+                    // when the event failed: failure still flows through
+                    // retry/logging, so movement here means not wedged.
+                    _lastProgressUtc = DateTime.UtcNow;
+                    Interlocked.Increment(ref _completedItems);
                 }
                 else if (wait.HasValue)
                 {
@@ -796,6 +804,35 @@ namespace TicTack
         public void Stop()
         {
             StopAsync().GetAwaiter().GetResult();
+        }
+
+        public string SourcePath => _config.Path;
+
+        // Watchdog probe (stall-while-alive): null = healthy, otherwise a
+        // one-line fault for the log + alert_path. Idle (empty queue) is
+        // healthy — zero-CPU idle means silence, not stall. Debounced-only
+        // backlog is healthy too: nothing is overdue until its time comes.
+        // Pure logic lives in EvaluateHealth (directly testable); this
+        // gathers live state.
+        public string? CheckHealth(TimeSpan stallAfter)
+        {
+            if (_disposed || _cts == null) return null;
+            Exception? processorError = null;
+            if (_processor != null && _processor.IsFaulted)
+                processorError = _processor.Exception;
+            return EvaluateHealth(_pendingEvents.Count, _lastProgressUtc,
+                DateTime.UtcNow, stallAfter, processorError);
+        }
+
+        internal static string? EvaluateHealth(int pendingCount, DateTime lastProgressUtc,
+            DateTime now, TimeSpan stallAfter, Exception? processorError)
+        {
+            if (processorError != null)
+                return "processor task faulted: " + processorError.GetBaseException().Message;
+            if (pendingCount > 0 && now - lastProgressUtc > stallAfter)
+                return "no progress for " + (now - lastProgressUtc).TotalMinutes.ToString("F0")
+                    + " min with " + pendingCount + " queued events";
+            return null;
         }
 
         public void Dispose()

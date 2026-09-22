@@ -49,6 +49,7 @@ sources:
 
 monitor:
   type: watcher # watcher | usn (NTFS journal, needs elevation, else falls back to watcher) | polling | composite
+  usn: false # composite-only: add the NTFS journal as a third member (needs elevation, else probe-skipped with a warning)
   watcher_buffer_kb: 1024
   polling_interval_seconds: 300
   restart_delay_seconds: 10

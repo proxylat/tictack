@@ -157,6 +157,66 @@ public class UsnMonitorTests : IDisposable
     }
 
     [Fact]
+    public void Config_AcceptsCompositeUsn()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = "/tmp/tt-src", Destination = "/tmp/tt-dst" });
+        cfg.Monitor = new MonitorConfig { Type = "composite", Usn = true };
+        var log = new RecordingLogger();
+
+        Assert.True(Config.Validate(cfg, log));
+    }
+
+    [Fact]
+    public void Config_WarnsUsnOnNonComposite()
+    {
+        var cfg = new TicTackConfig();
+        cfg.Sources.Add(new SourceConfig { Path = "/tmp/tt-src", Destination = "/tmp/tt-dst" });
+        cfg.Monitor = new MonitorConfig { Type = "watcher", Usn = true };
+        var log = new RecordingLogger();
+
+        Assert.True(Config.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.StartsWith("WRN:") && m.Contains("monitor.usn"));
+    }
+
+    [Fact]
+    public void Composite_WithUsnMember_SurfacesFileOps()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            using var probe = new UsnJournalMonitor(_dir);
+            probe.ProbeVolume();
+        }
+        catch
+        {
+            return; // unelevated
+        }
+
+        // Watcher + journal observe the same tree; the pipeline dedups by
+        // path downstream, so delivery may double — assert presence, not count.
+        using var composite = new CompositeMonitor(
+            new FileWatcherMonitor(_dir),
+            new UsnJournalMonitor(_dir));
+        var events = new List<FileChangedEventArgs>();
+        var gate = new object();
+        composite.Changed += (_, e) => { lock (gate) events.Add(e); };
+        composite.Start();
+        try
+        {
+            for (var i = 0; i < 3; i++)
+                File.WriteAllText(Path.Combine(_dir, "c" + i + ".txt"), "v1");
+            WaitFor(events, gate, 3);
+        }
+        finally { composite.Stop(); }
+
+        List<FileChangedEventArgs> snapshot;
+        lock (gate) snapshot = events.ToList();
+        for (var i = 0; i < 3; i++)
+            Assert.Contains(snapshot, e => e.FullPath == Path.Combine(_dir, "c" + i + ".txt"));
+    }
+
+    [Fact]
     public void Live_DetectsFileOps()
     {
         if (!OperatingSystem.IsWindows()) return;

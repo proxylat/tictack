@@ -19,7 +19,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 
 | Feature | Implementation |
 |---|---|
-| Change monitoring | `FileWatcherMonitor`, `PollingMonitor`, `CompositeMonitor` — pluggable via `IFileMonitor` |
+| Change monitoring | `FileWatcherMonitor` (Windows) / `FsWatchMonitor` (Linux), `UsnJournalMonitor` (Windows NTFS standalone, needs elevation, falls back to watcher), `PollingMonitor`, `CompositeMonitor` (+ optional `usn` member) — pluggable via `IFileMonitor` |
 | Comparison (date/size/hash) | `IFileComparer` — `SizeComparer`, `DateSizeComparer`, `HashComparer`, `FullComparer` |
 | Locked file handling | `FileAccessor` opens with `FileShare.ReadWrite|Delete` + `FILE_FLAG_BACKUP_SEMANTICS` (SYSTEM bypass); retry backoff |
 | VSS support | `VssFileAccessor` (`sync.file_access: vss`, Windows-only, needs elevation) — direct open fast path, on-demand per-volume snapshot only on lock failure, no writer coordination |
@@ -236,19 +236,19 @@ Fields from `verification` down live under the nested `sync:` key (`retry:`, `ve
 | `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` |
 | `durability` | `full` | `full` fsyncs each temporary file before rename; `fdatasync` (Linux) flushes file data but not metadata-only changes; `rename-only` skips per-file disk flush and fsyncs the destination directory instead, trading a power-loss window for speed |
 | `initial_sync_workers` | `2` | Bounded parallel workers for initial sync only; copying remains complete before parity/deletion cleanup |
-| `max_attempts` | `5` | Max retries on failed copy |
-| `delay_ms` | `1000` | Initial retry delay (ms) |
-| `backoff` | `2.0` | Delay multiplier per retry (1s → 2s → 4s) |
+| `retry.max_attempts` | `5` | Max retries on failed copy |
+| `retry.delay_ms` | `1000` | Initial retry delay (ms) |
+| `retry.backoff` | `2.0` | Delay multiplier per retry (1s → 2s → 4s) |
 | `lock_handling` | `retry` | `retry` = wait and retry when lock is held / `ignore` = proceed without lock |
 | `retry_lock_minutes` | `10` | Minutes to retry when lock is held before giving up (only when `lock_handling: retry`) |
 | `delete_threshold_count` | `1000` | Block deletion if one burst contains >= N files |
 | `delete_threshold_size_gb` | `50` | Block deletion if one burst total size >= N GB |
 | `delete_threshold_percent` | `50` | Block deletion if one burst >= N% of known files |
 | `delete_hold_days` | `7` | Days to hold blocked deletions before syncing; daily warnings sent |
-| `max_versions` | `10` | Keep up to N old versions per file |
-| `path` | — | Where archived versions go (timestamp suffix) |
-| `deletion_mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |
-| `path` | — | Target dir in `archive` mode |
+| `versioning.max_versions` | `10` | Keep up to N old versions per file |
+| `versioning.path` | — | Where archived versions go (timestamp suffix) |
+| `deletion.mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |
+| `deletion.path` | — | Target dir in `archive` mode |
 
 **Path mirroring:** archived and versioned files keep their real folder structure. With a shared `.archive` / `.versions` next to the sync root, deleting `Desktop\foo.txt` lands in `.archive\Desktop\foo_ts.txt` — not in the archive root.
 
@@ -260,7 +260,8 @@ Fields from `verification` down live under the nested `sync:` key (`retry:`, `ve
 
 | Field | Default | Description |
 |---|---|---|
-| `type` | `watcher` | `watcher` = instant OS events, zero CPU idle (`ReadDirectoryChangesW` P/Invoke on Windows, `FileSystemWatcher` on Linux). `usn` = NTFS USN-journal cursor (Windows-only, needs elevation; falls back to `watcher` with a warning otherwise) — miss-proof while running, no buffer overruns. `polling` = periodic dir scan (no missed events). `composite` = both (watcher for speed, polling as safety net) |
+| `type` | `watcher` | `watcher` = instant OS events, zero CPU idle (`ReadDirectoryChangesW` P/Invoke on Windows, `FileSystemWatcher` on Linux). `usn` = NTFS USN-journal cursor (Windows-only, needs elevation; falls back to `watcher` with a warning otherwise) — miss-proof while running, no buffer overruns. `polling` = periodic dir scan (no missed events). `composite` = watcher for speed + polling as safety net (+ optional `usn` journal member, next row) |
+| `usn` | `false` | Composite-only: also tap the NTFS journal as a third member (defense in depth — two independent observers must both miss an event to lose it). Windows + elevation required; probe-skips with a warning otherwise. Ignored with a warning for non-composite types |
 | `watcher_buffer_kb` | `64` | Watcher buffer in KB (NTFS on Windows, inotify on Linux). **Larger = survives bursts (git clone, npm install, unzip) without event loss.** Use 512+ for heavy churn |
 | `polling_interval_seconds` | `3600` | Full directory scan interval (s) for polling fallback. Min 10 |
 | `restart_delay_seconds` | `10` | Wait before restarting watcher after error |
@@ -280,8 +281,8 @@ Fields from `verification` down live under the nested `sync:` key (`retry:`, `ve
 
 | Field | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Periodic heartbeat log entry to prove the service is alive |
-| `interval_minutes` | `30` | Minutes between heartbeats |
+| `enabled` | `true` | Per-source stall check: a faulted processor task or a non-empty queue with no progress for a full interval writes `[WATCHDOG]` Error to the log, the `alert_path` dir, and the Windows EventLog. Heartbeat itself logs at `debug` only, so `info` stays quiet |
+| `interval_minutes` | `30` | Minutes between checks (also the no-progress stall threshold) |
 
 ### external_drives
 

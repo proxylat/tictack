@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 
@@ -29,28 +30,57 @@ namespace TicTack
                 last_run TEXT NOT NULL
             )";
 
+        // Startup recovery (crash-killed WAL, AV/Defender holding the -wal)
+        // can fail transiently with SQLITE_IOERR. Bounded retry here keeps
+        // a transient lock from crashing startup on strangers' machines.
         public static SqliteConnection Open(string dbPath, SqliteSchema schema)
         {
-            var dir = Path.GetDirectoryName(dbPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
+            const int maxAttempts = 5;
+            for (var attempt = 1; ; attempt++)
+            {
+                SqliteConnection? conn = null;
+                try
+                {
+                    var dir = Path.GetDirectoryName(dbPath);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
 
-            var conn = new SqliteConnection("Data Source=" + dbPath);
-            conn.Open();
-            Configure(conn, schema);
-            return conn;
+                    conn = new SqliteConnection("Data Source=" + dbPath);
+                    conn.Open();
+                    Configure(conn, schema);
+                    return conn;
+                }
+                catch (SqliteException) when (attempt < maxAttempts)
+                {
+                    conn?.Dispose();
+                    Thread.Sleep(100 * attempt);
+                }
+            }
         }
 
         public static async Task<SqliteConnection> OpenAsync(string dbPath, SqliteSchema schema)
         {
-            var dir = Path.GetDirectoryName(dbPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
+            const int maxAttempts = 5;
+            for (var attempt = 1; ; attempt++)
+            {
+                SqliteConnection? conn = null;
+                try
+                {
+                    var dir = Path.GetDirectoryName(dbPath);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
 
-            var conn = new SqliteConnection("Data Source=" + dbPath);
-            await conn.OpenAsync().ConfigureAwait(false);
-            await ConfigureAsync(conn, schema).ConfigureAwait(false);
-            return conn;
+                    conn = new SqliteConnection("Data Source=" + dbPath);
+                    await conn.OpenAsync().ConfigureAwait(false);
+                    await ConfigureAsync(conn, schema).ConfigureAwait(false);
+                    return conn;
+                }
+                catch (SqliteException) when (attempt < maxAttempts)
+                {
+                    conn?.Dispose();
+                    await Task.Delay(100 * attempt).ConfigureAwait(false);
+                }
+            }
         }
 
         private static void Configure(SqliteConnection conn, SqliteSchema schema)
