@@ -58,7 +58,23 @@ namespace TicTack
                 if (cfg.Watchdog != null && cfg.Watchdog.Enabled)
                 {
                     var ms = Math.Max(60000, cfg.Watchdog.IntervalMinutes * 60000);
-                    _heartbeat = new Timer(_ => _log!.Info("[HEARTBEAT] Service running"), null, ms, ms);
+                    var stallAfter = TimeSpan.FromMilliseconds(ms);
+                    _heartbeat = new Timer(_ =>
+                    {
+                        _log!.Debug("[HEARTBEAT] Service running");
+                        // Stall-while-alive: a faulted processor or a
+                        // non-empty queue with no progress for a full
+                        // interval means sync is wedged. Error fans out to
+                        // tictack.log, the alert_path .txt, and EventLog
+                        // via the MultiLogger — no new plumbing.
+                        if (_pipelines != null)
+                            foreach (var pipeline in _pipelines)
+                            {
+                                var fault = pipeline.CheckHealth(stallAfter);
+                                if (fault != null)
+                                    _log.Error("[WATCHDOG] Source '" + pipeline.SourcePath + "': " + fault);
+                            }
+                    }, null, ms, ms);
                 }
 
                 _log.Info("TicTack Service started");

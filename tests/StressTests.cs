@@ -200,13 +200,34 @@ public class StressTests
                 var args = new FileActionArgs(
                     new FileChangedEventArgs(ChangeType.Modified, file), src, dst);
                 var result = await action.ExecuteAsync(args, CancellationToken.None);
-                if (OperatingSystem.IsWindows())
+                // FileAccessor opens with FILE_FLAG_BACKUP_SEMANTICS: an
+                // elevated process holds backup privilege, which bypasses
+                // share-mode checks, so the locked copy succeeds (tolerance
+                // working as designed). Unelevated it fails. CI runners are
+                // elevated; dev boxes usually are not — assert accordingly.
+                if (OperatingSystem.IsWindows() && !IsElevated())
                     Assert.False(result.Success);
                 else
                     Assert.True(result.Success);
             }
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    static bool IsElevated()
+    {
+        if (!OperatingSystem.IsWindows())
+            return false;
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            return new System.Security.Principal.WindowsPrincipal(identity)
+                .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // ── 6. StateDb concurrent batch ──

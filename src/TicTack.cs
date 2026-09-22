@@ -451,12 +451,12 @@ namespace TicTack
             IFileMonitor CreateWatcher() => OperatingSystem.IsWindows()
                 ? new FileWatcherMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds)
                 : new FsWatchMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds);
-            IFileMonitor CreateUsnOrFallback()
+            IFileMonitor? TryCreateUsn(string fallbackMsg)
             {
                 if (!OperatingSystem.IsWindows())
                 {
-                    log.Warn("monitor.type 'usn' is Windows-only; falling back to watcher.");
-                    return CreateWatcher();
+                    log.Warn("USN journal is Windows-only; " + fallbackMsg + ".");
+                    return null;
                 }
                 try
                 {
@@ -466,9 +466,13 @@ namespace TicTack
                 }
                 catch (Exception ex)
                 {
-                    log.Warn("USN journal unavailable (" + ex.Message + "); falling back to watcher.");
-                    return CreateWatcher();
+                    log.Warn("USN journal unavailable (" + ex.Message + "); " + fallbackMsg + ".");
+                    return null;
                 }
+            }
+            IFileMonitor CreateUsnOrFallback()
+            {
+                return TryCreateUsn("falling back to watcher") ?? CreateWatcher();
             }
             switch (monitorConfig.Type != null ? monitorConfig.Type.ToLowerInvariant() : "")
             {
@@ -482,10 +486,21 @@ namespace TicTack
                     monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
                     break;
                 default:
-                    monitor = new CompositeMonitor(
+                    var members = new List<IFileMonitor>
+                    {
                         CreateWatcher(),
                         new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds)
-                    );
+                    };
+                    // Defense in depth: the journal cursor is an independent
+                    // observer alongside the lossy watcher. Path-keyed
+                    // dedup in the pipeline collapses the doubled events.
+                    // Probe-skips (non-Windows, unelevated) with a warn.
+                    if (monitorConfig.Usn)
+                    {
+                        var usn = TryCreateUsn("skipping USN member");
+                        if (usn != null) members.Add(usn);
+                    }
+                    monitor = new CompositeMonitor(members.ToArray());
                     break;
             }
 
