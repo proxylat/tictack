@@ -56,8 +56,11 @@ namespace TicTack
         private static JobRunStore CreateStore(TicTackConfig config)
         {
             string dir;
+            // StateDbPath is a directory root (GetStateDbPath appends
+            // "<sourcename>.db"), so use it directly — GetDirectoryName
+            // would strip it and land jobs.db one level too high.
             if (config.Sources != null && config.Sources.Count > 0 && !string.IsNullOrEmpty(config.Sources[0].StateDbPath))
-                dir = Path.GetDirectoryName(config.Sources[0].StateDbPath) ?? AppContext.BaseDirectory;
+                dir = config.Sources[0].StateDbPath;
             else
                 dir = AppContext.BaseDirectory;
             return new JobRunStore(Path.Combine(dir, "jobs.db"));
