@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace TicTack
 {
@@ -71,10 +72,93 @@ namespace TicTack
             {
                 if (job.WorkingDir != null)
                     job.WorkingDir = Resolve(job.WorkingDir, map);
+                // Command text too: unknown [brackets] pass through
+                // Resolve untouched, so shell syntax is safe.
+                if (job.Command != null)
+                    job.Command = Resolve(job.Command, map);
             }
 
             if (cfg.ExternalDrives != null && cfg.ExternalDrives.WorkingDir != null)
                 cfg.ExternalDrives.WorkingDir = Resolve(cfg.ExternalDrives.WorkingDir, map);
+            if (cfg.ExternalDrives != null && cfg.ExternalDrives.Command != null)
+                cfg.ExternalDrives.Command = Resolve(cfg.ExternalDrives.Command, map);
+        }
+
+        // Path fields only — never command text. Shell syntax like $a[0]
+        // or %VAR% contains brackets that are not volume labels.
+        internal static List<string> FindUnresolvedLabels(TicTackConfig cfg)
+        {
+            var fields = new List<string>();
+            if (cfg == null || cfg.Sources == null) return new List<string>();
+            foreach (var src in cfg.Sources)
+            {
+                AddField(fields, src.Path);
+                if (src.Paths != null) fields.AddRange(src.Paths);
+                AddField(fields, src.Destination);
+                AddField(fields, src.StateDbPath);
+                if (src.Sync != null)
+                {
+                    if (src.Sync.Versioning != null) AddField(fields, src.Sync.Versioning.Path);
+                    if (src.Sync.Deletion != null) AddField(fields, src.Sync.Deletion.Path);
+                }
+            }
+            if (cfg.Logging != null)
+            {
+                AddField(fields, cfg.Logging.Path);
+                AddField(fields, cfg.Logging.AlertPath);
+            }
+            foreach (var job in cfg.Jobs ?? Enumerable.Empty<JobConfig>())
+                AddField(fields, job.WorkingDir);
+            if (cfg.ExternalDrives != null) AddField(fields, cfg.ExternalDrives.WorkingDir);
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var labels = new List<string>();
+            foreach (var field in fields)
+            {
+                if (string.IsNullOrEmpty(field)) continue;
+                foreach (Match m in VolumePattern.Matches(field))
+                    if (seen.Add(m.Groups[1].Value))
+                        labels.Add(m.Groups[1].Value);
+            }
+            return labels;
+        }
+
+        static void AddField(List<string> fields, string? value)
+        {
+            if (!string.IsNullOrEmpty(value)) fields.Add(value);
+        }
+
+        // Post-logger gate: wait up to waitMinutes for slow volumes (USB
+        // spin-up), re-resolving each pass, then fail fast naming the
+        // still-unresolved labels instead of grinding on "[Label]" paths.
+        // waitMinutes 0 (or negative/NaN) = single pass, no waiting.
+        internal static bool EnsureResolved(TicTackConfig cfg, double waitMinutes, ILogger log)
+        {
+            if (double.IsNaN(waitMinutes) || waitMinutes < 0) waitMinutes = 0;
+            var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(waitMinutes);
+            bool warned = false;
+            while (true)
+            {
+                ResolveConfig(cfg, log);
+                var missing = FindUnresolvedLabels(cfg);
+                if (missing.Count == 0) return true;
+                if (DateTime.UtcNow >= deadline)
+                {
+                    log.Error("Volume(s) not available: " + string.Join(", ", missing)
+                        + ". Check the drive is plugged in and the label matches.");
+                    return false;
+                }
+                if (!warned)
+                {
+                    log.Warn("Waiting for volume(s): " + string.Join(", ", missing));
+                    warned = true;
+                }
+                else
+                {
+                    log.Debug("Still waiting for volume(s): " + string.Join(", ", missing));
+                }
+                Thread.Sleep(TimeSpan.FromSeconds(10));
+            }
         }
 
         private static IEnumerable<(string label, string root)> GetVolumes(ILogger? log)

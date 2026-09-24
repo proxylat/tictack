@@ -12,6 +12,9 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <InvariantGlobalization>true</InvariantGlobalization>
     <ServerGarbageCollection>false</ServerGarbageCollection>
+    <!-- Required: linked ../src/*.cs includes Handler.cs, whose
+         [GeneratedComInterface] COM source generator needs unsafe code. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />

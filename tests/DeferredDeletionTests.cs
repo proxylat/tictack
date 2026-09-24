@@ -111,6 +111,25 @@ public class DeferredDeletionTests
     }
 
     [Fact]
+    public void RecordPending_PathsLoggedAtDebugOnly()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var log = new RecordingLogger();
+            var dd = new DeferredDeletion(Path.Combine(dir, "deferred.json"), 7, log);
+            dd.RecordPending(new List<string> { Path.Combine(dir, "held.txt") }, dir);
+
+            // Count line stays at Warn; the path sample drops to Debug.
+            Assert.Contains(log.Messages, m => m.StartsWith("WRN:") && m.Contains("hold for 7 days"));
+            Assert.Contains(log.Messages, m => m.StartsWith("DBG:") && m.Contains("held.txt"));
+            Assert.DoesNotContain(log.Messages, m => (m.StartsWith("WRN:") || m.StartsWith("INF:")) && m.Contains("held.txt"));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
     public void RecordPending_SecondBatch_KeepsEarliestBlockedAt()
     {
         var dir = TestDir();

@@ -163,7 +163,7 @@ namespace TicTack
             if (_started) return;
             _started = true;
             var lockTimeout = _config.Sync != null && _config.Sync.LockHandling == "retry"
-                ? (TimeSpan?)TimeSpan.FromMinutes(_config.Sync.RetryLockMinutes > 0 ? _config.Sync.RetryLockMinutes : 10)
+                ? (TimeSpan?)TimeSpan.FromSeconds(_config.Sync.RetryLockSeconds > 0 ? _config.Sync.RetryLockSeconds : 600)
                 : null;
             try { Directory.CreateDirectory(_config.Destination); }
             catch (Exception ex) { _log.Debug("Destination create failed: " + ex.Message); }
@@ -403,7 +403,7 @@ namespace TicTack
                     {
                         var n = Interlocked.Increment(ref scanned);
                         if (n % 1000 == 0)
-                            _log.Info($"Initial sync progress: {n} scanned, {Interlocked.Read(ref copied)} copied, {Interlocked.Read(ref skipped)} skipped ({(DateTime.UtcNow - scanStart).TotalSeconds:F0}s): " + _config.Path);
+                            _log.Debug($"Initial sync progress: {n} scanned, {Interlocked.Read(ref copied)} copied, {Interlocked.Read(ref skipped)} skipped ({(DateTime.UtcNow - scanStart).TotalSeconds:F0}s): " + _config.Path);
                         if (!FileSnapshot.TryRead(f, out var sourceSnapshot))
                         {
                             Interlocked.Exchange(ref scanFailed, 1);

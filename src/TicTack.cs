@@ -75,6 +75,11 @@ namespace TicTack
                 return 1;
             }
 
+            // Pre-logger pass so the log/alert files themselves land on
+            // resolved volumes; the post-logger EnsureResolved below
+            // adds the wait-for-volume gate once logging exists.
+            VolumeResolver.ResolveConfig(cfg);
+
             var log = LoggerFactory.Create(
                 cfg.Logging,
                 baseDir,
@@ -82,7 +87,8 @@ namespace TicTack
                 eventLog: OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive));
             rootLogger = log;
 
-            VolumeResolver.ResolveConfig(cfg, log);
+            if (!VolumeResolver.EnsureResolved(cfg, cfg.VolumeWaitMinutes, log))
+                return 1;
 
             if (!Config.Validate(cfg, log))
                 return 1;
@@ -393,7 +399,7 @@ namespace TicTack
             return Path.Combine(root, SourceName(src) + ".db");
         }
 
-        internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log)
+        internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log, bool logMonitorStartup = false)
         {
             var accessor = CreateAccessorOrFallback(src, log);
             var level = Config.ParseVerification(src.Sync != null ? src.Sync.Verification : null);
@@ -460,7 +466,7 @@ namespace TicTack
                 }
                 try
                 {
-                    var m = new UsnJournalMonitor(src.Path, monitorConfig.RestartDelaySeconds);
+                    var m = new UsnJournalMonitor(src.Path, monitorConfig.RestartDelaySeconds, monitorConfig.UsnPollIntervalMs, monitorConfig.UsnParentPrefilter, log);
                     m.ProbeVolume();
                     return m;
                 }
@@ -478,12 +484,18 @@ namespace TicTack
             {
                 case "watcher":
                     monitor = CreateWatcher();
+                    if (logMonitorStartup)
+                        log.Info("Monitor: watcher on " + src.Path + " (buffer " + monitorConfig.WatcherBufferKb + "KB).");
                     break;
                 case "usn":
                     monitor = CreateUsnOrFallback();
+                    if (logMonitorStartup)
+                        log.Info("Monitor: " + (monitor is UsnJournalMonitor ? "usn" : "watcher (USN unavailable)") + " on " + src.Path + ".");
                     break;
                 case "polling":
                     monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
+                    if (logMonitorStartup)
+                        log.Info("Monitor: polling on " + src.Path + " (every " + monitorConfig.PollingIntervalSeconds + "s).");
                     break;
                 default:
                     var members = new List<IFileMonitor>
@@ -501,6 +513,8 @@ namespace TicTack
                         if (usn != null) members.Add(usn);
                     }
                     monitor = new CompositeMonitor(members.ToArray());
+                    if (logMonitorStartup)
+                        log.Info("Monitor: composite (watcher + polling every " + monitorConfig.PollingIntervalSeconds + "s" + (members.Count > 2 ? " + usn" : "") + ") on " + src.Path + ".");
                     break;
             }
 

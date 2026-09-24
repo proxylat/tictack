@@ -242,7 +242,7 @@ sources:
       complete_mode: inline
       initial_sync_workers: 2
       lock_handling: retry
-      retry_lock_minutes: 10
+      retry_lock_seconds: 600
       delete_threshold_count: 1000
       delete_threshold_size_gb: 50
       delete_threshold_percent: 50

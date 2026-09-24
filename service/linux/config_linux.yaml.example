@@ -34,7 +34,7 @@ sources:
         delay_ms: 1000
         backoff: 2.0
       lock_handling: retry
-      retry_lock_minutes: 10
+      retry_lock_seconds: 600
       delete_threshold_count: 1000
       delete_threshold_size_gb: 50
       delete_threshold_percent: 50
@@ -63,6 +63,9 @@ logging:
 watchdog:
   enabled: true
   interval_minutes: 60
+
+# Minutes to wait at startup for volumes to appear (slow USB); 0 = resolve once, then fail fast ([VolumeLabel] is Windows-only)
+volume_wait_minutes: 2
 
 external_drives:
   command: restic backup --compression auto "{source}" -r "{drive}/restic-repo"
