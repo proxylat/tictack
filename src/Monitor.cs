@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -576,6 +577,41 @@ namespace TicTack
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
 
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool LookupPrivilegeValue(string? systemName, string name, out Luid luid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(IntPtr tokenHandle, bool disableAllPrivileges,
+            ref TokenPrivileges newState, uint bufferLength, IntPtr previousState, IntPtr returnLength);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Luid
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenPrivileges
+        {
+            public uint PrivilegeCount;
+            public Luid Luid;
+            public uint Attributes;
+        }
+
+        private const uint TokenAdjustPrivileges = 0x20;
+        private const uint TokenQuery = 0x08;
+        private const uint SePrivilegeEnabled = 0x02;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(IntPtr hFile, out ByHandleFileInfo lpFileInformation);
+
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern IntPtr OpenFileById(IntPtr hVolumeHint, ref FileIdDescriptor lpFileId,
             uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition);
@@ -584,17 +620,26 @@ namespace TicTack
         private static extern uint GetFinalPathNameByHandle(IntPtr hFile, StringBuilder lpszFilePath,
             uint cchFilePath, uint dwFlags);
 
-        // FILE_ID_DESCRIPTOR with Type = 0 (raw 64-bit file reference number,
-        // zero-extended). Explicit padding keeps the native layout exact.
+        // FILE_ID_DESCRIPTOR (winioctl.h): dwSize(4) + Type(4) + union.
+        // The union is sized by its largest member (FILE_ID_128, 16
+        // bytes), so sizeof(FILE_ID_DESCRIPTOR) = 24 and dwSize must say
+        // 24 even for Type = 0 (raw 64-bit file reference). UnionTail
+        // keeps the managed layout at the true 24 bytes — the struct is
+        // pinned and handed to the kernel by reference, so a 16-byte
+        // struct would pass a short buffer. (A wrong dwSize makes
+        // OpenFileById fail with ERROR_INVALID_PARAMETER on every
+        // resolve, and TranslateRecord then drops every USN event as
+        // unresolvable: empty collections, no errors.)
         [StructLayout(LayoutKind.Sequential)]
-        private struct FileIdDescriptor
+        internal struct FileIdDescriptor
         {
             public int Size;
-            private int _pad1;
             public int Type;
-            private int _pad2;
             public long FileId;
+            public long UnionTail;
         }
+
+        internal static readonly int FileIdDescriptorSize = Marshal.SizeOf<FileIdDescriptor>();
 
         // USN_JOURNAL_DATA_V0/V1 prefix: only the journal id and the head
         // cursor are needed, so the longer V1 tail is never read.
@@ -619,9 +664,23 @@ namespace TicTack
             public ulong UsnJournalID;
         }
 
-        private const uint FsctlQueryUsnJournal = 0x000900f4;
-        private const uint FsctlReadUsnJournal = 0x000900fb;
-        private const uint FileReadAttributes = 0x0080;
+        // winioctl.h: CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 61, METHOD_BUFFERED,
+        // FILE_ANY_ACCESS). Cross-checked via the CTL_CODE formula against
+        // known siblings (ENUM 0x900B3, CREATE 0x900E7, READ 0x900BB).
+        internal const uint FsctlQueryUsnJournal = 0x000900f4;
+        // winioctl.h: CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 46, METHOD_NEITHER,
+        // FILE_ANY_ACCESS). Was 0x900FB (function 62, undefined) — that would
+        // have failed the first journal read right after a successful probe.
+        internal const uint FsctlReadUsnJournal = 0x000900bb;
+        // winioctl.h: CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED,
+        // FILE_ANY_ACCESS). Was 0x90028 (function 10 = FSCTL_UNLOCK_VOLUME),
+        // so the old "mounted control" was unlocking nothing, not checking
+        // the mount. In-probe control call: needs no buffers and no
+        // journal, so it discriminates handle/environment failure from a
+        // genuinely USN-specific rejection.
+        internal const uint FsctlIsVolumeMounted = 0x000900a8;
+        private const uint GenericRead = 0x80000000;
+        private const uint GenericWrite = 0x40000000;
         private const uint FileShareAll = 0x00000007;
         private const uint OpenExisting = 3;
         private const uint FileFlagBackupSemantics = 0x02000000;
@@ -640,6 +699,15 @@ namespace TicTack
             | 0x00000010 | 0x00000020 | 0x00000040 | 0x00000400 | 0x00000800
             | 0x00004000 | 0x00008000 | 0x00010000 | 0x00020000 | 0x00040000
             | 0x00080000 | 0x00100000 | 0x00200000 | 0x00400000 | 0x00800000;
+        // NTFS-side pre-filter: a record reaches us only if it carries at
+        // least one of these reasons. Covers exactly what TranslateRecord
+        // maps (create/delete/rename/modify); everything else (security,
+        // EA, reparse, quota, close-alone...) maps to null downstream, so
+        // dropping it here skips wasted resolves, never real events.
+        // If a new mapping is added below, extend this mask too
+        // (ReasonWatchMask_CoversAllMappedReasons fails otherwise).
+        internal const uint ReasonWatchMask = ReasonFileCreate | ReasonFileDelete
+            | ReasonRenameOldName | ReasonRenameNewName | ReasonModifyMask;
 
         // Parsed USN_RECORD_V2/V3 common prefix (both versions share these
         // field offsets; the V3-only tail past FileNameOffset is ignored).
@@ -658,30 +726,102 @@ namespace TicTack
         private readonly string _path;
         private readonly string _prefix;
         private readonly int _restartDelaySec;
+        private readonly int _pollIntervalMs;
         private readonly string _volumeDevice;
         private Thread? _worker;
         private volatile bool _stopping;
         private IntPtr _volumeHandle = IntPtr.Zero;
         private readonly ManualResetEventSlim _armed = new(false);
+        // Sleep gate for the poll loop. A dedicated event (not _armed:
+        // that one stays set once armed, so waiting on it would spin).
+        // Single kernel wait instead of a chunked Thread.Sleep loop: 5
+        // workers x 200ms chunks woke 25x/sec doing nothing (~147k
+        // cycles/sec in Task Manager with usn:true).
+        private readonly ManualResetEventSlim _wake = new(false);
         // Rename-old path by file reference number. A rename out of the
         // volume leaves an orphan entry; the cap bounds that leak.
         // ponytail: clear-all eviction, per-FRN LRU if renames ever dominate.
         private readonly Dictionary<ulong, string> _pendingOldNames = new();
+        // FRNs with a completed rename pair. The journal can deliver the
+        // new name twice (duplicate rename-new, or a create record for the
+        // new link): the paired rename already reported it, so a later
+        // create/orphan for the same FRN is a duplicate, not a new file.
+        // Cleared on delete (FRN lifecycle end), capped like pending.
+        private readonly HashSet<ulong> _renameTargets = new();
+        // Silent-drop observability: every by-id resolve failure lands
+        // here, so a live test with an empty collection can distinguish
+        // "no records arrived" from "records arrived but paths unresolvable".
+        internal long ResolveFailures;
+        // ParentRef pre-filter (usn_parent_prefilter): FRNs of every
+        // directory under the watched tree. The journal is volume-wide,
+        // so most records belong to other apps (Spotify, Temp...); a
+        // record whose parent is not a watched dir skips both resolves
+        // with zero syscalls. UnderWatch stays the authority — a stale
+        // entry only costs an extra resolve, never a wrong event.
+        private readonly HashSet<ulong> _watchDirFrns = new();
+        private readonly bool _parentPrefilter;
+        internal bool _prefilterActive;
+        private readonly ILogger? _log;
+        internal long PrefilteredSkips;
+        internal long _recordsSeen;
+        private long _eventsEmitted;
+        // Swappable for tests: production resolves FRNs via the OS,
+        // tests inject a fake mapping (native calls need Windows).
+        internal Func<string, ulong?> FrnOfPath = NativeFrnOfPath;
 
         public event EventHandler<FileChangedEventArgs>? Changed;
         public event EventHandler<MonitorErrorEventArgs>? Error;
 
-        public UsnJournalMonitor(string path, int restartDelaySec = 10)
+        public UsnJournalMonitor(string path, int restartDelaySec = 10, int pollIntervalMs = 200,
+            bool parentPrefilter = true, ILogger? log = null)
         {
             // No platform check here: translation and parsing are pure and
             // unit-tested cross-platform; ProbeVolume/Start throw on misuse.
             _path = Path.GetFullPath(path);
             _prefix = _path.EndsWith(Path.DirectorySeparatorChar) ? _path : _path + Path.DirectorySeparatorChar;
             _restartDelaySec = Math.Max(1, restartDelaySec);
+            // Floor blocks a typo from re-creating the busy-spin
+            // (proven by ProcMon: solid QUERY+READ, ~40% CPU idle).
+            _pollIntervalMs = Math.Max(50, pollIntervalMs);
+            _parentPrefilter = parentPrefilter;
+            _log = log;
             var root = Path.GetPathRoot(_path);
             if (string.IsNullOrEmpty(root) || root.StartsWith(@"\\", StringComparison.Ordinal))
                 throw new NotSupportedException("USN journal is per-volume; UNC paths are not supported: " + path);
             _volumeDevice = @"\\.\" + root.TrimEnd('\\');
+        }
+
+        // fsutil enables SeManageVolumePrivilege before touching the journal:
+        // presence in the token is not enough, Disabled stays disabled until
+        // adjusted. Reports per-privilege outcome so the probe failure line
+        // distinguishes "adjust failed" from "enabled yet ioctl still fails".
+        // Best-effort — the probe-skip fallback treats any non-ok as before,
+        // so unelevated callers behave exactly as before.
+        internal static string EnableVolumePrivileges()
+        {
+            if (!OperatingSystem.IsWindows())
+                return "unsupported";
+            if (!OpenProcessToken(GetCurrentProcess(), TokenAdjustPrivileges | TokenQuery, out var token)
+                || token == IntPtr.Zero)
+                return "token:err" + Marshal.GetLastWin32Error();
+            try
+            {
+                var parts = new List<string>();
+                foreach (var name in new[] { "SeManageVolumePrivilege", "SeBackupPrivilege" })
+                {
+                    if (!LookupPrivilegeValue(null, name, out var luid))
+                    {
+                        parts.Add(name + ":lookup-err" + Marshal.GetLastWin32Error());
+                        continue;
+                    }
+                    var state = new TokenPrivileges { PrivilegeCount = 1, Luid = luid, Attributes = SePrivilegeEnabled };
+                    bool adjusted = AdjustTokenPrivileges(token, false, ref state, 0, IntPtr.Zero, IntPtr.Zero);
+                    int w = Marshal.GetLastWin32Error();
+                    parts.Add(name + (adjusted && w == 0 ? ":ok" : ":err" + w));
+                }
+                return string.Join("/", parts);
+            }
+            finally { CloseHandle(token); }
         }
 
         // Opens the volume and reads the journal head. Called by the factory
@@ -692,8 +832,15 @@ namespace TicTack
         {
             if (!OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("UsnJournalMonitor requires Windows/NTFS.");
-            var handle = CreateFile(_volumeDevice, FileReadAttributes, FileShareAll,
-                IntPtr.Zero, OpenExisting, FileFlagBackupSemantics, IntPtr.Zero);
+            // Best-effort: Disabled privileges stay disabled until adjusted,
+            // and failure here keeps the existing probe-skip fallback.
+            // The report travels into the failure line (priv=...).
+            // Open shape is the documented sample (GENERIC_READ|WRITE,
+            // flags 0): probe-v4 proved FILE_READ_ATTRIBUTES delivery fails
+            // with Win32 1 on some stacks while this shape succeeds.
+            var priv = EnableVolumePrivileges();
+            var handle = CreateFile(_volumeDevice, GenericRead | GenericWrite, FileShareAll,
+                IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
             if (handle == InvalidHandle)
             {
                 var err = Marshal.GetLastWin32Error();
@@ -702,7 +849,7 @@ namespace TicTack
             }
             try
             {
-                return QueryJournal(handle);
+                return QueryJournal(handle, _volumeDevice, priv);
             }
             finally { CloseHandle(handle); }
         }
@@ -714,6 +861,7 @@ namespace TicTack
             Stop();
             _stopping = false;
             _armed.Reset();
+            _wake.Reset();
             _worker = new Thread(WorkerLoop) { IsBackground = true };
             _worker.Start();
             // Same contract as FileWatcherMonitor: do not return until the
@@ -723,12 +871,16 @@ namespace TicTack
 
         private void WorkerLoop()
         {
+            var priv = EnableVolumePrivileges();
             while (!_stopping)
             {
                 try
                 {
-                    _volumeHandle = CreateFile(_volumeDevice, FileReadAttributes, FileShareAll,
-                        IntPtr.Zero, OpenExisting, FileFlagBackupSemantics, IntPtr.Zero);
+                    // Same documented sample shape as ProbeVolume (see note
+                    // there): minimal-access opens fail FSCTL delivery on
+                    // some stacks with Win32 1.
+                    _volumeHandle = CreateFile(_volumeDevice, GenericRead | GenericWrite, FileShareAll,
+                        IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
                     if (_volumeHandle == InvalidHandle)
                     {
                         _armed.Set();
@@ -738,8 +890,12 @@ namespace TicTack
                     }
                     if (_stopping) break;
 
+                    // Seed before the head is captured: dirs created in
+                    // between still deliver CREATE records at/after it.
+                    SeedWatchDirs();
+                    ulong journalId;
                     long lastUsn;
-                    try { lastUsn = QueryJournal(_volumeHandle).NextUsn; }
+                    try { (journalId, lastUsn) = QueryJournal(_volumeHandle, _volumeDevice, priv); }
                     catch (Exception ex)
                     {
                         _armed.Set();
@@ -748,12 +904,17 @@ namespace TicTack
                         continue;
                     }
 
+                    _log?.Info("USN watch started [" + _path + "]: journal=" + journalId
+                        + " head=" + lastUsn + " mask=0x" + ReasonWatchMask.ToString("X8")
+                        + " poll=" + _pollIntervalMs + "ms prefilter="
+                        + (_prefilterActive ? "on (" + _watchDirFrns.Count + " dirs)" : "off"));
                     _armed.Set();
                     var buf = new byte[64 * 1024];
+                    var lastStats = Stopwatch.StartNew();
                     while (!_stopping)
                     {
                         List<UsnRecord>? records = null;
-                        try { records = ReadJournal(_volumeHandle, ref lastUsn, buf); }
+                        try { records = ReadJournal(_volumeHandle, journalId, ref lastUsn, buf); }
                         catch (Exception ex)
                         {
                             // Journal recreated/deleted underneath us: the gap
@@ -761,15 +922,37 @@ namespace TicTack
                             // head. InitialSync (or composite's polling leg)
                             // covers the missed range.
                             FireError(ex);
+                            _log?.Info("USN journal changed underneath, re-baselining at new head"
+                                + " (gap covered by InitialSync/polling leg).");
                             break;
                         }
                         if (records != null)
                         {
-                            foreach (var rec in records)
+                            if (records.Count == 0)
                             {
-                                if (_stopping) break;
-                                Dispatch(rec);
+                                // The read should block up to Timeout seconds,
+                                // but some stacks return instantly when caught
+                                // up — without this the loop busy-spins on an
+                                // ioctl per iteration (proven by ProcMon: solid
+                                // QUERY+READ with no sleeps, ~40% CPU idle).
+                                SleepOrStop(_pollIntervalMs);
                             }
+                            else
+                            {
+                                foreach (var rec in records)
+                                {
+                                    if (_stopping) break;
+                                    Dispatch(rec);
+                                }
+                            }
+                        }
+                        if (lastStats.Elapsed >= TimeSpan.FromMinutes(30))
+                        {
+                            _log?.Info("USN stats [" + _path + "]: records=" + _recordsSeen
+                                + " events=" + _eventsEmitted
+                                + " prefiltered=" + PrefilteredSkips
+                                + " resolveFailures=" + ResolveFailures);
+                            lastStats.Restart();
                         }
                     }
                 }
@@ -784,10 +967,17 @@ namespace TicTack
             }
         }
 
-        private void Dispatch(UsnRecord rec)
+        internal void Dispatch(UsnRecord rec)
         {
+            _recordsSeen++;
+            if (_log != null)
+                _log.Debug("USN usn=" + rec.Usn + " reason=0x" + rec.Reason.ToString("X8")
+                    + " name=" + rec.FileName + " parent=" + rec.ParentRef);
+            // Volume-wide journal: most records belong to other apps.
+            // A ParentRef miss skips both resolves with zero syscalls.
+            if (!IsWatchedParent(rec.ParentRef)) { PrefilteredSkips++; return; }
             var evt = TranslateRecord(rec, ResolvePath);
-            if (evt != null) FireChanged(evt.ChangeType, evt.FullPath, evt.OldFullPath);
+            if (evt != null) { _eventsEmitted++; FireChanged(evt.ChangeType, evt.FullPath, evt.OldFullPath); }
         }
 
         // Pure translation step, separated for testing: parse and rename
@@ -800,10 +990,18 @@ namespace TicTack
             if ((rec.Reason & ReasonFileDelete) != 0)
             {
                 type = ChangeType.Deleted;
+                _pendingOldNames.Remove(rec.FileRef);
+                _renameTargets.Remove(rec.FileRef);
+                // FRN lifecycle end: a later reuse starts untracked.
+                if (isDir) _watchDirFrns.Remove(rec.FileRef);
             }
             else if ((rec.Reason & ReasonRenameOldName) != 0)
             {
-                var oldFull = UnderWatch(resolvePath(rec.FileRef) ?? CombineParent(rec, resolvePath));
+                // By the time the journal is read the file has already
+                // moved, so opening it by id returns the NEW path. The
+                // record's parent ref + old name are the authoritative
+                // old location.
+                var oldFull = UnderWatch(CombineParent(rec, resolvePath));
                 if (oldFull != null)
                 {
                     if (_pendingOldNames.Count > 1024) _pendingOldNames.Clear();
@@ -816,13 +1014,34 @@ namespace TicTack
                 type = ChangeType.Renamed;
                 if (!_pendingOldNames.Remove(rec.FileRef, out oldPath))
                 {
+                    // Duplicate delivery of an already-paired rename (same
+                    // FRN): the rename event covered it, stay silent.
+                    if (_renameTargets.Contains(rec.FileRef)) return null;
                     // Rename into the watched tree (or a missed old-name):
                     // report as creation of the new name.
                     type = ChangeType.Created;
                 }
+                else
+                {
+                    if (_renameTargets.Count > 1024) _renameTargets.Clear();
+                    _renameTargets.Add(rec.FileRef);
+                }
+                if (isDir && _parentPrefilter && _watchDirFrns.Contains(rec.ParentRef))
+                {
+                    // Directory moved (or created) into the tree: track it
+                    // plus its subtree, closing the move-in gap. A move out
+                    // leaves a stale entry — harmless, UnderWatch drops it.
+                    _watchDirFrns.Add(rec.FileRef);
+                    AddSubtreeFrns(CombineParent(rec, resolvePath));
+                }
             }
             else if ((rec.Reason & ReasonFileCreate) != 0)
             {
+                // Create record for an already-paired rename target (same
+                // FRN): duplicate delivery of the new link, stay silent.
+                if (_renameTargets.Contains(rec.FileRef)) return null;
+                if (isDir && _parentPrefilter && _watchDirFrns.Contains(rec.ParentRef))
+                    _watchDirFrns.Add(rec.FileRef);
                 type = ChangeType.Created;
             }
             else if ((rec.Reason & ReasonModifyMask) != 0)
@@ -847,7 +1066,12 @@ namespace TicTack
             }
             else
             {
-                full = UnderWatch(resolvePath(rec.FileRef));
+                // Event-time path first: by the time the journal is read
+                // the file may have moved (by-id then reports the NEW
+                // name) or been deleted (by-id fails outright). The
+                // record's parent ref + name are where the event happened;
+                // by-id stays as the fallback for a deleted parent.
+                full = UnderWatch(CombineParent(rec, resolvePath) ?? resolvePath(rec.FileRef));
             }
             if (full == null) return null;
             // A rename whose old path resolved outside the watched tree is a
@@ -878,14 +1102,14 @@ namespace TicTack
         {
             var h = _volumeHandle;
             if (h == IntPtr.Zero || h == InvalidHandle) return null;
-            var desc = new FileIdDescriptor { Size = 24, Type = 0, FileId = (long)fileRef };
-            var fh = OpenFileById(h, ref desc, 0, FileShareAll, IntPtr.Zero, OpenExisting);
-            if (fh == InvalidHandle || fh == IntPtr.Zero) return null;
+            var desc = new FileIdDescriptor { Size = FileIdDescriptorSize, Type = 0, FileId = (long)fileRef };
+            var fh = OpenFileById(h, ref desc, 0, FileShareAll, IntPtr.Zero, FileFlagBackupSemantics);
+            if (fh == InvalidHandle || fh == IntPtr.Zero) { Interlocked.Increment(ref ResolveFailures); return null; }
             try
             {
                 var sb = new StringBuilder(512);
                 var len = GetFinalPathNameByHandle(fh, sb, (uint)sb.Capacity, 0);
-                if (len == 0 || len >= (uint)sb.Capacity) return null;
+                if (len == 0 || len >= (uint)sb.Capacity) { Interlocked.Increment(ref ResolveFailures); return null; }
                 var p = sb.ToString();
                 // GetFinalPathNameByHandle returns \\?\C:\...; strip to the
                 // plain DOS path so downstream long-path handling matches the
@@ -898,60 +1122,222 @@ namespace TicTack
             finally { CloseHandle(fh); }
         }
 
+        // Pack=4 is load-bearing: the native BY_HANDLE_FILE_INFORMATION is
+        // 52 bytes with 4-aligned fields. Default Pack=8 inserts 4 pad
+        // bytes after FileAttributes, shifting FileIndexHigh/Low onto
+        // bytes the OS never wrote — every computed FRN came out garbage
+        // and the ParentRef pre-filter dropped 100% of journal records
+        // (proven by prefiltered=seen, events=0 on Windows). With Pack=4
+        // the managed layout is byte-identical to native (SizeOf 52,
+        // FileIndexHigh@44, FileIndexLow@48 — pinned by
+        // ByHandleFileInfo_MatchesNativeLayout).
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        internal struct ByHandleFileInfo
+        {
+            public uint FileAttributes;
+            public long CreationTime;
+            public long LastAccessTime;
+            public long LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        private static ulong? NativeFrnOfPath(string path)
+        {
+            if (!OperatingSystem.IsWindows()) return null;
+            IntPtr h;
+            try
+            {
+                h = CreateFile(path, 0, FileShareAll, IntPtr.Zero, OpenExisting,
+                    FileFlagBackupSemantics, IntPtr.Zero);
+            }
+            catch { return null; }
+            if (h == InvalidHandle || h == IntPtr.Zero) return null;
+            try
+            {
+                if (!GetFileInformationByHandle(h, out var info)) return null;
+                return ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
+            }
+            finally { CloseHandle(h); }
+        }
+
+        // Seeds the ParentRef pre-filter: the FRN of the watched root plus
+        // every directory beneath it. Runs before the journal head is
+        // captured, so dirs created in between still deliver CREATE records
+        // at/after the head and join via the maintain rules below. An empty
+        // result (root missing, lookup failing) disables the pre-filter for
+        // the run: skipping everything would be blindness, not filtering.
+        internal void SeedWatchDirs()
+        {
+            _watchDirFrns.Clear();
+            _prefilterActive = false;
+            if (!_parentPrefilter) return;
+            IEnumerable<string> dirs;
+            try
+            {
+                dirs = Directory.EnumerateDirectories(_path, "*", SearchOption.AllDirectories)
+                    .Prepend(_path);
+            }
+            catch { return; }
+            foreach (var d in dirs)
+            {
+                ulong? frn;
+                try { frn = FrnOfPath(d); }
+                catch { continue; }
+                if (frn != null) _watchDirFrns.Add(frn.Value);
+            }
+            _prefilterActive = _watchDirFrns.Count > 0;
+        }
+
+        internal bool IsWatchedParent(ulong parentRef)
+        {
+            return !_prefilterActive || _watchDirFrns.Contains(parentRef);
+        }
+
+        private void AddSubtreeFrns(string? root)
+        {
+            if (root == null || !_prefilterActive) return;
+            IEnumerable<string> dirs;
+            try
+            {
+                dirs = Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories)
+                    .Prepend(root);
+            }
+            catch { return; }
+            foreach (var d in dirs)
+            {
+                ulong? frn;
+                try { frn = FrnOfPath(d); }
+                catch { continue; }
+                if (frn != null) _watchDirFrns.Add(frn.Value);
+            }
+        }
+
         internal static bool TryParseRecord(byte[] buf, int offset, out UsnRecord? record)
         {
             record = null;
-            // Fixed 52-byte prefix; FileName follows at FileNameOffset.
-            if (buf.Length - offset < 52) return false;
+            // True USN_RECORD_V2 layout (winioctl.h): RecordLength@0,
+            // Major@4, FileRef@8, ParentRef@16, Usn@24, TimeStamp@32,
+            // Reason@40, SourceInfo@44, SecurityId@48, Attributes@52,
+            // FileNameLength@56, FileNameOffset@58, FileName@60. The fixed
+            // prefix is 60 bytes, not 52 — the old 52-byte assumption read
+            // TimeStamp as Reason and SecurityId as name length, so the
+            // bounds check below rejected every real NTFS record and the
+            // monitor collected zero events with zero errors.
+            // V3 (ReFS, 128-bit file ids) is rejected: the by-id resolve
+            // path assumes 64-bit FRNs, so a clean skip beats misparsing.
+            if (buf.Length - offset < 60) return false;
             uint recLen = BitConverter.ToUInt32(buf, offset);
-            if (recLen < 52 || offset + recLen > (uint)buf.Length) return false;
+            if (recLen < 60 || offset + recLen > (uint)buf.Length) return false;
             ushort major = BitConverter.ToUInt16(buf, offset + 4);
-            if (major != 2 && major != 3) return false;
-            ushort nameLen = BitConverter.ToUInt16(buf, offset + 48);
-            ushort nameOff = BitConverter.ToUInt16(buf, offset + 50);
+            if (major != 2) return false;
+            ushort nameLen = BitConverter.ToUInt16(buf, offset + 56);
+            ushort nameOff = BitConverter.ToUInt16(buf, offset + 58);
             if (nameOff + nameLen > recLen) return false;
             record = new UsnRecord
             {
                 FileRef = BitConverter.ToUInt64(buf, offset + 8),
                 ParentRef = BitConverter.ToUInt64(buf, offset + 16),
                 Usn = BitConverter.ToInt64(buf, offset + 24),
-                Reason = BitConverter.ToUInt32(buf, offset + 32),
-                Attributes = BitConverter.ToUInt32(buf, offset + 44),
+                Reason = BitConverter.ToUInt32(buf, offset + 40),
+                Attributes = BitConverter.ToUInt32(buf, offset + 52),
                 FileName = Encoding.Unicode.GetString(buf, offset + nameOff, nameLen),
             };
             return true;
         }
 
-        private static (ulong JournalId, long NextUsn) QueryJournal(IntPtr volume)
+        // Baked into the failure message so a pasted line proves which
+        // binary produced it. Bump when the probe changes.
+        private const string ProbeMarker = "probe-v4";
+
+        // In-probe control: the trivial ioctl on the same handle. If it
+        // fails too, the handle/environment is broken — USN exonerated.
+        private static (bool Ok, int Win32) TestVolumeMounted(IntPtr volume)
         {
-            var outBuf = new byte[64];
-            if (!DeviceIoControl(volume, FsctlQueryUsnJournal, IntPtr.Zero, 0,
-                    outBuf, (uint)outBuf.Length, out var ret, IntPtr.Zero) || ret < 24)
-                throw new IOException("FSCTL_QUERY_USN_JOURNAL failed (Win32 " +
-                    Marshal.GetLastWin32Error() + "); the volume may have no active journal.");
-            var ptr = Marshal.AllocHGlobal(24);
+            if (!DeviceIoControl(volume, FsctlIsVolumeMounted, IntPtr.Zero, 0,
+                    Array.Empty<byte>(), 0, out _, IntPtr.Zero))
+                return (false, Marshal.GetLastWin32Error());
+            return (true, 0);
+        }
+
+        // probe-v4: retry the query on a fresh handle of the same
+        // documented shape. A fresh-handle success means the first handle
+        // was bad (transient); identical failure means volume FSCTLs are
+        // not delivered to NTFS in this process and no open shape will
+        // fix it. (This retry is also what convicted the old
+        // FILE_READ_ATTRIBUTES open: sample-shape=ok against Win32 1.)
+        private static string TrySampleShape(string device)
+        {
+            var handle = CreateFile(device, GenericRead | GenericWrite, FileShareAll,
+                IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (handle == InvalidHandle)
+                return "open-err" + Marshal.GetLastWin32Error();
             try
             {
-                Marshal.Copy(outBuf, 0, ptr, 24);
-                var data = Marshal.PtrToStructure<UsnJournalData>(ptr);
-                return (data.UsnJournalID, data.NextUsn);
+                var outBuf = new byte[64];
+                bool ok = DeviceIoControl(handle, FsctlQueryUsnJournal, IntPtr.Zero, 0,
+                    outBuf, (uint)outBuf.Length, out var ret, IntPtr.Zero);
+                int err = Marshal.GetLastWin32Error();
+                return ok && ret >= 24 ? "ok" : "fail/Win32 " + err;
             }
-            finally { Marshal.FreeHGlobal(ptr); }
+            finally { CloseHandle(handle); }
+        }
+
+        private static (ulong JournalId, long NextUsn) QueryJournal(IntPtr volume, string device, string priv)
+        {
+            var outBuf = new byte[64];
+            bool ok = DeviceIoControl(volume, FsctlQueryUsnJournal, IntPtr.Zero, 0,
+                outBuf, (uint)outBuf.Length, out var ret, IntPtr.Zero);
+            int err = Marshal.GetLastWin32Error();
+            if (ok && ret >= 24)
+            {
+                var ptr = Marshal.AllocHGlobal(24);
+                try
+                {
+                    Marshal.Copy(outBuf, 0, ptr, 24);
+                    var data = Marshal.PtrToStructure<UsnJournalData>(ptr);
+                    return (data.UsnJournalID, data.NextUsn);
+                }
+                finally { Marshal.FreeHGlobal(ptr); }
+            }
+            // Failure diagnostics: which branch fired, raw handle, bytes
+            // returned, in-process control call, documented-shape retry.
+            // Read the pasted line: sample-shape=ok means our open is the
+            // bug; sample-shape failing identically means volume FSCTLs are
+            // not delivered to NTFS in this process (a working fsutil proves
+            // the journal itself exists) and the USN member stays skipped.
+            var (mountedOk, mountedErr) = TestVolumeMounted(volume);
+            var sample = TrySampleShape(device);
+            throw new IOException("FSCTL_QUERY_USN_JOURNAL failed on " + device +
+                " [" + ProbeMarker + "] (Win32 " + err +
+                ", ok=" + ok + ", bytes=" + ret +
+                ", handle=0x" + volume.ToString("X") +
+                ", mounted-control=" + (mountedOk ? "ok" : "fail/Win32 " + mountedErr) +
+                ", sample-shape=" + sample +
+                ", priv=" + priv + "); " +
+                "USN member skipped, watcher/polling fallback in effect.");
         }
 
         // Reads one batch; advances lastUsn past the records returned.
-        // Empty (timeout) batches return an empty list, not null.
-        private static List<UsnRecord> ReadJournal(IntPtr volume, ref long lastUsn, byte[] buf)
+        // Empty (timeout) batches return an empty list, not null. The journal
+        // id is captured once by the caller on purpose: no per-poll QUERY
+        // (that ioctl doubled the idle syscall rate), and a recreation
+        // underneath us makes this read throw on id mismatch, which the
+        // worker turns into a re-baseline at the new head.
+        private static List<UsnRecord> ReadJournal(IntPtr volume, ulong journalId, ref long lastUsn, byte[] buf)
         {
-            var journal = QueryJournal(volume);
             var input = new ReadUsnInput
             {
                 StartUsn = lastUsn,
-                ReasonMask = 0xFFFFFFFF,
+                ReasonMask = ReasonWatchMask,
                 ReturnOnlyOnClose = 0,
                 Timeout = 5,
                 BytesToWaitFor = 1,
-                UsnJournalID = journal.JournalId,
+                UsnJournalID = journalId,
             };
             var size = Marshal.SizeOf<ReadUsnInput>();
             var ptr = Marshal.AllocHGlobal(size);
@@ -964,24 +1350,32 @@ namespace TicTack
                         Marshal.GetLastWin32Error() + ").");
                 var records = new List<UsnRecord>();
                 // First 8 bytes are the next-USN cursor, records follow.
+                // StartUsn is exclusive in practice, but if a stack ever
+                // returns the boundary record again the floor drops the
+                // replay: reprocessing one batch per poll would duplicate
+                // every event and strand rename pairing on orphans.
+                // The output cursor doubles as the head for the jump below,
+                // replacing the per-poll QUERY this method used to do.
+                long headUsn = ret >= 8 ? BitConverter.ToInt64(buf, 0) : lastUsn;
+                long floor = lastUsn;
                 int off = 8;
                 while (off + 4 <= ret)
                 {
                     uint recLen = BitConverter.ToUInt32(buf, off);
                     if (recLen == 0 || off + recLen > ret) break;
-                    if (TryParseRecord(buf, off, out var rec) && rec != null)
+                    if (TryParseRecord(buf, off, out var rec) && rec != null && rec.Usn > floor)
                     {
                         records.Add(rec);
                         if (rec.Usn > lastUsn) lastUsn = rec.Usn;
                     }
                     off += (int)recLen;
                 }
-                // If the journal was recreated under us the id changed and the
-                // read above threw; reaching here with records means the head
-                // only advanced — but re-query anyway when nothing came back
-                // so a recreation is noticed within one timeout, not one event.
-                if (records.Count == 0 && journal.NextUsn > lastUsn + 8 * 1024 * 1024)
-                    lastUsn = journal.NextUsn;
+                // Unparseable records (e.g. ReFS V3) never advance lastUsn
+                // via the loop above; jump to the head when it runs far
+                // ahead so one foreign batch can't pin the cursor forever.
+                // (Head comes from the read output cursor, not a QUERY.)
+                if (records.Count == 0 && headUsn > lastUsn + 8 * 1024 * 1024)
+                    lastUsn = headUsn;
                 return records;
             }
             finally { Marshal.FreeHGlobal(ptr); }
@@ -1005,18 +1399,14 @@ namespace TicTack
 
         private void SleepOrStop(int ms)
         {
-            var waited = 0;
-            while (!_stopping && waited < ms)
-            {
-                Thread.Sleep(Math.Min(200, ms - waited));
-                waited += 200;
-            }
+            try { _wake.Wait(ms); } catch (ObjectDisposedException) { }
         }
 
         public void Stop()
         {
             _stopping = true;
             _armed.Set();
+            _wake.Set();
             var h = _volumeHandle;
             // Cancel the blocked DeviceIoControl before closing: closing a
             // handle with a pending synchronous read can stall in a filter
@@ -1036,6 +1426,7 @@ namespace TicTack
         {
             Stop();
             _armed.Dispose();
+            _wake.Dispose();
         }
     }
 }
