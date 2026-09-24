@@ -32,7 +32,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | Max file size | `SizeFilter` — `max_file_size_mb: <number>` or `no-limit` |
 | Crash Recovery | `CopyAction` writes to `.tictack.tmp` then atomic rename; `PowerGuard.Cleanup()` recovers orphaned temps on startup |
 | Desktop alerts | `DesktopAlert.Write()` creates `TicTack-{LEVEL}-{timestamp}.txt` in `alert_path` (global 30s cooldown shared across levels) |
-| Zero-CPU idle | `SemaphoreSlim` in `SyncPipeline` — thread sleeps with zero CPU when idle, wakes instantly on file events |
+| Zero-CPU idle | `SemaphoreSlim` + blocking OS notifications — no CPU when idle; periodic wake-ups only: lock refresh (30s), deferred check (1h, when armed), parity rescan (6h), USN poll sleep, polling scan intervals |
 | Volume label paths | `[VolumeLabel]\path` syntax resolved to drive letters via `DriveInfo.GetDrives()` |
 | Scheduled jobs | `TimerScheduler` — daily shell commands (`cmd.exe /c` Windows, `/bin/sh -c` Linux) with `{source}` substitution |
 | External drive tasks | `DriveDiscoverer` — runs a shell command on each discovered external drive |
@@ -41,7 +41,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | Deferred deletion | `DeferredDeletion` — holds blocked deletions for `delete_hold_days`, daily warnings with first 20 paths, recheck before sync |
 | Delete-threshold guard | Blocks deletions when >50% of known files would be removed in one batch, or when count/size exceeds configured limits |
 | Source-disappearance guard | Refuses to process Deleted events when source folder is missing |
-| Exclusive lock | `.tictack.lock` — exclusive `FileMode.CreateNew` handle held open, identity write + flush, 5min stale timeout, 30s refresh, configurable retry timeout (`retry_lock_minutes`) |
+| Exclusive lock | `.tictack.lock` — exclusive `FileMode.CreateNew` handle held open, identity write + flush, 5min stale timeout, 30s refresh, configurable retry timeout (`retry_lock_seconds`) |
 | Sparse file support | Detects `FILE_ATTRIBUTE_SPARSE_FILE`, uses `FSCTL_SET_SPARSE` via `DeviceIoControl` |
 | EventLog propagation | `EventLogLogger` writes errors to Windows Application log under `TicTackSv` source |
 
@@ -212,14 +212,14 @@ dotnet-fullgc` — or skip the install and run them one-shot with `dnx`
 
 ## Configuration
 
-All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`) — resolves to the actual drive letter at startup.
+All paths support `[VolumeLabel]` syntax on Windows (e.g., `[Backup-Disk]\Sync`) — resolved to the actual drive letter at startup, before any log file is opened. If a labeled volume isn't present yet (slow USB), startup waits up to `volume_wait_minutes` (default `2`) for it to appear, then exits with an error naming the missing label instead of syncing against a wrong or empty path. `0` disables the wait (single resolution pass, then fail fast).
 Duplicate YAML keys are rejected at startup; unknown properties are ignored.
 
 **Do not use environment variables like `%USERPROFILE%` or `%HOME%`.** The Windows service runs as `LocalSystem`, so `%USERPROFILE%` resolves to `C:\WINDOWS\system32\config\systemprofile`, not your profile — same for `%HOME%` under systemd (root). Always write the full path (`C:\Users\User\Desktop`).
 
 ### sources
 
-Fields from `verification` down live under the nested `sync:` key (`retry:`, `versioning:`, `deletion:` are sub-blocks of it) — at source level they are silently ignored.
+Fields live at three levels: top-level source keys (`paths`, `destination`, `state_db_path`, `debounce_seconds`); the `filter:` sub-block (`max_file_size_mb`, `exclude`); everything else (`drain_strategy` through `file_access`, plus `verification` down) lives under the nested `sync:` key (`retry:`, `versioning:`, `deletion:` are sub-blocks of it) — `sync:` fields placed at source level are silently ignored.
 
 | Field | Default | Description |
 |---|---|---|
@@ -240,7 +240,7 @@ Fields from `verification` down live under the nested `sync:` key (`retry:`, `ve
 | `retry.delay_ms` | `1000` | Initial retry delay (ms) |
 | `retry.backoff` | `2.0` | Delay multiplier per retry (1s → 2s → 4s) |
 | `lock_handling` | `retry` | `retry` = wait and retry when lock is held / `ignore` = proceed without lock |
-| `retry_lock_minutes` | `10` | Minutes to retry when lock is held before giving up (only when `lock_handling: retry`) |
+| `retry_lock_seconds` | `600` | Seconds to retry when lock is held before giving up, with progressive backoff (2s→5s→15s→30s→60s cap, only when `lock_handling: retry`) |
 | `delete_threshold_count` | `1000` | Block deletion if one burst contains >= N files |
 | `delete_threshold_size_gb` | `50` | Block deletion if one burst total size >= N GB |
 | `delete_threshold_percent` | `50` | Block deletion if one burst >= N% of known files |
@@ -265,6 +265,8 @@ Fields from `verification` down live under the nested `sync:` key (`retry:`, `ve
 | `watcher_buffer_kb` | `64` | Watcher buffer in KB (NTFS on Windows, inotify on Linux). **Larger = survives bursts (git clone, npm install, unzip) without event loss.** Use 512+ for heavy churn |
 | `polling_interval_seconds` | `3600` | Full directory scan interval (s) for polling fallback. Min 10 |
 | `restart_delay_seconds` | `10` | Wait before restarting watcher after error |
+| `usn_poll_interval_ms` | `200` | Idle sleep (ms) between USN journal reads when no records arrive. Larger = quieter idle, slower pickup. Min 50 |
+| `usn_parent_prefilter` | `true` | USN only: skip journal records whose parent dir is outside the watched tree before any path resolve (kills the volume-wide resolve tax — Spotify/Temp churn costs zero syscalls). UnderWatch stays the authority, so disabling only costs syscalls, never events |
 
 ### logging
 

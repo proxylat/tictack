@@ -146,7 +146,7 @@ namespace TicTack
             if (files.Count > shown.Count)
                 msg += Environment.NewLine + "  ... and " + (files.Count - shown.Count) + " more";
             msg += Environment.NewLine + "Full list: " + _dbPath;
-            _log.Warn(msg);
+            _log.Debug(msg);
         }
 
         private void Load()

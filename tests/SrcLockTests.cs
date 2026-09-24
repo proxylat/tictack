@@ -43,6 +43,17 @@ public class SrcLockTests : IDisposable
     }
 
     [Fact]
+    public void NextLockWaitMs_ProgressesUpToCap()
+    {
+        Assert.Equal(2000, SrcLock.NextLockWaitMs(1));
+        Assert.Equal(5000, SrcLock.NextLockWaitMs(2));
+        Assert.Equal(15000, SrcLock.NextLockWaitMs(3));
+        Assert.Equal(30000, SrcLock.NextLockWaitMs(4));
+        Assert.Equal(60000, SrcLock.NextLockWaitMs(5));
+        Assert.Equal(60000, SrcLock.NextLockWaitMs(99));
+    }
+
+    [Fact]
     public void DetectsStaleLock()
     {
         File.WriteAllText(_lockPath, ForeignIdentity());
@@ -104,8 +115,9 @@ public class SrcLockTests : IDisposable
         sw.Stop();
 
         Assert.False(lockObj.IsHeld);
-        // One 5 s retry sleep must elapse: a zero sleep would return at ~300 ms.
-        Assert.True(sw.ElapsedMilliseconds >= 4000);
+        // One progressive retry sleep must elapse (attempt 1 = 2 s):
+        // a zero sleep would return at ~300 ms.
+        Assert.True(sw.ElapsedMilliseconds >= 1500);
         // The wait must be visible at info level, not buried in debug.
         Assert.Contains(_log.Messages, m => m.StartsWith("INF:") && m.Contains("Waiting for lock held by"));
         Assert.Contains(_log.Messages, m => m.Contains("lock acquisition failed"));

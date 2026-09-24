@@ -143,7 +143,7 @@ public sealed class PerfTests
 
             Assert.True(await pipeline.RunOnceAsync());
 
-            Assert.Contains(log.Messages, m => m.Contains("Initial sync progress: 1000 scanned"));
+            Assert.Contains(log.Messages, m => m.StartsWith("DBG:") && m.Contains("Initial sync progress: 1000 scanned"));
             Assert.Contains(log.Messages, m => m.Contains("Sync complete") && m.Contains("(1000 scanned, 1000 copied"));
         }
         finally { TryDelete(dir); }

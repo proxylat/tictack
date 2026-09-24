@@ -32,10 +32,16 @@ namespace TicTack
                 if (cfg == null)
                     throw new InvalidOperationException("Config not found: " + _configPath);
 
+                // Pre-logger pass so the log/alert files themselves land on
+                // resolved volumes; the post-logger EnsureResolved below
+                // adds the wait-for-volume gate once logging exists.
+                VolumeResolver.ResolveConfig(cfg);
+
                 var logDir = Path.GetDirectoryName(_configPath) ?? AppDomain.CurrentDomain.BaseDirectory;
                 _log = LoggerFactory.Create(cfg.Logging, logDir, console: cfg.Logging.Console, eventLog: true);
 
-                VolumeResolver.ResolveConfig(cfg, _log);
+                if (!VolumeResolver.EnsureResolved(cfg, cfg.VolumeWaitMinutes, _log))
+                    throw new InvalidOperationException("Volume(s) not available; see log for labels.");
 
                 PowerGuard.Cleanup(cfg, _log);
 
@@ -47,7 +53,7 @@ namespace TicTack
                 _pipelines = new List<SyncPipeline>();
                 foreach (var src in cfg.Sources)
                 {
-                    var pipeline = Program.BuildPipeline(src, cfg, _log);
+                    var pipeline = Program.BuildPipeline(src, cfg, _log, logMonitorStartup: true);
                     pipeline.Start();
                     _pipelines.Add(pipeline);
                 }

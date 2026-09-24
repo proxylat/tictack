@@ -16,6 +16,13 @@ namespace TicTack
         public WatchdogConfig Watchdog { get; set; }
         public ExternalDrivesConfig ExternalDrives { get; set; }
 
+        // Minutes to wait for [VolumeLabel] volumes to appear (slow USB
+        // spin-up) before failing fast on unresolved labels. Top-level on
+        // purpose: one shared deadline resolves every label in a single
+        // pass (sources, jobs, log/alert paths) — a per-source key would
+        // multiply worst-case waits and leave the log path homeless.
+        public double VolumeWaitMinutes { get; set; }
+
         // Populated by ExpandPathsList for problems that are only visible
         // during expansion; Validate reports them.
         [YamlIgnore]
@@ -30,6 +37,7 @@ namespace TicTack
             Jobs = new List<JobConfig>();
             Watchdog = new WatchdogConfig();
             ExternalDrives = new ExternalDrivesConfig();
+            VolumeWaitMinutes = 2;
         }
     }
 
@@ -79,7 +87,7 @@ namespace TicTack
         public RetryConfig Retry { get; set; }
         public string? LockHandling { get; set; }
         public string FileAccess { get; set; }
-        public int RetryLockMinutes { get; set; }
+        public int RetryLockSeconds { get; set; }
         public int DeleteThresholdCount { get; set; }
         public long? DeleteThresholdSizeGb { get; set; }
         public double DeleteThresholdPercent { get; set; }
@@ -98,7 +106,7 @@ namespace TicTack
             Retry = new RetryConfig();
             LockHandling = "retry";
             FileAccess = "direct";
-            RetryLockMinutes = 10;
+            RetryLockSeconds = 600;
             DeleteThresholdCount = 1000;
             DeleteThresholdSizeGb = 50;
             DeleteThresholdPercent = 50;
@@ -148,6 +156,12 @@ namespace TicTack
         public int WatcherBufferKb { get; set; }
         public int PollingIntervalSeconds { get; set; }
         public int RestartDelaySeconds { get; set; }
+        public int UsnPollIntervalMs { get; set; }
+        // USN only: skip journal records whose parent dir is outside the
+        // watched tree before any path resolve (volume-wide journal tax).
+        // UnderWatch stays the authority, so false entries only cost
+        // resolves, never wrong events. Default on.
+        public bool UsnParentPrefilter { get; set; }
         // Composite-only: also tap the NTFS USN journal as a third member.
         // Ignored for watcher/usn/polling types. Windows-only; on other
         // platforms or without elevation the member probe-skips with a warn.
@@ -159,6 +173,8 @@ namespace TicTack
             WatcherBufferKb = 64;
             PollingIntervalSeconds = 3600;
             RestartDelaySeconds = 10;
+            UsnPollIntervalMs = 200;
+            UsnParentPrefilter = true;
             Usn = false;
         }
     }
@@ -271,6 +287,11 @@ namespace TicTack
             if (cfg.Monitor != null && cfg.Monitor.Usn
                 && !string.Equals(cfg.Monitor.Type, "composite", StringComparison.OrdinalIgnoreCase))
                 log.Warn("monitor.usn only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'.");
+            if (double.IsNaN(cfg.VolumeWaitMinutes) || cfg.VolumeWaitMinutes < 0)
+            {
+                log.Error("volume_wait_minutes must be >= 0 (got: " + cfg.VolumeWaitMinutes + ")");
+                valid = false;
+            }
             var destinations = new Dictionary<string, string>(PathComparer);
             foreach (var src in cfg.Sources)
             {

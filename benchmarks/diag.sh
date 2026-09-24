@@ -168,7 +168,7 @@ sources:
       complete_mode: inline
       initial_sync_workers: 2
       lock_handling: retry
-      retry_lock_minutes: 10
+      retry_lock_seconds: 600
       versioning:
         max_versions: 10
         path: $troot/versions

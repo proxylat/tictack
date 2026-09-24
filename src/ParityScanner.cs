@@ -132,7 +132,7 @@ namespace TicTack
                 if (rel == ".versions" || UnderDir(rel, ".versions")) continue;
                 if (rel == ".tictack.lock") continue;
                 if (sourceDirectories.Contains(rel)) continue;
-                _log.Info("Cleanup: removing stale dir " + dir);
+                _log.Debug("Cleanup: removing stale dir " + dir);
                 await _deleter.DeleteAsync(null, dir, rel, "Parity deletion failed", ct);
             }
         }

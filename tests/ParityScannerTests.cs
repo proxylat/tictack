@@ -159,7 +159,7 @@ public sealed class ParityScannerTests
 
         var call = Assert.Single(deletion.Calls);
         Assert.Equal(Dst + "/gone", call.dst);
-        Assert.Contains(log.Messages, m => m.Contains("Cleanup: removing stale dir"));
+        Assert.Contains(log.Messages, m => m.StartsWith("DBG:") && m.Contains("Cleanup: removing stale dir"));
     }
 
     [Fact]
