@@ -454,7 +454,9 @@ public class UsnMonitorTests : IDisposable
             // Structural events only, ordinal-sorted: Modified differs by
             // transport design (USN coalesces a write into the create or
             // overwrite record; the watcher splits ADDED + MODIFIED) and
-            // Live_DetectsFileOps covers it.
+            // Live_DetectsFileOps covers it. The ready.txt sentinel is
+            // filtered: USN's poll cycle can deliver its delete after the
+            // clear above, and it is test scaffolding, not product signal.
             var expected = new List<string>
             {
                 "Created|" + p0 + "|",
@@ -464,8 +466,9 @@ public class UsnMonitorTests : IDisposable
                 "Renamed|" + q1 + "|" + p1,
             };
 
-            static List<string> Normalize(List<FileChangedEventArgs> evts) => evts
+            List<string> Normalize(List<FileChangedEventArgs> evts) => evts
                 .Where(e => e.ChangeType != ChangeType.Modified)
+                .Where(e => e.FullPath != sentinel && e.OldFullPath != sentinel)
                 .Select(e => e.ChangeType + "|" + e.FullPath + "|" + (e.OldFullPath ?? ""))
                 .Distinct()
                 .OrderBy(s => s, StringComparer.Ordinal)

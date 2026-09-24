@@ -39,7 +39,8 @@ public class CrashRecoveryTests
             // that is deleted instead of moved still leaves no file, and the
             // logged line says which happened.
             Assert.Contains(log.Messages, m => m.Contains("from validated temp"));
-            Assert.Equal(File.ReadAllText(sourceFile), File.ReadAllText(destinationFile));
+            Assert.Equal(await ReadAllTextWithRetryAsync(sourceFile, TimeSpan.FromSeconds(10)),
+                await ReadAllTextWithRetryAsync(destinationFile, TimeSpan.FromSeconds(10)));
             Assert.False(File.Exists(destinationFile + ".tictack.tmp"));
         }
         finally { try { Directory.Delete(root, true); } catch { } }
@@ -132,5 +133,20 @@ public class CrashRecoveryTests
         while (!File.Exists(path) && DateTime.UtcNow < deadline)
             await Task.Delay(25);
         Assert.True(File.Exists(path), "Timed out waiting for " + path);
+    }
+
+    // A freshly killed worker (or an AV scan on a CI runner) can hold a
+    // transient lock on a just-moved file; poll instead of failing once.
+    private static async Task<string> ReadAllTextWithRetryAsync(string path, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            try { return await File.ReadAllTextAsync(path); }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(100);
+            }
+        }
     }
 }
