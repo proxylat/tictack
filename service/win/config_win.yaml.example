@@ -52,6 +52,7 @@ monitor:
   usn: false # composite-only: add the NTFS journal as a third member (needs elevation, else probe-skipped with a warning)
   watcher_buffer_kb: 1024
   polling_interval_seconds: 300
+  polling_backstop: true # composite-only: false drops the polling member when the usn member is healthy (zero snapshot memory; gaps fire on-demand scans)
   restart_delay_seconds: 10
   usn_poll_interval_ms: 200 # idle sleep between USN journal reads (ms); larger = quieter idle, slower pickup
   usn_parent_prefilter: true # skip outside-tree journal records before any path resolve; false = resolve everything (more syscalls, same events)
@@ -81,3 +82,4 @@ jobs:
     time: "21:00"
     command: restic.exe backup --compression auto "{source}" -r D:\ResticRepo
     working_dir: C:\ProgramData\TicTack
+    timeout_minutes: 60

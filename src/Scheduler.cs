@@ -46,6 +46,11 @@ namespace TicTack
                     log.Warn("Invalid time '" + job.Time + "' for job '" + job.Name + "'");
                     continue;
                 }
+                if (job.TimeoutMinutes <= 0)
+                {
+                    log.Warn("Invalid timeout_minutes '" + job.TimeoutMinutes + "' for job '" + job.Name + "'");
+                    continue;
+                }
                 var entry = new JobEntry { Config = job, TimeOfDay = ts };
                 var last = _store.GetLastRun(job.Name!);
                 entry.LastRunOn = last ?? DateTime.MinValue;
@@ -120,11 +125,12 @@ namespace TicTack
                 _log.Info("Running job '" + job.Config.Name + "': " + cmd);
 
                 var (exitCode, _, err, timedOut) = await ProcessRunner.RunAsync(
-                    cmd, wd, redirect: true, _cts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+                    cmd, wd, redirect: true, _cts?.Token ?? CancellationToken.None,
+                    timeoutMs: (job.Config.TimeoutMinutes > 0 ? job.Config.TimeoutMinutes : 10) * 60000).ConfigureAwait(false);
 
                 if (timedOut)
                 {
-                    _log.Error(TimeoutMessage(job.Config.Name));
+                    _log.Error(TimeoutMessage(job.Config.Name, job.Config.TimeoutMinutes > 0 ? job.Config.TimeoutMinutes : 10));
                     return;
                 }
                 if (exitCode != 0)
@@ -145,8 +151,8 @@ namespace TicTack
             }
         }
 
-        internal static string TimeoutMessage(string? jobName) =>
-            "Job '" + jobName + "' timed out after " + (ProcessRunner.TimeoutMs / 60000) + " minutes, killed";
+        internal static string TimeoutMessage(string? jobName, int timeoutMinutes) =>
+            "Job '" + jobName + "' timed out after " + timeoutMinutes + " minutes, killed";
 
         public void Stop()
         {

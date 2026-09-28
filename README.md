@@ -38,7 +38,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | External drive tasks | `DriveDiscoverer` — runs a shell command on each discovered external drive |
 | State DB (skip-known) | `StateDb` — SQLite WAL, per-source, `size+mtime` cache to skip unchanged files on startup |
 | Pre-read fail-fast | `CopyAction` probes 1 byte before full copy — catches permission/lock issues instantly |
-| Deferred deletion | `DeferredDeletion` — holds blocked deletions for `delete_hold_days`, daily warnings with first 20 paths, recheck before sync |
+| Deferred deletion | `DeferredDeletion` — SQLite hold store (`tictack-deferred-<source>-<hash>.db`), one row per batch clock + one indexed row per path; one-shot deadline timer (no polling), watcher-driven cancel on restore, daily warnings from metadata only, bounded 500-path expiry chunks. Deleting the `.db` cancels every hold (keeps destination files). Empty store deletes its own files — no file means no pending work |
 | Delete-threshold guard | Blocks deletions when >50% of known files would be removed in one batch, or when count/size exceeds configured limits |
 | Source-disappearance guard | Refuses to process Deleted events when source folder is missing |
 | Exclusive lock | `.tictack.lock` — exclusive `FileMode.CreateNew` handle held open, identity write + flush, 5min stale timeout, 30s refresh, configurable retry timeout (`retry_lock_seconds`) |
@@ -254,7 +254,7 @@ Fields live at three levels: top-level source keys (`paths`, `destination`, `sta
 
 **Durability warning:** `rename-only` preserves atomic temp+rename behavior but does not force each file's data to stable storage before the rename. `fdatasync` (Linux only) flushes file contents but may skip metadata updates, so a freshly extended file can lose its size fix-up on power loss; on Windows it falls back to `full`. Use the default `full` setting when power-loss durability matters more than initial-sync speed.
 
-**Delete-threshold guard:** if one deletion burst exceeds `delete_threshold_count`, `delete_threshold_size_gb`, or `delete_threshold_percent` of known files, it is deferred to `tictack-deferred-<folder>.json` (next to the log file). After `delete_hold_days`, remaining files are synced; warnings are logged daily with the first 20 paths + full list location.
+**Delete-threshold guard:** if one deletion burst exceeds `delete_threshold_count`, `delete_threshold_size_gb`, or `delete_threshold_percent` of known files, it is deferred to the SQLite hold store `tictack-deferred-<source>-<hash>.db` (next to the log file). After `delete_hold_days`, remaining files are synced; warnings are logged daily with the first 20 paths. Deleting the `.db` cancels every hold (destination files kept).
 
 ### monitor
 
@@ -264,6 +264,7 @@ Fields live at three levels: top-level source keys (`paths`, `destination`, `sta
 | `usn` | `false` | Composite-only: also tap the NTFS journal as a third member (defense in depth — two independent observers must both miss an event to lose it). Windows + elevation required; probe-skips with a warning otherwise. Ignored with a warning for non-composite types |
 | `watcher_buffer_kb` | `64` | Watcher buffer in KB (NTFS on Windows, inotify on Linux). **Larger = survives bursts (git clone, npm install, unzip) without event loss.** Use 512+ for heavy churn |
 | `polling_interval_seconds` | `3600` | Full directory scan interval (s) for polling fallback. Min 10 |
+| `polling_backstop` | `true` | Composite-only: keep the polling member as the hourly safety net. Set `false` to drop it (zero snapshot memory) when the `usn` member is healthy — watcher overflows and USN journal re-baselines then fire on-demand covering scans instead (creates + modifies + deletes, nothing retained). Kept automatically when USN is unavailable, so there is always a backstop. Ignored with a warning for non-composite types |
 | `restart_delay_seconds` | `10` | Wait before restarting watcher after error |
 | `usn_poll_interval_ms` | `200` | Idle sleep (ms) between USN journal reads when no records arrive. Larger = quieter idle, slower pickup. Min 50 |
 | `usn_parent_prefilter` | `true` | USN only: skip journal records whose parent dir is outside the watched tree before any path resolve (kills the volume-wide resolve tax — Spotify/Temp churn costs zero syscalls). UnderWatch stays the authority, so disabling only costs syscalls, never events |
@@ -308,6 +309,7 @@ Scheduled commands run once per day (`cmd.exe /c` Windows, `/bin/sh -c` Linux). 
 | `time` | — | Daily trigger time, `HH:mm` 24h format **(required)** |
 | `command` | — | Shell command (`cmd.exe /c` on Windows, `/bin/sh -c` on Linux). `{source}` = all source paths quoted **(required)** |
 | `working_dir` | exe dir | Working directory for the command |
+| `timeout_minutes` | 10 | Per job: kill the command if it runs longer than this |
 
 ---
 

@@ -166,6 +166,13 @@ namespace TicTack
         // Ignored for watcher/usn/polling types. Windows-only; on other
         // platforms or without elevation the member probe-skips with a warn.
         public bool Usn { get; set; }
+        // Composite-only: keep the polling member as the hourly backstop.
+        // Set false to drop it (zero snapshot memory) when the USN member
+        // is healthy: watcher overflows and USN re-baselines fire
+        // on-demand covering scans instead. Ignored for
+        // watcher/usn/polling types. Kept on automatically when the USN
+        // member is unavailable, so there is always a backstop.
+        public bool PollingBackstop { get; set; }
 
         public MonitorConfig()
         {
@@ -176,6 +183,7 @@ namespace TicTack
             UsnPollIntervalMs = 200;
             UsnParentPrefilter = true;
             Usn = false;
+            PollingBackstop = true;
         }
     }
 
@@ -203,6 +211,12 @@ namespace TicTack
         public string? Time { get; set; }
         public string? Command { get; set; }
         public string? WorkingDir { get; set; }
+        public int TimeoutMinutes { get; set; }
+
+        public JobConfig()
+        {
+            TimeoutMinutes = 10;
+        }
     }
 
     public class WatchdogConfig
@@ -287,6 +301,9 @@ namespace TicTack
             if (cfg.Monitor != null && cfg.Monitor.Usn
                 && !string.Equals(cfg.Monitor.Type, "composite", StringComparison.OrdinalIgnoreCase))
                 log.Warn("monitor.usn only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'.");
+            if (cfg.Monitor != null && !cfg.Monitor.PollingBackstop
+                && !string.Equals(cfg.Monitor.Type, "composite", StringComparison.OrdinalIgnoreCase))
+                log.Warn("monitor.polling_backstop only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'.");
             if (double.IsNaN(cfg.VolumeWaitMinutes) || cfg.VolumeWaitMinutes < 0)
             {
                 log.Error("volume_wait_minutes must be >= 0 (got: " + cfg.VolumeWaitMinutes + ")");

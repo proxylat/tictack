@@ -154,7 +154,8 @@ internal static class Repro
             using var pipeline = new SyncPipeline(src, monitor, comparer, copyAction, renameAction,
                 retry, validator, versioning, deletion, log, stateDb,
                 autoExcludePrefixes: Array.Empty<string>(),
-                deferredPath: Path.Combine(root, "tictack-deferred-src.json"));
+                deferredDir: root,
+                deferredFilePrefix: "tictack-deferred-src");
             Mark("pipeline constructed");
             Mark("starting initial sync (RunOnceAsync)");
             var ok = await pipeline.RunOnceAsync();

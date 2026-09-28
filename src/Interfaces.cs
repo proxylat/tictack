@@ -143,6 +143,15 @@ namespace TicTack
         void Stop();
     }
 
+    // A monitor that can report coverage gaps it knows about (watcher
+    // buffer overflow, USN journal re-baseline). The pipeline answers
+    // with an on-demand covering scan, so the hourly polling backstop
+    // can stay off without losing any change the gap may have hidden.
+    public interface IGapSource
+    {
+        event EventHandler? GapDetected;
+    }
+
     public enum VerificationLevel { Size, DateAndSize, Hash, Full }
 
     public interface IFileComparer

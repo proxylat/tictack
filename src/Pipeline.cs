@@ -35,6 +35,8 @@ namespace TicTack
         private bool _started;
         private Task? _processor;
         private Task<bool>? _initialSync;
+        // Coalesces concurrent on-demand covering scans to one run.
+        private int _scanRunning;
         private readonly List<Task> _deferredTasks = new List<Task>();
         private readonly object _taskLock = new object();
         private Timer? _startRetryTimer;
@@ -70,7 +72,8 @@ namespace TicTack
             ILogger log,
             StateDb? stateDb = null,
             string[]? autoExcludePrefixes = null,
-            string? deferredPath = null,
+            string? deferredDir = null,
+            string? deferredFilePrefix = null,
             Func<string, bool>? directoryExists = null,
             Func<string, SearchOption, IEnumerable<string>>? enumerateFiles = null,
             Func<string, SearchOption, IEnumerable<string>>? enumerateDirectories = null,
@@ -114,7 +117,10 @@ namespace TicTack
             _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(_config.Path, () => pendingEvents.Count);
 
             var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : SyncConfig.DefaultDeleteHoldDays;
-            _deferred = new DeferredDeletion(deferredPath ?? Path.Combine(_config.Destination, ".tictack-deferred.json"), holdDays, _log);
+            _deferred = new DeferredDeletion(
+                deferredDir ?? _config.Destination,
+                deferredFilePrefix ?? "tictack-deferred",
+                holdDays, _log);
 
             var filters = new List<IFileFilter>();
             if (_config.Filter != null && _config.Filter.Exclude != null && _config.Filter.Exclude.Count > 0)
@@ -191,10 +197,10 @@ namespace TicTack
             _completer?.Start(_cts!.Token);
             _initialSync = Task.Run(() => InitialSyncAsync());
             _processor = Task.Run(() => ProcessLoop());
-            // Arm the hourly deferred-deletion recheck only when something is
-            // actually pending (e.g. persisted from a previous run). Recording
-            // new pending deletions arms it too; the check itself still runs
-            // hourly and still early-returns once nothing is pending.
+            // Arm the deadline deferred-deletion recheck only when something
+            // is actually pending (e.g. persisted from a previous run).
+            // Recording new pending deletions arms it too; the timer fires
+            // once at the next expiry/warning deadline, never periodically.
             if (_deferred.HasPending) ArmDeferredCheckTimer();
             _parityTimer = new Timer(_ => QueueParityCheck(), null, TimeSpan.FromHours(6), TimeSpan.FromHours(6));
         }
@@ -247,6 +253,13 @@ namespace TicTack
             _debounce[e.FullPath] = DateTime.UtcNow.AddSeconds(_config.DebounceSeconds);
             _pendingEvents[e.FullPath] = e;
             _drain.Signal(e.FullPath, _debounce[e.FullPath]);
+            // Restore fast path: a reappearing file drops its hold row by
+            // indexed key. CancelIfPending is a no-op without I/O unless
+            // holds exist, so the steady-state hot path stays untouched.
+            if (e.ChangeType != ChangeType.Deleted)
+            {
+                try { _deferred.CancelIfPending(e.FullPath); } catch { }
+            }
             _signal.Release();
         }
 
@@ -313,7 +326,38 @@ namespace TicTack
             }
         }
 
-        private async Task<bool> InitialSyncAsync()
+        // On-demand covering scan for monitor gap signals (watcher
+        // overflow, USN re-baseline). Reuses the bounded chunked scan +
+        // trailing parity of initial sync, so creates, modifies AND
+        // deletes are covered with nothing retained after. Concurrent
+        // requests coalesce to one scan; requests while the startup
+        // scan is still running are dropped (it covers everything).
+        public Task<bool> RequestRescanAsync()
+        {
+            if (!_started) return Task.FromResult(false);
+            if (_initialSync != null && !_initialSync.IsCompleted) return Task.FromResult(false);
+            if (!TryClaimScan()) return Task.FromResult(false);
+            return RescanAsync();
+        }
+
+        // Testable coalescing mechanism: only one covering scan runs at a
+        // time; concurrent RequestRescanAsync calls drop to false.
+        internal bool TryClaimScan() => Interlocked.Exchange(ref _scanRunning, 1) == 0;
+        internal void ReleaseScan() => Interlocked.Exchange(ref _scanRunning, 0);
+
+        private async Task<bool> RescanAsync()
+        {
+            try
+            {
+                _log.Info("Gap-triggered rescan starting: " + _config.Path);
+                return await ScanAndSyncAsync("Gap rescan");
+            }
+            finally { ReleaseScan(); }
+        }
+
+        private Task<bool> InitialSyncAsync() => ScanAndSyncAsync("Initial sync");
+
+        private async Task<bool> ScanAndSyncAsync(string reason)
         {
             if (!_directoryExists(_config.Path)) return false;
             // No snapshot: per-file point lookups via TryGetStateAsync keep
@@ -333,7 +377,7 @@ namespace TicTack
                 ? new DirSyncBatcher() : null;
             if (_copyAction is CopyAction batchCopy) batchCopy.DirBatch = dirBatch;
             var scanStart = DateTime.UtcNow;
-            _log.Info("Initial sync scan starting: " + _config.Path);
+            _log.Info(reason + " scan starting: " + _config.Path);
 
             void FlushState()
             {
@@ -403,7 +447,7 @@ namespace TicTack
                     {
                         var n = Interlocked.Increment(ref scanned);
                         if (n % 1000 == 0)
-                            _log.Debug($"Initial sync progress: {n} scanned, {Interlocked.Read(ref copied)} copied, {Interlocked.Read(ref skipped)} skipped ({(DateTime.UtcNow - scanStart).TotalSeconds:F0}s): " + _config.Path);
+                            _log.Debug($"{reason} progress: {n} scanned, {Interlocked.Read(ref copied)} copied, {Interlocked.Read(ref skipped)} skipped ({(DateTime.UtcNow - scanStart).TotalSeconds:F0}s): " + _config.Path);
                         if (!FileSnapshot.TryRead(f, out var sourceSnapshot))
                         {
                             Interlocked.Exchange(ref scanFailed, 1);
@@ -455,7 +499,7 @@ namespace TicTack
                         };
                         var fresh = await ExecuteCopyAsync(args,
                             CopyWithRetryAsync,
-                            "Initial sync failed", "Initial sync validation FAILED", token, batchUpsert);
+                            reason + " failed", reason + " validation FAILED", token, batchUpsert);
                         if (fresh == null) return;
 
                         if (!UsePipelined(batchUpsert) && _stateDb != null)
@@ -472,7 +516,7 @@ namespace TicTack
                     catch (Exception ex)
                     {
                         Interlocked.Exchange(ref scanFailed, 1);
-                        _log.Error("Initial sync failed: " + f, ex);
+                        _log.Error(reason + " failed: " + f, ex);
                     }
                 }
 
@@ -848,6 +892,7 @@ namespace TicTack
             _queueCounter?.Dispose();
             _monitor.Dispose();
             if (_stateDb != null) _stateDb.Dispose();
+            _deferred.Dispose();
             if (_lock != null) _lock.Dispose();
         }
 
@@ -858,37 +903,72 @@ namespace TicTack
             _signal.Release();
         }
 
+        // One-shot deadline timer: fires once at the next hold expiry or
+        // due daily warning, then re-arms. Nothing pending means disarmed —
+        // zero wake-ups, zero scans, zero disk writes while waiting.
         private void ArmDeferredCheckTimer()
         {
             lock (_taskLock)
             {
-                _deferredCheckTimer ??= new Timer(_ => CheckDeferredDeletions(), null, TimeSpan.FromHours(1), TimeSpan.FromHours(1));
+                if (_disposed || _cts == null || _cts.IsCancellationRequested) return;
+                DateTime? due;
+                try { due = _deferred.NextDueUtc(); }
+                catch { return; }
+                if (due == null)
+                {
+                    try { _deferredCheckTimer?.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
+                    return;
+                }
+                var delay = due.Value - DateTime.UtcNow;
+                if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
+                if (_deferredCheckTimer == null)
+                    _deferredCheckTimer = new Timer(_ => CheckDeferredDeletions(), null, delay, Timeout.InfiniteTimeSpan);
+                else
+                {
+                    try { _deferredCheckTimer.Change(delay, Timeout.InfiniteTimeSpan); } catch { }
+                }
             }
         }
 
         private void CheckDeferredDeletions()
         {
-            if (!_deferred.HasPending) return;
-
-            var action = _deferred.Check();
-            if (action.Type == DeferredActionType.Proceed)
+            lock (_taskLock)
             {
-                _log.Warn("Deferred deletion: proceeding with " + (action.Files?.Count ?? 0) + " files");
+                if (_disposed || _cts == null || _cts.IsCancellationRequested) return;
                 var task = Task.Run(async () =>
                 {
-                    foreach (var f in action.Files!)
-                    {
-                        var rel = PathUtil.Relative(f, _config.Path);
-                        var destPath = Path.Combine(_config.Destination, rel);
-                        await _deleter.DeleteAsync(f, destPath, rel, "Deferred deletion failed", CancellationToken.None);
-                    }
+                    try { await CheckDeferredDeletionsAsync(); }
+                    catch (Exception ex) { _log.Error("Deferred deletion check failed", ex); }
+                    finally { ArmDeferredCheckTimer(); }
                 });
-                lock (_taskLock) _deferredTasks.Add(task);
+                _deferredTasks.Add(task);
             }
-            else if (action.Type == DeferredActionType.Cancel)
+        }
+
+        // Expiry drains in bounded 500-path chunks so a 2M-file hold never
+        // materializes a second in-memory list; warnings are metadata-only.
+        private async Task CheckDeferredDeletionsAsync()
+        {
+            _deferred.CheckWarnings();
+            var total = 0;
+            var cancelled = 0;
+            while (true)
             {
-                _log.Info("Deferred deletion: cancelled, files reappeared");
+                var chunk = _deferred.TakeExpiredChunk(500);
+                cancelled += chunk.Cancelled;
+                if (chunk.Files.Count == 0) break;
+                total += chunk.Files.Count;
+                foreach (var f in chunk.Files)
+                {
+                    var rel = PathUtil.Relative(f, _config.Path);
+                    var destPath = Path.Combine(_config.Destination, rel);
+                    await _deleter.DeleteAsync(f, destPath, rel, "Deferred deletion failed", CancellationToken.None);
+                }
             }
+            if (total > 0)
+                _log.Warn("Deferred deletion: proceeding with " + total + " files");
+            else if (cancelled > 0)
+                _log.Info("Deferred deletion: cancelled, files reappeared");
         }
 
     }

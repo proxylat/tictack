@@ -87,11 +87,11 @@ public class SchedulerTests
     }
 
     [Fact]
-    public void TimeoutMessage_DerivesTheMinutesFromProcessRunner()
+    public void TimeoutMessage_ReportsTheConfiguredMinutes()
     {
-        var message = TimerScheduler.TimeoutMessage("backup");
-
-        Assert.Equal("Job 'backup' timed out after " + (ProcessRunner.TimeoutMs / 60000) + " minutes, killed", message);
-        Assert.Contains("10 minutes", message);
+        Assert.Equal("Job 'backup' timed out after 10 minutes, killed",
+            TimerScheduler.TimeoutMessage("backup", 10));
+        Assert.Equal("Job 'workbck' timed out after 45 minutes, killed",
+            TimerScheduler.TimeoutMessage("workbck", 45));
     }
 }

@@ -50,6 +50,7 @@ monitor:
   type: watcher
   watcher_buffer_kb: 1024
   polling_interval_seconds: 300
+  polling_backstop: true # composite-only: false drops the polling member when the usn member is healthy (zero snapshot memory; gaps fire on-demand scans)
   restart_delay_seconds: 10
 
 logging:
