@@ -403,15 +403,18 @@ public class PipelineTests : IDisposable
         var dbFile = string.Empty;
         WaitFor(() =>
         {
+            // The .db appears at open (possibly zero-length, rows still in
+            // -wal); the commit log fires after the insert transaction, so
+            // require both before asserting.
             dbFile = Directory.GetFiles(_dstDir, "tictack-deferred.db").FirstOrDefault() ?? string.Empty;
-            return dbFile.Length > 0;
+            return dbFile.Length > 0 && _log.Messages.Any(m => m.Contains("total held"));
         }, "deferred record");
 
         Assert.Empty(_deletion.Calls);
         Assert.True(File.Exists(destA));
         Assert.True(File.Exists(destB));
         Assert.Contains(_log.Messages, m => m.Contains("Delete guard"));
-        Assert.True(new FileInfo(dbFile).Length > 0);
+        Assert.True(File.Exists(dbFile));
     }
 
     [Fact]
