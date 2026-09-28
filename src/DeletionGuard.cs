@@ -9,7 +9,7 @@ namespace TicTack
     // Delete-threshold guard batching, moved verbatim out of SyncPipeline.
     // Collects source-deleted paths via Add; FlushAsync evaluates the
     // count/size/percent guards and either defers (records + arms the
-    // hourly recheck through onDefer) or deletes through TrackedDeleter.
+    // deadline recheck through onDefer) or deletes through TrackedDeleter.
     internal sealed class DeletionGuard
     {
         private readonly SourceConfig _config;

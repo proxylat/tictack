@@ -140,6 +140,41 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task RequestRescan_SyncsNewFileAndRemovesStaleDestFile()
+    {
+        // Seed through the live event path so state and dest agree first.
+        foreach (var name in new[] { "keep1.txt", "keep2.txt", "gone.txt" })
+        {
+            var p = Path.Combine(_srcDir, name);
+            File.WriteAllText(p, "x");
+            _monitor.Fire(ChangeType.Created, p);
+        }
+        WaitFor(() => _db.LoadAll().Count >= 3, "seed sync");
+
+        // The gap the Modified-only watcher rescan cannot see: a delete
+        // plus a create with no events fired for either.
+        File.Delete(Path.Combine(_srcDir, "gone.txt"));
+        File.WriteAllText(Path.Combine(_srcDir, "fresh.txt"), "fresh");
+
+        Assert.True(await _pipeline.RequestRescanAsync());
+        Assert.True(File.Exists(Path.Combine(_dstDir, "fresh.txt")));
+        Assert.False(File.Exists(Path.Combine(_dstDir, "gone.txt")));
+    }
+
+    [Fact]
+    public void ScanGuard_SecondClaimFailsWhileHeld()
+    {
+        // Deterministic coalescing proof: an empty-dir scan can finish
+        // synchronously, so back-to-back RequestRescanAsync calls cannot
+        // reliably observe the busy state. The guard they share can.
+        Assert.True(_pipeline.TryClaimScan());
+        Assert.False(_pipeline.TryClaimScan());
+        _pipeline.ReleaseScan();
+        Assert.True(_pipeline.TryClaimScan());
+        _pipeline.ReleaseScan();
+    }
+
+    [Fact]
     public void Deleted_InvokesDeletionStrategy_AndRemovesState()
     {
         _db.Upsert("gone.txt", 1, 1);
@@ -365,16 +400,18 @@ public class PipelineTests : IDisposable
         _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "a.txt"));
         _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "b.txt"));
 
-        var deferredPath = Path.Combine(_dstDir, ".tictack-deferred.json");
-        WaitFor(() => File.Exists(deferredPath), "deferred record");
+        var dbFile = string.Empty;
+        WaitFor(() =>
+        {
+            dbFile = Directory.GetFiles(_dstDir, "tictack-deferred.db").FirstOrDefault() ?? string.Empty;
+            return dbFile.Length > 0;
+        }, "deferred record");
 
         Assert.Empty(_deletion.Calls);
         Assert.True(File.Exists(destA));
         Assert.True(File.Exists(destB));
         Assert.Contains(_log.Messages, m => m.Contains("Delete guard"));
-        var deferred = File.ReadAllText(deferredPath);
-        Assert.Contains("a.txt", deferred);
-        Assert.Contains("b.txt", deferred);
+        Assert.True(new FileInfo(dbFile).Length > 0);
     }
 
     [Fact]

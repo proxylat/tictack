@@ -134,4 +134,31 @@ public class MonitorTests : IDisposable
         Assert.True(DateTime.UtcNow - start < TimeSpan.FromSeconds(9),
             "Start blocked waiting for a watcher that never armed");
     }
+
+    [Theory]
+    [MemberData(nameof(GapSourceMonitors))]
+    public void GapSource_SignalGap_FiresAndContainsThrowingSubscriber(Func<string, IGapSource> create)
+    {
+        // No Start(): the gap signal is independent of the watch loop, and
+        // UsnJournalMonitor.Start throws off-Windows by design.
+        using var _ = (IDisposable)create(_dir);
+        var monitor = (IGapSource)_;
+        var count = 0;
+        monitor.GapDetected += (_, _) => count++;
+        monitor.GapDetected += (_, _) => throw new InvalidOperationException("bad subscriber");
+
+        if (monitor is FileWatcherMonitor w) w.SignalGap();
+        else if (monitor is FsWatchMonitor f) f.SignalGap();
+        else if (monitor is UsnJournalMonitor u) u.SignalGap();
+        else throw new InvalidOperationException("unknown monitor");
+
+        Assert.Equal(1, count);
+    }
+
+    public static TheoryData<Func<string, IGapSource>> GapSourceMonitors => new()
+    {
+        dir => new FileWatcherMonitor(dir),
+        dir => new FsWatchMonitor(dir),
+        dir => new UsnJournalMonitor(dir),
+    };
 }

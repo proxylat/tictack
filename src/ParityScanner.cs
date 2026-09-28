@@ -81,6 +81,12 @@ namespace TicTack
                     if (ct.IsCancellationRequested) return;
                     var name = Path.GetFileName(f);
                     if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
+                    // Our own hold ledger must never look like a stale file:
+                    // archiving it would silently cancel deferred holds.
+                    if (name.StartsWith("tictack-deferred-", StringComparison.OrdinalIgnoreCase)
+                        && (name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+                            || name.EndsWith(".db", StringComparison.OrdinalIgnoreCase)
+                            || name.IndexOf(".db-", StringComparison.OrdinalIgnoreCase) >= 0)) continue;
                     var rel = PathUtil.Relative(f, _config.Destination);
                     if (UnderDir(rel, ".archive") || UnderDir(rel, ".versions")) continue;
                     if (sourcePaths.Contains(rel)) continue;

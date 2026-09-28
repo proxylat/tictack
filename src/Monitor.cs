@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -9,7 +8,7 @@ using System.Threading;
 
 namespace TicTack
 {
-    public class FileWatcherMonitor : IFileMonitor
+    public class FileWatcherMonitor : IFileMonitor, IGapSource
     {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess,
@@ -58,6 +57,7 @@ namespace TicTack
 
         public event EventHandler<FileChangedEventArgs>? Changed;
         public event EventHandler<MonitorErrorEventArgs>? Error;
+        public event EventHandler? GapDetected;
 
         public FileWatcherMonitor(string path, int bufferKb = 256, int restartDelaySec = 10)
         {
@@ -124,6 +124,7 @@ namespace TicTack
                         {
                             FireError(new IOException("ReadDirectoryChangesW buffer overflow; rescanning"));
                             Rescan();
+                            SignalGap();
                             break;
                         }
                         ParseEvents(buf, ret);
@@ -193,6 +194,15 @@ namespace TicTack
 
         private void Rescan() =>
             MonitorRescan.FireModifiedFiles(_path, FireError, (t, p) => FireChanged(t, p));
+
+        // Coverage-gap signal: the overflow above may have hidden changes
+        // (including deletes the Modified-only rescan cannot see). The
+        // pipeline answers with an on-demand covering scan.
+        internal void SignalGap()
+        {
+            try { GapDetected?.Invoke(this, EventArgs.Empty); }
+            catch { }
+        }
 
         private void FlushRename()
         {
@@ -332,6 +342,10 @@ namespace TicTack
 
                 _snapshot = current;
                 _scratch = prev;
+                // Release the stale tree between polls: prev still holds a
+                // full set of path strings. Clear drops the references
+                // (memory freed) while keeping the buckets for reuse.
+                _scratch.Clear();
             }
             catch (Exception ex) { FireError(ex); }
             finally { Interlocked.Exchange(ref _scanning, 0); }
@@ -439,7 +453,7 @@ namespace TicTack
 
     // Cross-platform watcher (System.IO.FileSystemWatcher) — used on non-Windows where
     // FileWatcherMonitor's ReadDirectoryChangesW P/Invoke is unavailable.
-    public class FsWatchMonitor : IFileMonitor
+    public class FsWatchMonitor : IFileMonitor, IGapSource
     {
         private readonly string _path;
         private readonly int _bufferSize;
@@ -450,6 +464,7 @@ namespace TicTack
 
         public event EventHandler<FileChangedEventArgs>? Changed;
         public event EventHandler<MonitorErrorEventArgs>? Error;
+        public event EventHandler? GapDetected;
 
         public FsWatchMonitor(string path, int bufferKb = 256, int restartDelaySec = 10)
         {
@@ -489,6 +504,7 @@ namespace TicTack
                         {
                             try { watcher.Dispose(); } catch { }
                             Rescan();
+                            SignalGap();
                             while (!_stopping)
                             {
                                 Thread.Sleep(_restartDelaySec * 1000);
@@ -510,6 +526,14 @@ namespace TicTack
 
         private void Rescan() =>
             MonitorRescan.FireModifiedFiles(_path, FireError, (t, p) => FireChanged(t, p));
+
+        // Coverage-gap signal: a watcher error/restart may have hidden
+        // changes (including deletes the Modified-only rescan cannot see).
+        internal void SignalGap()
+        {
+            try { GapDetected?.Invoke(this, EventArgs.Empty); }
+            catch { }
+        }
 
         private void FireChanged(ChangeType type, string path, string? oldPath = null)
         {
@@ -558,7 +582,7 @@ namespace TicTack
     // by the cursor (restart re-baselines at the current NextUsn); they are
     // covered by InitialSync, which reconciles every source->dest difference
     // on startup. Pair with composite mode when the gap matters live.
-    public class UsnJournalMonitor : IFileMonitor
+    public class UsnJournalMonitor : IFileMonitor, IGapSource
     {
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess,
@@ -771,6 +795,7 @@ namespace TicTack
 
         public event EventHandler<FileChangedEventArgs>? Changed;
         public event EventHandler<MonitorErrorEventArgs>? Error;
+        public event EventHandler? GapDetected;
 
         public UsnJournalMonitor(string path, int restartDelaySec = 10, int pollIntervalMs = 200,
             bool parentPrefilter = true, ILogger? log = null)
@@ -910,7 +935,6 @@ namespace TicTack
                         + (_prefilterActive ? "on (" + _watchDirFrns.Count + " dirs)" : "off"));
                     _armed.Set();
                     var buf = new byte[64 * 1024];
-                    var lastStats = Stopwatch.StartNew();
                     while (!_stopping)
                     {
                         List<UsnRecord>? records = null;
@@ -919,11 +943,12 @@ namespace TicTack
                         {
                             // Journal recreated/deleted underneath us: the gap
                             // is real, so say so, then re-baseline at the new
-                            // head. InitialSync (or composite's polling leg)
-                            // covers the missed range.
+                            // head. The gap signal fires an on-demand covering
+                            // scan; the polling leg covers it otherwise.
                             FireError(ex);
                             _log?.Info("USN journal changed underneath, re-baselining at new head"
-                                + " (gap covered by InitialSync/polling leg).");
+                                + " (gap covered by on-demand rescan).");
+                            SignalGap();
                             break;
                         }
                         if (records != null)
@@ -945,14 +970,6 @@ namespace TicTack
                                     Dispatch(rec);
                                 }
                             }
-                        }
-                        if (lastStats.Elapsed >= TimeSpan.FromMinutes(30))
-                        {
-                            _log?.Info("USN stats [" + _path + "]: records=" + _recordsSeen
-                                + " events=" + _eventsEmitted
-                                + " prefiltered=" + PrefilteredSkips
-                                + " resolveFailures=" + ResolveFailures);
-                            lastStats.Restart();
                         }
                     }
                 }
@@ -978,6 +995,15 @@ namespace TicTack
             if (!IsWatchedParent(rec.ParentRef)) { PrefilteredSkips++; return; }
             var evt = TranslateRecord(rec, ResolvePath);
             if (evt != null) { _eventsEmitted++; FireChanged(evt.ChangeType, evt.FullPath, evt.OldFullPath); }
+        }
+
+        // Coverage-gap signal: a journal re-baseline skips the records
+        // between the old cursor and the new head. The pipeline answers
+        // with an on-demand covering scan.
+        internal void SignalGap()
+        {
+            try { GapDetected?.Invoke(this, EventArgs.Empty); }
+            catch { }
         }
 
         // Pure translation step, separated for testing: parse and rename

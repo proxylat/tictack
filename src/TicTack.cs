@@ -292,12 +292,25 @@ namespace TicTack
                 try
                 {
                     using var pipeline = BuildPipeline(src, cfg, log);
-                    var deferredFile = Path.Combine(deferredDir, DeferredFileName(src));
+                    // Rebuild resets everything: state rows, the whole hold
+                    // store (SQLite .db + sidecars, every legacy batch file
+                    // and legacy name), then re-syncs from scratch.
+                    var deferredPrefix = DeferredFilePrefix(src);
+                    try
+                    {
+                        foreach (var f in Directory.EnumerateFiles(deferredDir, deferredPrefix + "-*.json"))
+                            DeleteWithRetry(f);
+                    }
+                    catch (Exception ex) { log.Debug("Rebuild deferred cleanup skipped: " + ex.Message); }
+                    var deferredDb = Path.Combine(deferredDir, deferredPrefix + ".db");
+                    DeleteWithRetry(deferredDb);
+                    foreach (var ext in new[] { "-wal", "-shm", "-journal" })
+                        DeleteWithRetry(deferredDb + ext);
+                    DeleteWithRetry(Path.Combine(deferredDir, LegacyDeferredFileName(src)));
+                    DeleteWithRetry(Path.Combine(src.Destination, ".tictack-deferred.json"));
                     var rebuilt = await pipeline.RunOnceAsync(() =>
                     {
                         pipeline.ResetState();
-                        DeleteWithRetry(deferredFile);
-                        DeleteWithRetry(Path.Combine(src.Destination, ".tictack-deferred.json"));
                         return Task.CompletedTask;
                     });
                     if (rebuilt)
@@ -386,17 +399,80 @@ namespace TicTack
             return string.IsNullOrEmpty(name) ? "default" : name;
         }
 
-        internal static string DeferredFileName(SourceConfig src) =>
+        internal static string DeferredFilePrefix(SourceConfig src) =>
+            "tictack-deferred-" + SourceName(src).ToLowerInvariant() + "-" + DeferredDeletion.StableHash(src.Path);
+
+        internal static string LegacyDeferredFileName(SourceConfig src) =>
             "tictack-deferred-" + SourceName(src).ToLowerInvariant() + ".json";
 
-        static string GetStateDbPath(SourceConfig src)
+        internal static string DeferredDbPath(string deferredDir, SourceConfig src) =>
+            Path.Combine(deferredDir, DeferredFilePrefix(src) + ".db");
+
+        // Leaf name plus a stable hash of the full source path: two sources
+        // sharing a folder name (C:\a\Desktop vs D:\b\Desktop) must not
+        // share one .db. One-time move from the legacy leaf-only name so
+        // existing installs keep their state (plus WAL sidecars).
+        internal static string GetStateDbPath(SourceConfig src)
         {
             var root = !string.IsNullOrEmpty(src.StateDbPath)
                 ? src.StateDbPath
                 : OperatingSystem.IsWindows()
                     ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TicTack")
                     : "/var/lib/tictack";
-            return Path.Combine(root, SourceName(src) + ".db");
+            var path = Path.Combine(root, SourceName(src) + "-" + DeferredDeletion.StableHash(src.Path) + ".db");
+            var legacy = Path.Combine(root, SourceName(src) + ".db");
+            if (!File.Exists(path) && File.Exists(legacy))
+            {
+                try
+                {
+                    File.Move(legacy, path);
+                    foreach (var ext in new[] { "-wal", "-shm" })
+                    {
+                        var side = legacy + ext;
+                        if (File.Exists(side)) File.Move(side, path + ext);
+                    }
+                }
+                catch { }
+            }
+            return path;
+        }
+
+        // Testable composite member selection: watcher always, USN when
+        // probed OK, polling unless explicitly stood down with a healthy
+        // USN member. Factories are injected so tests use fakes (USN
+        // probing needs Windows + elevation).
+        internal static List<IFileMonitor> BuildCompositeMembers(
+            MonitorConfig monitorConfig, string path,
+            Func<IFileMonitor> createWatcher, Func<IFileMonitor?> tryCreateUsn)
+        {
+            var members = new List<IFileMonitor> { createWatcher() };
+            // Defense in depth: the journal cursor is an independent
+            // observer alongside the lossy watcher. Path-keyed
+            // dedup in the pipeline collapses the doubled events.
+            // Probe-skips (non-Windows, unelevated) with a warn.
+            IFileMonitor? usn = null;
+            if (monitorConfig.Usn)
+                usn = tryCreateUsn();
+            if (usn != null) members.Add(usn);
+            // Stand-down: with a healthy USN member, watcher overflows and
+            // journal re-baselines fire on-demand covering scans, so the
+            // hourly polling snapshot is pure redundancy. Kept automatically
+            // when USN is unavailable: always a backstop.
+            if (monitorConfig.PollingBackstop || usn == null)
+                members.Add(new PollingMonitor(path, monitorConfig.PollingIntervalSeconds));
+            return members;
+        }
+
+        internal static string DescribeMembers(List<IFileMonitor> members, MonitorConfig monitorConfig)
+        {
+            var parts = new List<string>();
+            foreach (var m in members)
+            {
+                if (m is PollingMonitor) parts.Add("polling every " + monitorConfig.PollingIntervalSeconds + "s");
+                else if (m is UsnJournalMonitor) parts.Add("usn");
+                else parts.Add("watcher");
+            }
+            return string.Join(" + ", parts);
         }
 
         internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log, bool logMonitorStartup = false)
@@ -432,6 +508,7 @@ namespace TicTack
             }
 
             IFileMonitor monitor;
+            List<IFileMonitor>? compositeMembers = null;
             var monitorConfig = cfg.Monitor ?? new MonitorConfig();
             IFileAccessor CreateAccessorOrFallback(SourceConfig s, ILogger l)
             {
@@ -498,23 +575,11 @@ namespace TicTack
                         log.Info("Monitor: polling on " + src.Path + " (every " + monitorConfig.PollingIntervalSeconds + "s).");
                     break;
                 default:
-                    var members = new List<IFileMonitor>
-                    {
-                        CreateWatcher(),
-                        new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds)
-                    };
-                    // Defense in depth: the journal cursor is an independent
-                    // observer alongside the lossy watcher. Path-keyed
-                    // dedup in the pipeline collapses the doubled events.
-                    // Probe-skips (non-Windows, unelevated) with a warn.
-                    if (monitorConfig.Usn)
-                    {
-                        var usn = TryCreateUsn("skipping USN member");
-                        if (usn != null) members.Add(usn);
-                    }
-                    monitor = new CompositeMonitor(members.ToArray());
+                    compositeMembers = BuildCompositeMembers(
+                        monitorConfig, src.Path, CreateWatcher, () => TryCreateUsn("skipping USN member"));
+                    monitor = new CompositeMonitor(compositeMembers.ToArray());
                     if (logMonitorStartup)
-                        log.Info("Monitor: composite (watcher + polling every " + monitorConfig.PollingIntervalSeconds + "s" + (members.Count > 2 ? " + usn" : "") + ") on " + src.Path + ".");
+                        log.Info("Monitor: composite (" + DescribeMembers(compositeMembers, monitorConfig) + ") on " + src.Path + ".");
                     break;
             }
 
@@ -531,24 +596,44 @@ namespace TicTack
             if (logDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase) && !excludes.Contains(logDir))
                 excludes.Add(logDir);
 
-            var deferredPath = Path.Combine(Path.GetDirectoryName(logPath) ?? baseDir, DeferredFileName(src));
+            var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
+            var deferredPrefix = DeferredFilePrefix(src);
             var legacyDeferred = Path.Combine(src.Destination, ".tictack-deferred.json");
             try
             {
-                if (!File.Exists(deferredPath) && File.Exists(legacyDeferred))
+                // Old dest-side single file moves to the legacy per-source
+                // name; DeferredDeletion migrates it into the hold database.
+                var legacyTarget = Path.Combine(deferredDir, LegacyDeferredFileName(src));
+                // Legacy dest file first: short-circuits before any directory
+                // enumeration on fresh installs.
+                if (File.Exists(legacyDeferred) && !File.Exists(legacyTarget)
+                    && Directory.EnumerateFiles(deferredDir, deferredPrefix + "-*.json").FirstOrDefault() == null)
                 {
-                    var dd = Path.GetDirectoryName(deferredPath);
-                    if (!string.IsNullOrEmpty(dd) && !Directory.Exists(dd))
-                        Directory.CreateDirectory(dd);
-                    File.Move(legacyDeferred, deferredPath);
+                    if (!Directory.Exists(deferredDir))
+                        Directory.CreateDirectory(deferredDir);
+                    File.Move(legacyDeferred, legacyTarget);
                 }
             }
             catch (Exception ex) { log.Warn("Legacy deferred-state migration failed: " + ex.Message); }
 
-            return new SyncPipeline(src, monitor, comparer, copyAction, renameAction,
+            var pipeline = new SyncPipeline(src, monitor, comparer, copyAction, renameAction,
                 retry, validator, versioning, deletion, log, stateDb,
                 autoExcludePrefixes: excludes.ToArray(),
-                deferredPath: deferredPath);
+                deferredDir: deferredDir,
+                deferredFilePrefix: deferredPrefix);
+            // Gap-triggered covering scans: watcher overflows and USN
+            // re-baselines fire GapDetected; the pipeline answers with an
+            // on-demand scan (creates + modifies + deletes, nothing
+            // retained). Works with or without the polling member.
+            if (compositeMembers != null)
+            {
+                foreach (var m in compositeMembers)
+                {
+                    if (m is IGapSource gap)
+                        gap.GapDetected += (s, e) => { try { _ = pipeline.RequestRescanAsync(); } catch { } };
+                }
+            }
+            return pipeline;
         }
     }
 }

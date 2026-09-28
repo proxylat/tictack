@@ -1,185 +1,694 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Data.Sqlite;
 
 namespace TicTack
 {
-    // Source-generated JSON metadata: no runtime reflection or codegen,
-    // so deferred-state persistence works under NativeAOT/trimming.
+    // Source-generated JSON metadata: only used for the one-time migration
+    // of pre-SQLite batch files. No runtime reflection, AOT/trimming safe.
     [JsonSerializable(typeof(DeferredDeletion.DeferredState))]
     internal sealed partial class DeferredDeletionJsonContext : JsonSerializerContext
     {
     }
 
-    public sealed class DeferredDeletion
+    // SQLite-backed deferred deletions: every blocked batch gets its own
+    // hold clock (BlockedAt identity), all paths live in one indexed table.
+    // The .db file is the source of truth — deleting it (while stopped, or
+    // on Linux while running) cancels every hold for that source, keeping
+    // destination files. That is the only fail-safe reading: no file means
+    // no pending work, never mass deletion. When the last hold clears, the
+    // .db (+ WAL sidecars) is deleted, so idle state is zero files, zero
+    // RAM, zero timers. Production expiry uses TakeExpiredChunk (bounded);
+    // Check is the small-scale/test compat wrapper.
+    public sealed class DeferredDeletion : IDisposable
     {
+        private const int ChunkSize = 500;
+
+        private readonly string _dir;
+        private readonly string _prefix;
+        private readonly string? _legacyName;
         private readonly string _dbPath;
         private readonly int _holdDays;
         private readonly ILogger _log;
         private readonly object _lock = new object();
-        private DeferredState? _state;
-        // Windows paths are case-insensitive; Linux is not, so 'a.txt' and
-        // 'A.txt' must both stay in the pending set there.
-        private static readonly StringComparer PathComparer =
-            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        private SqliteConnection? _conn;
+        private bool _hasPending;
+        private bool _disposed;
 
-        public DeferredDeletion(string dbPath, int holdDays, ILogger log)
+        public DeferredDeletion(string directory, string filePrefix, int holdDays, ILogger log, string? legacyFileName = null)
         {
-            _dbPath = dbPath;
+            _dir = directory;
+            _prefix = filePrefix;
+            _legacyName = legacyFileName;
+            _dbPath = Path.Combine(directory, filePrefix + ".db");
             _holdDays = holdDays;
             _log = log;
-            Load();
+            try
+            {
+                if (Directory.Exists(_dir) && (File.Exists(_dbPath) || HasJsonBatches() || HasLegacyFile()))
+                {
+                    EnsureConn();
+                    MigrateJsonBatches();
+                    _hasPending = CountInternal() > 0;
+                    if (!_hasPending)
+                        DeleteStoreFiles();
+                }
+            }
+            catch (Exception ex) { _log.Warn("Deferred deletion state could not be loaded: " + _dir + " (" + ex.Message + ")"); }
         }
+
+        internal string DbPath => _dbPath;
+
+        // Stable across runs (string.GetHashCode is not): two sources with
+        // the same folder name must not share one batch namespace.
+        internal static string StableHash(string text)
+        {
+            unchecked
+            {
+                uint h = 2166136261;
+                foreach (var c in text.ToUpperInvariant())
+                {
+                    h ^= c;
+                    h *= 16777619;
+                }
+                return h.ToString("x8", CultureInfo.InvariantCulture);
+            }
+        }
+
+        internal static string BatchTimestamp(DateTime blockedAt) =>
+            blockedAt.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+
+        // Dedup identity: Windows is case-insensitive, Linux is not, so
+        // 'a.txt' and 'A.txt' stay distinct rows there.
+        internal static string NormalizeKey(string path) =>
+            OperatingSystem.IsWindows() ? path.ToUpperInvariant() : path;
 
         public void RecordPending(IEnumerable<string> files, string? sourceRoot = null)
         {
             lock (_lock)
             {
-                if (_state == null)
-                    _state = new DeferredState();
-
-                // Union with any batch still held: replacing it would silently
-                // drop the earlier deletions, which would then never be applied.
-                if (_state.PendingFiles == null)
-                    _state.PendingFiles = new List<string>();
-                var pending = _state.PendingFiles;
-                var wasEmpty = pending.Count == 0;
-                var seen = new HashSet<string>(pending, PathComparer);
-                var added = new List<string>();
+                if (_disposed) throw new ObjectDisposedException(nameof(DeferredDeletion));
+                var incoming = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var f in files)
                 {
-                    if (seen.Add(f))
-                    {
-                        pending.Add(f);
-                        added.Add(f);
-                    }
+                    var key = NormalizeKey(f);
+                    if (!incoming.ContainsKey(key))
+                        incoming[key] = f;
                 }
-
-                _state.SourceRoot = sourceRoot;
-                // Keep the earliest hold start: resetting it on every blocked
-                // batch would restart the clock for already-aged entries.
-                if (wasEmpty)
+                if (incoming.Count == 0) return;
+                try
                 {
-                    _state.BlockedAt = DateTime.UtcNow;
-                    _state.LastWarningAt = DateTime.MinValue;
+                    EnsureConn();
+                    var existing = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var chunk in Chunk(incoming.Keys))
+                    {
+                        using var cmd = _conn!.CreateCommand();
+                        var names = new string[chunk.Count];
+                        for (int i = 0; i < chunk.Count; i++)
+                        {
+                            names[i] = "@p" + i;
+                            cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                        }
+                        // Only generated @pN placeholder names are concatenated;
+                        // every value is bound, so no user input reaches SQL.
+                        // nosemgrep: csharp-sqli
+                        cmd.CommandText = "SELECT path_key FROM pending WHERE path_key IN (" + string.Join(",", names) + ")";
+                        using var reader = cmd.ExecuteReader();
+                        while (reader.Read()) existing.Add(reader.GetString(0));
+                    }
+                    var added = new List<KeyValuePair<string, string>>();
+                    foreach (var kv in incoming)
+                        if (!existing.Contains(kv.Key))
+                            added.Add(kv);
+                    if (added.Count == 0)
+                    {
+                        _log.Debug("Deferred deletion: all files already pending, no new batch");
+                        return;
+                    }
+
+                    var now = DateTime.UtcNow;
+                    var batchId = UniqueBatchId(now);
+                    using (var tx = _conn!.BeginTransaction())
+                    {
+                        using (var cmd = _conn.CreateCommand())
+                        {
+                            cmd.Transaction = tx;
+                            cmd.CommandText = "INSERT INTO batches (batch_id, blocked_at, last_warning_at, source_root) VALUES (@b, @t, 0, @s)";
+                            cmd.Parameters.AddWithValue("@b", batchId);
+                            cmd.Parameters.AddWithValue("@t", now.Ticks);
+                            cmd.Parameters.AddWithValue("@s", (object?)sourceRoot ?? DBNull.Value);
+                            cmd.ExecuteNonQuery();
+                        }
+                        using (var cmd = _conn.CreateCommand())
+                        {
+                            cmd.Transaction = tx;
+                            cmd.CommandText = "INSERT OR IGNORE INTO pending (path_key, batch_id, path) VALUES (@k, @b, @p)";
+                            var k = cmd.Parameters.Add("@k", SqliteType.Text);
+                            var b = cmd.Parameters.Add("@b", SqliteType.Text);
+                            var p = cmd.Parameters.Add("@p", SqliteType.Text);
+                            b.Value = batchId;
+                            foreach (var kv in added)
+                            {
+                                k.Value = kv.Key;
+                                p.Value = kv.Value;
+                                cmd.ExecuteNonQuery();
+                            }
+                        }
+                        tx.Commit();
+                    }
+                    _hasPending = true;
+                    var total = CountInternal();
+                    _log.Warn("Deferred deletion: batch " + BatchTimestamp(now) + ": " + added.Count
+                        + " new files (" + total + " total held), hold for " + _holdDays + " days");
+                    LogSample(added.Select(kv => kv.Value).ToList(), batchId);
                 }
-                Save();
-                _log.Warn("Deferred deletion: " + pending.Count + " files, hold for " + _holdDays + " days");
-                if (added.Count > 0) LogSample(added);
+                catch (Exception ex) { _log.Warn("Deferred deletion state could not be saved: " + _dbPath + " (" + ex.Message + ")"); }
             }
         }
 
-        public DeferredAction Check()
+        // Watcher fast path: a restored file fires Created, dropping its hold
+        // row by indexed key. No I/O at all unless something is held.
+        public bool CancelIfPending(string fullPath)
         {
             lock (_lock)
             {
-                if (_state == null || _state.PendingFiles == null || _state.PendingFiles.Count == 0)
-                    return new DeferredAction { Type = DeferredActionType.None };
-
-                var elapsed = (DateTime.UtcNow - _state.BlockedAt).TotalDays;
-
-                if (elapsed < _holdDays)
+                if (_disposed || !_hasPending) return false;
+                try
                 {
-                    if ((DateTime.UtcNow - _state.LastWarningAt).TotalDays >= 1)
+                    if (_conn == null || !File.Exists(_dbPath))
                     {
-                        var remaining = _holdDays - (int)elapsed;
-                        _log.Warn("Deferred deletion: " + _state.PendingFiles.Count + " files pending, " + remaining + " day(s) remaining (full list: " + _dbPath + ")");
-                        _state.LastWarningAt = DateTime.UtcNow;
-                        Save();
+                        ResetToEmpty(cancelled: true);
+                        return false;
                     }
-                    return new DeferredAction { Type = DeferredActionType.Waiting };
-                }
-
-                var filesStillDeleted = new List<string>();
-                if (!string.IsNullOrEmpty(_state.SourceRoot) && !Directory.Exists(_state.SourceRoot))
-                {
-                    // Same 1/day throttle as the hold branch: the pipeline
-                    // rechecks hourly and must not warn every hour.
-                    if ((DateTime.UtcNow - _state.LastWarningAt).TotalDays >= 1)
+                    var key = NormalizeKey(fullPath);
+                    string? batchId;
+                    using (var cmd = _conn.CreateCommand())
                     {
-                        _log.Warn("Deferred deletion: source unavailable, holding pending deletions");
-                        _state.LastWarningAt = DateTime.UtcNow;
-                        Save();
+                        cmd.CommandText = "SELECT batch_id FROM pending WHERE path_key = @k";
+                        cmd.Parameters.AddWithValue("@k", key);
+                        batchId = cmd.ExecuteScalar() as string;
                     }
-                    return new DeferredAction { Type = DeferredActionType.Waiting };
+                    if (batchId == null) return false;
+                    using (var cmd = _conn.CreateCommand())
+                    {
+                        cmd.CommandText = "DELETE FROM pending WHERE path_key = @k";
+                        cmd.Parameters.AddWithValue("@k", key);
+                        cmd.ExecuteNonQuery();
+                    }
+                    _log.Debug("Deferred deletion: hold cancelled by restore: " + fullPath);
+                    DropBatchIfEmpty(batchId, cancelledByRestore: true);
+                    RefreshPendingFlag();
+                    return true;
                 }
-                foreach (var f in _state.PendingFiles)
-                {
-                    if (!File.Exists(f))
-                        filesStillDeleted.Add(f);
-                }
+                catch (Exception ex) { _log.Warn("Deferred deletion cancel failed: " + ex.Message); return false; }
+            }
+        }
 
-                var result = new DeferredAction
+        // Next wake-up: earliest expiry or earliest due daily warning across
+        // batches. Null means nothing held — the pipeline timer disarms.
+        public DateTime? NextDueUtc()
+        {
+            lock (_lock)
+            {
+                if (_disposed || !_hasPending || _conn == null) return null;
+                try
                 {
-                    Type = filesStillDeleted.Count > 0 ? DeferredActionType.Proceed : DeferredActionType.Cancel,
-                    Files = filesStillDeleted
-                };
-
-                if (filesStillDeleted.Count > 0)
-                {
-                    _log.Warn("Deferred deletion: " + filesStillDeleted.Count + " files still deleted after hold, syncing");
-                    LogSample(filesStillDeleted);
+                    if (!File.Exists(_dbPath))
+                    {
+                        ResetToEmpty(cancelled: true);
+                        return null;
+                    }
+                    var now = DateTime.UtcNow;
+                    DateTime? due = null;
+                    using (var cmd = _conn.CreateCommand())
+                    {
+                        cmd.CommandText = "SELECT blocked_at, last_warning_at FROM batches";
+                        using var reader = cmd.ExecuteReader();
+                        while (reader.Read())
+                        {
+                            var blocked = new DateTime(reader.GetInt64(0), DateTimeKind.Utc);
+                            var warned = new DateTime(reader.GetInt64(1), DateTimeKind.Utc);
+                            var expiry = blocked.AddDays(_holdDays);
+                            if (expiry < due || due == null) due = expiry;
+                            if (now < expiry)
+                            {
+                                var warnDue = warned == DateTime.MinValue ? now : warned.AddDays(1);
+                                if (warnDue < due) due = warnDue;
+                            }
+                        }
+                    }
+                    if (due != null && due < now) return now;
+                    return due;
                 }
-                else
-                {
-                    _log.Info("Deferred deletion: files reappeared, cancelling");
-                }
+                catch (Exception ex) { _log.Warn("Deferred deletion schedule failed: " + ex.Message); return null; }
+            }
+        }
 
-                _state = null;
-                Save();
+        // Metadata-only pass: daily warnings + source-missing holds. Touches
+        // only the tiny batches table — never the pending rows.
+        public DeferredActionType CheckWarnings()
+        {
+            lock (_lock)
+            {
+                if (_disposed || !_hasPending || _conn == null) return DeferredActionType.None;
+                try
+                {
+                    if (!File.Exists(_dbPath))
+                    {
+                        ResetToEmpty(cancelled: true);
+                        return DeferredActionType.None;
+                    }
+                    var now = DateTime.UtcNow;
+                    var waiting = false;
+                    foreach (var b in ReadBatches())
+                    {
+                        if (BatchCount(b.BatchId) == 0)
+                        {
+                            DeleteBatchRow(b.BatchId);
+                            continue;
+                        }
+                        var elapsed = (now - b.BlockedAt).TotalDays;
+                        if (elapsed < _holdDays)
+                        {
+                            if ((now - b.LastWarningAt).TotalDays >= 1)
+                            {
+                                var remaining = _holdDays - (int)elapsed;
+                                var count = BatchCount(b.BatchId);
+                                _log.Warn("Deferred deletion: batch " + BatchTimestamp(b.BlockedAt) + ": " + count + " files pending, " + remaining + " day(s) remaining");
+                                TouchWarning(b.BatchId, now);
+                            }
+                            waiting = true;
+                        }
+                        else if (!string.IsNullOrEmpty(b.SourceRoot) && !Directory.Exists(b.SourceRoot))
+                        {
+                            if ((now - b.LastWarningAt).TotalDays >= 1)
+                            {
+                                _log.Warn("Deferred deletion: batch " + BatchTimestamp(b.BlockedAt) + ": source unavailable, holding pending deletions");
+                                TouchWarning(b.BatchId, now);
+                            }
+                            waiting = true;
+                        }
+                    }
+                    RefreshPendingFlag();
+                    return waiting ? DeferredActionType.Waiting : DeferredActionType.None;
+                }
+                catch (Exception ex) { _log.Warn("Deferred deletion warning check failed: " + ex.Message); return DeferredActionType.None; }
+            }
+        }
+
+        // Bounded expiry drain: claims up to limit still-deleted paths from
+        // expired batches (oldest first), removing every claimed row — both
+        // proceeded and reappeared — so memory and disk stay flat at 2M-file
+        // scale. Call in a loop until Files is empty.
+        public ExpiredChunk TakeExpiredChunk(int limit = ChunkSize)
+        {
+            var result = new ExpiredChunk();
+            lock (_lock)
+            {
+                if (_disposed || !_hasPending || _conn == null || limit <= 0) return result;
+                try
+                {
+                    if (!File.Exists(_dbPath))
+                    {
+                        ResetToEmpty(cancelled: true);
+                        return result;
+                    }
+                    var now = DateTime.UtcNow;
+                    foreach (var b in ReadBatches())
+                    {
+                        if (result.Files.Count >= limit) break;
+                        if ((now - b.BlockedAt).TotalDays < _holdDays) continue;
+                        if (!string.IsNullOrEmpty(b.SourceRoot) && !Directory.Exists(b.SourceRoot)) continue;
+                        var paths = ReadBatchPaths(b.BatchId, limit - result.Files.Count);
+                        if (paths.Count == 0)
+                        {
+                            DeleteBatchRow(b.BatchId);
+                            continue;
+                        }
+                        var still = new List<string>();
+                        var gone = 0;
+                        foreach (var p in paths)
+                        {
+                            if (File.Exists(p)) gone++;
+                            else still.Add(p);
+                        }
+                        DeletePaths(paths);
+                        result.Files.AddRange(still);
+                        result.Cancelled += gone;
+                        if (BatchCount(b.BatchId) == 0)
+                        {
+                            var tag = BatchTimestamp(b.BlockedAt);
+                            DeleteBatchRow(b.BatchId);
+                            if (still.Count > 0)
+                            {
+                                _log.Warn("Deferred deletion: batch " + tag + ": " + still.Count + " files still deleted after hold, syncing");
+                                LogSample(still, tag);
+                            }
+                            else
+                            {
+                                _log.Info("Deferred deletion: batch " + tag + ": files reappeared, cancelling");
+                            }
+                        }
+                    }
+                    RefreshPendingFlag();
+                }
+                catch (Exception ex) { _log.Warn("Deferred deletion expiry check failed: " + ex.Message); }
                 return result;
             }
         }
 
-        public bool HasPending
+        // Small-scale/test compat: warnings plus a full drain. Production
+        // uses CheckWarnings + TakeExpiredChunk in a loop instead.
+        public DeferredAction Check()
         {
-            get { lock (_lock) { return _state != null && _state.PendingFiles != null && _state.PendingFiles.Count > 0; } }
+            var waiting = CheckWarnings() == DeferredActionType.Waiting;
+            var proceed = new List<string>();
+            var cancelled = 0;
+            while (true)
+            {
+                var chunk = TakeExpiredChunk(ChunkSize);
+                proceed.AddRange(chunk.Files);
+                cancelled += chunk.Cancelled;
+                if (chunk.Files.Count == 0) break;
+            }
+            if (proceed.Count > 0)
+                return new DeferredAction { Type = DeferredActionType.Proceed, Files = proceed };
+            if (waiting)
+                return new DeferredAction { Type = DeferredActionType.Waiting };
+            if (cancelled > 0)
+                return new DeferredAction { Type = DeferredActionType.Cancel, Files = new List<string>() };
+            return new DeferredAction { Type = DeferredActionType.None };
         }
 
-        private void LogSample(List<string> files)
+        public bool HasPending
+        {
+            get { lock (_lock) { return _hasPending; } }
+        }
+
+        internal int PendingCount
+        {
+            get { lock (_lock) { return _conn == null ? 0 : CountInternal(); } }
+        }
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                CloseConn();
+            }
+        }
+
+        private void EnsureConn()
+        {
+            if (_conn != null) return;
+            var dir = Path.GetDirectoryName(_dbPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+            _conn = SqliteBootstrap.Open(_dbPath, SqliteSchema.Deferred);
+        }
+
+        private void CloseConn()
+        {
+            if (_conn == null) return;
+            try { _conn.Close(); } catch { }
+            try { _conn.Dispose(); } catch { }
+            _conn = null;
+        }
+
+        private void DeleteStoreFiles()
+        {
+            CloseConn();
+            // Defense vs stale pooled handles: with Pooling=False there
+            // should be none, but a delete must never resurrect a ghost.
+            try { SqliteConnection.ClearAllPools(); } catch { }
+            foreach (var ext in new[] { string.Empty, "-wal", "-shm", "-journal" })
+            {
+                try
+                {
+                    var f = _dbPath + ext;
+                    if (File.Exists(f)) File.Delete(f);
+                }
+                catch { }
+            }
+        }
+
+        // The hold file is gone while we still hold rows: an external delete
+        // means cancel (keep destination files), never proceed.
+        private void ResetToEmpty(bool cancelled)
+        {
+            var had = _hasPending;
+            DeleteStoreFiles();
+            _hasPending = false;
+            if (cancelled && had)
+                _log.Info("Deferred deletion: hold file deleted externally, holds cancelled");
+        }
+
+        private void RefreshPendingFlag()
+        {
+            if (_conn == null)
+            {
+                _hasPending = false;
+                return;
+            }
+            var n = CountInternal();
+            _hasPending = n > 0;
+            if (n == 0)
+                DeleteStoreFiles();
+        }
+
+        private int CountInternal()
+        {
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM pending";
+            return (int)(long)(cmd.ExecuteScalar() ?? 0L);
+        }
+
+        private int BatchCount(string batchId)
+        {
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM pending WHERE batch_id = @b";
+            cmd.Parameters.AddWithValue("@b", batchId);
+            return (int)(long)(cmd.ExecuteScalar() ?? 0L);
+        }
+
+        private void DeleteBatchRow(string batchId)
+        {
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "DELETE FROM batches WHERE batch_id = @b";
+            cmd.Parameters.AddWithValue("@b", batchId);
+            cmd.ExecuteNonQuery();
+        }
+
+        private void DropBatchIfEmpty(string batchId, bool cancelledByRestore)
+        {
+            if (BatchCount(batchId) > 0) return;
+            DeleteBatchRow(batchId);
+            if (cancelledByRestore)
+                _log.Debug("Deferred deletion: batch completed by restore: " + batchId);
+        }
+
+        private void TouchWarning(string batchId, DateTime now)
+        {
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "UPDATE batches SET last_warning_at = @t WHERE batch_id = @b";
+            cmd.Parameters.AddWithValue("@t", now.Ticks);
+            cmd.Parameters.AddWithValue("@b", batchId);
+            cmd.ExecuteNonQuery();
+        }
+
+        private List<BatchRow> ReadBatches()
+        {
+            var rows = new List<BatchRow>();
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "SELECT batch_id, blocked_at, last_warning_at, source_root FROM batches ORDER BY blocked_at";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                rows.Add(new BatchRow
+                {
+                    BatchId = reader.GetString(0),
+                    BlockedAt = new DateTime(reader.GetInt64(1), DateTimeKind.Utc),
+                    LastWarningAt = new DateTime(reader.GetInt64(2), DateTimeKind.Utc),
+                    SourceRoot = reader.IsDBNull(3) ? null : reader.GetString(3)
+                });
+            }
+            return rows;
+        }
+
+        private List<string> ReadBatchPaths(string batchId, int limit)
+        {
+            var paths = new List<string>();
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "SELECT path FROM pending WHERE batch_id = @b LIMIT @n";
+            cmd.Parameters.AddWithValue("@b", batchId);
+            cmd.Parameters.AddWithValue("@n", limit);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) paths.Add(reader.GetString(0));
+            return paths;
+        }
+
+        private void DeletePaths(List<string> paths)
+        {
+            foreach (var chunk in Chunk(paths.Select(NormalizeKey)))
+            {
+                using var cmd = _conn!.CreateCommand();
+                var names = new string[chunk.Count];
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    names[i] = "@p" + i;
+                    cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                }
+                // Only generated @pN placeholder names are concatenated;
+                // every value is bound, so no user input reaches SQL.
+                // nosemgrep: csharp-sqli
+                cmd.CommandText = "DELETE FROM pending WHERE path_key IN (" + string.Join(",", names) + ")";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static List<List<T>> Chunk<T>(IEnumerable<T> items, int size = 500)
+        {
+            var chunks = new List<List<T>>();
+            var cur = new List<T>(size);
+            foreach (var item in items)
+            {
+                cur.Add(item);
+                if (cur.Count >= size)
+                {
+                    chunks.Add(cur);
+                    cur = new List<T>(size);
+                }
+            }
+            if (cur.Count > 0) chunks.Add(cur);
+            return chunks;
+        }
+
+        private string UniqueBatchId(DateTime blockedAt)
+        {
+            var id = BatchTimestamp(blockedAt);
+            var n = 2;
+            while (BatchExists(id))
+                id = BatchTimestamp(blockedAt) + "-" + (n++);
+            return id;
+        }
+
+        private bool BatchExists(string batchId)
+        {
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM batches WHERE batch_id = @b";
+            cmd.Parameters.AddWithValue("@b", batchId);
+            return cmd.ExecuteScalar() != null;
+        }
+
+        private bool HasLegacyFile()
+        {
+            if (string.IsNullOrEmpty(_legacyName)) return false;
+            try { return File.Exists(Path.Combine(_dir, _legacyName)); }
+            catch { return false; }
+        }
+
+        private bool HasJsonBatches()
+        {
+            try { return Directory.EnumerateFiles(_dir, _prefix + "-*.json").FirstOrDefault() != null; }
+            catch { return false; }
+        }
+
+        // One-time adoption of the pre-SQLite per-batch files (plus the old
+        // single-file name): entries keep their ORIGINAL BlockedAt clock,
+        // dupes collapse to the earliest batch, then each JSON is removed.
+        private void MigrateJsonBatches()
+        {
+            List<string> files;
+            try { files = Directory.EnumerateFiles(_dir, _prefix + "-*.json").OrderBy(p => p, StringComparer.Ordinal).ToList(); }
+            catch { return; }
+            if (!string.IsNullOrEmpty(_legacyName))
+            {
+                var legacy = Path.Combine(_dir, _legacyName);
+                if (File.Exists(legacy)) files.Add(legacy);
+            }
+            foreach (var path in files)
+            {
+                DeferredState? state;
+                try
+                {
+                    var json = File.ReadAllText(path);
+                    state = JsonSerializer.Deserialize(json, DeferredDeletionJsonContext.Default.DeferredState);
+                }
+                catch { _log.Warn("Deferred deletion state could not be loaded; preserving it for recovery: " + path); continue; }
+                if (state == null || state.PendingFiles == null || state.PendingFiles.Count == 0)
+                {
+                    try { File.Delete(path); } catch { }
+                    continue;
+                }
+                try
+                {
+                    ImportBatch(state);
+                    try { File.Delete(path); } catch { }
+                    _log.Info("Deferred deletion: migrated " + state.PendingFiles.Count + " held files to the hold database");
+                }
+                catch (Exception ex) { _log.Warn("Deferred deletion migration failed; preserving it for recovery: " + path + " (" + ex.Message + ")"); }
+            }
+        }
+
+        private void ImportBatch(DeferredState state)
+        {
+            var blocked = state.BlockedAt == default ? DateTime.UtcNow : state.BlockedAt.ToUniversalTime();
+            var warned = state.LastWarningAt == default ? DateTime.MinValue : state.LastWarningAt.ToUniversalTime();
+            var batchId = UniqueBatchId(blocked);
+            using (var tx = _conn!.BeginTransaction())
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "INSERT INTO batches (batch_id, blocked_at, last_warning_at, source_root) VALUES (@b, @t, @w, @s)";
+                    cmd.Parameters.AddWithValue("@b", batchId);
+                    cmd.Parameters.AddWithValue("@t", blocked.Ticks);
+                    cmd.Parameters.AddWithValue("@w", warned.Ticks);
+                    cmd.Parameters.AddWithValue("@s", (object?)state.SourceRoot ?? DBNull.Value);
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "INSERT OR IGNORE INTO pending (path_key, batch_id, path) VALUES (@k, @b, @p)";
+                    var k = cmd.Parameters.Add("@k", SqliteType.Text);
+                    var b = cmd.Parameters.Add("@b", SqliteType.Text);
+                    var p = cmd.Parameters.Add("@p", SqliteType.Text);
+                    b.Value = batchId;
+                    foreach (var f in state.PendingFiles!)
+                    {
+                        k.Value = NormalizeKey(f);
+                        p.Value = f;
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+                tx.Commit();
+            }
+        }
+
+        private void LogSample(List<string> files, string batchId)
         {
             var shown = files.Take(20).ToList();
             var msg = string.Join(Environment.NewLine, shown.Select(f => "  " + f));
             if (files.Count > shown.Count)
                 msg += Environment.NewLine + "  ... and " + (files.Count - shown.Count) + " more";
-            msg += Environment.NewLine + "Full list: " + _dbPath;
+            msg += Environment.NewLine + "Hold database: " + _dbPath + " (batch " + batchId + ")";
             _log.Debug(msg);
         }
 
-        private void Load()
+        private sealed class BatchRow
         {
-            try
-            {
-                if (File.Exists(_dbPath))
-                {
-                    var json = File.ReadAllText(_dbPath);
-                    _state = JsonSerializer.Deserialize(json, DeferredDeletionJsonContext.Default.DeferredState);
-                }
-            }
-            catch { _log.Warn("Deferred deletion state could not be loaded; preserving it for recovery: " + _dbPath); }
-        }
-
-        private void Save()
-        {
-            try
-            {
-                var dir = Path.GetDirectoryName(_dbPath);
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
-                var temp = _dbPath + ".tictack.tmp";
-                using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
-                using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
-                {
-                    JsonSerializer.Serialize(writer, _state ?? new DeferredState(), DeferredDeletionJsonContext.Default.DeferredState);
-                    writer.Flush();
-                    stream.Flush(true);
-                }
-                File.Move(temp, _dbPath, true);
-            }
-            catch (Exception ex) { _log.Warn("Deferred deletion state could not be saved: " + _dbPath + " (" + ex.Message + ")"); }
+            public string BatchId = string.Empty;
+            public DateTime BlockedAt;
+            public DateTime LastWarningAt;
+            public string? SourceRoot;
         }
 
         internal class DeferredState
@@ -189,6 +698,12 @@ namespace TicTack
             public List<string>? PendingFiles { get; set; }
             public string? SourceRoot { get; set; }
         }
+    }
+
+    public sealed class ExpiredChunk
+    {
+        public List<string> Files { get; } = new List<string>();
+        public int Cancelled { get; set; }
     }
 
     public class DeferredAction
