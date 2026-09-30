@@ -578,6 +578,56 @@ public class UsnMonitorTests : IDisposable
         if (OperatingSystem.IsWindows()) return; // exercised live on Windows
         Assert.Equal("unsupported", UsnJournalMonitor.EnableVolumePrivileges());
     }
+
+    // USN_JOURNAL_DATA_V0 offsets (winioctl.h): id@0, FirstUsn@8,
+    // NextUsn@16, LowestValidUsn@24, MaxUsn@32, MaximumSize@40,
+    // AllocationDelta@48. A wrong offset reads a neighbor field and the
+    // seed warning fires on garbage (or never fires on a tiny journal).
+    [Fact]
+    public void ParseJournalData_ReadsIdHeadAndSizes()
+    {
+        var buf = new byte[64];
+        BitConverter.GetBytes(0x123456789ABCDEF0UL).CopyTo(buf, 0);
+        BitConverter.GetBytes(1000L).CopyTo(buf, 8);
+        BitConverter.GetBytes(2000L).CopyTo(buf, 16);
+        BitConverter.GetBytes(500L).CopyTo(buf, 24);
+        BitConverter.GetBytes(9000L).CopyTo(buf, 32);
+        BitConverter.GetBytes(33_554_432UL).CopyTo(buf, 40);
+        BitConverter.GetBytes(8_388_608UL).CopyTo(buf, 48);
+
+        var (id, next, max, delta) = UsnJournalMonitor.ParseJournalData(buf, 56);
+        Assert.Equal(0x123456789ABCDEF0UL, id);
+        Assert.Equal(2000L, next);
+        Assert.Equal(33_554_432UL, max);
+        Assert.Equal(8_388_608UL, delta);
+    }
+
+    // Short reads (ret < 56) carry no size fields: id/head still parse,
+    // sizes come back zero so the seed warning stays silent instead of
+    // firing on uninitialized bytes.
+    [Fact]
+    public void ParseJournalData_ShortBuffer_YieldsZeroSizes()
+    {
+        var buf = new byte[64];
+        BitConverter.GetBytes(0xABCDEFUL).CopyTo(buf, 0);
+        BitConverter.GetBytes(77L).CopyTo(buf, 16);
+
+        var (id, next, max, delta) = UsnJournalMonitor.ParseJournalData(buf, 24);
+        Assert.Equal(0xABCDEFUL, id);
+        Assert.Equal(77L, next);
+        Assert.Equal(0UL, max);
+        Assert.Equal(0UL, delta);
+    }
+
+    // Contract: the Win32 code travels as a field AND inside the message.
+    // The worker logs the code; no cause is ever guessed in prose.
+    [Fact]
+    public void UsnJournalReadException_CarriesWin32Code()
+    {
+        var ex = new UsnJournalMonitor.UsnJournalReadException(1179);
+        Assert.Equal(1179, ex.Win32Code);
+        Assert.Contains("Win32 1179", ex.Message);
+    }
 }
 
 // Discovery-time gate: static Skip is understood by every runner, so a

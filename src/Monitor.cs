@@ -665,14 +665,44 @@ namespace TicTack
 
         internal static readonly int FileIdDescriptorSize = Marshal.SizeOf<FileIdDescriptor>();
 
-        // USN_JOURNAL_DATA_V0/V1 prefix: only the journal id and the head
-        // cursor are needed, so the longer V1 tail is never read.
-        [StructLayout(LayoutKind.Sequential)]
-        private struct UsnJournalData
+        // USN_JOURNAL_DATA_V0/V1 prefix: the id and head cursor drive the
+        // baseline; MaximumSize/AllocationDelta feed the small-journal
+        // seed warning. Parsed by offset (not Marshal) so the layout is
+        // unit-testable without a volume handle. V0 is 56 bytes; V1 only
+        // appends past it, so the first 56 offsets hold for both.
+        internal static (ulong JournalId, long NextUsn, ulong MaximumSize, ulong AllocationDelta) ParseJournalData(byte[] buf, uint bytesReturned)
         {
-            public ulong UsnJournalID;
-            public long FirstUsn;
-            public long NextUsn;
+            if (buf.Length < 24 || bytesReturned < 24) return (0, 0, 0, 0);
+            var id = BitConverter.ToUInt64(buf, 0);
+            var next = BitConverter.ToInt64(buf, 16);
+            if (buf.Length < 56 || bytesReturned < 56) return (id, next, 0, 0);
+            return (id, next, BitConverter.ToUInt64(buf, 40), BitConverter.ToUInt64(buf, 48));
+        }
+
+        private static (ulong JournalId, long NextUsn, ulong MaximumSize, ulong AllocationDelta) QueryJournal(IntPtr volume, string device, string priv)
+        {
+            var outBuf = new byte[64];
+            bool ok = DeviceIoControl(volume, FsctlQueryUsnJournal, IntPtr.Zero, 0,
+                outBuf, (uint)outBuf.Length, out var ret, IntPtr.Zero);
+            int err = Marshal.GetLastWin32Error();
+            if (ok && ret >= 24)
+                return ParseJournalData(outBuf, ret);
+            // Failure diagnostics: which branch fired, raw handle, bytes
+            // returned, in-process control call, documented-shape retry.
+            // Read the pasted line: sample-shape=ok means our open is the
+            // bug; sample-shape failing identically means volume FSCTLs are
+            // not delivered to NTFS in this process (a working fsutil proves
+            // the journal itself exists) and the USN member stays skipped.
+            var (mountedOk, mountedErr) = TestVolumeMounted(volume);
+            var sample = TrySampleShape(device);
+            throw new IOException("FSCTL_QUERY_USN_JOURNAL failed on " + device +
+                " [" + ProbeMarker + "] (Win32 " + err +
+                ", ok=" + ok + ", bytes=" + ret +
+                ", handle=0x" + volume.ToString("X") +
+                ", mounted-control=" + (mountedOk ? "ok" : "fail/Win32 " + mountedErr) +
+                ", sample-shape=" + sample +
+                ", priv=" + priv + "); " +
+                "USN member skipped, watcher/polling fallback in effect.");
         }
 
         // READ_USN_JOURNAL_DATA_V0 input: StartUsn is exclusive, Timeout
@@ -853,7 +883,7 @@ namespace TicTack
         // before wiring the monitor so elevation failure falls back to the
         // watcher with a warning instead of failing startup. Also called by
         // Start for the late-start path.
-        internal (ulong JournalId, long NextUsn) ProbeVolume()
+        internal (ulong JournalId, long NextUsn, ulong MaximumSize, ulong AllocationDelta) ProbeVolume()
         {
             if (!OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("UsnJournalMonitor requires Windows/NTFS.");
@@ -920,7 +950,8 @@ namespace TicTack
                     SeedWatchDirs();
                     ulong journalId;
                     long lastUsn;
-                    try { (journalId, lastUsn) = QueryJournal(_volumeHandle, _volumeDevice, priv); }
+                    ulong journalMaxSize;
+                    try { (journalId, lastUsn, journalMaxSize, _) = QueryJournal(_volumeHandle, _volumeDevice, priv); }
                     catch (Exception ex)
                     {
                         _armed.Set();
@@ -929,24 +960,55 @@ namespace TicTack
                         continue;
                     }
 
-                    _log?.Info("USN watch started [" + _path + "]: journal=" + journalId
-                        + " head=" + lastUsn + " mask=0x" + ReasonWatchMask.ToString("X8")
-                        + " poll=" + _pollIntervalMs + "ms prefilter="
-                        + (_prefilterActive ? "on (" + _watchDirFrns.Count + " dirs)" : "off"));
+                    // Seed receipt: dir count proves the tree was covered,
+                    // journal+head are the baseline the re-baseline line
+                    // compares against when the journal changes. Mask, poll
+                    // interval and prefilter flag are config/constants —
+                    // never logged, read them in the config file.
+                    var leaf = Path.GetFileName(_path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                    if (string.IsNullOrEmpty(leaf)) leaf = _path;
+                    if (_prefilterActive)
+                        _log?.Debug("USN seeded: " + leaf + ": " + _watchDirFrns.Count + " dirs, journal=" + journalId + ", from head=" + lastUsn);
+                    else
+                        _log?.Debug("USN seeded: " + leaf + ": journal=" + journalId + ", from head=" + lastUsn + " (prefilter off)");
+                    // A small journal wraps in minutes on a busy volume,
+                    // turning every poll into a re-baseline loop. One
+                    // actionable line per seed, exact command included.
+                    // _volumeDevice is \\.\X: so the last 2 chars are the
+                    // drive fsutil wants.
+                    if (journalMaxSize > 0 && journalMaxSize < 128UL * 1024 * 1024)
+                    {
+                        var drive = _volumeDevice.Length >= 2 ? _volumeDevice.Substring(_volumeDevice.Length - 2) : _volumeDevice;
+                        _log?.Warn("USN journal is " + (journalMaxSize / 1024 / 1024) + "MB on " + _volumeDevice
+                            + "; consider: fsutil usn createjournal m=134217728 a=8388608 " + drive);
+                    }
                     _armed.Set();
                     var buf = new byte[64 * 1024];
                     while (!_stopping)
                     {
                         List<UsnRecord>? records = null;
-                        try { records = ReadJournal(_volumeHandle, journalId, ref lastUsn, buf); }
+                        try
+                        {
+                            records = ReadJournal(_volumeHandle, journalId, ref lastUsn, buf, out var headJumped);
+                            // A head jump skipped events the cursor can never
+                            // revisit: same covering scan as a recreation.
+                            if (headJumped) SignalGap();
+                        }
+                        catch (UsnJournalReadException jex)
+                        {
+                            // Same recovery for every read failure; the Win32
+                            // code in the error line is the diagnosis (wrap
+                            // vs deletion vs access denied), never a guess.
+                            FireError(jex);
+                            _log?.Info("USN journal unreadable (Win32 " + jex.Win32Code + "), re-baselining at new head"
+                                + " (gap covered by on-demand rescan).");
+                            SignalGap();
+                            break;
+                        }
                         catch (Exception ex)
                         {
-                            // Journal recreated/deleted underneath us: the gap
-                            // is real, so say so, then re-baseline at the new
-                            // head. The gap signal fires an on-demand covering
-                            // scan; the polling leg covers it otherwise.
                             FireError(ex);
-                            _log?.Info("USN journal changed underneath, re-baselining at new head"
+                            _log?.Info("USN journal read failed, re-baselining at new head"
                                 + " (gap covered by on-demand rescan).");
                             SignalGap();
                             break;
@@ -1313,39 +1375,17 @@ namespace TicTack
             finally { CloseHandle(handle); }
         }
 
-        private static (ulong JournalId, long NextUsn) QueryJournal(IntPtr volume, string device, string priv)
+        // Typed read failure: the Win32 code is the diagnosis (journal
+        // deleted vs invalid cursor vs access denied), so it travels as a
+        // field. No cause is guessed in prose anywhere this is logged.
+        internal sealed class UsnJournalReadException : IOException
         {
-            var outBuf = new byte[64];
-            bool ok = DeviceIoControl(volume, FsctlQueryUsnJournal, IntPtr.Zero, 0,
-                outBuf, (uint)outBuf.Length, out var ret, IntPtr.Zero);
-            int err = Marshal.GetLastWin32Error();
-            if (ok && ret >= 24)
+            public int Win32Code { get; }
+            public UsnJournalReadException(int win32)
+                : base("FSCTL_READ_USN_JOURNAL_DATA failed (Win32 " + win32 + ").")
             {
-                var ptr = Marshal.AllocHGlobal(24);
-                try
-                {
-                    Marshal.Copy(outBuf, 0, ptr, 24);
-                    var data = Marshal.PtrToStructure<UsnJournalData>(ptr);
-                    return (data.UsnJournalID, data.NextUsn);
-                }
-                finally { Marshal.FreeHGlobal(ptr); }
+                Win32Code = win32;
             }
-            // Failure diagnostics: which branch fired, raw handle, bytes
-            // returned, in-process control call, documented-shape retry.
-            // Read the pasted line: sample-shape=ok means our open is the
-            // bug; sample-shape failing identically means volume FSCTLs are
-            // not delivered to NTFS in this process (a working fsutil proves
-            // the journal itself exists) and the USN member stays skipped.
-            var (mountedOk, mountedErr) = TestVolumeMounted(volume);
-            var sample = TrySampleShape(device);
-            throw new IOException("FSCTL_QUERY_USN_JOURNAL failed on " + device +
-                " [" + ProbeMarker + "] (Win32 " + err +
-                ", ok=" + ok + ", bytes=" + ret +
-                ", handle=0x" + volume.ToString("X") +
-                ", mounted-control=" + (mountedOk ? "ok" : "fail/Win32 " + mountedErr) +
-                ", sample-shape=" + sample +
-                ", priv=" + priv + "); " +
-                "USN member skipped, watcher/polling fallback in effect.");
         }
 
         // Reads one batch; advances lastUsn past the records returned.
@@ -1354,7 +1394,7 @@ namespace TicTack
         // (that ioctl doubled the idle syscall rate), and a recreation
         // underneath us makes this read throw on id mismatch, which the
         // worker turns into a re-baseline at the new head.
-        private static List<UsnRecord> ReadJournal(IntPtr volume, ulong journalId, ref long lastUsn, byte[] buf)
+        private static List<UsnRecord> ReadJournal(IntPtr volume, ulong journalId, ref long lastUsn, byte[] buf, out bool headJumped)
         {
             var input = new ReadUsnInput
             {
@@ -1367,13 +1407,16 @@ namespace TicTack
             };
             var size = Marshal.SizeOf<ReadUsnInput>();
             var ptr = Marshal.AllocHGlobal(size);
+            headJumped = false;
             try
             {
                 Marshal.StructureToPtr(input, ptr, false);
                 if (!DeviceIoControl(volume, FsctlReadUsnJournal, ptr, (uint)size,
                         buf, (uint)buf.Length, out var ret, IntPtr.Zero))
-                    throw new IOException("FSCTL_READ_USN_JOURNAL_DATA failed (Win32 " +
-                        Marshal.GetLastWin32Error() + ").");
+                {
+                    // Capture immediately: any later call may overwrite it.
+                    throw new UsnJournalReadException(Marshal.GetLastWin32Error());
+                }
                 var records = new List<UsnRecord>();
                 // First 8 bytes are the next-USN cursor, records follow.
                 // StartUsn is exclusive in practice, but if a stack ever
@@ -1396,12 +1439,17 @@ namespace TicTack
                     }
                     off += (int)recLen;
                 }
-                // Unparseable records (e.g. ReFS V3) never advance lastUsn
-                // via the loop above; jump to the head when it runs far
-                // ahead so one foreign batch can't pin the cursor forever.
+                // Unparseable records (e.g. a corrupt batch) never advance
+                // lastUsn via the loop above; jump to the head when it runs
+                // far ahead so one foreign batch can't pin the cursor
+                // forever. The jump skips events, so it fires the gap
+                // signal exactly like a wrap or recreation does.
                 // (Head comes from the read output cursor, not a QUERY.)
                 if (records.Count == 0 && headUsn > lastUsn + 8 * 1024 * 1024)
+                {
                     lastUsn = headUsn;
+                    headJumped = true;
+                }
                 return records;
             }
             finally { Marshal.FreeHGlobal(ptr); }

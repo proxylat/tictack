@@ -485,6 +485,25 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void DeleteThreshold_Percent_StaleBaselineFlagsSuspect()
+    {
+        _pipeline.Dispose();
+        StartPipeline(c => c.DebounceSeconds = 0.5);
+
+        // Baseline smaller than the batch: 70 deletes vs 60 known rows
+        // (dead rows accumulate via renames/orphans). Still fails closed,
+        // but the log must say the baseline is suspect, not print 116%.
+        for (int i = 0; i < 60; i++)
+            _db.Upsert($"s{i}.txt", 1, 1);
+        for (int i = 0; i < 70; i++)
+            _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, $"ghost{i}.txt"));
+
+        WaitFor(() => _log.Messages.Any(m => m.Contains("dead rows")), "suspect flag");
+
+        Assert.Empty(_deletion.Calls);
+    }
+
+    [Fact]
     public void Created_CaseDistinctNames_BothCopied()
     {
         if (OperatingSystem.IsWindows()) return; // Windows paths are case-insensitive
@@ -505,6 +524,69 @@ public class PipelineTests : IDisposable
 
         Assert.Equal("upper", File.ReadAllText(Path.Combine(_dstDir, "Case.txt")));
         Assert.Equal("lower", File.ReadAllText(Path.Combine(_dstDir, "case.txt")));
+    }
+
+    [Fact]
+    public void DeleteThreshold_LocalizedBatch_ProceedsAsCleanup()
+    {
+        _pipeline.Dispose();
+        StartPipeline(c =>
+        {
+            c.Sync.DeleteThresholdCount = 10;
+            c.DebounceSeconds = 0.5;
+        });
+
+        // 12 deletes, all under one folder: trips the count wire but reads
+        // as a deliberate folder cleanup, so it proceeds with a Warn.
+        // State rows make the baseline trustworthy (12 <= 12).
+        var sub = Path.Combine("old-stuff");
+        Directory.CreateDirectory(Path.Combine(_dstDir, sub));
+        for (int i = 0; i < 12; i++)
+        {
+            _db.Upsert(Path.Combine(sub, $"f{i}.txt"), 1, 1);
+            File.WriteAllText(Path.Combine(_dstDir, sub, $"f{i}.txt"), "x");
+        }
+        for (int i = 0; i < 12; i++)
+            _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, sub, $"f{i}.txt"));
+
+        WaitFor(() => _deletion.Calls.Count == 12, "localized deletes");
+
+        Assert.Contains(_log.Messages, m => m.Contains("folder cleanup"));
+        for (int i = 0; i < 12; i++)
+            Assert.False(File.Exists(Path.Combine(_dstDir, sub, $"f{i}.txt")));
+    }
+
+    [Fact]
+    public void DeleteThreshold_ScatteredBatch_HoldsWithWarn()
+    {
+        _pipeline.Dispose();
+        StartPipeline(c =>
+        {
+            c.Sync.DeleteThresholdCount = 10;
+            c.DebounceSeconds = 0.5;
+        });
+
+        // 12 deletes spread over 6 folders (2 each, max share 17%): no
+        // locality story, so the count wire holds the batch as before.
+        // State rows keep the baseline trustworthy so scatter is what holds.
+        for (int d = 0; d < 6; d++)
+        {
+            var sub = Path.Combine($"dir{d}");
+            Directory.CreateDirectory(Path.Combine(_dstDir, sub));
+            for (int i = 0; i < 2; i++)
+            {
+                _db.Upsert(Path.Combine(sub, $"f{i}.txt"), 1, 1);
+                File.WriteAllText(Path.Combine(_dstDir, sub, $"f{i}.txt"), "x");
+                _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, sub, $"f{i}.txt"));
+            }
+        }
+
+        WaitFor(() => _log.Messages.Any(m => m.Contains("Delete guard")), "guard");
+
+        Assert.Empty(_deletion.Calls);
+        // Holds are warnings now, never errors.
+        Assert.Contains(_log.Messages, m => m.StartsWith("WRN:Delete guard"));
+        Assert.DoesNotContain(_log.Messages, m => m.StartsWith("ERR:Delete guard"));
     }
 
 }

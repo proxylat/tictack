@@ -439,6 +439,29 @@ namespace TicTack
             }
         }
 
+        // Rebuild path: drop every hold through the open connection instead
+        // of deleting the files around it — Windows refuses to delete a
+        // file our own SQLite handle has open. A surviving IOException
+        // means someone else (the running service) holds the store; it
+        // propagates so the caller can say so instead of dumping a stack.
+        public void ClearStore()
+        {
+            lock (_lock)
+            {
+                if (_disposed) throw new ObjectDisposedException(nameof(DeferredDeletion));
+                var had = _hasPending || File.Exists(_dbPath);
+                CloseConn();
+                try { SqliteConnection.ClearAllPools(); } catch { }
+                foreach (var ext in new[] { string.Empty, "-wal", "-shm", "-journal" })
+                {
+                    var f = _dbPath + ext;
+                    if (File.Exists(f)) File.Delete(f);
+                }
+                _hasPending = false;
+                if (had) _log.Info("Deferred deletion: hold store cleared by rebuild");
+            }
+        }
+
         // The hold file is gone while we still hold rows: an external delete
         // means cancel (keep destination files), never proceed.
         private void ResetToEmpty(bool cancelled)

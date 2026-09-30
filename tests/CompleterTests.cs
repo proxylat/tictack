@@ -132,6 +132,34 @@ public sealed class CompleterTests : IDisposable
     }
 
     [Fact]
+    public async Task FailedRename_NeverUpserts()
+    {
+        // Write-order pin: the tmp was never written, so CompleteTemp fails
+        // before any rename — the upsert must never run and no dest appears.
+        var src = Path.Combine(_dir, "src-norename");
+        var dst = Path.Combine(_dir, "dst-norename");
+        WriteFiles(src, 1, 512);
+        var srcFile = Path.Combine(src, "file00000.bin");
+        var dstFile = Path.Combine(dst, "file00000.bin");
+        var copy = new CopyAction(new FileAccessor());
+        var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Created, srcFile), src, dst);
+        var tmp = new TempCopyResult { Success = true, Dst = dstFile, Tmp = dstFile + ".tictack.tmp" };
+
+        using var cts = new CancellationTokenSource();
+        var completer = new FileCompleter(copy, new SizeValidator(), new RecordingLogger(), 4);
+        completer.Start(cts.Token);
+        int upserts = 0;
+        var fresh = await completer.EnqueueAsync(args, tmp, "Copy failed", "Validation FAILED",
+            (snap, _) => { Interlocked.Increment(ref upserts); return Task.CompletedTask; }, cts.Token);
+        completer.Complete();
+        await completer.LoopTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Null(fresh);
+        Assert.Equal(0, upserts);
+        Assert.False(File.Exists(dstFile));
+    }
+
+    [Fact]
     public async Task CancelledItem_NeverCompletesOrUpserts()
     {
         var src = Path.Combine(_dir, "src");

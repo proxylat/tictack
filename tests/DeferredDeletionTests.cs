@@ -47,6 +47,37 @@ public class DeferredDeletionTests
     }
 
     [Fact]
+    public void ClearStore_DropsHoldsAndReopens()
+    {
+        // Rebuild path: clearing through the open connection must work
+        // (Windows refuses to delete the .db around our own handle),
+        // leave no files, and accept new holds afterwards.
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            const string prefix = "tictack-deferred-test";
+            using var dd = new DeferredDeletion(dir, prefix, 7, new RecordingLogger());
+            dd.ClearStore();
+            Assert.False(dd.HasPending);
+
+            var a = Path.Combine(dir, "a.txt");
+            dd.RecordPending(new List<string> { a }, dir);
+            Assert.True(dd.HasPending);
+            Assert.True(File.Exists(DbFile(dir, prefix)));
+
+            dd.ClearStore();
+            Assert.False(dd.HasPending);
+            Assert.False(File.Exists(DbFile(dir, prefix)));
+            Assert.Empty(Directory.GetFiles(dir, prefix + ".db*"));
+
+            dd.RecordPending(new List<string> { a }, dir);
+            Assert.True(dd.HasPending);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
     public void RecordPending_PureDupes_CreatesNoNewRows()
     {
         var dir = TestDir();

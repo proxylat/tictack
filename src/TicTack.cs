@@ -275,12 +275,14 @@ namespace TicTack
                 ? Path.Combine(baseDir, "tictack.log")
                 : cfg.Logging.Path;
             var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
+            var failures = 0;
 
             foreach (var src in cfg.Sources)
             {
                 if (!Directory.Exists(src.Path))
                 {
                     log.Error("Source folder missing, rebuild skipped: " + src.Path);
+                    failures++;
                     continue;
                 }
                 if (!DriveGuard.IsReady(src.Destination))
@@ -292,9 +294,15 @@ namespace TicTack
                 try
                 {
                     using var pipeline = BuildPipeline(src, cfg, log);
-                    // Rebuild resets everything: state rows, the whole hold
-                    // store (SQLite .db + sidecars, every legacy batch file
-                    // and legacy name), then re-syncs from scratch.
+                    // Holds clear through the pipeline's own store: it owns
+                    // the SQLite handle, and Windows refuses to delete open
+                    // files. A lock here means another process — the running
+                    // service — holds the store, so say so instead of
+                    // dumping a sharing-violation stack.
+                    try { pipeline.ClearDeferredHolds(); }
+                    catch (IOException ex) { throw new IOException("Rebuild blocked: stop the TicTackSv service first, then retry (" + ex.Message + ")", ex); }
+                    // Rebuild resets everything: state rows, every legacy
+                    // batch file and legacy name, then re-syncs from scratch.
                     var deferredPrefix = DeferredFilePrefix(src);
                     try
                     {
@@ -302,10 +310,6 @@ namespace TicTack
                             DeleteWithRetry(f);
                     }
                     catch (Exception ex) { log.Debug("Rebuild deferred cleanup skipped: " + ex.Message); }
-                    var deferredDb = Path.Combine(deferredDir, deferredPrefix + ".db");
-                    DeleteWithRetry(deferredDb);
-                    foreach (var ext in new[] { "-wal", "-shm", "-journal" })
-                        DeleteWithRetry(deferredDb + ext);
                     DeleteWithRetry(Path.Combine(deferredDir, LegacyDeferredFileName(src)));
                     DeleteWithRetry(Path.Combine(src.Destination, ".tictack-deferred.json"));
                     var rebuilt = await pipeline.RunOnceAsync(() =>
@@ -320,11 +324,15 @@ namespace TicTack
                 }
                 catch (Exception ex)
                 {
+                    failures++;
                     log.Error("Rebuild failed: " + src.Path, ex);
                 }
             }
 
-            log.Info("Full rebuild finished. All databases cleared, source re-scanned, parity enforced.");
+            if (failures > 0)
+                log.Warn("Full rebuild finished with " + failures + " failure(s).");
+            else
+                log.Info("Full rebuild finished. All databases cleared, source re-scanned, parity enforced.");
         }
 
         static void DeleteWithRetry(string path)
@@ -475,6 +483,16 @@ namespace TicTack
             return string.Join(" + ", parts);
         }
 
+        // Startup one-liner names only: intervals and buffer sizes are config
+        // echoes, not decisions. Polling-only keeps its interval (otherwise
+        // the line says nothing about when it runs).
+        internal static string MemberShortName(IFileMonitor m) => m switch
+        {
+            PollingMonitor => "polling",
+            UsnJournalMonitor => "usn",
+            _ => "watcher",
+        };
+
         internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log, bool logMonitorStartup = false)
         {
             var accessor = CreateAccessorOrFallback(src, log);
@@ -562,24 +580,24 @@ namespace TicTack
                 case "watcher":
                     monitor = CreateWatcher();
                     if (logMonitorStartup)
-                        log.Info("Monitor: watcher on " + src.Path + " (buffer " + monitorConfig.WatcherBufferKb + "KB).");
+                        log.Info("Syncing: " + SourceName(src) + " (watcher).");
                     break;
                 case "usn":
                     monitor = CreateUsnOrFallback();
                     if (logMonitorStartup)
-                        log.Info("Monitor: " + (monitor is UsnJournalMonitor ? "usn" : "watcher (USN unavailable)") + " on " + src.Path + ".");
+                        log.Info("Syncing: " + SourceName(src) + (monitor is UsnJournalMonitor ? " (usn)." : " (watcher, USN unavailable)."));
                     break;
                 case "polling":
                     monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
                     if (logMonitorStartup)
-                        log.Info("Monitor: polling on " + src.Path + " (every " + monitorConfig.PollingIntervalSeconds + "s).");
+                        log.Info("Syncing: " + SourceName(src) + " (polling every " + monitorConfig.PollingIntervalSeconds + "s).");
                     break;
                 default:
                     compositeMembers = BuildCompositeMembers(
                         monitorConfig, src.Path, CreateWatcher, () => TryCreateUsn("skipping USN member"));
                     monitor = new CompositeMonitor(compositeMembers.ToArray());
                     if (logMonitorStartup)
-                        log.Info("Monitor: composite (" + DescribeMembers(compositeMembers, monitorConfig) + ") on " + src.Path + ".");
+                        log.Info("Syncing: " + SourceName(src) + " (composite: " + string.Join(" + ", compositeMembers.Select(MemberShortName)) + ").");
                     break;
             }
 

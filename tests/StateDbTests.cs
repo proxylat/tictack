@@ -234,6 +234,38 @@ public class StateDbTests : IDisposable
         Assert.Equal((2L, 20L), all[$"aXb{S}keep.txt"]);
     }
 
+    [Fact]
+    public void UpdatePrefix_OntoExistingRows_ReplacesWithoutThrow()
+    {
+        // Folder merge: old\f.txt renames onto an already-tracked new\f.txt.
+        // Plain UPDATE aborts the whole statement with UNIQUE constraint
+        // failed (live crash in ProcessEvent); OR REPLACE lets the renamed
+        // row win and the loser is re-upserted by the post-rename scan.
+        var S = Path.DirectorySeparatorChar;
+        _db.Upsert($"old{S}f.txt", 1, 10);
+        _db.Upsert($"new{S}f.txt", 2, 20);
+
+        _db.UpdatePrefix("old", "new");
+
+        var all = _db.LoadAll();
+        Assert.Single(all);
+        Assert.Equal((1L, 10L), all[$"new{S}f.txt"]);
+    }
+
+    [Fact]
+    public async Task UpdatePrefixAsync_OntoExistingRows_ReplacesWithoutThrow()
+    {
+        var S = Path.DirectorySeparatorChar;
+        await _db.UpsertAsync($"old{S}f.txt", 1, 10);
+        await _db.UpsertAsync($"new{S}f.txt", 2, 20);
+
+        await _db.UpdatePrefixAsync("old", "new");
+
+        var all = await _db.LoadAllAsync();
+        Assert.Single(all);
+        Assert.Equal((1L, 10L), all[$"new{S}f.txt"]);
+    }
+
     private void BreakConnection()
     {
         var field = typeof(StateDb).GetField("_conn", BindingFlags.NonPublic | BindingFlags.Instance);
