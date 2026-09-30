@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
@@ -57,7 +57,7 @@ jobs:
           done
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ matrix.os }}
           path: tests/TestResults/
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: semgrep r/csharp
         run: |
           # Pinned: a new rule release must not turn the gate red on its own.
@@ -79,7 +79,7 @@ jobs:
           ast-grep scan
       - name: Upload semgrep results
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: static-results
           path: semgrep.json
@@ -90,7 +90,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
@@ -122,7 +122,7 @@ jobs:
           }
       - name: Upload hang diagnostics
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: hang-dumps-windows
           path: tests/TestResults/
