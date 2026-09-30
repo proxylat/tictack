@@ -30,8 +30,14 @@ namespace TicTack
         private const string StateSql = @"CREATE TABLE IF NOT EXISTS state (
                 path TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
-                mtime INTEGER NOT NULL
+                mtime INTEGER NOT NULL,
+                file_id TEXT,
+                ctime INTEGER NOT NULL DEFAULT 0,
+                hash TEXT
             )";
+            // NOTE: idx_state_fileid is created by EnsureStateColumns below,
+            // not here — old 3-column DBs must gain the column first or the
+            // index build fails and migration never runs.
 
         private const string JobRunsSql = @"CREATE TABLE IF NOT EXISTS job_runs (
                 name TEXT PRIMARY KEY,
@@ -98,7 +104,7 @@ namespace TicTack
                     if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                         Directory.CreateDirectory(dir);
 
-                    conn = new SqliteConnection("Data Source=" + dbPath);
+                    conn = new SqliteConnection(ConnectionString(dbPath, schema));
                     await conn.OpenAsync().ConfigureAwait(false);
                     await ConfigureAsync(conn, schema).ConfigureAwait(false);
                     return conn;
@@ -128,6 +134,36 @@ namespace TicTack
                 cmd.CommandText = SchemaSql(schema);
                 cmd.ExecuteNonQuery();
             }
+            if (schema == SqliteSchema.State)
+                EnsureStateColumns(conn);
+        }
+
+        // Old state DBs have the 3-column table (path/size/mtime). New
+        // columns arrive via ALTER TABLE, never a rebuild: the rows are the
+        // user's skip-known history, losing them means re-hashing everything.
+        private static void EnsureStateColumns(SqliteConnection conn)
+        {
+            var cols = new System.Collections.Generic.HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "PRAGMA table_info(state)";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read()) cols.Add(reader.GetString(1));
+            }
+            if (!cols.Contains("file_id"))
+                Exec(conn, "ALTER TABLE state ADD COLUMN file_id TEXT");
+            if (!cols.Contains("ctime"))
+                Exec(conn, "ALTER TABLE state ADD COLUMN ctime INTEGER NOT NULL DEFAULT 0");
+            if (!cols.Contains("hash"))
+                Exec(conn, "ALTER TABLE state ADD COLUMN hash TEXT");
+            Exec(conn, "CREATE INDEX IF NOT EXISTS idx_state_fileid ON state(file_id)");
+        }
+
+        private static void Exec(SqliteConnection conn, string sql)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.ExecuteNonQuery();
         }
 
         private static async Task ConfigureAsync(SqliteConnection conn, SqliteSchema schema)
@@ -147,6 +183,33 @@ namespace TicTack
                 cmd.CommandText = SchemaSql(schema);
                 await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
             }
+            if (schema == SqliteSchema.State)
+                await EnsureStateColumnsAsync(conn).ConfigureAwait(false);
+        }
+
+        private static async Task EnsureStateColumnsAsync(SqliteConnection conn)
+        {
+            var cols = new System.Collections.Generic.HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "PRAGMA table_info(state)";
+                using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
+                while (await reader.ReadAsync().ConfigureAwait(false)) cols.Add(reader.GetString(1));
+            }
+            if (!cols.Contains("file_id"))
+                await ExecAsync(conn, "ALTER TABLE state ADD COLUMN file_id TEXT").ConfigureAwait(false);
+            if (!cols.Contains("ctime"))
+                await ExecAsync(conn, "ALTER TABLE state ADD COLUMN ctime INTEGER NOT NULL DEFAULT 0").ConfigureAwait(false);
+            if (!cols.Contains("hash"))
+                await ExecAsync(conn, "ALTER TABLE state ADD COLUMN hash TEXT").ConfigureAwait(false);
+            await ExecAsync(conn, "CREATE INDEX IF NOT EXISTS idx_state_fileid ON state(file_id)").ConfigureAwait(false);
+        }
+
+        private static async Task ExecAsync(SqliteConnection conn, string sql)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
         }
 
         private static string SchemaSql(SqliteSchema schema) => schema switch

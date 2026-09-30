@@ -41,6 +41,7 @@
     <Compile Include="../src/Config.cs" Link="src/Config.cs" />
     <Compile Include="../src/Comparer.cs" Link="src/Comparer.cs" />
     <Compile Include="../src/Validator.cs" Link="src/Validator.cs" />
+    <Compile Include="../src/FileIdentity.cs" Link="src/FileIdentity.cs" />
     <Compile Include="../src/Filter.cs" Link="src/Filter.cs" />
     <Compile Include="../src/StateDb.cs" Link="src/StateDb.cs" />
     <Compile Include="../src/SrcLock.cs" Link="src/SrcLock.cs" />
@@ -65,6 +66,9 @@
     <Compile Include="../src/DeferredDeletion.cs" Link="src/DeferredDeletion.cs" />
     <Compile Include="../src/Scheduler.cs" Link="src/Scheduler.cs" />
     <Compile Include="../src/JobState.cs" Link="src/JobState.cs" />
+    <Compile Include="../src/Scrubber.cs" Link="src/Scrubber.cs" />
+    <Compile Include="../src/ChurnMonitor.cs" Link="src/ChurnMonitor.cs" />
+    <Compile Include="../src/DestinationGuard.cs" Link="src/DestinationGuard.cs" />
     <Compile Include="../src/Metrics.cs" Link="src/Metrics.cs" />
     <Compile Include="../src/DriveGuard.cs" Link="src/DriveGuard.cs" />
     <Compile Include="../src/ParityScanner.cs" Link="src/ParityScanner.cs" />

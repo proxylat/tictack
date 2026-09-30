@@ -39,5 +39,10 @@
     <Compile Include="../../src/TrackedDeleter.cs" Link="src/TrackedDeleter.cs" />
     <Compile Include="../../src/ProcessRunner.cs" Link="src/ProcessRunner.cs" />
     <Compile Include="../../src/SqliteBootstrap.cs" Link="src/SqliteBootstrap.cs" />
+    <Compile Include="../../src/JobState.cs" Link="src/JobState.cs" />
+    <Compile Include="../../src/FileIdentity.cs" Link="src/FileIdentity.cs" />
+    <Compile Include="../../src/Scrubber.cs" Link="src/Scrubber.cs" />
+    <Compile Include="../../src/ChurnMonitor.cs" Link="src/ChurnMonitor.cs" />
+    <Compile Include="../../src/DestinationGuard.cs" Link="src/DestinationGuard.cs" />
   </ItemGroup>
 </Project>

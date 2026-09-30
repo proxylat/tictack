@@ -91,7 +91,48 @@ namespace TicTack
         public int DeleteThresholdCount { get; set; }
         public long? DeleteThresholdSizeGb { get; set; }
         public double DeleteThresholdPercent { get; set; }
+        // Locality shortcut: when a would-be-blocked batch has this share
+        // (percent) of its paths under one parent directory, it looks like a
+        // deliberate folder cleanup, not a catastrophe — proceed with a Warn
+        // instead of holding. Scattered batches hold as before. Default 80.
+        // Zero or negative disables (every tripped batch holds).
+        public double DeleteLocalityPercent { get; set; }
         public int DeleteHoldDays { get; set; }
+
+        // Full content re-verify cadence in days: when due, files whose
+        // size+mtime look unchanged are still byte-compared against the
+        // destination instead of skipped. Default 14. Zero or negative
+        // disables (trust size+mtime only).
+        public int FullVerifyDays { get; set; }
+
+        // Churn guard: sliding-window anomaly brake. Trips when any single
+        // wire fires inside the window — bytes copied, files copied, or
+        // dest renames replayed. A trip writes a .tictack-churn-hold marker
+        // next to the lock file and freezes copies, deletes, and the
+        // deferred drain until the user deletes the marker (file-is-truth).
+        // Each wire ≤0 disables that wire. Defaults: 60min / 100GB /
+        // 50000 files / 10000 renames.
+        public int ChurnWindowMinutes { get; set; }
+        public long ChurnBytesGb { get; set; }
+        public int ChurnFileCount { get; set; }
+        public int ChurnRenameCount { get; set; }
+
+        // Proof-by-restore: every N days, hash-compare a random sample of
+        // destination files against their sources (read-only; mismatches
+        // log Error and re-alert next run, repair is the scrub's job).
+        // Default 0 = off. RestoreVerifyFiles bounds the sample size.
+        public int RestoreVerifyDays { get; set; }
+        public int RestoreVerifyFiles { get; set; }
+
+        // Destination self-defense: when true, the destination root is
+        // hardened at startup so only the service identity can write —
+        // ransomware running as the user gets access-denied. Windows:
+        // inheritable Users deny-write (service runs as SYSTEM, unaffected).
+        // Linux: group/other write bits stripped (service runs as root).
+        // Default false: enabling locks the user's own CLI runs out too
+        // (service mode only), existing trees need a one-time recursive
+        // pass (see README), toggle-off does not revert ACLs.
+        public bool DestinationProtect { get; set; }
         public VersioningConfig? Versioning { get; set; }
         public DeletionConfig? Deletion { get; set; }
 
@@ -110,7 +151,16 @@ namespace TicTack
             DeleteThresholdCount = 1000;
             DeleteThresholdSizeGb = 50;
             DeleteThresholdPercent = 50;
+            DeleteLocalityPercent = 80;
             DeleteHoldDays = DefaultDeleteHoldDays;
+            FullVerifyDays = 14;
+            ChurnWindowMinutes = 60;
+            ChurnBytesGb = 100;
+            ChurnFileCount = 50000;
+            ChurnRenameCount = 10000;
+            RestoreVerifyDays = 0;
+            RestoreVerifyFiles = 10;
+            DestinationProtect = false;
         }
     }
 

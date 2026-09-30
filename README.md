@@ -8,7 +8,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 
 - **Never lose data** — fsync before rename ensures data is on disk before the final path is updated. Post-copy validation (size, hash, or both) verifies every file. Three layers of integrity: pre-read probe catches permissions early, temp+rename prevents partial overwrites, validation catches corruption.
 - **Detect early, fail fast** — a 1-byte read from the source catches ~90% of lock/permission/access issues before the full copy starts. Delete-threshold guard blocks accidental mass deletions. Source-disappearance guard prevents syncing from an unmounted or empty directory.
-- **Zero CPU idle** — `SemaphoreSlim` blocks the processing thread with no CPU usage when no events are queued. Default `watcher` monitor blocks inside OS file-change notifications. SQLite state DB uses incremental writes (no periodic full rewrites). Periodic wake-ups still exist: lock refresh (30s), deferred-deletion check (1h, only when armed), parity rescan (6h); `polling`/`composite` monitor modes add their scan interval on top.
+- **Zero CPU idle** — `SemaphoreSlim` blocks the processing thread with no CPU usage when no events are queued. Default `watcher` monitor blocks inside OS file-change notifications. SQLite state DB uses incremental writes (no periodic full rewrites). Periodic wake-ups still exist: lock refresh (30s), deferred-deletion deadline timer (one-shot, only when holds exist), parity rescan (6h); `polling`/`composite` monitor modes add their scan interval on top.
 - **Crash-proof by construction** — every write follows the temp-then-rename pattern: no partial file ever lands at the final path. Startup recovery (`PowerGuard.Cleanup()`) collects orphaned `.tictack.tmp` files. SQLite WAL journal survives power loss without corruption. Lock files have stale-detection and auto-release.
 - **No secrets** — zero external network calls, no accounts, no cloud. EventLog entries stay on the machine.
 - **Dependency-light** — four runtime dependencies (Microsoft.Data.Sqlite, YamlDotNet, System.ServiceProcess.ServiceController, System.Diagnostics.EventLog). No npm, pip, cargo, or gem trees.
@@ -32,7 +32,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | Max file size | `SizeFilter` — `max_file_size_mb: <number>` or `no-limit` |
 | Crash Recovery | `CopyAction` writes to `.tictack.tmp` then atomic rename; `PowerGuard.Cleanup()` recovers orphaned temps on startup |
 | Desktop alerts | `DesktopAlert.Write()` creates `TicTack-{LEVEL}-{timestamp}.txt` in `alert_path` (global 30s cooldown shared across levels) |
-| Zero-CPU idle | `SemaphoreSlim` + blocking OS notifications — no CPU when idle; periodic wake-ups only: lock refresh (30s), deferred check (1h, when armed), parity rescan (6h), USN poll sleep, polling scan intervals |
+| Zero-CPU idle | `SemaphoreSlim` + blocking OS notifications — no CPU when idle; periodic wake-ups only: lock refresh (30s), deferred deadline timer (one-shot, when holds exist), parity rescan (6h), USN poll sleep, polling scan intervals |
 | Volume label paths | `[VolumeLabel]\path` syntax resolved to drive letters via `DriveInfo.GetDrives()` |
 | Scheduled jobs | `TimerScheduler` — daily shell commands (`cmd.exe /c` Windows, `/bin/sh -c` Linux) with `{source}` substitution |
 | External drive tasks | `DriveDiscoverer` — runs a shell command on each discovered external drive |
@@ -225,7 +225,7 @@ Fields live at three levels: top-level source keys (`paths`, `destination`, `sta
 |---|---|---|
 | `paths` | — | List of source folders to monitor. Each entry becomes its own source at `destination + foldername` |
 | `destination` | — | Drive+folder to sync into, supports `[VolumeLabel]` |
-| `state_db_path` | `C:\ProgramData\TicTack` / `/var/lib/tictack` | **Directory** for per-source state DBs (`<folder>.db`, SQLite WAL) used to skip unchanged files on startup |
+| `state_db_path` | `C:\ProgramData\TicTack` / `/var/lib/tictack` | **Directory** for per-source state DBs (`<folder>-<hash>.db`, SQLite WAL — hash suffix keeps same-leaf sources apart) used to skip unchanged files on startup |
 | `debounce_seconds` | `10` | Wait time (s) after last change before triggering sync |
 | `drain_strategy` | `scan` | Backlog drain order: `scan` = hash-order scan (zero extra memory) / `ready_queue` = earliest-expiry-first heap (bounded drain under watcher-overflow backlogs, transient ~2x backlog memory) |
 | `dir_sync` | `per-file` | Directory-entry durability after each rename: `per-file` = fsync each file's parent dir / `per-batch` = collect dirs and fsync once per state checkpoint (fewer syncs on initial sync, larger crash window: files already renamed but not yet dir-synced may need a re-copy). Measured: neutral under `full`, but 3.5x faster cold initial sync when combined with `rename-only` (24.7s → 7.0s, 10k files / 2GB) |
@@ -245,6 +245,7 @@ Fields live at three levels: top-level source keys (`paths`, `destination`, `sta
 | `delete_threshold_size_gb` | `50` | Block deletion if one burst total size >= N GB |
 | `delete_threshold_percent` | `50` | Block deletion if one burst >= N% of known files |
 | `delete_hold_days` | `7` | Days to hold blocked deletions before syncing; daily warnings sent |
+| `full_verify_days` | `14` | Days between full content re-verifies: when due, unchanged files are byte-compared instead of skipped; `0` disables |
 | `versioning.max_versions` | `10` | Keep up to N old versions per file |
 | `versioning.path` | — | Where archived versions go (timestamp suffix) |
 | `deletion.mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |

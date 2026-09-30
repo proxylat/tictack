@@ -47,6 +47,47 @@ namespace TicTack
             }
         }
 
+        // Integer counters sharing the same store (scrub shard index).
+        // The table self-migrates: no bootstrap change needed.
+        public int GetCounter(string name)
+        {
+            lock (_lock)
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)";
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT value FROM counters WHERE name = @n";
+                    cmd.Parameters.AddWithValue("@n", name);
+                    var r = cmd.ExecuteScalar();
+                    if (r == null || r is DBNull) return 0;
+                    return (int)(long)r;
+                }
+            }
+        }
+
+        public void SetCounter(string name, int value)
+        {
+            lock (_lock)
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)";
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "INSERT OR REPLACE INTO counters (name, value) VALUES (@n, @v)";
+                    cmd.Parameters.AddWithValue("@n", name);
+                    cmd.Parameters.AddWithValue("@v", value);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed) return;

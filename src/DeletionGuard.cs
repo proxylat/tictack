@@ -18,6 +18,7 @@ namespace TicTack
         private readonly DeferredDeletion _deferred;
         private readonly ILogger _log;
         private readonly Action _onDefer;
+        private readonly ChurnMonitor? _churn;
         private readonly List<PendingDeletion> _pendingDeletions = new List<PendingDeletion>();
 
         public DeletionGuard(
@@ -26,7 +27,8 @@ namespace TicTack
             TrackedDeleter deleter,
             DeferredDeletion deferred,
             ILogger log,
-            Action onDefer)
+            Action onDefer,
+            ChurnMonitor? churn = null)
         {
             _config = config;
             _stateDb = stateDb;
@@ -34,6 +36,7 @@ namespace TicTack
             _deferred = deferred;
             _log = log;
             _onDefer = onDefer;
+            _churn = churn;
         }
 
         public void Add(PendingDeletion deletion)
@@ -44,6 +47,13 @@ namespace TicTack
         public async Task FlushAsync(CancellationToken ct)
         {
             if (_pendingDeletions.Count == 0) return;
+
+            // Churn freeze: leave items queued, retry on the next flush.
+            if (_churn != null && _churn.IsHeld())
+            {
+                _log.Debug("Churn hold active, keeping deletion batch queued.");
+                return;
+            }
 
             var batch = new List<PendingDeletion>(_pendingDeletions);
             _pendingDeletions.Clear();
@@ -104,11 +114,38 @@ namespace TicTack
                 blocked = true;
                 var percent = (double)totalCount / stateCount * 100;
                 reason = percent.ToString("F1") + "% of " + stateCount + " files >= " + _config.Sync.DeleteThresholdPercent + "%";
+                if (totalCount > stateCount)
+                    reason += " (batch exceeds baseline — StateDb holds dead rows, treated as suspect, failing closed)";
             }
 
             if (blocked)
             {
-                _log.Error("Delete guard: " + reason + ". Deferring.");
+                // Locality shortcut: a batch concentrated in one folder is a
+                // cleanup, not a catastrophe — proceed loudly instead of
+                // holding. Needs two preconditions: statistical weight (tiny
+                // batches carry no signal) and a trustworthy baseline (a
+                // batch bigger than the known state means dead rows — fail
+                // closed, locality reasoning cannot apply). Otherwise the
+                // batch falls through to the hold.
+                var localityPct = _config.Sync != null ? _config.Sync.DeleteLocalityPercent : 80;
+                if (localityPct > 0 && countKnown && totalCount <= stateCount && totalCount >= 10)
+                {
+                    var locality = LocalityShare(batch);
+                    if (locality.Share * 100 >= localityPct)
+                    {
+                        _log.Warn("Delete guard: " + reason + " — but "
+                            + (locality.Share * 100).ToString("F0") + "% of the batch is under '" + locality.Dir
+                            + "', treating as folder cleanup, proceeding.");
+                        _churn?.ReportBulkDelete(totalSize, totalCount);
+                        foreach (var d in batch)
+                        {
+                            await _deleter.DeleteAsync(d.Path, d.DestPath, PathUtil.Relative(d.Path, _config.Path), "Deletion failed", ct);
+                        }
+                        return;
+                    }
+                }
+                _log.Warn("Delete guard: " + reason + ". Deferring.");
+                _churn?.ReportBulkDelete(totalSize, totalCount);
                 var files = batch.ConvertAll(d => d.Path);
                 _deferred.RecordPending(files, _config.Path);
                 _onDefer();
@@ -119,7 +156,27 @@ namespace TicTack
             {
                 await _deleter.DeleteAsync(d.Path, d.DestPath, PathUtil.Relative(d.Path, _config.Path), "Deletion failed", ct);
             }
+            _churn?.ReportBulkDelete(totalSize, totalCount);
             _log.Debug("Deleted: " + batch.Count + " files");
+        }
+
+        // Largest single-parent-directory share of the batch. Source paths
+        // decide: the user acts on the source side, dest mirrors it.
+        private static (string Dir, double Share) LocalityShare(List<PendingDeletion> batch)
+        {
+            var cmp = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            var counts = new Dictionary<string, int>(cmp);
+            foreach (var d in batch)
+            {
+                var dir = Path.GetDirectoryName(d.Path) ?? string.Empty;
+                counts.TryGetValue(dir, out var n);
+                counts[dir] = n + 1;
+            }
+            var top = string.Empty;
+            var topCount = 0;
+            foreach (var kv in counts)
+                if (kv.Value > topCount) { top = kv.Key; topCount = kv.Value; }
+            return (top, batch.Count == 0 ? 0 : (double)topCount / batch.Count);
         }
 
         public sealed class PendingDeletion
