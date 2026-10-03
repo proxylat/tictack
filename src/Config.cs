@@ -87,42 +87,42 @@ namespace TicTack
         public RetryConfig Retry { get; set; }
         public string? LockHandling { get; set; }
         public string FileAccess { get; set; }
-        public int RetryLockSeconds { get; set; }
+        public int LockWaitSeconds { get; set; }
         public int DeleteThresholdCount { get; set; }
         public long? DeleteThresholdSizeGb { get; set; }
         public double DeleteThresholdPercent { get; set; }
-        // Locality shortcut: when a would-be-blocked batch has this share
+        // Bulk-cleanup shortcut: when a would-be-blocked batch has this share
         // (percent) of its paths under one parent directory, it looks like a
         // deliberate folder cleanup, not a catastrophe — proceed with a Warn
-        // instead of holding. Scattered batches hold as before. Default 80.
-        // Zero or negative disables (every tripped batch holds).
-        public double DeleteLocalityPercent { get; set; }
+        // instead of holding. Scattered batches hold as before. Default 0 =
+        // off (absent key means off; every tripped batch holds).
+        public double BulkCleanupPercent { get; set; }
         public int DeleteHoldDays { get; set; }
 
-        // Full content re-verify cadence in days: when due, files whose
+        // Full content routine-check cadence in days: when due, files whose
         // size+mtime look unchanged are still byte-compared against the
         // destination instead of skipped. Default 14. Zero or negative
         // disables (trust size+mtime only).
-        public int FullVerifyDays { get; set; }
+        public int FullRoutineCheckDays { get; set; }
 
-        // Churn guard: sliding-window anomaly brake. Trips when any single
+        // Spike guard: sliding-window anomaly brake. Trips when any single
         // wire fires inside the window — bytes copied, files copied, or
         // dest renames replayed. A trip writes a .tictack-churn-hold marker
         // next to the lock file and freezes copies, deletes, and the
         // deferred drain until the user deletes the marker (file-is-truth).
         // Each wire ≤0 disables that wire. Defaults: 60min / 100GB /
         // 50000 files / 10000 renames.
-        public int ChurnWindowMinutes { get; set; }
-        public long ChurnBytesGb { get; set; }
-        public int ChurnFileCount { get; set; }
-        public int ChurnRenameCount { get; set; }
+        public int SpikeWindowMinutes { get; set; }
+        public long SpikeBytesGb { get; set; }
+        public int SpikeFiles { get; set; }
+        public int SpikeRenames { get; set; }
 
         // Proof-by-restore: every N days, hash-compare a random sample of
         // destination files against their sources (read-only; mismatches
         // log Error and re-alert next run, repair is the scrub's job).
-        // Default 0 = off. RestoreVerifyFiles bounds the sample size.
-        public int RestoreVerifyDays { get; set; }
-        public int RestoreVerifyFiles { get; set; }
+        // Default 0 = off. RoutineCheckFiles bounds the sample size.
+        public int RoutineCheckDays { get; set; }
+        public int RoutineCheckFiles { get; set; }
 
         // Destination self-defense: when true, the destination root is
         // hardened at startup so only the service identity can write —
@@ -147,19 +147,19 @@ namespace TicTack
             Retry = new RetryConfig();
             LockHandling = "retry";
             FileAccess = "direct";
-            RetryLockSeconds = 600;
+            LockWaitSeconds = 600;
             DeleteThresholdCount = 1000;
             DeleteThresholdSizeGb = 50;
             DeleteThresholdPercent = 50;
-            DeleteLocalityPercent = 80;
+            BulkCleanupPercent = 0;
             DeleteHoldDays = DefaultDeleteHoldDays;
-            FullVerifyDays = 14;
-            ChurnWindowMinutes = 60;
-            ChurnBytesGb = 100;
-            ChurnFileCount = 50000;
-            ChurnRenameCount = 10000;
-            RestoreVerifyDays = 0;
-            RestoreVerifyFiles = 10;
+            FullRoutineCheckDays = 14;
+            SpikeWindowMinutes = 60;
+            SpikeBytesGb = 100;
+            SpikeFiles = 50000;
+            SpikeRenames = 10000;
+            RoutineCheckDays = 0;
+            RoutineCheckFiles = 10;
             DestinationProtect = false;
         }
     }
@@ -262,6 +262,13 @@ namespace TicTack
         public string? Command { get; set; }
         public string? WorkingDir { get; set; }
         public int TimeoutMinutes { get; set; }
+        // Cadence: daily (default) | weekly | monthly. Weekly needs Day as a
+        // weekday name (Monday-Sunday); monthly needs Day as 1-31 (clamped to
+        // short months, so 31 runs on the 30th/28th). Mutually exclusive with
+        // RunOnceOn, which is an ISO date (YYYY-MM-DD) that fires once.
+        public string? Schedule { get; set; }
+        public string? Day { get; set; }
+        public string? RunOnceOn { get; set; }
 
         public JobConfig()
         {

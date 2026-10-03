@@ -55,7 +55,7 @@ namespace TicTack
             foreach (var d in snapshot)
             {
                 if (CopyAction.FlushDirectory(d)) continue;
-                log?.Warn("Directory fsync failed: " + d);
+                log?.Warn("Directory fsync failed: " + d + CopyAction.DirSyncDetail());
                 lock (_gate)
                 {
                     foreach (var rest in snapshot) _dirs.Add(rest);
@@ -113,6 +113,27 @@ namespace TicTack
             out uint lpBytesReturned, IntPtr lpOverlapped);
 
         const uint FSCTL_SET_SPARSE = 0x000900C4;
+
+        // Directory fsync on Windows: open the directory with backup
+        // semantics and flush it, so the rename entry itself is durable.
+        // (Rename is only atomic w.r.t. normal operation, not w.r.t. crash
+        // — without this, a power loss can lose the rename on NTFS too.)
+        [DllImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern IntPtr CreateDirectoryHandle(string lpFileName, uint dwDesiredAccess,
+            uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+            uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool FlushFileBuffers(IntPtr hFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr hObject);
+
+        const uint WIN_GENERIC_READ = 0x80000000;
+        const uint WIN_GENERIC_WRITE = 0x40000000;
+        const uint WIN_SHARE_ALL = 0x7;
+        const uint WIN_OPEN_EXISTING = 3;
+        const uint WIN_FLAG_BACKUP_SEMANTICS = 0x02000000;
 
         public CopyAction(IFileAccessor accessor, bool fullDurability = true, ILogger? log = null)
             : this(accessor, fullDurability ? FileDurability.Full : FileDurability.RenameOnly, null, log)
@@ -308,7 +329,7 @@ namespace TicTack
                 _checkpoint?.Invoke(CopyCheckpoint.AfterCommit);
 
                 if (!SyncDirectory(dst))
-                    return ActionResult.Fail("Could not fsync destination directory");
+                    return ActionResult.Fail("Could not fsync destination directory" + DirSyncDetail(), retryable: true);
 
                 // Count only fully committed copies.
                 if (tmp.CopyMs >= 0) TicTackEventSource.Log.CopyCompleted(tmp.CopyMs);
@@ -358,13 +379,61 @@ namespace TicTack
             return FlushDirectory(parent);
         }
 
+        // Last dir-sync failure on THIS thread (diagnostic only): raw OS
+        // error + step ("open"/"flush"), so a failing machine says WHY.
+        // ThreadStatic because copy workers run in parallel; each thread
+        // reads its own failure straight after its own failed call.
+        [ThreadStatic]
+        internal static int DirSyncError;
+        [ThreadStatic]
+        internal static string? DirSyncStep;
+
+        // Renders the thread-local failure above for error messages and
+        // logs. Empty when the last call succeeded (code stays 0).
+        internal static string DirSyncDetail() =>
+            DirSyncError != 0 ? " (os error " + DirSyncError + " at " + (DirSyncStep ?? "?") + ")" : "";
+
         internal static bool FlushDirectory(string? path)
         {
-            if (!OperatingSystem.IsLinux() || string.IsNullOrEmpty(path)) return true;
-            var fd = OpenDirectory(path, O_RDONLY | O_DIRECTORY);
-            if (fd < 0) return false;
-            try { return Fsync(fd) == 0; }
-            finally { Close(fd); }
+            if (string.IsNullOrEmpty(path)) return true;
+            if (OperatingSystem.IsLinux())
+            {
+                var fd = OpenDirectory(path, O_RDONLY | O_DIRECTORY);
+                if (fd < 0) { DirSyncError = Marshal.GetLastSystemError(); DirSyncStep = "open"; return false; }
+                try
+                {
+                    if (Fsync(fd) != 0) { DirSyncError = Marshal.GetLastSystemError(); DirSyncStep = "flush"; return false; }
+                    return true;
+                }
+                finally { Close(fd); }
+            }
+            if (OperatingSystem.IsWindows())
+            {
+                // FlushFileBuffers on a directory handle fails with
+                // ERROR_ACCESS_DENIED when the handle is read-only on
+                // several stacks: open write-capable first (a dest dir we
+                // just renamed into is writable by construction), fall
+                // back to read-only for locked-down dirs.
+                if (FlushDirectoryHandle(path, WIN_GENERIC_READ | WIN_GENERIC_WRITE)) return true;
+                return FlushDirectoryHandle(path, WIN_GENERIC_READ);
+            }
+            return true;
+        }
+
+        private static bool FlushDirectoryHandle(string? path, uint access)
+        {
+            if (string.IsNullOrEmpty(path)) return true;
+            var handle = CreateDirectoryHandle(PathUtil.EnsureExtended(path),
+                access, WIN_SHARE_ALL, IntPtr.Zero,
+                WIN_OPEN_EXISTING, WIN_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) { DirSyncError = Marshal.GetLastWin32Error(); DirSyncStep = "open"; return false; }
+            try
+            {
+                if (!FlushFileBuffers(handle)) { DirSyncError = Marshal.GetLastWin32Error(); DirSyncStep = "flush"; return false; }
+                DirSyncError = 0;
+                return true;
+            }
+            finally { CloseHandle(handle); }
         }
 
     }
@@ -393,7 +462,10 @@ namespace TicTack
                 if (Directory.Exists(oldDest))
                 {
                     if (!Directory.Exists(dest))
+                    {
                         Directory.Move(oldDest, dest);
+                        SyncParents(oldDest, dest);
+                    }
                     else
                     {
                         // Collision: the old-name tree holds destination-only content.
@@ -414,7 +486,10 @@ namespace TicTack
                         // The strategy consumed the old tree (mirror deletes, archive
                         // moves it aside); move only if something is left to move.
                         if (Directory.Exists(oldDest))
+                        {
                             Directory.Move(oldDest, dest);
+                            SyncParents(oldDest, dest);
+                        }
                     }
                 }
                 else if (File.Exists(oldDest))
@@ -437,6 +512,7 @@ namespace TicTack
                         }
                     }
                     File.Move(oldDest, dest);
+                    SyncParents(oldDest, dest);
                 }
             }
             catch (IOException ex)
@@ -455,6 +531,25 @@ namespace TicTack
                 return ActionResult.Fail(ex.Message);
             }
             return ActionResult.Ok();
+
+            // A directory fsync flushes every pending entry change in that
+            // dir, so one sync per affected parent covers the whole
+            // delete-then-move sequence above. Never fails the rename:
+            // a lost entry resurrects and the next scan replays it.
+            void SyncParents(string oldPath, string newPath)
+            {
+                string? synced = null;
+                foreach (var p in new[] { newPath, oldPath })
+                {
+                    string? parent = null;
+                    try { parent = Path.GetDirectoryName(p); } catch { }
+                    if (string.IsNullOrEmpty(parent)) continue;
+                    if (parent.Equals(synced, StringComparison.Ordinal)) continue;
+                    synced = parent;
+                    if (!CopyAction.FlushDirectory(parent))
+                        _log?.Debug("Rename directory sync failed: " + parent);
+                }
+            }
         }
     }
 

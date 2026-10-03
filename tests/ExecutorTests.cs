@@ -170,9 +170,8 @@ public class ExecutorTests : IDisposable
     [Fact]
     public async Task CopyAction_DestDirRemovedBeforeCommit_FailsDirectoryFsync()
     {
-        // FlushDirectory is Linux-only; on Windows it always reports success.
-        if (!OperatingSystem.IsLinux()) return;
-
+        // Directory fsync runs on Linux and Windows alike; deleting the
+        // destination tree after commit must fail the copy on both.
         File.WriteAllText(Src("a.txt"), "fsync fail test");
         var action = new CopyAction(_accessor, true, cp =>
         {
@@ -183,6 +182,45 @@ public class ExecutorTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Contains("fsync", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CopyAction_RetryAfterCommitFailure_RewritesFromSource()
+    {
+        // Rebello ATC'20 pin: after a commit failure the page cache is
+        // poisoned — re-flushing the dead tmp is useless. The retry must
+        // rewrite the bytes from the source. The open counter proves it:
+        // a re-flush-only retry would add zero source opens.
+        File.WriteAllText(Src("r.txt"), "rebello rewrite test");
+        var counting = new CountingAccessor(_accessor);
+        var first = true;
+        var action = new CopyAction(counting, true, cp =>
+        {
+            if (cp == CopyCheckpoint.AfterCommit && first)
+            {
+                first = false;
+                Directory.Delete(_dstDir, true);
+            }
+        });
+        var failed = await action.ExecuteAsync(MakeArgs(Src("r.txt")), CancellationToken.None);
+        Assert.False(failed.Success);
+        var opensAfterFail = counting.Opens;
+        Assert.True(opensAfterFail > 0);
+
+        // What CopyWithRetryAsync runs on retryable failure: a whole new
+        // ExecuteAsync (fresh tmp, fresh bytes), never a bare re-flush.
+        var result = await new CopyAction(counting).ExecuteAsync(MakeArgs(Src("r.txt")), CancellationToken.None);
+        Assert.True(result.Success);
+        Assert.True(counting.Opens > opensAfterFail);
+        Assert.Equal("rebello rewrite test", File.ReadAllText(Dst("r.txt")));
+    }
+
+    private sealed class CountingAccessor : IFileAccessor
+    {
+        private readonly IFileAccessor _inner;
+        public int Opens;
+        public CountingAccessor(IFileAccessor inner) { _inner = inner; }
+        public Stream OpenRead(string path) { Opens++; return _inner.OpenRead(path); }
     }
 
     [Fact]

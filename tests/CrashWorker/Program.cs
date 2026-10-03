@@ -52,6 +52,24 @@ if (args[0].Equals("statedb", StringComparison.OrdinalIgnoreCase))
     Thread.Sleep(Timeout.Infinite);
 }
 
+if (args[0].Equals("deferred-drain", StringComparison.OrdinalIgnoreCase))
+{
+    // Crash-matrix probe for the two-phase hold drain: claims an expired
+    // batch, sweeps (confirms) only the FIRST path, then hangs for the
+    // parent to kill. Post-kill the store must still hold the second path
+    // as claimed (HasPending true, re-drain returns it) while the first is
+    // gone. ConfirmClaimed stands in for the dest-file delete + sweep.
+    if (args.Length != 4)
+        return 2;
+    using var dd = new DeferredDeletion(args[1], args[2], 0, new WorkerLogger());
+    dd.RecordPending(new[] { Path.Combine(args[1], "held-a.txt"), Path.Combine(args[1], "held-b.txt") });
+    var chunk = dd.TakeExpiredChunk();
+    if (chunk.Files.Count > 0)
+        dd.ConfirmClaimed(new[] { chunk.Files[0] });
+    File.WriteAllLines(args[3], chunk.Files);
+    Thread.Sleep(Timeout.Infinite);
+}
+
 if (args[0].Equals("repro", StringComparison.OrdinalIgnoreCase))
 {
     if (args.Length != 2)

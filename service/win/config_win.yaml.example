@@ -30,16 +30,25 @@ sources:
       complete_mode: inline  # inline = fsync on the copy worker; pipelined = one completer thread owns flush->rename->validate->upsert
       file_access: direct  # direct | vss (VSS snapshots for locked files, needs elevation, else falls back to direct)
       initial_sync_workers: 2
-      retry:
+      retry:  # per-file copy retry (one file, seconds) — not the source lock
         max_attempts: 5
         delay_ms: 1000
         backoff: 2.0
-      lock_handling: retry
-      retry_lock_seconds: 600
+      lock_handling: retry  # source lock: retry = wait / ignore = proceed without lock
+      lock_wait_seconds: 600  # source lock: total wait budget before giving up
       delete_threshold_count: 1000
       delete_threshold_size_gb: 50
       delete_threshold_percent: 50
       delete_hold_days: 7
+      # bulk_cleanup_percent: 80  # one folder owning >=80% of a 10+ file batch = cleanup, proceeds (absent = off)
+      # full_routine_check_days: 14  # byte-compare everything this often; <=0 disables
+      # spike_window_minutes: 60  # ransomware-shaped spikes freeze syncing until you delete .tictack-churn-hold
+      # spike_bytes_gb: 100
+      # spike_files: 50000
+      # spike_renames: 10000
+      # routine_check_days: 0  # periodic proof-by-restore sampling; 0 = off
+      # routine_check_files: 10
+      destination_protect: false  # service-only write ACLs on the backup drive; true = on, does not revert on false
       versioning:
         max_versions: 10
         path: '[TicTack]\Sync\.versions'
@@ -83,3 +92,10 @@ jobs:
     command: restic.exe backup --compression auto "{source}" -r D:\ResticRepo
     working_dir: C:\ProgramData\TicTack
     timeout_minutes: 60
+  # Optional cadences: day = weekday name for weekly, day = 1-31 for monthly
+  # (clamped to short months), run_once_on = ISO date that fires once.
+  # - name: weekly_report
+  #   schedule: weekly
+  #   day: Sunday
+  #   time: "08:00"
+  #   command: report.exe

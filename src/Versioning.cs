@@ -64,6 +64,11 @@ namespace TicTack
                     if (!FileHasher.SameContent(destPath, temp))
                         throw new IOException("Version validation failed: " + destPath);
                     File.Move(temp, verFile);
+                    // Barrier for the version commit (same Pillai surface as
+                    // the copy path). Silent best-effort: a lost version
+                    // entry just re-archives next run; no logger is wired
+                    // through this strategy, and the data itself is flushed.
+                    CopyAction.FlushDirectory(verDir);
                 }
                 finally
                 {
@@ -85,6 +90,7 @@ namespace TicTack
                     Array.Sort(files, StringComparer.Ordinal);
                     for (int i = 0; i < files.Length - _maxVersions; i++)
                         File.Delete(files[i]);
+                    CopyAction.FlushDirectory(verDir);
                 }
                 return Task.FromResult(ActionResult.Ok());
             }

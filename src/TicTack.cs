@@ -51,6 +51,8 @@ namespace TicTack
                 var baseDir = AppDomain.CurrentDomain.BaseDirectory;
             var cfgPath = Path.Combine(baseDir, "config.yaml");
             bool isService = false, isCli = false, isOnce = false, isValidate = false, isExternalDrives = false, isRebuild = false;
+            bool isDeferredList = false;
+            string? deferredVerb = null, deferredTarget = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -65,10 +67,37 @@ namespace TicTack
                     case "--validate": isValidate = true; break;
                     case "--external-drives": isExternalDrives = true; break;
                     case "--rebuild": isRebuild = true; break;
+                    case "--deferred-list": isDeferredList = true; break;
+                    case "--deferred-approve":
+                    case "--deferred-check":
+                    case "--reprove":
+                    case "--deferred-cancel":
+                        deferredVerb = args[i].ToLowerInvariant();
+                        if (i + 1 < args.Length) deferredTarget = args[++i];
+                        break;
                 }
             }
 
-            var cfg = Config.Load(cfgPath);
+            TicTackConfig? cfg;
+            try
+            {
+                cfg = Config.Load(cfgPath);
+            }
+            catch (YamlDotNet.Core.YamlException ex)
+            {
+                // User error, not a crash: plain message on stderr, no stack
+                // trace, no crash log. Scanner errors already carry their own
+                // (Line/Col); escape errors get a hint because the classic is
+                // a double-quoted Windows path ("C:\Users\..." — \U wants 8
+                // hex digits, \x wants 2).
+                var msg = "Invalid config " + cfgPath + ": " + ex.Message + ConfigErrorHint(ex);
+                Console.Error.WriteLine(msg);
+                if (OperatingSystem.IsWindows())
+                {
+                    try { EventLog.WriteEntry("TicTackSv", msg, EventLogEntryType.Error); } catch { }
+                }
+                return 1;
+            }
             if (cfg == null)
             {
                 Console.Error.WriteLine("config.yaml not found or invalid");
@@ -83,7 +112,7 @@ namespace TicTack
             var log = LoggerFactory.Create(
                 cfg.Logging,
                 baseDir,
-                console: isCli || isOnce || isValidate || isRebuild || cfg.Logging.Console,
+                console: isCli || isOnce || isValidate || isRebuild || isDeferredList || deferredVerb != null || cfg.Logging.Console,
                 eventLog: OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive));
             rootLogger = log;
 
@@ -105,6 +134,11 @@ namespace TicTack
             {
                 await RunRebuildAsync(cfg, log);
                 return 0;
+            }
+
+            if (isDeferredList || deferredVerb != null)
+            {
+                return await RunDeferredAsync(cfg, log, isDeferredList, deferredVerb, deferredTarget);
             }
 
             if (isValidate)
@@ -131,7 +165,7 @@ namespace TicTack
                 return 0;
             }
 
-            log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --external-drives | --service | --config <path>");
+            log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --external-drives | --deferred-list | --deferred-approve <source> | --deferred-check <source> | --reprove <source> | --service | --config <path>");
             return 0;
             }
             catch (Exception ex)
@@ -335,6 +369,150 @@ namespace TicTack
                 log.Info("Full rebuild finished. All databases cleared, source re-scanned, parity enforced.");
         }
 
+        internal static int DeferredHoldDays(SourceConfig src) =>
+            src.Sync != null && src.Sync.DeleteHoldDays > 0 ? src.Sync.DeleteHoldDays : SyncConfig.DefaultDeleteHoldDays;
+
+        internal static SourceConfig? ResolveDeferredSource(TicTackConfig cfg, string target, ILogger log)
+        {
+            foreach (var src in cfg.Sources)
+                if (string.Equals(DeferredFilePrefix(src), target, StringComparison.OrdinalIgnoreCase))
+                    return src;
+            var leafHits = cfg.Sources.Where(s => string.Equals(SourceName(s), target, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (leafHits.Count == 1) return leafHits[0];
+            if (leafHits.Count > 1)
+            {
+                log.Error("Ambiguous source '" + target + "', use one of: "
+                    + string.Join(", ", leafHits.Select(s => DeferredFilePrefix(s))));
+                return null;
+            }
+            log.Error("Unknown deferred source '" + target + "', see --deferred-list");
+            return null;
+        }
+
+        internal static string FormatAge(TimeSpan span)
+        {
+            if (span < TimeSpan.Zero) span = TimeSpan.Zero;
+            if (span.TotalDays >= 1) return (int)span.TotalDays + "d";
+            if (span.TotalHours >= 1) return (int)span.TotalHours + "h";
+            return (int)span.TotalMinutes + "m";
+        }
+
+        // Next due across batches: earliest of per-batch expiry and daily
+        // warning, labelled so the list shows what the timer waits for.
+        internal static string FormatNextDue(List<BatchSummary> batches, int holdDays, DateTime now)
+        {
+            string? best = null;
+            var bestDue = DateTime.MaxValue;
+            foreach (var b in batches)
+            {
+                var expiry = b.BlockedAt.AddDays(holdDays);
+                var warnDue = b.LastWarningAt == DateTime.MinValue ? now : b.LastWarningAt.AddDays(1);
+                var due = expiry < warnDue ? expiry : warnDue;
+                var label = due == expiry ? "expiry" : "warning";
+                if (due < bestDue) { bestDue = due; best = label; }
+            }
+            if (best == null) return "-";
+            return bestDue <= now ? best + " now" : best + " in " + FormatAge(bestDue - now);
+        }
+
+        // Stop the service first for approve/cancel: the service owns the
+        // store connection, so a second writer either blocks (Windows) or
+        // races the drain (Linux). List and check are read-only.
+        internal static async Task<int> RunDeferredAsync(TicTackConfig cfg, ILogger log, bool list, string? verb, string? target)
+        {
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
+                ? Path.Combine(baseDir, "tictack.log")
+                : cfg.Logging.Path;
+            var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
+
+            if (list)
+            {
+                var any = false;
+                foreach (var src in cfg.Sources)
+                {
+                    using var dd = new DeferredDeletion(deferredDir, DeferredFilePrefix(src), DeferredHoldDays(src), log);
+                    var batches = dd.GetBatchSummaries();
+                    if (batches.Count == 0) continue;
+                    any = true;
+                    var now = DateTime.UtcNow;
+                    var oldest = batches.Min(b => b.BlockedAt);
+                    log.Info(DeferredFilePrefix(src) + "  " + src.Path + "  batches=" + batches.Count
+                        + " files=" + batches.Sum(b => b.Files)
+                        + " oldest=" + FormatAge(now - oldest) + " ago"
+                        + " next=" + FormatNextDue(batches, DeferredHoldDays(src), now));
+                }
+                if (!any) log.Info("No deferred holds.");
+                return 0;
+            }
+
+            if (string.IsNullOrEmpty(target))
+            {
+                log.Error("Missing <source>: " + verb + " needs a source stem, see --deferred-list");
+                return 1;
+            }
+            var match = ResolveDeferredSource(cfg, target, log);
+            if (match == null) return 1;
+            var stem = DeferredFilePrefix(match);
+
+            if (verb == "--deferred-check")
+            {
+                using var dd = new DeferredDeletion(deferredDir, stem, DeferredHoldDays(match), log);
+                if (!dd.HasPending) log.Info("No deferred holds for " + stem);
+                else dd.CheckWarnings();
+                return 0;
+            }
+
+            if (verb == "--reprove" || verb == "--deferred-cancel")
+            {
+                using var dd = new DeferredDeletion(deferredDir, stem, DeferredHoldDays(match), log);
+                if (!dd.HasPending && !File.Exists(DeferredDbPath(deferredDir, match)))
+                {
+                    log.Info("No deferred holds for " + stem);
+                    return 0;
+                }
+                try { dd.ClearStore("reprove"); }
+                catch (IOException)
+                {
+                    log.Error("Hold store is locked — stop the TicTackSv service first, then retry");
+                    return 1;
+                }
+                log.Info("Hold cancelled for " + stem + ", destination files kept");
+                return 0;
+            }
+
+            if (verb == "--deferred-approve")
+            {
+                SyncPipeline? pipeline = null;
+                try
+                {
+                    pipeline = BuildPipeline(match, cfg, log);
+                    var (ran, proceeded, cancelled) = await pipeline.DrainExpiredAsync();
+                    if (!ran)
+                    {
+                        log.Error("Exclusive lock unavailable — stop the TicTackSv service first, then retry");
+                        return 1;
+                    }
+                    if (proceeded > 0) log.Warn("Deferred deletion: proceeding with " + proceeded + " files");
+                    else if (cancelled > 0) log.Info("Deferred deletion: cancelled, files reappeared");
+                    else log.Info("Nothing to approve for " + stem + ": no expired batches");
+                    return 0;
+                }
+                catch (Exception ex)
+                {
+                    log.Error("Deferred approve failed: " + match.Path, ex);
+                    return 1;
+                }
+                finally
+                {
+                    pipeline?.Dispose();
+                }
+            }
+
+            log.Error("Unknown deferred verb '" + verb + "'");
+            return 1;
+        }
+
         static void DeleteWithRetry(string path)
         {
             for (int attempt = 0; ; attempt++)
@@ -398,6 +576,15 @@ namespace TicTack
             if (!OperatingSystem.IsWindows()) return;
             try { EventLog.WriteEntry("TicTackSv", "Main failed: " + ex, EventLogEntryType.Error); } catch { }
         }
+
+        // Backslash escapes only exist in double-quoted YAML scalars, so a
+        // hex/escape scanner error is near-always a "C:\..." path in double
+        // quotes. Point at the one-line fix; anything else gets no hint.
+        internal static string ConfigErrorHint(Exception ex) =>
+            ex.Message.Contains("hexadecimal", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("quoted scalar", StringComparison.OrdinalIgnoreCase)
+                ? " Hint: backslash escapes (\\U, \\x) only work in double-quoted strings — put Windows paths in 'single quotes' or use forward slashes."
+                : "";
 
         // One derivation for the per-source name, state DB file, and deferred
         // file: the rebuild, the pipeline build, and the state path must agree.

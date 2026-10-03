@@ -533,6 +533,7 @@ public class PipelineTests : IDisposable
         StartPipeline(c =>
         {
             c.Sync.DeleteThresholdCount = 10;
+            c.Sync.BulkCleanupPercent = 80;
             c.DebounceSeconds = 0.5;
         });
 

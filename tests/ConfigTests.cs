@@ -309,6 +309,23 @@ logging:
     }
 
     [Fact]
+    public void DoubleQuotedWindowsPath_HintNamesSingleQuotes()
+    {
+        // The classic config crash: "C:\Users\..." in double quotes (\U
+        // wants 8 hex digits). Main catches this via ConfigErrorHint and
+        // prints the one-line fix instead of a stack trace.
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, "sources:\n- path: \"C:\\Users\\x\"\n  destination: \"D:\\bk\"\n");
+            var ex = Assert.ThrowsAny<Exception>(() => Config.Load(path));
+            Assert.Contains("single quotes", Program.ConfigErrorHint(ex), StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("", Program.ConfigErrorHint(new IOException("disk full")));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
     public void Validate_RejectsDuplicateDestination()
     {
         var cfg = new TicTackConfig();
@@ -408,5 +425,56 @@ logging:
     {
         Assert.Equal(7, SyncConfig.DefaultDeleteHoldDays);
         Assert.Equal(SyncConfig.DefaultDeleteHoldDays, new SyncConfig().DeleteHoldDays);
+    }
+
+    [Fact]
+    public void Load_ParsesRenamedKeys()
+    {
+        var yaml = "sources:\n  - path: '/tmp/tt-src'\n    destination: '/tmp/tt-dst'\n    sync:\n      bulk_cleanup_percent: 80\n      full_routine_check_days: 30\n      spike_window_minutes: 15\n      spike_bytes_gb: 5\n      spike_files: 100\n      spike_renames: 10\n      routine_check_days: 7\n      routine_check_files: 3\n      lock_wait_seconds: 120\n";
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, yaml);
+            var cfg = Config.Load(path)!;
+            var sync = cfg.Sources[0].Sync;
+            Assert.Equal(80, sync.BulkCleanupPercent);
+            Assert.Equal(30, sync.FullRoutineCheckDays);
+            Assert.Equal(15, sync.SpikeWindowMinutes);
+            Assert.Equal(5, sync.SpikeBytesGb);
+            Assert.Equal(100, sync.SpikeFiles);
+            Assert.Equal(10, sync.SpikeRenames);
+            Assert.Equal(7, sync.RoutineCheckDays);
+            Assert.Equal(3, sync.RoutineCheckFiles);
+            Assert.Equal(120, sync.LockWaitSeconds);
+            Assert.True(Config.Validate(cfg, new RecordingLogger()));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void Load_RemovedKeysAreRejected()
+    {
+        var yaml = "sources:\n  - path: '/tmp/tt-src'\n    destination: '/tmp/tt-dst'\n    sync:\n      delete_locality_percent: 80\n      full_verify_days: 30\n      churn_window_minutes: 15\n      churn_bytes_gb: 5\n      churn_files: 100\n      churn_renames: 10\n      restore_verify_days: 7\n      restore_verify_files: 3\n      retry_lock_seconds: 120\n";
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, yaml);
+            Assert.ThrowsAny<Exception>(() => Config.Load(path));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void LockWaitSeconds_DefaultsTo600()
+    {
+        Assert.Equal(600, new SyncConfig().LockWaitSeconds);
+    }
+
+    [Fact]
+    public void RenamedKeys_DefaultToOff()
+    {
+        var sync = new SyncConfig();
+        Assert.Equal(0, sync.BulkCleanupPercent);
+        Assert.Equal(0, sync.RoutineCheckDays);
     }
 }
