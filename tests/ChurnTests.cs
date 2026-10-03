@@ -33,7 +33,7 @@ public class ChurnTests : IDisposable
         churn.ReportCopy(10);
         Assert.True(churn.IsHeld());
         Assert.True(File.Exists(_marker));
-        Assert.Contains(_log.Messages, m => m.Contains("Churn guard tripped"));
+        Assert.Contains(_log.Messages, m => m.Contains("Spike guard tripped"));
     }
 
     [Fact]
@@ -57,7 +57,7 @@ public class ChurnTests : IDisposable
         Assert.True(churn.IsHeld());
         File.Delete(_marker);
         Assert.False(churn.IsHeld());
-        Assert.Contains(_log.Messages, m => m.Contains("Churn hold cleared, resuming"));
+        Assert.Contains(_log.Messages, m => m.Contains("Spike hold cleared, resuming"));
         // Window was reset on clear: two more reports must not re-trip.
         churn.ReportCopy(10);
         Assert.False(churn.IsHeld());

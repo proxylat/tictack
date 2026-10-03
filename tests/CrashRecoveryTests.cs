@@ -81,6 +81,42 @@ public class CrashRecoveryTests
     }
 
     [Fact]
+    [Trait("Category", "CrashRecovery")]
+    public async Task KillAfterClaimBeforeDelete_HoldForgottenNothingRemoved()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-drain-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var sentinel = Path.Combine(root, "claimed.txt");
+            using var process = StartWorker("deferred-drain", root, "tictack-deferred-test", sentinel);
+            await WaitForFileAsync(sentinel, TimeSpan.FromSeconds(15));
+
+            // The dead worker claimed both rows, then swept (confirmed) only
+            // the first before hanging.
+            var claimed = await File.ReadAllLinesAsync(sentinel);
+            Assert.Equal(2, claimed.Length);
+
+            process.Kill();
+            await WaitForExitAsync(process, TimeSpan.FromSeconds(10));
+            Assert.True(process.HasExited);
+
+            // Fresh instance: the first path is gone (swept), the second is
+            // still held as claimed. A re-drain replays it idempotently.
+            var log = new RecordingLogger();
+            using var dd = new DeferredDeletion(root, "tictack-deferred-test", 0, log);
+            Assert.True(dd.HasPending);
+            Assert.Equal(1, dd.PendingCount);
+            var replay = dd.TakeExpiredChunk();
+            Assert.Equal(claimed[1], Assert.Single(replay.Files));
+            Assert.Equal(1, dd.ConfirmClaimed(replay.Files));
+            Assert.False(dd.HasPending);
+            Assert.Equal(0, dd.PendingCount);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
     [Trait("Category", "LockContention")]
     public async Task LockHolder_BlocksSecondProcess()
     {

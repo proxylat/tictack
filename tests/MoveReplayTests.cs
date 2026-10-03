@@ -79,7 +79,7 @@ public class MoveReplayTests : IDisposable
     }
 
     [Fact]
-    public void IdentityCapture_EventCopyStoresFileId()
+    public async Task IdentityCapture_EventCopyStoresFileId()
     {
         using var pipeline = StartDbPipeline("ident-state.db", null, out var db);
         var file = Path.Combine(_srcDir, "id.txt");
@@ -87,7 +87,7 @@ public class MoveReplayTests : IDisposable
         _monitor.Fire(ChangeType.Created, file);
         WaitFor(() => db.LoadAll().ContainsKey("id.txt"), "state update");
 
-        var row = db.GetFullStateAsync("id.txt").GetAwaiter().GetResult();
+        var row = await db.GetFullStateAsync("id.txt");
         Assert.True(row.HasValue);
         Assert.False(string.IsNullOrEmpty(row.Value.fileId));
         pipeline.Dispose();
@@ -98,7 +98,7 @@ public class MoveReplayTests : IDisposable
     public async Task FullVerify_Disabled_SkipsTamperedDest()
     {
         using var pipeline = StartDbPipeline("verifyA-state.db",
-            cfg => cfg.Sync = new SyncConfig { FullVerifyDays = 0 }, out var db);
+            cfg => cfg.Sync = new SyncConfig { FullRoutineCheckDays = 0 }, out var db);
         var src = Path.Combine(_srcDir, "v.txt");
         var dst = Path.Combine(_dstDir, "v.txt");
         File.WriteAllText(src, "0123456789");
@@ -120,7 +120,7 @@ public class MoveReplayTests : IDisposable
         var stateDir = Path.Combine(_root, "vstate");
         Directory.CreateDirectory(stateDir);
         using var pipeline = StartDbPipeline("verifyB-state.db",
-            cfg => { cfg.Sync = new SyncConfig { FullVerifyDays = 14 }; cfg.StateDbPath = stateDir; }, out var db);
+            cfg => { cfg.Sync = new SyncConfig { FullRoutineCheckDays = 14 }; cfg.StateDbPath = stateDir; }, out var db);
         var src = Path.Combine(_srcDir, "v.txt");
         var dst = Path.Combine(_dstDir, "v.txt");
         File.WriteAllText(src, "0123456789");

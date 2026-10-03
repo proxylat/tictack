@@ -62,8 +62,9 @@ namespace TicTack
         private long _completedItems;
         private DateTime _lastProgressUtc;
         private bool _disposed;
-        // Full-verify cadence store (own JobRunStore, own file): last date a
-        // full content re-verify completed. Null when FullVerifyDays <= 0.
+        // Full routine-check cadence store (own JobRunStore, own file): last
+        // date a full content re-verify completed. Null when
+        // FullRoutineCheckDays <= 0.
         private readonly JobRunStore? _verifyStore;
         private readonly string _verifyKey;
         private readonly string _restoreKey;
@@ -148,17 +149,17 @@ namespace TicTack
             var syncCfg = _config.Sync;
             _churnArmed = false;
             _churn = new ChurnMonitor(Path.Combine(_config.Destination, ".tictack-churn-hold"),
-                TimeSpan.FromMinutes(syncCfg != null && syncCfg.ChurnWindowMinutes > 0 ? syncCfg.ChurnWindowMinutes : 60),
-                (long)((syncCfg != null && syncCfg.ChurnBytesGb > 0 ? syncCfg.ChurnBytesGb : 100) * 1024L * 1024L * 1024L),
-                syncCfg != null && syncCfg.ChurnFileCount > 0 ? syncCfg.ChurnFileCount : 50000,
-                syncCfg != null && syncCfg.ChurnRenameCount > 0 ? syncCfg.ChurnRenameCount : 10000,
+                TimeSpan.FromMinutes(syncCfg != null && syncCfg.SpikeWindowMinutes > 0 ? syncCfg.SpikeWindowMinutes : 60),
+                (long)((syncCfg != null && syncCfg.SpikeBytesGb > 0 ? syncCfg.SpikeBytesGb : 100) * 1024L * 1024L * 1024L),
+                syncCfg != null && syncCfg.SpikeFiles > 0 ? syncCfg.SpikeFiles : 50000,
+                syncCfg != null && syncCfg.SpikeRenames > 0 ? syncCfg.SpikeRenames : 10000,
                 _log, null,
                 () => !_churnArmed || (_initialSync != null && !_initialSync.IsCompleted));
             _deletions = new DeletionGuard(_config, stateDb, _deleter, _deferred, log, ArmDeferredCheckTimer, _churn);
             // Own cadence file, not the scheduler's jobs.db: keyed per source
             // like the state DB name. Carries the full-verify stamp and the
             // scrub shard index. Failures fall back to always-verify.
-            // Always created (not gated on FullVerifyDays): the scrub shard
+            // Always created (not gated on FullRoutineCheckDays): the scrub shard
             // rotation persists here too, and FullVerifyDue still returns
             // false when days <= 0, so behavior is unchanged.
             _verifyKey = "fullverify-" + SourceLeaf(_config).ToLowerInvariant() + "-" + DeferredDeletion.StableHash(_config.Path);
@@ -214,7 +215,7 @@ namespace TicTack
             if (_started) return;
             _started = true;
             var lockTimeout = _config.Sync != null && _config.Sync.LockHandling == "retry"
-                ? (TimeSpan?)TimeSpan.FromSeconds(_config.Sync.RetryLockSeconds > 0 ? _config.Sync.RetryLockSeconds : 600)
+                ? (TimeSpan?)TimeSpan.FromSeconds(_config.Sync.LockWaitSeconds > 0 ? _config.Sync.LockWaitSeconds : 600)
                 : null;
             try { Directory.CreateDirectory(_config.Destination); }
             catch (Exception ex) { _log.Debug("Destination create failed: " + ex.Message); }
@@ -313,7 +314,11 @@ namespace TicTack
             // holds exist, so the steady-state hot path stays untouched.
             if (e.ChangeType != ChangeType.Deleted)
             {
-                try { _deferred.CancelIfPending(e.FullPath); } catch { }
+                // A failed cancel keeps the hold: the file deletes at expiry
+                // despite having reappeared. Loud at Debug, silent otherwise —
+                // the hot path must not pay for logging when nothing is held.
+                try { _deferred.CancelIfPending(e.FullPath); }
+                catch (Exception ex) { _log.Debug("Deferred cancel failed for " + e.FullPath + ": " + ex.Message); }
             }
             _signal.Release();
         }
@@ -637,10 +642,12 @@ namespace TicTack
                 // re-arm after a ResetState disarm).
                 _churnArmed = true;
                 // Successful scan + parity: stamp the full-verify cadence.
-                // Never fails the sync if the store is unavailable.
+                // Never fails the sync if the store is unavailable — but a
+                // failed stamp re-runs the full check every scan, so say so.
                 if (_verifyStore != null)
                 {
-                    try { _verifyStore.SetLastRun(_verifyKey, DateTime.UtcNow); } catch { }
+                    try { _verifyStore.SetLastRun(_verifyKey, DateTime.UtcNow); }
+                    catch (Exception ex) { _log.Debug("Full-verify stamp failed, rechecking next scan: " + ex.Message); }
                 }
                 await RunRestoreVerifyAsync(_cts!.Token);
             }
@@ -683,8 +690,8 @@ namespace TicTack
         // job. Skips are silent per-file; only the summary is logged.
         private async Task RunRestoreVerifyAsync(CancellationToken ct)
         {
-            var days = _config.Sync != null ? _config.Sync.RestoreVerifyDays : 0;
-            var count = _config.Sync != null && _config.Sync.RestoreVerifyFiles > 0 ? _config.Sync.RestoreVerifyFiles : 10;
+            var days = _config.Sync != null ? _config.Sync.RoutineCheckDays : 0;
+            var count = _config.Sync != null && _config.Sync.RoutineCheckFiles > 0 ? _config.Sync.RoutineCheckFiles : 10;
             if (days <= 0 || _stateDb == null || _verifyStore == null) return;
             try
             {
@@ -694,12 +701,12 @@ namespace TicTack
             catch { }
             if (!_directoryExists(_config.Destination))
             {
-                _log.Error("Restore verify: destination unavailable, backups unverifiable: " + _config.Destination);
+                _log.Error("Routine check: destination unavailable, backups unverifiable: " + _config.Destination);
                 return;
             }
             List<string> sample;
             try { sample = await _stateDb.GetRandomPathsAsync(count); }
-            catch (Exception ex) { _log.Debug("Restore verify sample failed: " + ex.Message); return; }
+            catch (Exception ex) { _log.Debug("Routine check sample failed: " + ex.Message); return; }
             if (sample.Count == 0) return;
             int ok = 0, failed = 0, skipped = 0;
             foreach (var rel in sample)
@@ -711,24 +718,25 @@ namespace TicTack
                 try { hd = FileHasher.ComputeHex(PathUtil.EnsureExtended(Path.Combine(_config.Destination, rel)), null); }
                 catch { skipped++; continue; }
                 if (hs == hd) ok++;
-                else { failed++; _log.Error("Restore verify FAILED (destination differs from source): " + rel); }
+                else { failed++; _log.Error("Routine check FAILED (destination differs from source): " + rel); }
             }
             if (failed > 0)
             {
                 // No stamp: re-alerts on the next run until fixed.
-                _log.Error("Restore verify: " + failed + " of " + sample.Count + " sampled files differ — reruns next scan until clean");
+                _log.Error("Routine check: " + failed + " of " + sample.Count + " sampled files differ — reruns next scan until clean");
                 return;
             }
-            _log.Info("Restore verify: " + ok + "/" + sample.Count + " sampled files match (" + skipped + " skipped)");
-            try { _verifyStore.SetLastRun(_restoreKey, DateTime.UtcNow); } catch { }
+            _log.Info("Routine check: " + ok + "/" + sample.Count + " sampled files match (" + skipped + " skipped)");
+            try { _verifyStore.SetLastRun(_restoreKey, DateTime.UtcNow); }
+            catch (Exception ex) { _log.Debug("Routine-check stamp failed, rechecking next scan: " + ex.Message); }
         }
 
-        // Full-verify cadence: due when enabled and never stamped, or the
-        // stamp is at least FullVerifyDays old (date granularity). Store
-        // failures fail open toward verifying rather than skipping.
+        // Full routine-check cadence: due when enabled and never stamped, or
+        // the stamp is at least FullRoutineCheckDays old (date granularity).
+        // Store failures fail open toward verifying rather than skipping.
         private bool FullVerifyDue()
         {
-            var days = _config.Sync != null ? _config.Sync.FullVerifyDays : 0;
+            var days = _config.Sync != null ? _config.Sync.FullRoutineCheckDays : 0;
             if (days <= 0 || _verifyStore == null) return false;
             try
             {
@@ -848,7 +856,7 @@ namespace TicTack
         {
             if (_churn.IsHeld())
             {
-                _log.Debug("Churn hold active, skipping copy: " + args.ChangeEvent.FullPath);
+                _log.Debug("Spike hold active, skipping copy: " + args.ChangeEvent.FullPath);
                 return null;
             }
             var src = args.ChangeEvent.FullPath;
@@ -1317,31 +1325,64 @@ namespace TicTack
             _deferred.CheckWarnings();
             if (_churn.IsHeld())
             {
-                _log.Debug("Churn hold active, deferred drain paused");
+                _log.Debug("Spike hold active, deferred drain paused");
                 return;
             }
-            var total = 0;
-            var cancelled = 0;
-            await WithExclusiveLockAsync(async () =>
-            {
-                while (true)
-                {
-                    var chunk = _deferred.TakeExpiredChunk(500);
-                    cancelled += chunk.Cancelled;
-                    if (chunk.Files.Count == 0) break;
-                    total += chunk.Files.Count;
-                    foreach (var f in chunk.Files)
-                    {
-                        var rel = PathUtil.Relative(f, _config.Path);
-                        var destPath = Path.Combine(_config.Destination, rel);
-                        await _deleter.DeleteAsync(f, destPath, rel, "Deferred deletion failed", CancellationToken.None);
-                    }
-                }
-            });
+            var (ran, total, cancelled) = await DrainExpiredAsync();
+            if (!ran) return;
             if (total > 0)
                 _log.Warn("Deferred deletion: proceeding with " + total + " files");
             else if (cancelled > 0)
                 _log.Info("Deferred deletion: cancelled, files reappeared");
+        }
+
+        // On-demand expiry drain for --deferred-approve: same bounded
+        // 500-path chunks as the timer path, minus warnings. Returns
+        // whether the exclusive sweep ran (false = lock held elsewhere).
+        // Two-phase: TakeExpiredChunk claims, dest deletes run, then
+        // ConfirmClaimed sweeps only successes. Failed deletes stay claimed
+        // for the next drain to retry (also fixes the old behavior where a
+        // failed delete was already forgotten by the hold store).
+        internal async Task<(bool ran, int proceeded, int cancelled)> DrainExpiredAsync()
+        {
+            var total = 0;
+            var cancelled = 0;
+            var ran = false;
+            await WithExclusiveLockAsync(async () =>
+            {
+                ran = true;
+                while (true)
+                {
+                    var chunk = _deferred.TakeExpiredChunk(500);
+                    cancelled += chunk.Cancelled;
+                    if (chunk.Files.Count == 0 && chunk.Cancelled == 0) break;
+                    var confirmed = new List<string>(chunk.Files.Count + chunk.CancelledPaths.Count);
+                    confirmed.AddRange(chunk.CancelledPaths);
+                    var failed = false;
+                    foreach (var f in chunk.Files)
+                    {
+                        var rel = PathUtil.Relative(f, _config.Path);
+                        var destPath = Path.Combine(_config.Destination, rel);
+                        if (await _deleter.DeleteAsync(f, destPath, rel, "Deferred deletion failed", CancellationToken.None))
+                        {
+                            confirmed.Add(f);
+                            total++;
+                        }
+                        else
+                        {
+                            failed = true;
+                        }
+                    }
+                    if (confirmed.Count > 0)
+                        _deferred.ConfirmClaimed(confirmed);
+                    // A failed delete stays claimed for the next drain.
+                    // Break instead of re-claiming in this pass: re-taking
+                    // would return the same failed rows immediately and spin.
+                    if (failed) break;
+                    if (chunk.Files.Count == 0) break;
+                }
+            });
+            return (ran, total, cancelled);
         }
 
     }

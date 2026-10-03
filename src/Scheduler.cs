@@ -52,13 +52,30 @@ namespace TicTack
                     continue;
                 }
                 var entry = new JobEntry { Config = job, TimeOfDay = ts };
+                if (!ParseSchedule(job, entry, log)) continue;
                 var last = _store.GetLastRun(job.Name!);
-                entry.LastRunOn = last ?? DateTime.MinValue;
+                if (last == null && entry.Kind != JobKind.Once)
+                {
+                    // Fresh store (first install or post-quarantine rebuild):
+                    // no history would read as overdue-since-forever and
+                    // fire every periodic job on the first tick. Seed today
+                    // instead — the job waits for its next scheduled slot.
+                    // One-shots keep MinValue: a reached run_once_on with no
+                    // record has never fired and must still catch up.
+                    entry.LastRunOn = DateTime.Today;
+                    try { _store.SetLastRun(job.Name!, DateTime.Today); }
+                    catch (Exception ex) { log.Debug("Job seed failed for '" + job.Name + "': " + ex.Message); }
+                    log.Info("Job '" + job.Name + "' has no run history, waiting for its next scheduled time");
+                }
+                else
+                {
+                    entry.LastRunOn = last ?? DateTime.MinValue;
+                }
                 _jobs.Add(entry);
             }
         }
 
-        private static JobRunStore CreateStore(TicTackConfig config)
+        private JobRunStore CreateStore(TicTackConfig config)
         {
             string dir;
             // StateDbPath is a directory root (GetStateDbPath appends
@@ -68,7 +85,21 @@ namespace TicTack
                 dir = config.Sources[0].StateDbPath;
             else
                 dir = AppContext.BaseDirectory;
-            return new JobRunStore(Path.Combine(dir, "jobs.db"));
+            var dbPath = Path.Combine(dir, "jobs.db");
+            try
+            {
+                return new JobRunStore(dbPath);
+            }
+            catch (CorruptDatabaseException ex)
+            {
+                // Bootstrap already moved the bad file aside; reopening
+                // creates a fresh store. Missing rows seed to today in the
+                // ctor below, so periodic jobs wait for their next slot
+                // instead of all firing at startup — only past-due one-shots
+                // catch up. Skipped runs, never duplicate destruction.
+                _log.Error("Job store corrupt, quarantined (" + ex.QuarantinePath + "), rebuilding: " + dbPath);
+                return new JobRunStore(dbPath);
+            }
         }
 
         // Run if not already run today AND (time reached today OR at least one full day was missed).
@@ -80,6 +111,103 @@ namespace TicTack
             if (lastRun < today.AddDays(-1)) return true;
             return false;
         }
+
+        // Weekly: due when the most recent (weekday, time) occurrence is
+        // newer than the last run. Missed weeks stay due via catch-up.
+        // Date granularity (like the daily rule): the store stamps days,
+        // so a same-day run satisfies today's slot and restarts can't
+        // double-fire it.
+        public static bool IsDueWeekly(DateTime now, DateTime lastRun, TimeSpan timeOfDay, DayOfWeek target)
+        {
+            var daysBack = ((int)now.DayOfWeek - (int)target + 7) % 7;
+            var occurrence = now.Date.AddDays(-daysBack).Add(timeOfDay);
+            if (occurrence > now) occurrence = occurrence.AddDays(-7);
+            return lastRun.Date < occurrence.Date;
+        }
+
+        // Monthly: target day clamped to short months (31 runs on the
+        // 30th/28th). Same most-recent-occurrence rule as weekly.
+        public static bool IsDueMonthly(DateTime now, DateTime lastRun, TimeSpan timeOfDay, int dayOfMonth)
+        {
+            var occurrence = ClampToMonth(now.Year, now.Month, dayOfMonth).Add(timeOfDay);
+            if (occurrence > now)
+            {
+                var prev = now.AddMonths(-1);
+                occurrence = ClampToMonth(prev.Year, prev.Month, dayOfMonth).Add(timeOfDay);
+            }
+            return lastRun.Date < occurrence.Date;
+        }
+
+        private static DateTime ClampToMonth(int year, int month, int dayOfMonth) =>
+            new DateTime(year, month, Math.Min(dayOfMonth, DateTime.DaysInMonth(year, month)));
+
+        // One-shot: due once the stamped date+time passes, never again after
+        // a successful run stamps the store. Failed runs retry next tick.
+        public static bool IsDueOnce(DateTime now, DateTime lastRun, TimeSpan timeOfDay, DateTime runDate) =>
+            lastRun == DateTime.MinValue && now >= runDate.Date.Add(timeOfDay);
+
+        // Schedule/day/run_once_on validation. Returns false (skip job) on
+        // contradictory or unparseable cadence config.
+        private static bool ParseSchedule(JobConfig job, JobEntry entry, ILogger log)
+        {
+            var schedule = (job.Schedule ?? "daily").Trim().ToLowerInvariant();
+            var hasOnce = !string.IsNullOrWhiteSpace(job.RunOnceOn);
+            if (hasOnce && (schedule != "daily" || !string.IsNullOrWhiteSpace(job.Day)))
+            {
+                log.Warn("Job '" + job.Name + "': run_once_on is mutually exclusive with schedule/day, skipping");
+                return false;
+            }
+            if (schedule == "daily" && !hasOnce)
+            {
+                if (!string.IsNullOrWhiteSpace(job.Day))
+                    log.Warn("Job '" + job.Name + "': day is ignored for daily schedules");
+                entry.Kind = JobKind.Daily;
+                return true;
+            }
+            if (schedule == "weekly")
+            {
+                if (!Enum.TryParse<DayOfWeek>(job.Day?.Trim(), ignoreCase: true, out var weekday))
+                {
+                    log.Warn("Invalid day '" + job.Day + "' for weekly job '" + job.Name + "' (use Monday-Sunday)");
+                    return false;
+                }
+                entry.Kind = JobKind.Weekly;
+                entry.TargetDay = weekday;
+                return true;
+            }
+            if (schedule == "monthly")
+            {
+                if (!int.TryParse(job.Day?.Trim(), out var dom) || dom < 1 || dom > 31)
+                {
+                    log.Warn("Invalid day '" + job.Day + "' for monthly job '" + job.Name + "' (use 1-31)");
+                    return false;
+                }
+                entry.Kind = JobKind.Monthly;
+                entry.DayOfMonth = dom;
+                return true;
+            }
+            if (schedule == "once" || hasOnce)
+            {
+                if (!DateTime.TryParse(job.RunOnceOn?.Trim(), out var date))
+                {
+                    log.Warn("Invalid run_once_on '" + job.RunOnceOn + "' for job '" + job.Name + "' (use YYYY-MM-DD)");
+                    return false;
+                }
+                entry.Kind = JobKind.Once;
+                entry.RunDate = date.Date;
+                return true;
+            }
+            log.Warn("Invalid schedule '" + job.Schedule + "' for job '" + job.Name + "' (use daily/weekly/monthly/once)");
+            return false;
+        }
+
+        private static bool EntryIsDue(DateTime now, JobEntry job) => job.Kind switch
+        {
+            JobKind.Weekly => IsDueWeekly(now, job.LastRunOn, job.TimeOfDay, job.TargetDay),
+            JobKind.Monthly => IsDueMonthly(now, job.LastRunOn, job.TimeOfDay, job.DayOfMonth),
+            JobKind.Once => IsDueOnce(now, job.LastRunOn, job.TimeOfDay, job.RunDate),
+            _ => IsDue(now, job.LastRunOn, job.TimeOfDay),
+        };
 
         public void Start()
         {
@@ -95,7 +223,7 @@ namespace TicTack
             var now = DateTime.Now;
             foreach (var job in _jobs)
             {
-                if (IsDue(now, job.LastRunOn, job.TimeOfDay))
+                if (EntryIsDue(now, job))
                 {
                     job.LastRunOn = now.Date; // in-memory guard against same-day re-trigger
                     // Deliberate fire-and-forget: daily jobs must not block the
@@ -181,11 +309,17 @@ namespace TicTack
             _store?.Dispose();
         }
 
+        private enum JobKind { Daily, Weekly, Monthly, Once }
+
         private class JobEntry
         {
             public JobConfig Config { get; set; } = null!;
             public TimeSpan TimeOfDay { get; set; }
             public DateTime LastRunOn { get; set; }
+            public JobKind Kind { get; set; }
+            public DayOfWeek TargetDay { get; set; }
+            public int DayOfMonth { get; set; }
+            public DateTime RunDate { get; set; }
         }
     }
 }

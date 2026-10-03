@@ -43,7 +43,18 @@ namespace TicTack
                 catch (Exception ex) { _log?.Debug("StateDb close failed during reconnect: " + ex.Message); }
                 _conn.Dispose();
             }
-            _conn = SqliteBootstrap.Open(_dbPath, SqliteSchema.State);
+            try
+            {
+                _conn = SqliteBootstrap.Open(_dbPath, SqliteSchema.State);
+            }
+            catch (CorruptDatabaseException ex)
+            {
+                // Bootstrap already moved the bad file aside; reopening
+                // creates a fresh store. Skip-history is lost (one full
+                // re-compare), data is not: nothing is ever deleted for this.
+                _log?.Error("StateDb corrupt, quarantined (" + ex.QuarantinePath + "), rebuilding: " + _dbPath);
+                _conn = SqliteBootstrap.Open(_dbPath, SqliteSchema.State);
+            }
         }
 
         void EnsureConnected()

@@ -75,7 +75,7 @@ public class RestoreVerifyTests : IDisposable
 
     private static void TweakVerify(SourceConfig cfg)
     {
-        cfg.Sync = new SyncConfig { FullVerifyDays = 0, RestoreVerifyDays = 1, RestoreVerifyFiles = 10 };
+        cfg.Sync = new SyncConfig { FullRoutineCheckDays = 0, RoutineCheckDays = 1, RoutineCheckFiles = 10 };
     }
 
     [Fact]
@@ -89,7 +89,7 @@ public class RestoreVerifyTests : IDisposable
         _log.Messages.Clear();
         await pipeline.RequestRescanAsync();
         WaitForSecondSync();
-        Assert.DoesNotContain(_log.Messages, m => m.Contains("Restore verify"));
+        Assert.DoesNotContain(_log.Messages, m => m.Contains("Routine check"));
     }
 
     [Fact]
@@ -101,7 +101,7 @@ public class RestoreVerifyTests : IDisposable
         WaitFor(() => File.ReadAllText(Path.Combine(_dstDir, name)) == "pristine-12345", "initial copy");
 
         // Same-size content tamper on the destination only. SizeComparer
-        // sees no change (FullVerifyDays=0), scrub skips the shard.
+        // sees no change (FullRoutineCheckDays=0), scrub skips the shard.
         // Align mtimes so the scan skips it: only restore must notice.
         // The initial sync already consumed the fresh-store due, so
         // backdate the stamp to force the rescan's restore pass.
@@ -113,7 +113,7 @@ public class RestoreVerifyTests : IDisposable
         await pipeline.RequestRescanAsync();
         WaitForSecondSync();
 
-        Assert.Contains(_log.Messages, m => m.Contains("Restore verify FAILED") && m.Contains(name));
+        Assert.Contains(_log.Messages, m => m.Contains("Routine check FAILED") && m.Contains(name));
         // Read-only proof: the tampered file is reported, not repaired.
         Assert.Equal("tampered-12345", File.ReadAllText(Path.Combine(_dstDir, name)));
     }
@@ -126,7 +126,7 @@ public class RestoreVerifyTests : IDisposable
         WaitFor(() => File.Exists(Path.Combine(_dstDir, "b.txt")), "dest copy");
 
         // Fresh store: the initial sync's own restore pass is due and runs.
-        Assert.Contains(_log.Messages, m => m.Contains("Restore verify:") && m.Contains("match"));
-        Assert.DoesNotContain(_log.Messages, m => m.Contains("Restore verify FAILED"));
+        Assert.Contains(_log.Messages, m => m.Contains("Routine check:") && m.Contains("match"));
+        Assert.DoesNotContain(_log.Messages, m => m.Contains("Routine check FAILED"));
     }
 }

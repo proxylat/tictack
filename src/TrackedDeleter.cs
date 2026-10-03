@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -28,6 +29,12 @@ namespace TicTack
                 _log.Error(label + ": " + destPath + ": " + result.ErrorMessage);
                 return false;
             }
+            // Barrier symmetry with the copy path (file fsync → rename →
+            // dir sync): without this a crash can resurrect the unlinked
+            // entry. Benign when it fails — next parity re-deletes — so a
+            // failed sync never fails the delete, it just gets logged.
+            if (!CopyAction.FlushDirectory(Path.GetDirectoryName(destPath)))
+                _log.Debug(label + ": directory sync failed after delete: " + destPath);
             if (_stateDb != null)
             {
                 try { await _stateDb.DeleteAsync(rel); }

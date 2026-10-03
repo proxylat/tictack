@@ -51,7 +51,7 @@ namespace TicTack
             // Churn freeze: leave items queued, retry on the next flush.
             if (_churn != null && _churn.IsHeld())
             {
-                _log.Debug("Churn hold active, keeping deletion batch queued.");
+                _log.Debug("Spike hold active, keeping deletion batch queued.");
                 return;
             }
 
@@ -120,14 +120,14 @@ namespace TicTack
 
             if (blocked)
             {
-                // Locality shortcut: a batch concentrated in one folder is a
+                // Bulk-cleanup shortcut: a batch concentrated in one folder is a
                 // cleanup, not a catastrophe — proceed loudly instead of
                 // holding. Needs two preconditions: statistical weight (tiny
                 // batches carry no signal) and a trustworthy baseline (a
                 // batch bigger than the known state means dead rows — fail
-                // closed, locality reasoning cannot apply). Otherwise the
+                // closed, cleanup reasoning cannot apply). Otherwise the
                 // batch falls through to the hold.
-                var localityPct = _config.Sync != null ? _config.Sync.DeleteLocalityPercent : 80;
+                var localityPct = _config.Sync != null ? _config.Sync.BulkCleanupPercent : 0;
                 if (localityPct > 0 && countKnown && totalCount <= stateCount && totalCount >= 10)
                 {
                     var locality = LocalityShare(batch);

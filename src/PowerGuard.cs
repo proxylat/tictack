@@ -46,7 +46,16 @@ namespace TicTack
                             continue;
                         }
                     }
-                    try { File.Delete(tmp); log.Warn(string.Format("Cleaned stale temp {0}", Path.GetFileName(tmp))); }
+                    try
+                    {
+                        File.Delete(tmp);
+                        // Barrier for the unlink above: without it the stale
+                        // tmp resurrects on crash. Benign (next startup
+                        // re-cleans), so a failed sync never fails the clean.
+                        if (!CopyAction.FlushDirectory(Path.GetDirectoryName(tmp)))
+                            log.Debug("PowerGuard: directory sync failed after cleaning " + Path.GetFileName(tmp));
+                        log.Warn(string.Format("Cleaned stale temp {0}", Path.GetFileName(tmp)));
+                    }
                     catch (Exception ex) { log.Warn(string.Format("Could not clean {0}: {1}", Path.GetFileName(tmp), ex.Message)); }
                 }
             }
@@ -69,6 +78,8 @@ namespace TicTack
                 try
                 {
                     File.Move(tmp, dest);
+                    // Same barrier for the crash-recovery commit itself.
+                    CopyAction.FlushDirectory(Path.GetDirectoryName(dest));
                     log.Warn(string.Format("Recovered {0} from validated temp", Path.GetFileName(dest)));
                     return;
                 }

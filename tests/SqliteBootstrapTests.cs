@@ -49,6 +49,19 @@ public sealed class SqliteBootstrapTests : IDisposable
             SqliteBootstrap.Open(DbPath("bad"), (SqliteSchema)999));
     }
 
+    [Fact]
+    public void Open_SetsFullSynchronousAndBusyTimeout()
+    {
+        var path = DbPath("durable");
+        using var conn = SqliteBootstrap.Open(path, SqliteSchema.State);
+
+        // 2 = FULL: every commit waits for stable storage (WAL alone
+        // defaults to NORMAL — ack before bytes land). 5000 = busy wait
+        // instead of instant SQLITE_BUSY when the CLI meets the service.
+        Assert.Equal(2L, Scalar(conn, "PRAGMA synchronous"));
+        Assert.Equal(5000L, Scalar(conn, "PRAGMA busy_timeout"));
+    }
+
     private static object? Scalar(SqliteConnection conn, string sql)
     {
         using var cmd = conn.CreateCommand();

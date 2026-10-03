@@ -55,6 +55,12 @@ namespace TicTack
                     throw new IOException("Archive validation failed: " + src);
                 File.Move(temp, archivePath, true);
                 File.Delete(src);
+                // Ordering barrier (Pillai): the move and the unlink each
+                // change a directory entry; without a dir sync a crash
+                // resurrects the unlinked entry. Benign (next parity
+                // re-deletes), so best-effort — never fails the archive.
+                CopyAction.FlushDirectory(Path.GetDirectoryName(archivePath));
+                CopyAction.FlushDirectory(Path.GetDirectoryName(src));
             }
             finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
         }
@@ -87,6 +93,9 @@ namespace TicTack
                         ArchiveFile(f, Path.Combine(_archiveBase, rel));
                     }
                     Directory.Delete(destPath, true);
+                    // Same barrier for the recursive delete above: without
+                    // it the whole removed tree can resurrect on crash.
+                    CopyAction.FlushDirectory(Path.GetDirectoryName(destPath));
                 }
                 return Task.FromResult(ActionResult.Ok());
             }

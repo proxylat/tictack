@@ -9,6 +9,8 @@ namespace TicTack
     // tripping freezes all three funnels until a human clears it. Clearing is
     // file-is-truth: the user deletes the marker file, the next enforcement
     // check sees it gone and resumes with an Info line. No UI, no RPC.
+    // Config keys are spike_*; the class/marker names keep the old word so
+    // pre-rename holds survive an upgrade.
     public sealed class ChurnMonitor
     {
         private readonly string _markerPath;
@@ -107,15 +109,15 @@ namespace TicTack
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
                 File.WriteAllText(_markerPath,
-                    "Churn guard tripped at " + now.ToString("O") + ": "
+                    "Spike guard tripped at " + now.ToString("O") + ": "
                     + bytes + " bytes, " + files + " files, " + renames + " renames in window. "
                     + "Delete this file to resume syncing.");
             }
-            catch (Exception ex) { _log.Debug("Churn marker write failed: " + ex.Message); }
+            catch (Exception ex) { _log.Debug("Spike marker write failed: " + ex.Message); }
             if (!_holdLogged)
             {
                 _holdLogged = true;
-                _log.Error("Churn guard tripped (" + bytes + " bytes, " + files + " files, " + renames
+                _log.Error("Spike guard tripped (" + bytes + " bytes, " + files + " files, " + renames
                     + " renames in window) — syncing frozen until " + _markerPath + " is deleted");
             }
         }
@@ -133,7 +135,7 @@ namespace TicTack
                 {
                     _holdLogged = false;
                     Reset();
-                    _log.Info("Churn hold cleared, resuming");
+                    _log.Info("Spike hold cleared, resuming");
                 }
                 return held;
             }

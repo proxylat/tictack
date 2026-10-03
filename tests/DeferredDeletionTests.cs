@@ -201,6 +201,92 @@ public class DeferredDeletionTests
 
             Assert.Equal(gone, Assert.Single(chunk.Files));
             Assert.Equal(1, chunk.Cancelled);
+            Assert.Equal(back, Assert.Single(chunk.CancelledPaths));
+            // Claim-only: rows survive the take; the sweep confirms them.
+            Assert.True(dd.HasPending);
+            var toConfirm = new List<string>(chunk.Files);
+            toConfirm.AddRange(chunk.CancelledPaths);
+            Assert.Equal(2, dd.ConfirmClaimed(toConfirm));
+            Assert.False(dd.HasPending);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void TakeExpiredChunk_ClaimIsIdempotent()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 0, new RecordingLogger());
+            var a = Path.Combine(dir, "a.txt");
+            var b = Path.Combine(dir, "b.txt");
+            dd.RecordPending(new List<string> { a, b }, dir);
+
+            var first = dd.TakeExpiredChunk(500);
+            var second = dd.TakeExpiredChunk(500);
+
+            // Nothing deleted at claim time: the second take replays the
+            // same files. The sweep (ConfirmClaimed) is what empties.
+            Assert.Equal(first.Files.OrderBy(p => p), second.Files.OrderBy(p => p));
+            Assert.True(dd.HasPending);
+            Assert.Equal(2, dd.ConfirmClaimed(second.Files));
+            Assert.False(dd.HasPending);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void ConfirmClaimed_UnclaimedKeys_DeleteNothing()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 0, new RecordingLogger());
+            var a = Path.Combine(dir, "a.txt");
+            dd.RecordPending(new List<string> { a }, dir);
+
+            // No claim yet: the claimed = 1 predicate guards the sweep.
+            Assert.Equal(0, dd.ConfirmClaimed(new List<string> { a }));
+            Assert.True(dd.HasPending);
+            Assert.Equal(1, dd.PendingCount);
+
+            // After claim the same call confirms exactly one row.
+            var chunk = dd.TakeExpiredChunk(500);
+            Assert.Equal(a, Assert.Single(chunk.Files));
+            Assert.Equal(1, dd.ConfirmClaimed(new List<string> { a }));
+            Assert.False(dd.HasPending);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void RecordPending_ReblockedClaimedKey_RestartsHold()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 0, new RecordingLogger());
+            var a = Path.Combine(dir, "a.txt");
+            dd.RecordPending(new List<string> { a }, dir);
+
+            var chunk = dd.TakeExpiredChunk(500);
+            Assert.Equal(a, Assert.Single(chunk.Files));
+
+            // Fresh block during a slow drain resets claimed, so the pending
+            // sweep cannot delete it: the hold clock restarts instead.
+            dd.RecordPending(new List<string> { a }, dir);
+            Assert.Equal(0, dd.ConfirmClaimed(new List<string> { a }));
+            Assert.True(dd.HasPending);
+            Assert.Equal(1, dd.PendingCount);
+
+            // The re-blocked hold drains normally on the next pass.
+            var replay = dd.TakeExpiredChunk(500);
+            Assert.Equal(a, Assert.Single(replay.Files));
+            Assert.Equal(1, dd.ConfirmClaimed(replay.Files));
             Assert.False(dd.HasPending);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
@@ -217,13 +303,19 @@ public class DeferredDeletionTests
             var files = Enumerable.Range(0, 1200).Select(i => Path.Combine(dir, "f" + i + ".txt")).ToList();
             dd.RecordPending(files, dir);
 
+            // Two-phase: each take claims a bounded chunk, the sweep
+            // confirms it, the next take advances. Without the confirm the
+            // same chunk replays (see TakeExpiredChunk_ClaimIsIdempotent).
             var first = dd.TakeExpiredChunk(500);
             Assert.Equal(500, first.Files.Count);
             Assert.True(dd.HasPending);
+            dd.ConfirmClaimed(first.Files);
             var second = dd.TakeExpiredChunk(500);
             Assert.Equal(500, second.Files.Count);
+            dd.ConfirmClaimed(second.Files);
             var third = dd.TakeExpiredChunk(500);
             Assert.Equal(200, third.Files.Count);
+            dd.ConfirmClaimed(third.Files);
             Assert.False(dd.HasPending);
             Assert.False(File.Exists(DbFile(dir, "tictack-deferred-test")));
         }
@@ -431,5 +523,66 @@ public class DeferredDeletionTests
             Assert.Equal(expected, action.Files!.Count);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void GetBatchSummaries_ReturnsPerBatchCounts()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 7, new RecordingLogger());
+            dd.RecordPending(new List<string> { Path.Combine(dir, "a.txt"), Path.Combine(dir, "b.txt") }, dir);
+            dd.RecordPending(new List<string> { Path.Combine(dir, "c.txt") }, dir);
+
+            var rows = dd.GetBatchSummaries();
+            Assert.Equal(2, rows.Count);
+            Assert.Equal(3, rows.Sum(r => r.Files));
+            Assert.True(rows.All(r => r.BlockedAt > DateTime.MinValue));
+            // Read-only: snapshot changes nothing, store untouched.
+            Assert.True(dd.HasPending);
+            Assert.Equal(2, dd.GetBatchSummaries().Count);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void GetBatchSummaries_EmptyStore_ReturnsNoRows()
+    {
+        var dir = TestDir();
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 7, new RecordingLogger());
+            Assert.Empty(dd.GetBatchSummaries());
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void FormatNextDue_LabelsExpiryAndWarning()
+    {
+        var now = DateTime.UtcNow;
+        // Fresh batch, never warned: warning due now.
+        var fresh = new List<BatchSummary>
+        {
+            new BatchSummary { BlockedAt = now, LastWarningAt = DateTime.MinValue, Files = 5 }
+        };
+        Assert.StartsWith("warning", Program.FormatNextDue(fresh, 7, now));
+        // Warned an hour ago: warning in ~23h, expiry in 7d → warning wins.
+        var warned = new List<BatchSummary>
+        {
+            new BatchSummary { BlockedAt = now, LastWarningAt = now.AddHours(-1), Files = 5 }
+        };
+        var label = Program.FormatNextDue(warned, 7, now);
+        Assert.StartsWith("warning in ", label);
+        // Expired batch: expiry now.
+        var expired = new List<BatchSummary>
+        {
+            new BatchSummary { BlockedAt = now.AddDays(-8), LastWarningAt = now.AddHours(-1), Files = 5 }
+        };
+        Assert.Equal("expiry now", Program.FormatNextDue(expired, 7, now));
+        Assert.Equal("-", Program.FormatNextDue(new List<BatchSummary>(), 7, now));
     }
 }

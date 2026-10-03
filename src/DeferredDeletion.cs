@@ -125,7 +125,32 @@ namespace TicTack
                     foreach (var kv in incoming)
                         if (!existing.Contains(kv.Key))
                             added.Add(kv);
-                    if (added.Count == 0)
+                    // Two-phase drain: a fresh block during a slow drain must
+                    // restart that path's hold clock, not inherit
+                    // sweep-deletion. Claimed rows re-blocked here move to
+                    // the new batch with claimed reset. Unclaimed dupes keep
+                    // the old behavior (ignored, original clock stands).
+                    var reblocked = new List<string>();
+                    if (existing.Count > 0)
+                    {
+                        foreach (var chunk in Chunk(incoming.Keys.Where(k => existing.Contains(k))))
+                        {
+                            using var cmd = _conn!.CreateCommand();
+                            var names = new string[chunk.Count];
+                            for (int i = 0; i < chunk.Count; i++)
+                            {
+                                names[i] = "@p" + i;
+                                cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                            }
+                            // Only generated @pN placeholder names are concatenated;
+                            // every value is bound, so no user input reaches SQL.
+                            // nosemgrep: csharp-sqli
+                            cmd.CommandText = "SELECT path_key FROM pending WHERE claimed = 1 AND path_key IN (" + string.Join(",", names) + ")";
+                            using var reader = cmd.ExecuteReader();
+                            while (reader.Read()) reblocked.Add(reader.GetString(0));
+                        }
+                    }
+                    if (added.Count == 0 && reblocked.Count == 0)
                     {
                         _log.Debug("Deferred deletion: all files already pending, no new batch");
                         return;
@@ -159,13 +184,54 @@ namespace TicTack
                                 cmd.ExecuteNonQuery();
                             }
                         }
+                        if (reblocked.Count > 0)
+                        {
+                            foreach (var chunk in Chunk(reblocked))
+                            {
+                                using var cmd = _conn.CreateCommand();
+                                cmd.Transaction = tx;
+                                var names = new string[chunk.Count];
+                                for (int i = 0; i < chunk.Count; i++)
+                                {
+                                    names[i] = "@p" + i;
+                                    cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                                }
+                                cmd.Parameters.AddWithValue("@b", batchId);
+                                // Only generated @pN placeholder names are concatenated;
+                                // every value is bound, so no user input reaches SQL.
+                                // nosemgrep: csharp-sqli
+                                cmd.CommandText = "UPDATE pending SET batch_id = @b, claimed = 0 WHERE path_key IN (" + string.Join(",", names) + ")";
+                                cmd.ExecuteNonQuery();
+                            }
+                        }
                         tx.Commit();
                     }
                     _hasPending = true;
                     var total = CountInternal();
-                    _log.Warn("Deferred deletion: batch " + BatchTimestamp(now) + ": " + added.Count
+                    var fresh = added.Count + reblocked.Count;
+                    _log.Warn("Deferred deletion: batch " + BatchTimestamp(now) + ": " + fresh
                         + " new files (" + total + " total held), hold for " + _holdDays + " days");
-                    LogSample(added.Select(kv => kv.Value).ToList(), batchId);
+                    var sample = added.Select(kv => kv.Value).ToList();
+                    if (reblocked.Count > 0)
+                    {
+                        foreach (var chunk in Chunk(reblocked))
+                        {
+                            using var cmd = _conn!.CreateCommand();
+                            var names = new string[chunk.Count];
+                            for (int i = 0; i < chunk.Count; i++)
+                            {
+                                names[i] = "@p" + i;
+                                cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                            }
+                            // Only generated @pN placeholder names are concatenated;
+                            // every value is bound, so no user input reaches SQL.
+                            // nosemgrep: csharp-sqli
+                            cmd.CommandText = "SELECT path FROM pending WHERE path_key IN (" + string.Join(",", names) + ")";
+                            using var reader = cmd.ExecuteReader();
+                            while (reader.Read()) sample.Add(reader.GetString(0));
+                        }
+                    }
+                    LogSample(sample, batchId);
                 }
                 catch (Exception ex) { _log.Warn("Deferred deletion state could not be saved: " + _dbPath + " (" + ex.Message + ")"); }
             }
@@ -301,10 +367,13 @@ namespace TicTack
             }
         }
 
-        // Bounded expiry drain: claims up to limit still-deleted paths from
-        // expired batches (oldest first), removing every claimed row — both
-        // proceeded and reappeared — so memory and disk stay flat at 2M-file
-        // scale. Call in a loop until Files is empty.
+        // Bounded expiry drain, two-phase: claims up to limit still-deleted
+        // paths from expired batches (oldest first), marking rows claimed
+        // instead of deleting them. The caller sweeps dest files, then
+        // ConfirmClaimed deletes only still-claimed rows. A kill between
+        // claim and sweep leaves claimed rows behind; the next drain
+        // re-claims (idempotent) and replays the idempotent deletes. Call
+        // in a loop until Files is empty AND Cancelled is 0.
         public ExpiredChunk TakeExpiredChunk(int limit = ChunkSize)
         {
             var result = new ExpiredChunk();
@@ -324,35 +393,32 @@ namespace TicTack
                         if (result.Files.Count >= limit) break;
                         if ((now - b.BlockedAt).TotalDays < _holdDays) continue;
                         if (!string.IsNullOrEmpty(b.SourceRoot) && !Directory.Exists(b.SourceRoot)) continue;
-                        var paths = ReadBatchPaths(b.BatchId, limit - result.Files.Count);
-                        if (paths.Count == 0)
+                        var entries = ReadBatchEntries(b.BatchId, limit - result.Files.Count);
+                        if (entries.Count == 0)
                         {
                             DeleteBatchRow(b.BatchId);
                             continue;
                         }
+                        ClaimBatchPaths(b.BatchId, entries);
                         var still = new List<string>();
-                        var gone = 0;
-                        foreach (var p in paths)
+                        var gone = new List<string>();
+                        foreach (var e in entries)
                         {
-                            if (File.Exists(p)) gone++;
-                            else still.Add(p);
+                            if (File.Exists(e.Path)) gone.Add(e.Path);
+                            else still.Add(e.Path);
                         }
-                        DeletePaths(paths);
                         result.Files.AddRange(still);
-                        result.Cancelled += gone;
-                        if (BatchCount(b.BatchId) == 0)
+                        result.CancelledPaths.AddRange(gone);
+                        result.Cancelled += gone.Count;
+                        var tag = BatchTimestamp(b.BlockedAt);
+                        if (still.Count > 0)
                         {
-                            var tag = BatchTimestamp(b.BlockedAt);
-                            DeleteBatchRow(b.BatchId);
-                            if (still.Count > 0)
-                            {
-                                _log.Warn("Deferred deletion: batch " + tag + ": " + still.Count + " files still deleted after hold, syncing");
-                                LogSample(still, tag);
-                            }
-                            else
-                            {
-                                _log.Info("Deferred deletion: batch " + tag + ": files reappeared, cancelling");
-                            }
+                            _log.Warn("Deferred deletion: batch " + tag + ": " + still.Count + " files still deleted after hold, syncing");
+                            LogSample(still, tag);
+                        }
+                        else
+                        {
+                            _log.Info("Deferred deletion: batch " + tag + ": files reappeared, cancelling");
                         }
                     }
                     RefreshPendingFlag();
@@ -362,8 +428,55 @@ namespace TicTack
             }
         }
 
+        // Sweep phase: deletes only still-claimed rows. The claimed = 1
+        // predicate is the safety: a concurrently re-blocked path was reset
+        // to claimed = 0 by RecordPending and survives the sweep. After
+        // deleting, drops newly-empty batch rows. Returns confirmed count.
+        public int ConfirmClaimed(IEnumerable<string> paths)
+        {
+            lock (_lock)
+            {
+                if (_disposed || _conn == null) return 0;
+                try
+                {
+                    if (!File.Exists(_dbPath)) return 0;
+                    var keys = paths.Select(NormalizeKey).Distinct(StringComparer.Ordinal).ToList();
+                    if (keys.Count == 0) return 0;
+                    var confirmed = 0;
+                    foreach (var chunk in Chunk(keys))
+                    {
+                        using var cmd = _conn.CreateCommand();
+                        var names = new string[chunk.Count];
+                        for (int i = 0; i < chunk.Count; i++)
+                        {
+                            names[i] = "@p" + i;
+                            cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                        }
+                        // Only generated @pN placeholder names are concatenated;
+                        // every value is bound, so no user input reaches SQL.
+                        // nosemgrep: csharp-sqli
+                        cmd.CommandText = "DELETE FROM pending WHERE claimed = 1 AND path_key IN (" + string.Join(",", names) + ")";
+                        confirmed += cmd.ExecuteNonQuery();
+                    }
+                    if (confirmed > 0)
+                    {
+                        foreach (var b in ReadBatches())
+                        {
+                            if (BatchCount(b.BatchId) == 0)
+                                DeleteBatchRow(b.BatchId);
+                        }
+                    }
+                    RefreshPendingFlag();
+                    return confirmed;
+                }
+                catch (Exception ex) { _log.Warn("Deferred deletion confirm failed: " + ex.Message); return 0; }
+            }
+        }
+
         // Small-scale/test compat: warnings plus a full drain. Production
-        // uses CheckWarnings + TakeExpiredChunk in a loop instead.
+        // uses CheckWarnings + TakeExpiredChunk in a loop instead. Confirms
+        // everything it drains so the store empties like the old
+        // delete-at-claim behavior did.
         public DeferredAction Check()
         {
             var waiting = CheckWarnings() == DeferredActionType.Waiting;
@@ -374,6 +487,11 @@ namespace TicTack
                 var chunk = TakeExpiredChunk(ChunkSize);
                 proceed.AddRange(chunk.Files);
                 cancelled += chunk.Cancelled;
+                var toConfirm = new List<string>(chunk.Files.Count + chunk.CancelledPaths.Count);
+                toConfirm.AddRange(chunk.Files);
+                toConfirm.AddRange(chunk.CancelledPaths);
+                if (toConfirm.Count > 0)
+                    ConfirmClaimed(toConfirm);
                 if (chunk.Files.Count == 0) break;
             }
             if (proceed.Count > 0)
@@ -388,6 +506,32 @@ namespace TicTack
         public bool HasPending
         {
             get { lock (_lock) { return _hasPending; } }
+        }
+
+        public int HoldDays => _holdDays;
+
+        // Metadata-only snapshot for --deferred-list: one row per batch.
+        // Never touches pending paths, never mutates.
+        public List<BatchSummary> GetBatchSummaries()
+        {
+            var rows = new List<BatchSummary>();
+            lock (_lock)
+            {
+                if (_disposed || !_hasPending || _conn == null) return rows;
+                try
+                {
+                    if (!File.Exists(_dbPath)) return rows;
+                    foreach (var b in ReadBatches())
+                        rows.Add(new BatchSummary
+                        {
+                            BlockedAt = b.BlockedAt,
+                            LastWarningAt = b.LastWarningAt,
+                            Files = BatchCount(b.BatchId)
+                        });
+                }
+                catch (Exception ex) { _log.Warn("Deferred deletion summary failed: " + ex.Message); }
+            }
+            return rows;
         }
 
         internal int PendingCount
@@ -444,7 +588,7 @@ namespace TicTack
         // file our own SQLite handle has open. A surviving IOException
         // means someone else (the running service) holds the store; it
         // propagates so the caller can say so instead of dumping a stack.
-        public void ClearStore()
+        public void ClearStore(string reason = "rebuild")
         {
             lock (_lock)
             {
@@ -458,7 +602,7 @@ namespace TicTack
                     if (File.Exists(f)) File.Delete(f);
                 }
                 _hasPending = false;
-                if (had) _log.Info("Deferred deletion: hold store cleared by rebuild");
+                if (had) _log.Info("Deferred deletion: hold store cleared by " + reason);
             }
         }
 
@@ -555,6 +699,47 @@ namespace TicTack
             using var reader = cmd.ExecuteReader();
             while (reader.Read()) paths.Add(reader.GetString(0));
             return paths;
+        }
+
+        private sealed class BatchEntry
+        {
+            public string Key = string.Empty;
+            public string Path = string.Empty;
+        }
+
+        // All rows in the batch (claimed or not): crash-replayed drains must
+        // see already-claimed rows again, so claim is idempotent.
+        private List<BatchEntry> ReadBatchEntries(string batchId, int limit)
+        {
+            var entries = new List<BatchEntry>();
+            using var cmd = _conn!.CreateCommand();
+            cmd.CommandText = "SELECT path_key, path FROM pending WHERE batch_id = @b LIMIT @n";
+            cmd.Parameters.AddWithValue("@b", batchId);
+            cmd.Parameters.AddWithValue("@n", limit);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) entries.Add(new BatchEntry { Key = reader.GetString(0), Path = reader.GetString(1) });
+            return entries;
+        }
+
+        private void ClaimBatchPaths(string batchId, List<BatchEntry> entries)
+        {
+            var keys = entries.Select(e => e.Key).Distinct(StringComparer.Ordinal).ToList();
+            foreach (var chunk in Chunk(keys))
+            {
+                using var cmd = _conn!.CreateCommand();
+                var names = new string[chunk.Count];
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    names[i] = "@p" + i;
+                    cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                }
+                cmd.Parameters.AddWithValue("@b", batchId);
+                // Only generated @pN placeholder names are concatenated;
+                // every value is bound, so no user input reaches SQL.
+                // nosemgrep: csharp-sqli
+                cmd.CommandText = "UPDATE pending SET claimed = 1 WHERE batch_id = @b AND claimed = 0 AND path_key IN (" + string.Join(",", names) + ")";
+                cmd.ExecuteNonQuery();
+            }
         }
 
         private void DeletePaths(List<string> paths)
@@ -727,6 +912,18 @@ namespace TicTack
     {
         public List<string> Files { get; } = new List<string>();
         public int Cancelled { get; set; }
+        // Reappeared paths claimed in this chunk (File.Exists at claim).
+        // Needed so the sweeper can confirm them: their dest delete is a
+        // no-op, but the hold row must still go. Kept in sync with
+        // Cancelled by TakeExpiredChunk.
+        public List<string> CancelledPaths { get; } = new List<string>();
+    }
+
+    public sealed class BatchSummary
+    {
+        public DateTime BlockedAt;
+        public DateTime LastWarningAt;
+        public int Files;
     }
 
     public class DeferredAction

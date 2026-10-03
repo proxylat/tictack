@@ -160,6 +160,43 @@ public sealed class CompleterTests : IDisposable
     }
 
     [Fact]
+    public async Task FailedValidation_NeverUpserts()
+    {
+        // Barrier pin (Pillai): the rename below is durable but validation
+        // failed — the file stays on disk, state must not claim it. Claim
+        // without proof would let a crash bless a corrupt copy; instead the
+        // next run re-copies and the completer stays the single enforcer.
+        var src = Path.Combine(_dir, "src-badval");
+        var dst = Path.Combine(_dir, "dst-badval");
+        WriteFiles(src, 1, 512);
+        var srcFile = Path.Combine(src, "file00000.bin");
+        var dstFile = Path.Combine(dst, "file00000.bin");
+        var copy = new CopyAction(new FileAccessor());
+        var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Created, srcFile), src, dst);
+        var tmp = await copy.CopyToTempAsync(args, CancellationToken.None);
+        Assert.True(tmp.Success);
+
+        using var cts = new CancellationTokenSource();
+        var completer = new FileCompleter(copy, new FailingValidator(), new RecordingLogger(), 4);
+        completer.Start(cts.Token);
+        int upserts = 0;
+        var fresh = await completer.EnqueueAsync(args, tmp, "Copy failed", "Validation FAILED",
+            (snap, _) => { Interlocked.Increment(ref upserts); return Task.CompletedTask; }, cts.Token);
+        completer.Complete();
+        await completer.LoopTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Null(fresh);
+        Assert.Equal(0, upserts);
+        Assert.True(File.Exists(dstFile));
+    }
+
+    private sealed class FailingValidator : IValidator
+    {
+        public Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null) =>
+            Task.FromResult(false);
+    }
+
+    [Fact]
     public async Task CancelledItem_NeverCompletesOrUpserts()
     {
         var src = Path.Combine(_dir, "src");

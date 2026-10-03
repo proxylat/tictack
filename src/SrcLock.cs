@@ -210,7 +210,7 @@ namespace TicTack
             {
                 var waitedFor = retryTimeout.HasValue ? $" after {retryTimeout.Value.TotalSeconds:F0}s" : "";
                 _log.Warn("Lock held by " + what + " — lock acquisition failed" + waitedFor
-                          + "; stop the other TicTack instance or raise retry_lock_seconds");
+                          + "; stop the other TicTack instance or raise lock_wait_seconds");
                 return false;
             }
             attempt++;

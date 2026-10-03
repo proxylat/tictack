@@ -62,4 +62,89 @@ public class CommandTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    static TicTackConfig DeferredCfg(string logPath, params SourceConfig[] sources) => new TicTackConfig
+    {
+        Logging = new LoggingConfig { Path = logPath },
+        Sources = new List<SourceConfig>(sources)
+    };
+
+    [Fact]
+    public async Task DeferredList_PrintsStemPathAndCounts()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-deferredcli-" + Guid.NewGuid().ToString("N"));
+        var source = Path.Combine(root, "a", "Desktop");
+        Directory.CreateDirectory(source);
+        try
+        {
+            var src = new SourceConfig { Path = source, Destination = Path.Combine(root, "dst") };
+            var stem = Program.DeferredFilePrefix(src);
+            var log = new RecordingLogger();
+            using (var dd = new DeferredDeletion(root, stem, 7, log))
+                dd.RecordPending(new List<string> { Path.Combine(source, "x.txt") }, source);
+
+            var rc = await Program.RunDeferredAsync(DeferredCfg(Path.Combine(root, "tictack.log"), src), log, true, null, null);
+            Assert.Equal(0, rc);
+            Assert.Contains(log.Messages, m => m.Contains(stem) && m.Contains(source) && m.Contains("files=1"));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task DeferredList_NoHolds_PrintsEmpty()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-deferredcli-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var src = new SourceConfig { Path = Path.Combine(root, "src"), Destination = Path.Combine(root, "dst") };
+            var log = new RecordingLogger();
+            var rc = await Program.RunDeferredAsync(DeferredCfg(Path.Combine(root, "tictack.log"), src), log, true, null, null);
+            Assert.Equal(0, rc);
+            Assert.Contains(log.Messages, m => m.Contains("No deferred holds."));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task DeferredCancel_ClearsHoldsKeepsFiles()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-deferredcli-" + Guid.NewGuid().ToString("N"));
+        var source = Path.Combine(root, "a", "Desktop");
+        Directory.CreateDirectory(source);
+        try
+        {
+            var src = new SourceConfig { Path = source, Destination = Path.Combine(root, "dst") };
+            var stem = Program.DeferredFilePrefix(src);
+            using (var dd = new DeferredDeletion(root, stem, 7, new RecordingLogger()))
+                dd.RecordPending(new List<string> { Path.Combine(source, "x.txt") }, source);
+
+            var log = new RecordingLogger();
+            var rc = await Program.RunDeferredAsync(DeferredCfg(Path.Combine(root, "tictack.log"), src), log, false, "--reprove", stem);
+            Assert.Equal(0, rc);
+            Assert.Contains(log.Messages, m => m.Contains("kept"));
+            using var dd2 = new DeferredDeletion(root, stem, 7, new RecordingLogger());
+            Assert.False(dd2.HasPending);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task DeferredCheck_AmbiguousLeaf_ListsCandidates()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-deferredcli-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "a", "Desktop"));
+        Directory.CreateDirectory(Path.Combine(root, "b", "Desktop"));
+        try
+        {
+            var a = new SourceConfig { Path = Path.Combine(root, "a", "Desktop"), Destination = Path.Combine(root, "x") };
+            var b = new SourceConfig { Path = Path.Combine(root, "b", "Desktop"), Destination = Path.Combine(root, "y") };
+            var log = new RecordingLogger();
+            var rc = await Program.RunDeferredAsync(DeferredCfg(Path.Combine(root, "tictack.log"), a, b), log, false, "--deferred-check", "Desktop");
+            Assert.Equal(1, rc);
+            Assert.Contains(log.Messages, m => m.Contains("Ambiguous")
+                && m.Contains(Program.DeferredFilePrefix(a)) && m.Contains(Program.DeferredFilePrefix(b)));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }
