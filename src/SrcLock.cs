@@ -47,10 +47,23 @@ namespace TicTack
                 {
                     _heldPath = held;
                     IsHeld = true;
+                    // Touch through the held handle, not by path: the
+                    // exclusive handle stays open with FileShare.Read, so a
+                    // by-path touch hits a sharing violation on Windows
+                    // (swallowed by the catch below → mtime frozen, holder
+                    // looks stale). Shared mode closed its create stream,
+                    // so by-path is safe there.
+                    var handle = _handle;
                     var touch = held;
                     _refreshTimer = new Timer(_ =>
                     {
-                        try { File.SetLastWriteTimeUtc(touch, DateTime.UtcNow); }
+                        try
+                        {
+                            if (handle != null)
+                                File.SetLastWriteTimeUtc(handle.SafeFileHandle, DateTime.UtcNow);
+                            else
+                                File.SetLastWriteTimeUtc(touch, DateTime.UtcNow);
+                        }
                         catch (Exception ex) { _log.Debug("Lock refresh failed: " + ex.Message); }
                     }, null, refresh, refresh);
                 }

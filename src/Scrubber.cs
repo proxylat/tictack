@@ -16,7 +16,7 @@ namespace TicTack
     internal sealed class Scrubber
     {
         internal const int ShardCount = 20;
-        private const string ShardKey = "scrub-shard";
+        internal const string ShardKey = "scrub-shard";
 
         private readonly SourceConfig _config;
         private readonly IFileFilter? _filter;

@@ -97,8 +97,18 @@ public class MoveReplayTests : IDisposable
     [Fact]
     public async Task FullVerify_Disabled_SkipsTamperedDest()
     {
+        // Isolate the scrub shard counter (default is an OS-global
+        // verify.db shared with every other test) and park it far from
+        // v.txt's shard. Only two scrub runs happen here (initial sync +
+        // rescan — the event path never scrubs), so +5 clears both with
+        // margin. Without this the rescan's scrub samples the tampered
+        // file, deletes it, and the assert races the recopy.
+        var stateDir = Path.Combine(_root, "vstateA");
+        Directory.CreateDirectory(stateDir);
+        using (var seed = new JobRunStore(Path.Combine(stateDir, "verify.db")))
+            seed.SetCounter(Scrubber.ShardKey, (Scrubber.ShardOf("v.txt") + 5) % Scrubber.ShardCount);
         using var pipeline = StartDbPipeline("verifyA-state.db",
-            cfg => cfg.Sync = new SyncConfig { FullRoutineCheckDays = 0 }, out var db);
+            cfg => { cfg.Sync = new SyncConfig { FullRoutineCheckDays = 0 }; cfg.StateDbPath = stateDir; }, out var db);
         var src = Path.Combine(_srcDir, "v.txt");
         var dst = Path.Combine(_dstDir, "v.txt");
         File.WriteAllText(src, "0123456789");
