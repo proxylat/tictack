@@ -345,28 +345,29 @@ namespace TicTack
 
     // Single owner for the logger stack: Program.Main and TicTackService had
     // drifted (desktop-alert level, default log directory, EventLog condition).
+    // Primitive params (not the app config model) so Corpus can share it.
     internal static class LoggerFactory
     {
-        public static ILogger Create(LoggingConfig cfg, string defaultLogDir, bool console, bool eventLog, string? backupDir = null)
+        public static ILogger Create(string? levelName, string logPath, int maxSizeMb, int maxFiles,
+            string? alertPath, bool console, bool eventLog, string? backupPath = null)
         {
-            var level = LogLevelParser.Parse(cfg.Level);
-            var logPath = string.IsNullOrEmpty(cfg.Path) ? Path.Combine(defaultLogDir, "tictack.log") : cfg.Path;
+            var level = LogLevelParser.Parse(levelName);
             var loggers = new List<ILogger>
             {
-                new BufferedLogger(new FileLogger(logPath, level, cfg.MaxSizeMb, cfg.MaxFiles))
+                new BufferedLogger(new FileLogger(logPath, level, maxSizeMb, maxFiles))
             };
             // Second, time-bounded copy next to the state DBs so a size storm
             // (which cycles the size-rotated primary in minutes) still leaves
             // ~48h of history behind.
-            if (!string.IsNullOrEmpty(backupDir))
-                loggers.Add(new DailyBackupLogger(Path.Combine(backupDir, "tictack.log.bak"), level));
+            if (!string.IsNullOrEmpty(backupPath))
+                loggers.Add(new DailyBackupLogger(backupPath, level));
             if (console) loggers.Add(new ConsoleLogger(level));
             // Alerts are a Warn/Error channel per the documented contract.
-            loggers.Add(new DesktopAlertLogger(LogLevel.Warn, cfg.AlertPath));
+            loggers.Add(new DesktopAlertLogger(LogLevel.Warn, alertPath));
             if (eventLog) loggers.Add(new EventLogLogger());
             var log = new MultiLogger(loggers);
-            if (!string.IsNullOrEmpty(cfg.Level) && !LogLevelParser.IsValid(cfg.Level))
-                log.Warn("Unknown logging.level '" + cfg.Level + "', using " + level);
+            if (!string.IsNullOrEmpty(levelName) && !LogLevelParser.IsValid(levelName))
+                log.Warn("Unknown logging.level '" + levelName + "', using " + level);
             return log;
         }
     }

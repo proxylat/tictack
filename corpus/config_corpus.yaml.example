@@ -1,0 +1,24 @@
+# Corpus — system imaging config (scaffold: store + index + log only).
+# Snake_case keys (UnderscoredNamingConvention), like TicTack's config.yaml.
+
+# Chunk packs + manifests live here. Required.
+store_path: '/var/lib/corpus/store'
+# Windows: 'C:\ProgramData\Corpus\store'
+
+# Chunk-index .db root. Empty = platform default
+# (/var/lib/corpus, or C:\ProgramData\Corpus on Windows).
+state_db_path: '/var/lib/corpus'
+
+# Fixed chunk size for volume streams in MiB (1..64). PBS evidence says
+# fixed suffices for guests; CDC only if shift-churn measurements say so.
+chunk_mib: 4
+
+compression:
+  # zstd level 1..22. 3 = Veeam-High default, 1 = fast landing-zone tier.
+  level: 3
+
+logging:
+  level: info
+  # Empty = corpus.log beside the exe.
+  path: ''
+  console: false

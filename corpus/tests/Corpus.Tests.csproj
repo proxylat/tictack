@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);NU1903;CS8892</NoWarn>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <PackageReference Include="ZstdSharp" Version="0.7.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="../CorpusConfig.cs" Link="corpus/CorpusConfig.cs" />
+    <Compile Include="../Chunker.cs" Link="corpus/Chunker.cs" />
+    <Compile Include="../ChunkId.cs" Link="corpus/ChunkId.cs" />
+    <Compile Include="../Compression.cs" Link="corpus/Compression.cs" />
+    <Compile Include="../IBlockSource.cs" Link="corpus/IBlockSource.cs" />
+    <Compile Include="../PackWriter.cs" Link="corpus/PackWriter.cs" />
+    <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
+    <Compile Include="../Manifest.cs" Link="corpus/Manifest.cs" />
+    <Compile Include="../Store.cs" Link="corpus/Store.cs" />
+    <Compile Include="../../src/Interfaces.cs" Link="shared/Interfaces.cs" />
+    <Compile Include="../../src/PathUtil.cs" Link="shared/PathUtil.cs" />
+    <Compile Include="../../src/SqliteBootstrap.cs" Link="shared/SqliteBootstrap.cs" />
+  </ItemGroup>
+
+</Project>

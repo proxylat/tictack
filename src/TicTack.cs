@@ -156,12 +156,18 @@ namespace TicTack
             // adds the wait-for-volume gate once logging exists.
             VolumeResolver.ResolveConfig(cfg);
 
+            var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
+                ? Path.Combine(baseDir, "tictack.log")
+                : cfg.Logging.Path;
             var log = LoggerFactory.Create(
-                cfg.Logging,
-                baseDir,
+                cfg.Logging.Level,
+                logPath,
+                cfg.Logging.MaxSizeMb,
+                cfg.Logging.MaxFiles,
+                cfg.Logging.AlertPath,
                 console: isCli || isOnce || isValidate || isRebuild || isDeferredList || deferredVerb != null || isForget || isVersionsList || pinVerb != null || cfg.Logging.Console,
                 eventLog: OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive),
-                backupDir: StateDbRoot(cfg));
+                backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"));
             rootLogger = log;
 
             if (!VolumeResolver.EnsureResolved(cfg, cfg.VolumeWaitMinutes, log))

@@ -72,6 +72,27 @@ jobs:
           path: tests/TestResults/
           if-no-files-found: ignore
 
+  corpus:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Restore
+        run: |
+          dotnet restore corpus/Corpus.csproj
+          dotnet restore corpus/tests/Corpus.Tests.csproj
+      - name: Build application
+        run: dotnet build corpus/Corpus.csproj --configuration Release --no-restore
+      - name: Run tests
+        run: dotnet test corpus/tests/Corpus.Tests.csproj --configuration Release --no-restore
+
   static:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -81,7 +102,7 @@ jobs:
         run: |
           # Pinned: a new rule release must not turn the gate red on its own.
           pipx install 'semgrep==1.177.0'
-          semgrep --config r/csharp --metrics off --json -o semgrep.json src
+          semgrep --config r/csharp --metrics off --json -o semgrep.json src corpus
       - name: ast-grep banked rules
         run: |
           npm install -g '@ast-grep/cli@0.45.3'

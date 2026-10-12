@@ -13,7 +13,10 @@ namespace TicTack
     {
         State,
         JobRuns,
-        Deferred
+        Deferred,
+        // Corpus chunk index (owned by corpus/, which source-links this
+        // file): shares open/retry/WAL/quarantine, own table below.
+        Corpus
     }
 
     // Thrown when PRAGMA quick_check reports corruption. The file has
@@ -82,6 +85,20 @@ namespace TicTack
             );
             CREATE INDEX IF NOT EXISTS idx_pending_batch ON pending(batch_id);
             CREATE INDEX IF NOT EXISTS idx_pending_unclaimed ON pending(batch_id) WHERE claimed = 0";
+
+        // Corpus chunk index (system-image-future.md §6): blob digest keys,
+        // WITHOUT ROWID, mark column for the GC sweep. Snapshot→chunk maps
+        // live in flat per-snapshot files, not here — this table holds chunk
+        // locations plus GC bookkeeping only.
+        private const string CorpusSql = @"CREATE TABLE IF NOT EXISTS chunks (
+                digest BLOB PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                stored_bytes INTEGER NOT NULL,
+                pack TEXT NOT NULL,
+                pack_offset INTEGER NOT NULL,
+                mark INTEGER NOT NULL DEFAULT 0
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_chunks_pack ON chunks(pack)";
 
         // Startup recovery (crash-killed WAL, AV/Defender holding the -wal)
         // can fail transiently with SQLITE_IOERR. Bounded retry here keeps
@@ -393,6 +410,7 @@ namespace TicTack
             SqliteSchema.State => StateSql,
             SqliteSchema.JobRuns => JobRunsSql,
             SqliteSchema.Deferred => DeferredSql,
+            SqliteSchema.Corpus => CorpusSql,
             _ => throw new ArgumentOutOfRangeException(nameof(schema), schema, null)
         };
     }
