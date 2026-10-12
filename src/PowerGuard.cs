@@ -6,9 +6,8 @@ namespace TicTack
 {
     public static class PowerGuard
     {
-        public static void Cleanup(TicTackConfig? cfg, ILogger log)
+        public static void Cleanup(TicTackConfig cfg, ILogger log)
         {
-            if (cfg == null || cfg.Sources == null) return;
             foreach (var src in cfg.Sources)
             {
                 if (!string.IsNullOrEmpty(src.Destination) && Directory.Exists(src.Destination))

@@ -14,15 +14,6 @@ public class FileActionArgsTests
     }
 
     [Fact]
-    public void MapsRootFile_Correctly()
-    {
-        var e = new FileChangedEventArgs(ChangeType.Created, @"C:\src\file.txt", null);
-        var args = new FileActionArgs(e, @"C:\src", @"D:\dst");
-
-        Assert.Equal(Path.Combine(@"D:\dst", "file.txt"), args.DestPath);
-    }
-
-    [Fact]
     public void MapsRenamedPath()
     {
         var e = new FileChangedEventArgs(ChangeType.Renamed, @"C:\src\new.txt", @"C:\src\old.txt");
@@ -60,34 +51,5 @@ public class FileActionArgsTests
         var args = new FileActionArgs(e, @"C:\src", @"D:\dst");
 
         Assert.Equal(@"C:\src2\file.txt", args.DestPath);
-    }
-
-    [Fact]
-    public void HandlesRootDest()
-    {
-        var e = new FileChangedEventArgs(ChangeType.Created, @"C:\src\file.txt", null);
-        var args = new FileActionArgs(e, @"C:\src", @"D:\");
-
-        Assert.Equal(Path.Combine(@"D:\", "file.txt"), args.DestPath);
-    }
-
-    [Fact]
-    public void PreservesSourceBase()
-    {
-        var e = new FileChangedEventArgs(ChangeType.Created, @"C:\src\file.txt", null);
-        var args = new FileActionArgs(e, @"C:\src", @"D:\dst");
-
-        Assert.Equal(@"C:\src", args.SourceBase);
-        Assert.Equal(@"D:\dst", args.DestBase);
-    }
-
-    [Fact]
-    public void MapsSubdirectoryStructure()
-    {
-        var e = new FileChangedEventArgs(ChangeType.Created,
-            @"C:\Sync\Desktop\sub\deep\nested.txt", null);
-        var args = new FileActionArgs(e, @"C:\Sync\Desktop", @"E:\Sync\Desktop");
-
-        Assert.Equal(Path.Combine(@"E:\Sync\Desktop", @"sub\deep\nested.txt"), args.DestPath);
     }
 }

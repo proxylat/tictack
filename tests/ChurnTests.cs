@@ -79,4 +79,61 @@ public class ChurnTests : IDisposable
         for (int i = 0; i < 100; i++) churn.ReportCopy(1_000_000);
         Assert.False(churn.IsHeld());
     }
+
+    [Fact]
+    public void TripOnBytes_SumsAcrossReports()
+    {
+        var churn = Make(bytes: 1000);
+        churn.ReportCopy(600);
+        Assert.False(churn.IsHeld());
+        churn.ReportCopy(500);
+        Assert.True(churn.IsHeld());
+        Assert.True(File.Exists(_marker));
+    }
+
+    [Fact]
+    public void TripOnRenames_WritesMarkerAndHolds()
+    {
+        var churn = Make(renames: 2);
+        churn.ReportRename();
+        Assert.False(churn.IsHeld());
+        churn.ReportRename();
+        Assert.True(churn.IsHeld());
+        Assert.Contains(_log.Messages, m => m.Contains("Spike guard tripped"));
+    }
+
+    [Fact]
+    public void TripOnDeletes_CountsFiles()
+    {
+        var churn = Make(files: 2);
+        churn.ReportDelete();
+        Assert.False(churn.IsHeld());
+        churn.ReportDelete();
+        Assert.True(churn.IsHeld());
+    }
+
+    [Fact]
+    public void BulkDelete_TripsFilesWire()
+    {
+        var churn = Make(files: 5);
+        churn.ReportBulkDelete(100, 5);
+        Assert.True(churn.IsHeld());
+    }
+
+    [Fact]
+    public void BulkDelete_TripsBytesWire()
+    {
+        var churn = Make(bytes: 1000);
+        churn.ReportBulkDelete(1100, 1);
+        Assert.True(churn.IsHeld());
+    }
+
+    [Fact]
+    public void BulkDelete_ZeroFiles_IsNoopEvenWithHugeBytes()
+    {
+        var churn = Make(bytes: 10);
+        churn.ReportBulkDelete(1_000_000, 0);
+        Assert.False(churn.IsHeld());
+        Assert.False(File.Exists(_marker));
+    }
 }

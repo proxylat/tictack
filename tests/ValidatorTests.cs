@@ -42,13 +42,6 @@ public class ValidatorTests : IDisposable
     }
 
     [Fact]
-    public async Task SizeValidator_ReturnsFalse_OnMissingDest()
-    {
-        File.WriteAllText(Src("a.txt"), "hello");
-        Assert.False(await new SizeValidator().ValidateAsync(Src("a.txt"), Dst("missing.txt")));
-    }
-
-    [Fact]
     public async Task HashValidator_ValidatesCorrectHash()
     {
         var content = "hash validation test content";

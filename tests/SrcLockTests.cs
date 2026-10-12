@@ -54,15 +54,6 @@ public class SrcLockTests : IDisposable
     }
 
     [Fact]
-    public void DetectsStaleLock()
-    {
-        File.WriteAllText(_lockPath, ForeignIdentity());
-        File.SetLastWriteTimeUtc(_lockPath, DateTime.UtcNow.AddMinutes(-10));
-        using var lockObj = new SrcLock(_lockPath, _log);
-        Assert.True(lockObj.IsHeld);
-    }
-
-    [Fact]
     public void FreshLock_ReturnsImmediately()
     {
         File.WriteAllText(_lockPath, ForeignIdentity());

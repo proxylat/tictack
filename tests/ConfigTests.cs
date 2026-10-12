@@ -421,6 +421,30 @@ logging:
     }
 
     [Fact]
+    public void MonitorConfig_Defaults_AreSet()
+    {
+        var m = new MonitorConfig();
+        Assert.Equal("watcher", m.Type);
+        Assert.Equal(64, m.WatcherBufferKb);
+        Assert.Equal(3600, m.PollingIntervalSeconds);
+        Assert.Equal(10, m.RestartDelaySeconds);
+        Assert.Equal(200, m.UsnPollIntervalMs);
+        Assert.True(m.UsnParentPrefilter);
+        Assert.True(m.UsnResolveGap);
+        Assert.True(m.UsnCheckpoint);
+        Assert.False(m.Usn);
+        Assert.True(m.PollingBackstop);
+    }
+
+    [Fact]
+    public void ExternalDrives_DefaultCommand_IsLinuxShape()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        Assert.Equal("restic backup --compression auto \"{source}\" -r \"{drive}/restic-repo\"",
+            new ExternalDrivesConfig().Command);
+    }
+
+    [Fact]
     public void DeleteHoldDays_DefaultsToTheSharedConstant()
     {
         Assert.Equal(7, SyncConfig.DefaultDeleteHoldDays);
@@ -476,5 +500,86 @@ logging:
         var sync = new SyncConfig();
         Assert.Equal(0, sync.BulkCleanupPercent);
         Assert.Equal(0, sync.RoutineCheckDays);
+    }
+
+    [Theory]
+    [InlineData("30s", 30)]
+    [InlineData("15m", 900)]
+    [InlineData("6h", 21600)]
+    [InlineData("30d", 2592000)]
+    [InlineData("1h30m", 5400)]
+    [InlineData(" 6 H ", 21600)]
+    [InlineData("0s", 0)]
+    [InlineData("2 days", 172800)]
+    public void TryParseDuration_AcceptsSpellings(string raw, long expectedSeconds)
+    {
+        Assert.True(Config.TryParseDuration(raw, out var duration));
+        Assert.Equal(TimeSpan.FromSeconds(expectedSeconds), duration);
+    }
+
+    [Theory]
+    [InlineData("90")]     // bare number: unit required
+    [InlineData("abc")]
+    [InlineData("5x")]
+    [InlineData("-5m")]
+    [InlineData("5000d")]  // >10y typo guard
+    [InlineData("")]
+    [InlineData(null)]
+    public void TryParseDuration_RejectsGarbage(string? raw)
+    {
+        Assert.False(Config.TryParseDuration(raw, out _));
+    }
+
+    [Fact]
+    public void Load_ParsesJobsDefaults()
+    {
+        var yaml = "sources:\n  - path: '/tmp/tt-src'\n    destination: '/tmp/tt-dst'\njobs_defaults:\n  missed_run: skip\n  timeout_minutes: 45\njobs:\n  - name: a\n    time: '00:00'\n    command: echo a\n";
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, yaml);
+            var cfg = Config.Load(path)!;
+            Assert.Equal("skip", cfg.JobsDefaults.MissedRun);
+            Assert.Equal(45, cfg.JobsDefaults.TimeoutMinutes);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void Load_ParsesJobAndRetentionKeys()
+    {
+        var yaml = "sources:\n  - path: '/tmp/tt-src'\n    destination: '/tmp/tt-dst'\n    sync:\n      versioning:\n        path: '/tmp/tt-ver'\n        keep_last: 5\n        keep_within: 30d\n        keep_daily: 7\n        keep_weekly: 4\n        keep_monthly: 6\njobs:\n  - name: hourly\n    every: 6h\n    missed_run: skip\n    overlap: queue\n    jitter: 15m\n    pre_command: echo pre\n    post_command: echo post\n    on_failure: echo fail\n    low_priority: true\n    on_ac_only: true\n    prevent_sleep: true\n    command: echo run\n";
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, yaml);
+            var cfg = Config.Load(path)!;
+            var ver = cfg.Sources[0].Sync.Versioning!;
+            Assert.Equal(5, ver.KeepLast);
+            Assert.Equal("30d", ver.KeepWithin);
+            Assert.Equal(7, ver.KeepDaily);
+            Assert.Equal(4, ver.KeepWeekly);
+            Assert.Equal(6, ver.KeepMonthly);
+            Assert.Null(ver.MaxVersions);
+            var job = cfg.Jobs[0];
+            Assert.Equal("6h", job.Every);
+            Assert.Equal("skip", job.MissedRun);
+            Assert.Equal("queue", job.Overlap);
+            Assert.Equal("15m", job.Jitter);
+            Assert.Equal("echo pre", job.PreCommand);
+            Assert.Equal("echo post", job.PostCommand);
+            Assert.Equal("echo fail", job.OnFailure);
+            Assert.True(job.LowPriority);
+            Assert.True(job.OnAcOnly);
+            Assert.True(job.PreventSleep);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void VersioningConfig_MaxVersionsDefaultsToNull()
+    {
+        Assert.Null(new VersioningConfig().MaxVersions);
+        Assert.Equal(0, new JobConfig().TimeoutMinutes);
     }
 }

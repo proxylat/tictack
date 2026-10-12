@@ -27,7 +27,7 @@ One-way file synchronisation service for Windows and Linux. Monitors source dire
 | Logging | `FileLogger` (rotating), `BufferedLogger` (async channel, flushes on shutdown), `ConsoleLogger` (color), `DesktopAlertLogger`, `EventLogLogger`, `MultiLogger` |
 | Rename detection | Best-effort pairing via `FileChangedEventArgs.OldFullPath`, plus file-ID move replay: a renamed file whose identity is already in the state DB moves on the destination instead of re-copying |
 | Deletion handling | `MirrorDeletion`, `ArchiveDeletion` (default; archives under `destination/.archive`, overwriting the same mirrored path — no timestamp) — factory-selected; an unknown mode falls back to archive |
-| Versioning | `TimestampVersioning` (timestamp+guid suffix, max-versions limit), `NoVersioning` — factory-selected; versioning is off unless `versioning.path` is set |
+| Versioning | `TimestampVersioning` (timestamp+guid suffix, `keep_last`/`keep_within`/daily-weekly-monthly retention, pin sidecars), `NoVersioning` — factory-selected; versioning is off unless `versioning.path` is set |
 | Post-copy validation | `SizeValidator`, `HashValidator` — mirrors the comparison level, except `full` compares date+size+hash but validates hash-only |
 | Max file size | `SizeFilter` — `max_file_size_mb: <number>`, `no-limit` (default) or `none` (skip everything) |
 | Crash Recovery | `CopyAction` writes to `.tictack.tmp` then atomic rename; `PowerGuard.Cleanup()` recovers orphaned temps on startup |
@@ -212,7 +212,7 @@ dotnet-fullgc` — or skip the install and run them one-shot with `dnx`
 
 | Flag | Description |
 |---|---|
-| `--cli` | Interactive console mode — live monitoring with per-event logging |
+| `--cli` | Interactive console mode — live monitoring with per-event logging, plus scheduled jobs (systemd's service mode) |
 | `--once` | Single sync pass over all sources, then exit (always exits 0, even on per-file failures; scheduled jobs never run, parity cleanup does) |
 | `--validate` | Load and validate config, exit with code 0/1 |
 | `--rebuild` | Clear state DBs and re-sync everything from scratch (archives stale dest files under `archive` mode, deletes them under `mirror`). Stop the service first — it locks the state DBs |
@@ -221,6 +221,10 @@ dotnet-fullgc` — or skip the install and run them one-shot with `dnx`
 | `--deferred-check <source>` | Run warnings + expiry evaluation once, without draining (still stamps the daily-warning clock, so it is not read-only) |
 | `--reprove <source>` | Cancel the hold, keep every destination file (same as deleting the hold `.db`; `--deferred-cancel` alias; the store file is deleted afterwards). Stop the service first |
 | `--external-drives` | Auto-discover external drives with marker file, ask `Proceed? (y/n)` per drive, run command on each (Restic, Rclone, rsync, etc.; commands are killed after 10 minutes, no knob) |
+| `--forget [--dry-run]` | Apply each source's `keep_*` policies to its versions dir (`--dry-run` prints would-remove/would-keep, changes nothing). `--keep-last N` / `--keep-within 30d` / `--keep-daily N` / `--keep-weekly N` / `--keep-monthly N` override the config for one run |
+| `--versions-list [glob] [--latest N] [--json]` | List stored versions newest-first (`--latest` caps per file, `--json` prints a scriptable array) |
+| `--versions-pin <spec>` / `--versions-unpin <spec>` | Never auto-delete (or re-allow) versions matching a path or `file@timestamp` (`--unpin` alias) |
+| `--help` / `--version` | Print help / version (no config needed) |
 | `--service` | Run as Windows Service (auto-detected when non-interactive; Windows-only) |
 | `--config <path>` | Path to config file (default: `config.yaml` in exe dir) |
 
@@ -270,8 +274,11 @@ Fields live at three levels: top-level source keys (`path`/`paths`, `destination
 | `spike_bytes_gb` | `100` | Trip when copied bytes in the window reach N GB (`0` or negative falls back to 100) |
 | `spike_files` | `50000` | Trip when changed files in the window reach N (`0` or negative falls back to 50000) |
 | `spike_renames` | `10000` | Trip when renames in the window reach N (`0` or negative falls back to 10000) |
-| `versioning.max_versions` | `10` | Keep up to N old versions per file |
+| `versioning.max_versions` | `10` | Legacy flat cap: keep up to N old versions per file (unset + no `keep_*` = 10; any `keep_*` set replaces it) |
 | `versioning.path` | — | Where archived versions go (timestamp suffix) |
+| `versioning.keep_last` | — | Keep the N newest versions per file |
+| `versioning.keep_within` | — | Keep versions newer than this (`30d`, `12h`) |
+| `versioning.keep_daily/weekly/monthly` | — | Keep N newest calendar buckets (1 newest version per day / ISO week / month) |
 | `deletion.mode` | `archive` | On source deletion: `mirror` = delete dest too / `archive` = move to .archive |
 | `deletion.path` | — | Target dir in `archive` mode |
 
@@ -299,7 +306,9 @@ Fields live at three levels: top-level source keys (`path`/`paths`, `destination
 | `polling_backstop` | `true` | Composite-only: keep the polling member as the hourly safety net. Set `false` to drop it (zero snapshot memory) when the `usn` member is healthy — watcher overflows and USN journal re-baselines then fire on-demand covering scans instead (creates + modifies + deletes, nothing retained). Kept automatically when USN is unavailable. Turning off both still polls — there is no watcher-only composite. Ignored with a warning for non-composite types |
 | `restart_delay_seconds` | `10` | Wait before restarting watcher after error |
 | `usn_poll_interval_ms` | `200` | Idle sleep (ms) between USN journal reads when no records arrive. Larger = quieter idle, slower pickup. Lower values silently clamp to 50 |
-| `usn_parent_prefilter` | `true` | USN only: skip journal records whose parent dir is outside the watched tree before any path resolve (kills the volume-wide resolve tax — Spotify/Temp churn costs zero syscalls). UnderWatch stays the authority, so disabling only costs syscalls, never events |
+| `usn_parent_prefilter` | `true` | USN only: skip journal records whose parent dir is outside the watched tree before any path resolve (kills the volume-wide resolve tax — Spotify/Temp churn costs zero syscalls). UnderWatch stays the authority, so disabling only costs syscalls, never events. Also the membership signal for `usn_resolve_gap` — with the prefilter off, tree-deletes lose their gap signal (parity still covers them) |
+| `usn_resolve_gap` | `true` | USN only: fire a rate-limited (1/min) covering gap when a delete's tracked parent no longer resolves — the tree-delete safety net. Without it, deletes under a vanished parent linger silently until parity. Set `false` if pathological churn causes scan spam |
+| `usn_checkpoint` | `true` | USN only: persist the journal cursor across restarts so startup replays the offline window (bounded: 100k records / 60s) instead of depending solely on the initial walk. Any failure falls back to head + walk |
 
 ### logging
 
@@ -333,18 +342,32 @@ Run any command on each discovered external drive (Restic, Rclone, rsync, etc.).
 
 ### jobs
 
-Scheduled commands (`cmd.exe /c` Windows, `/bin/sh -c` Linux). Bare `time:` = daily; add `schedule: weekly` + `day:` weekday, `schedule: monthly` + `day:` 1-31 (clamped to short months, so 31 covers the 30th/28th), or `run_once_on:` ISO date for a one-shot (an explicit `schedule: daily` next to `run_once_on:` is still treated as one-shot). If the machine was off at the scheduled time, the job runs on next startup (catch-up fires immediately at startup). Jobs are fire-and-forget with no overlap guard; a timed-out or failed job is never stamped, so it re-fires next cycle.
+Scheduled commands (`cmd.exe /c` Windows, `/bin/sh -c` Linux). A job picks exactly one trigger: bare `time:` = daily (an explicit `schedule: daily` means the same, kept for old configs); `schedule: weekly` + `day:` weekday or `days:` mask (`[mon, wed, fri]`); `schedule: monthly` + `day:` 1-31 (clamped to short months, so 31 covers the 30th/28th); `run_once_on:` ISO date + `time:` for a one-shot; `every:` interval (`6h`, `15m`) for sub-daily runs, never combined with the calendar keys. `missed_run: catch_up` (default) fires missed slots at startup, `skip` drops them; `overlap: skip` (default) stands down while the previous run is active, `queue` chains one follow-up. A timed-out or failed job is never stamped, so it re-fires next cycle. `jobs_defaults:` sets shared `missed_run` / `timeout_minutes` for every job (per-job values win).
+
+**Jobs run as the service account** — LocalSystem on Windows, the systemd unit user on Linux — so they see the *machine* environment, not your interactive PATH or HOME. A bare `restic` that works in your terminal fails in a job with `'restic' is not recognized...` (the log names the fix at the failure point). No config change needed — register the tool once:
+
+- Windows (admin prompt): `service\win\add-tool-env.bat restic` — takes a command name or a path (`C:\tools\restic`, `C:\tools\restic\restic.exe`)
+- Linux: `sudo service/linux/add-tool-env.sh restic` — same contract, symlinks into `/usr/local/bin`
+
+Then restart the service (`sc stop TicTackSv && sc start TicTackSv`, `sudo systemctl restart tictack`): it snapshots its environment at start, so the new PATH only applies after restart. A job failing with `Access is denied` instead means filesystem ACLs — grant `NT AUTHORITY\SYSTEM` (Windows) or the service user (Linux) read/execute on the paths the command touches.
 
 | Field | Default | Description |
 |---|---|---|
 | `name` | — | Job label for logs **(required)** |
-| `time` | — | Trigger time, `HH:mm` 24h format **(required)** |
-| `schedule` | `daily` | Cadence: `daily` \| `weekly` \| `monthly` (mutually exclusive with `run_once_on`) |
+| `time` | — | Trigger time, `HH:mm` 24h format **(required unless `every:` is set)** |
+| `schedule` | `daily` | Cadence: `daily` (redundant) \| `weekly` \| `monthly` (mutually exclusive with `run_once_on` and `every`) |
 | `day` | — | Weekly: weekday name (`Monday`-`Sunday`). Monthly: day of month `1`-`31` |
-| `run_once_on` | — | One-shot date, `YYYY-MM-DD` (mutually exclusive with `schedule`/`day`) |
+| `days` | — | Weekly mask: `[mon, wed, fri]` (full names or 3-letter, mutually exclusive with `day`) |
+| `run_once_on` | — | One-shot date, `YYYY-MM-DD` (mutually exclusive with `schedule`/`day`/`every`) |
+| `every` | — | Interval trigger: `30s`/`15m`/`6h`/`1d` (minimum 30s, mutually exclusive with the calendar keys) |
+| `missed_run` | `catch_up` | `catch_up` (fire missed slots ASAP) \| `skip` (drop missed slots) |
+| `overlap` | `skip` | `skip` (stand down while the previous run is active) \| `queue` (wait, then run once) |
+| `jitter` | — | Random `0`-span pre-delay per fire (`15m`), so jobs never align into I/O storms |
+| `pre_command` / `post_command` / `on_failure` | — | Gate (non-zero skips main) / cleanup after main ran / pager when pre or main fails — same dir, same `{source}`, same timeout each |
+| `low_priority` / `on_ac_only` / `prevent_sleep` | `false` | Idle CPU priority / skip on battery / hold a sleep inhibitor for the run |
 | `command` | — | Shell command (`cmd.exe /c` on Windows, `/bin/sh -c` on Linux). `{source}` = all source paths quoted **(required)** |
 | `working_dir` | exe dir | Working directory for the command |
-| `timeout_minutes` | 10 | Per job: kill the command if it runs longer than this (`0` or negative skips the job entirely) |
+| `timeout_minutes` | 10 | Kill the command if it runs longer than this (`0` = unset, falls back to `jobs_defaults`, then 10; negative skips the job) |
 
 ---
 

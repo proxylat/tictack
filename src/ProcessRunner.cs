@@ -37,10 +37,19 @@ namespace TicTack
         }
 
         public static async Task<(int ExitCode, string Stdout, string Stderr, bool TimedOut)> RunAsync(
-            string command, string workingDir, bool redirect, CancellationToken ct = default, int timeoutMs = TimeoutMs)
+            string command, string workingDir, bool redirect, CancellationToken ct = default, int timeoutMs = TimeoutMs, bool lowPriority = false)
         {
             using var p = Process.Start(CreateStartInfo(command, workingDir, redirect));
             if (p == null) return (-1, string.Empty, string.Empty, false);
+
+            // Laptop-trio low_priority: idle CPU so bulk jobs do not fight
+            // interactive sync. Best-effort (rights, platform): the job runs
+            // at normal priority when the set fails. .NET maps Idle to the
+            // platform idle class (IDLE_PRIORITY_CLASS / nice 19).
+            if (lowPriority)
+            {
+                try { p.PriorityClass = ProcessPriorityClass.Idle; } catch { }
+            }
 
             Task<string>? stdout = null, stderr = null;
             if (redirect)

@@ -52,6 +52,13 @@ sources:
       versioning:
         max_versions: 10
         path: '[TicTack]\Sync\.versions'
+        # Restic-style retention (OR per file: a version survives when ANY
+        # policy keeps it; replaces max_versions when set):
+        # keep_last: 5
+        # keep_within: 30d
+        # keep_daily: 7
+        # keep_weekly: 4
+        # keep_monthly: 6
       deletion:
         mode: archive
         path: '[TicTack]\Sync\.archive'
@@ -65,6 +72,8 @@ monitor:
   restart_delay_seconds: 10
   usn_poll_interval_ms: 200 # idle sleep between USN journal reads (ms); larger = quieter idle, slower pickup
   usn_parent_prefilter: true # skip outside-tree journal records before any path resolve; false = resolve everything (more syscalls, same events)
+  usn_resolve_gap: true # fire a covering gap when a delete's tracked parent no longer resolves (tree-delete safety net, 1/min max)
+  usn_checkpoint: true # persist the journal cursor across restarts; startup replays the offline window (100k records / 60s max)
 
 logging:
   level: info
@@ -86,16 +95,40 @@ external_drives:
   require_marker_file: true
   marker_file_name: .tictack-target
 
+# Shared job defaults (each jobs: entry overrides these per key).
+# jobs_defaults:
+#   missed_run: skip        # catch_up | skip
+#   timeout_minutes: 30
+
 jobs:
   - name: restic_archive
     time: "21:00"
     command: restic.exe backup --compression auto "{source}" -r D:\ResticRepo
     working_dir: C:\ProgramData\TicTack
     timeout_minutes: 60
-  # Optional cadences: day = weekday name for weekly, day = 1-31 for monthly
-  # (clamped to short months), run_once_on = ISO date that fires once.
+  # Optional cadences: time alone = daily. every = interval (6h/15m/30s/1d,
+  # never combined with schedule/day/time/run_once_on). days = weekday mask
+  # for weekly (mutually exclusive with day). run_once_on = ISO date + time
+  # that fires once. missed_run/overlap/jitter tune every trigger shape.
   # - name: weekly_report
   #   schedule: weekly
   #   day: Sunday
   #   time: "08:00"
   #   command: report.exe
+  # - name: workdays_verify
+  #   schedule: weekly
+  #   days: [mon, wed, fri]
+  #   time: "02:30"
+  #   missed_run: skip
+  #   overlap: skip
+  #   jitter: 15m
+  #   pre_command: wake-nas.bat
+  #   on_failure: alert.bat
+  #   low_priority: true
+  #   on_ac_only: true
+  #   prevent_sleep: true
+  #   command: verify.exe
+  # - name: quarter_hourly
+  #   every: 15m
+  #   overlap: skip
+  #   command: recheck.exe

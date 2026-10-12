@@ -21,7 +21,7 @@ public class CorruptDbTests
         Assert.Single(Directory.GetFiles(dir, "*.corrupt-*"));
 
     [Fact]
-    public void StateDb_CorruptSchemaPage_QuarantinedAndRebuilt()
+    public async Task StateDb_CorruptSchemaPage_QuarantinedAndRebuilt()
     {
         var dir = Path.Combine(Path.GetTempPath(), "tictack-corrupt-state-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -30,8 +30,8 @@ public class CorruptDbTests
             var path = Path.Combine(dir, "state.db");
             using (var db = new StateDb(path))
             {
-                db.Upsert("a.txt", 100, 1000);
-                db.Upsert("b.txt", 200, 2000);
+                await db.UpsertAsync("a.txt", 100, 1000);
+                await db.UpsertAsync("b.txt", 200, 2000);
             }
             // Pools cleared BEFORE corrupting: a pooled close/checkpoint
             // after the write would patch the page header back (12 bytes).
@@ -43,8 +43,9 @@ public class CorruptDbTests
             var log = new RecordingLogger();
             using (var db = new StateDb(path, log))
             {
-                db.Upsert("c.txt", 300, 3000);
-                Assert.Equal("c.txt", Assert.Single(db.LoadAll()).Key);
+                await db.UpsertAsync("c.txt", 300, 3000);
+                Assert.Equal(1L, await db.CountAsync());
+                Assert.NotNull(await db.GetSizeAsync("c.txt"));
             }
             Quarantine(dir);
             Assert.Contains(log.Messages, m => m.Contains("quarantined"));

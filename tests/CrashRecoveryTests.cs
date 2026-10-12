@@ -72,7 +72,7 @@ public class CrashRecoveryTests
             Assert.True(process.HasExited);
 
             using var db = new StateDb(dbPath);
-            var all = db.LoadAll();
+            var all = await db.GetStatesAsync(new[] { "crash-a.txt", "crash-b.txt" });
             Assert.Equal(2, all.Count);
             Assert.Equal((100L, 1000L), all["crash-a.txt"]);
             Assert.Equal((200L, 2000L), all["crash-b.txt"]);

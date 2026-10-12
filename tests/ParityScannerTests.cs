@@ -130,6 +130,9 @@ public sealed class ParityScannerTests
             {
                 Dst + "/.tictack.lock",
                 Dst + "/.tictack-deferred.json",
+                Dst + "/tictack-deferred-src.db",
+                Dst + "/tictack-deferred-src.db-wal",
+                Dst + "/tictack-deferred-20000101-000000.json",
                 Dst + "/.archive/old.txt",
                 Dst + "/.versions/old.txt",
             },

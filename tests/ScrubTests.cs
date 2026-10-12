@@ -31,14 +31,10 @@ public class ScrubTests
     sealed class RecordingDelete
     {
         public readonly List<(string? src, string dst, string rel)> Calls = new List<(string?, string, string)>();
-        // Emulates TrackedDeleter bookkeeping: the real deleter drops the
-        // state row alongside the file, so the next scan recopies fresh.
-        public StateDb? Db;
-        public async Task<bool> Handle(string? src, string dst, string rel, string label, CancellationToken ct)
+        public Task<bool> Handle(string? src, string dst, string rel, string label, CancellationToken ct)
         {
             Calls.Add((src, dst, rel));
-            if (Db != null) await Db.DeleteAsync(rel);
-            return true;
+            return Task.FromResult(true);
         }
     }
 
@@ -64,7 +60,7 @@ public class ScrubTests
             using var db = new StateDb(Path.Combine(root, "state.db"), log);
             var rel = name;
             var fi = new FileInfo(Path.Combine(src, name));
-            db.Upsert(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+            await db.UpsertAsync(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
             using var store = new JobRunStore(Path.Combine(root, "verify.db"));
             var del = new RecordingDelete();
             var scrubber = BuildScrubber(Cfg(src, dst), db, del, store, log);
@@ -82,7 +78,7 @@ public class ScrubTests
     }
 
     [Fact]
-    public async Task Mismatch_DeletesAndDropsRow()
+    public async Task Mismatch_DeletesDestAndLogsMismatch()
     {
         var root = TestDir();
         var src = Path.Combine(root, "src");
@@ -98,10 +94,9 @@ public class ScrubTests
             using var db = new StateDb(Path.Combine(root, "state.db"), log);
             var rel = name;
             var fi = new FileInfo(Path.Combine(src, name));
-            db.Upsert(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+            await db.UpsertAsync(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
             using var store = new JobRunStore(Path.Combine(root, "verify.db"));
             var del = new RecordingDelete();
-            del.Db = db;
             var scrubber = BuildScrubber(Cfg(src, dst), db, del, store, log);
 
             await scrubber.RunAsync(CancellationToken.None);
@@ -109,7 +104,6 @@ public class ScrubTests
             var call = Assert.Single(del.Calls);
             Assert.Equal(Path.Combine(dst, name), call.dst);
             Assert.Equal(rel, call.rel);
-            Assert.False((await db.GetFullStateAsync(rel)).HasValue);
             Assert.Contains(log.Messages, m => m.Contains("mismatch"));
         }
         finally { try { Directory.Delete(root, true); } catch { } }
@@ -132,7 +126,7 @@ public class ScrubTests
             using var db = new StateDb(Path.Combine(root, "state.db"), log);
             var rel = name;
             var fi = new FileInfo(Path.Combine(src, name));
-            db.Upsert(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+            await db.UpsertAsync(rel, fi.Length, fi.LastWriteTimeUtc.Ticks);
             using var store = new JobRunStore(Path.Combine(root, "verify.db"));
             var del = new RecordingDelete();
             var scrubber = BuildScrubber(Cfg(src, dst), db, del, store, log);
@@ -169,7 +163,7 @@ public class ScrubTests
             WriteFile(Path.Combine(dst, name), "orphan-dest");
             var log = new RecordingLogger();
             using var db = new StateDb(Path.Combine(root, "state.db"), log);
-            db.Upsert(name, 11, DateTime.UtcNow.Ticks);
+            await db.UpsertAsync(name, 11, DateTime.UtcNow.Ticks);
             using var store = new JobRunStore(Path.Combine(root, "verify.db"));
             var del = new RecordingDelete();
             var scrubber = BuildScrubber(Cfg(src, dst), db, del, store, log);

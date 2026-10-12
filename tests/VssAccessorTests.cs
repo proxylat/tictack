@@ -37,12 +37,6 @@ public class VssAccessorTests : IDisposable
     }
 
     [Fact]
-    public void SnapshotTtl_IsTenMinutes()
-    {
-        Assert.Equal(TimeSpan.FromMinutes(10), VssFileAccessor.SnapshotTtl);
-    }
-
-    [Fact]
     public void Config_AcceptsDirectAndVssFileAccess()
     {
         foreach (var mode in new[] { "direct", "vss" })

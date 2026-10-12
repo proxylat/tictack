@@ -36,13 +36,23 @@ namespace TicTack
         }
     }
 
-    public class FileLogger : ILogger
+    public class FileLogger : ILogger, IDisposable
     {
         private readonly string _logPath;
         private readonly LogLevel _minLevel;
         private readonly long _maxSizeBytes;
         private readonly int _maxFiles;
         private readonly object _lock = new object();
+        // Repeat-suppression: identical consecutive lines collapse to one
+        // "(repeated Nx)" line. A storm of the same warning must not rotate
+        // real history out of the file. First occurrence always writes, so a
+        // crash mid-streak loses only the tail count.
+        private string _streakKey = "";
+        private string _streakLevel = "";
+        private string _streakMsg = "";
+        private long _streakCount;
+        private DateTime _streakAt;
+        private const int StreakFlushSeconds = 60;
 
         public FileLogger(string path, LogLevel minLevel = LogLevel.Info, long maxSizeMb = 10, int maxFiles = 5)
         {
@@ -73,17 +83,52 @@ namespace TicTack
 
         private void Write(string level, string msg)
         {
-            var line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg + Environment.NewLine;
+            var now = DateTime.Now;
             lock (_lock)
             {
-                try
+                var key = level + "\u0000" + msg;
+                if (key == _streakKey)
                 {
-                    if (File.Exists(_logPath) && new FileInfo(_logPath).Length > _maxSizeBytes)
-                        Rotate();
-                    File.AppendAllText(_logPath, line);
+                    _streakCount++;
+                    // Long incident: emit a heartbeat so the log still shows
+                    // it is happening, then keep collapsing.
+                    if ((now - _streakAt).TotalSeconds >= StreakFlushSeconds)
+                    {
+                        EmitLocked(level, msg + " (repeated " + _streakCount + "x, ongoing)");
+                        _streakAt = now;
+                        _streakCount = 0;
+                    }
+                    return;
                 }
-                catch { }
+                FlushStreakLocked();
+                _streakKey = key;
+                _streakLevel = level;
+                _streakMsg = msg;
+                _streakCount = 0;
+                _streakAt = now;
+                EmitLocked(level, msg);
             }
+        }
+
+        // Caller holds the lock. Closes a run of identical lines with its count.
+        private void FlushStreakLocked()
+        {
+            if (_streakCount > 0)
+                EmitLocked(_streakLevel, _streakMsg + " (repeated " + _streakCount + "x)");
+            _streakCount = 0;
+            _streakKey = "";
+        }
+
+        private void EmitLocked(string level, string msg)
+        {
+            try
+            {
+                if (File.Exists(_logPath) && new FileInfo(_logPath).Length > _maxSizeBytes)
+                    Rotate();
+                File.AppendAllText(_logPath,
+                    "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg + Environment.NewLine);
+            }
+            catch { }
         }
 
         private void Rotate()
@@ -101,6 +146,75 @@ namespace TicTack
             var first = _logPath + ".1";
             if (File.Exists(first)) File.Delete(first);
             File.Move(_logPath, first);
+        }
+
+        public void Dispose()
+        {
+            lock (_lock) FlushStreakLocked();
+        }
+    }
+
+    // Daily-rotated backup log: one file per calendar day, the previous day
+    // kept as "<path>.1" (~48h window). Time bounds the window, not line rate,
+    // so no formatting/size storm can erode it the way size rotation can.
+    public sealed class DailyBackupLogger : ILogger
+    {
+        private readonly string _path;
+        private readonly LogLevel _minLevel;
+        private readonly object _lock = new object();
+        private string _day;
+
+        public DailyBackupLogger(string path, LogLevel minLevel = LogLevel.Info)
+        {
+            _path = path;
+            _minLevel = minLevel;
+            _day = LastWriteDay(path);
+            var dir = Path.GetDirectoryName(path);
+            try
+            {
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+            }
+            catch { }
+        }
+
+        public void Debug(string msg) { if (_minLevel <= LogLevel.Debug) Write("DBG", msg); }
+        public void Info(string msg) { if (_minLevel <= LogLevel.Info) Write("INF", msg); }
+        public void Warn(string msg) { if (_minLevel <= LogLevel.Warn) Write("WRN", msg); }
+        public void Error(string msg, Exception? ex = null)
+        {
+            if (_minLevel > LogLevel.Error) return;
+            Write("ERR", msg);
+            if (ex != null) Write("ERR", ex.ToString());
+        }
+
+        private void Write(string level, string msg)
+        {
+            var now = DateTime.Now;
+            lock (_lock)
+            {
+                try
+                {
+                    var today = now.ToString("yyyy-MM-dd");
+                    if (today != _day)
+                    {
+                        var prev = _path + ".1";
+                        if (File.Exists(prev)) File.Delete(prev);
+                        if (File.Exists(_path)) File.Move(_path, prev);
+                        _day = today;
+                    }
+                    File.AppendAllText(_path,
+                        "[" + now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg + Environment.NewLine);
+                }
+                catch { }
+            }
+        }
+
+        private static string LastWriteDay(string path)
+        {
+            try { if (File.Exists(path)) return File.GetLastWriteTime(path).ToString("yyyy-MM-dd"); }
+            catch { }
+            return DateTime.Now.ToString("yyyy-MM-dd");
         }
     }
 
@@ -233,7 +347,7 @@ namespace TicTack
     // drifted (desktop-alert level, default log directory, EventLog condition).
     internal static class LoggerFactory
     {
-        public static ILogger Create(LoggingConfig cfg, string defaultLogDir, bool console, bool eventLog)
+        public static ILogger Create(LoggingConfig cfg, string defaultLogDir, bool console, bool eventLog, string? backupDir = null)
         {
             var level = LogLevelParser.Parse(cfg.Level);
             var logPath = string.IsNullOrEmpty(cfg.Path) ? Path.Combine(defaultLogDir, "tictack.log") : cfg.Path;
@@ -241,6 +355,11 @@ namespace TicTack
             {
                 new BufferedLogger(new FileLogger(logPath, level, cfg.MaxSizeMb, cfg.MaxFiles))
             };
+            // Second, time-bounded copy next to the state DBs so a size storm
+            // (which cycles the size-rotated primary in minutes) still leaves
+            // ~48h of history behind.
+            if (!string.IsNullOrEmpty(backupDir))
+                loggers.Add(new DailyBackupLogger(Path.Combine(backupDir, "tictack.log.bak"), level));
             if (console) loggers.Add(new ConsoleLogger(level));
             // Alerts are a Warn/Error channel per the documented contract.
             loggers.Add(new DesktopAlertLogger(LogLevel.Warn, cfg.AlertPath));

@@ -28,15 +28,28 @@ public sealed class DriveReadyTests
     }
 
     [Fact]
-    public void IsDriveReady_DifferentProbe_RefreshesCache()
+    public void SelectReady_LongestReadyRoot_Wins()
     {
-        var probesA = 0;
-        var probesB = 0;
-        Func<DriveInfo[]> probeA = () => { probesA++; return DriveInfo.GetDrives(); };
-        Func<DriveInfo[]> probeB = () => { probesB++; return DriveInfo.GetDrives(); };
-        Assert.True(DriveGuard.IsReady(Path.GetTempPath(), probeA));
-        Assert.True(DriveGuard.IsReady(Path.GetTempPath(), probeB));
-        Assert.Equal(1, probesA);
-        Assert.Equal(1, probesB);
+        var drives = new List<(string Root, bool Ready)> { ("C:\\", true), ("C:\\data", true), ("D:\\", false) };
+        Assert.True(DriveGuard.SelectReady("C:\\data\\f.txt", drives));
+        Assert.False(DriveGuard.SelectReady("D:\\f.txt", drives));
+        Assert.False(DriveGuard.SelectReady("E:\\f.txt", drives));
+    }
+
+    [Theory]
+    [InlineData("/srv", false)]
+    [InlineData("/srv/x", false)]
+    [InlineData("/mnt", false)]
+    [InlineData("/mnt/x", false)]
+    [InlineData("/media/x", false)]
+    [InlineData("/run/media/u/x", false)]
+    [InlineData("/home/u/x", true)]
+    [InlineData("/srvx/y", true)]
+    [InlineData("/", true)]
+    public void SelectReady_LinuxMountGuard_Matrix(string path, bool expected)
+    {
+        if (!OperatingSystem.IsLinux()) return;
+        var drives = new List<(string Root, bool Ready)> { ("/", true) };
+        Assert.Equal(expected, DriveGuard.SelectReady(path, drives));
     }
 }

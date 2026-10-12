@@ -644,6 +644,31 @@ namespace TicTack
         private static extern uint GetFinalPathNameByHandle(IntPtr hFile, StringBuilder lpszFilePath,
             uint cchFilePath, uint dwFlags);
 
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool GetVolumeInformation(string rootPathName, StringBuilder? volumeNameBuffer,
+            uint volumeNameSize, out uint volumeSerialNumber, out uint maximumComponentLength,
+            out uint fileSystemFlags, StringBuilder fileSystemNameBuffer, uint fileSystemNameSize);
+
+        // probe-v5: skip volumes whose filesystem cannot yield V2 records.
+        // ReFS parses zero records and used to scan-storm via the head-jump
+        // heuristic; FAT/exFAT fail the query anyway, but naming the FS in
+        // the skip line beats a raw Win32 code. Unknown (query failed) =
+        // proceed: today's behavior, the query is the backstop.
+        internal static bool RequiresNtfsSkip(string? fileSystemName) =>
+            !string.IsNullOrEmpty(fileSystemName) && !fileSystemName.Equals("NTFS", StringComparison.OrdinalIgnoreCase);
+
+        private static string? QueryFileSystemName(string rootPath)
+        {
+            try
+            {
+                var fs = new StringBuilder(32);
+                if (GetVolumeInformation(rootPath, null, 0, out _, out _, out _, fs, (uint)fs.Capacity))
+                    return fs.ToString();
+            }
+            catch { }
+            return null;
+        }
+
         // FILE_ID_DESCRIPTOR (winioctl.h): dwSize(4) + Type(4) + union.
         // The union is sized by its largest member (FILE_ID_128, 16
         // bytes), so sizeof(FILE_ID_DESCRIPTOR) = 24 and dwSize must say
@@ -793,15 +818,19 @@ namespace TicTack
         // cycles/sec in Task Manager with usn:true).
         private readonly ManualResetEventSlim _wake = new(false);
         // Rename-old path by file reference number. A rename out of the
-        // volume leaves an orphan entry; the cap bounds that leak.
-        // ponytail: clear-all eviction, per-FRN LRU if renames ever dominate.
+        // volume leaves an orphan entry; FIFO eviction at the cap bounds
+        // that leak oldest-first, so bulk renames degrade gracefully
+        // instead of losing the whole pairing window at once.
         private readonly Dictionary<ulong, string> _pendingOldNames = new();
+        private readonly Queue<ulong> _pendingOldOrder = new();
+        private const int RenameStashCap = 4096;
         // FRNs with a completed rename pair. The journal can deliver the
         // new name twice (duplicate rename-new, or a create record for the
         // new link): the paired rename already reported it, so a later
         // create/orphan for the same FRN is a duplicate, not a new file.
         // Cleared on delete (FRN lifecycle end), capped like pending.
         private readonly HashSet<ulong> _renameTargets = new();
+        private readonly Queue<ulong> _renameTargetOrder = new();
         // Silent-drop observability: every by-id resolve failure lands
         // here, so a live test with an empty collection can distinguish
         // "no records arrived" from "records arrived but paths unresolvable".
@@ -818,6 +847,26 @@ namespace TicTack
         private readonly ILogger? _log;
         internal long PrefilteredSkips;
         internal long _recordsSeen;
+        // Tree-delete gap signal (usn_resolve_gap): last fire instant for
+        // the 60s cooldown. Internal + settable cooldown so tests drive
+        // both the fire and the suppression deterministically.
+        private DateTime _lastResolveGapUtc = DateTime.MinValue;
+        internal TimeSpan ResolveGapCooldown = TimeSpan.FromSeconds(60);
+        private readonly bool _resolveGap;
+        // Offline-window checkpoint (usn_checkpoint): persisted cursor the
+        // next run replays from. Live cursor pair under a lock: the worker
+        // advances it per batch, Stop() reads it for the final write.
+        private readonly bool _checkpointEnabled;
+        private readonly StateDb? _checkpointStore;
+        private readonly object _cursorLock = new object();
+        private ulong _cursorJournalId;
+        private long _cursorUsn;
+        private DateTime _lastCheckpointWriteUtc = DateTime.MinValue;
+        private bool _caughtUpOnce;
+        // Reused 32 KiB resolve buffer (worker thread only): NTFS paths
+        // reach 32K, and a small buffer silently drops deep long-path
+        // files the product otherwise supports end to end.
+        private readonly StringBuilder _resolvePathBuf = new StringBuilder(32768);
         private long _eventsEmitted;
         // Swappable for tests: production resolves FRNs via the OS,
         // tests inject a fake mapping (native calls need Windows).
@@ -828,7 +877,8 @@ namespace TicTack
         public event EventHandler? GapDetected;
 
         public UsnJournalMonitor(string path, int restartDelaySec = 10, int pollIntervalMs = 200,
-            bool parentPrefilter = true, ILogger? log = null)
+            bool parentPrefilter = true, ILogger? log = null,
+            bool resolveGap = true, bool checkpointEnabled = true, StateDb? checkpointStore = null)
         {
             // No platform check here: translation and parsing are pure and
             // unit-tested cross-platform; ProbeVolume/Start throw on misuse.
@@ -840,6 +890,9 @@ namespace TicTack
             _pollIntervalMs = Math.Max(50, pollIntervalMs);
             _parentPrefilter = parentPrefilter;
             _log = log;
+            _resolveGap = resolveGap;
+            _checkpointEnabled = checkpointEnabled;
+            _checkpointStore = checkpointStore;
             var root = Path.GetPathRoot(_path);
             if (string.IsNullOrEmpty(root) || root.StartsWith(@"\\", StringComparison.Ordinal))
                 throw new NotSupportedException("USN journal is per-volume; UNC paths are not supported: " + path);
@@ -887,6 +940,10 @@ namespace TicTack
         {
             if (!OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("UsnJournalMonitor requires Windows/NTFS.");
+            var root = Path.GetPathRoot(_path);
+            var fsName = !string.IsNullOrEmpty(root) ? QueryFileSystemName(root) : null;
+            if (RequiresNtfsSkip(fsName))
+                throw new IOException("Volume " + root + " is " + fsName + "; USN journal monitoring requires NTFS — use watcher mode.");
             // Best-effort: Disabled privileges stay disabled until adjusted,
             // and failure here keeps the existing probe-skip fallback.
             // The report travels into the failure line (priv=...).
@@ -915,6 +972,7 @@ namespace TicTack
                 throw new PlatformNotSupportedException("UsnJournalMonitor requires Windows/NTFS.");
             Stop();
             _stopping = false;
+            _caughtUpOnce = false;
             _armed.Reset();
             _wake.Reset();
             _worker = new Thread(WorkerLoop) { IsBackground = true };
@@ -947,6 +1005,7 @@ namespace TicTack
 
                     // Seed before the head is captured: dirs created in
                     // between still deliver CREATE records at/after it.
+                    var buf = new byte[64 * 1024];
                     SeedWatchDirs();
                     ulong journalId;
                     long lastUsn;
@@ -959,6 +1018,15 @@ namespace TicTack
                         SleepOrStop(_restartDelaySec * 1000);
                         continue;
                     }
+                    // First run only: replay the offline window from the
+                    // persisted checkpoint. Re-baselines go straight to head
+                    // (the error path already fired its gap); replaying there
+                    // would only re-deliver already-processed records.
+                    if (!_caughtUpOnce)
+                    {
+                        _caughtUpOnce = true;
+                        lastUsn = TryCatchUpOffline(_volumeHandle, journalId, lastUsn, buf);
+                    }
 
                     // Seed receipt: dir count proves the tree was covered,
                     // journal+head are the baseline the re-baseline line
@@ -968,9 +1036,9 @@ namespace TicTack
                     var leaf = Path.GetFileName(_path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
                     if (string.IsNullOrEmpty(leaf)) leaf = _path;
                     if (_prefilterActive)
-                        _log?.Debug("USN seeded: " + leaf + ": " + _watchDirFrns.Count + " dirs, journal=" + journalId + ", from head=" + lastUsn);
+                        _log?.Debug("USN seeded: " + leaf + ": " + _watchDirFrns.Count + " dirs, journal=" + journalId + ", from=" + lastUsn);
                     else
-                        _log?.Debug("USN seeded: " + leaf + ": journal=" + journalId + ", from head=" + lastUsn + " (prefilter off)");
+                        _log?.Debug("USN seeded: " + leaf + ": journal=" + journalId + ", from=" + lastUsn + " (prefilter off)");
                     // A small journal wraps in minutes on a busy volume,
                     // turning every poll into a re-baseline loop. One
                     // actionable line per seed, exact command included.
@@ -983,7 +1051,6 @@ namespace TicTack
                             + "; consider: fsutil usn createjournal m=134217728 a=8388608 " + drive);
                     }
                     _armed.Set();
-                    var buf = new byte[64 * 1024];
                     while (!_stopping)
                     {
                         List<UsnRecord>? records = null;
@@ -1032,13 +1099,16 @@ namespace TicTack
                                     Dispatch(rec);
                                 }
                             }
+                            WriteCheckpointIfDue(journalId, lastUsn);
                         }
                     }
                 }
                 finally
                 {
-                    var h = _volumeHandle;
-                    _volumeHandle = IntPtr.Zero;
+                    // Exchange, not read-then-zero: Stop() closes from another
+                    // thread, and a plain read here could double-close the
+                    // same handle after Stop closed it first.
+                    var h = Interlocked.Exchange(ref _volumeHandle, IntPtr.Zero);
                     if (h != IntPtr.Zero && h != InvalidHandle)
                         CloseHandle(h);
                 }
@@ -1092,8 +1162,14 @@ namespace TicTack
                 var oldFull = UnderWatch(CombineParent(rec, resolvePath));
                 if (oldFull != null)
                 {
-                    if (_pendingOldNames.Count > 1024) _pendingOldNames.Clear();
+                    // FIFO at the cap: stale queue stubs (already paired or
+                    // deleted FRNs) drain without effect until one live
+                    // entry evicts. Every add enqueues exactly once, so the
+                    // queue can never run dry while the map is over the cap.
+                    while (_pendingOldNames.Count >= RenameStashCap && _pendingOldOrder.Count > 0)
+                        _pendingOldNames.Remove(_pendingOldOrder.Dequeue());
                     _pendingOldNames[rec.FileRef] = oldFull;
+                    _pendingOldOrder.Enqueue(rec.FileRef);
                 }
                 return null;
             }
@@ -1111,8 +1187,10 @@ namespace TicTack
                 }
                 else
                 {
-                    if (_renameTargets.Count > 1024) _renameTargets.Clear();
+                    while (_renameTargets.Count >= RenameStashCap && _renameTargetOrder.Count > 0)
+                        _renameTargets.Remove(_renameTargetOrder.Dequeue());
                     _renameTargets.Add(rec.FileRef);
+                    _renameTargetOrder.Enqueue(rec.FileRef);
                 }
                 if (isDir && _parentPrefilter && _watchDirFrns.Contains(rec.ParentRef))
                 {
@@ -1150,7 +1228,10 @@ namespace TicTack
             {
                 // Deleted files cannot be opened by id; resolve through the
                 // (usually surviving) parent directory instead.
-                full = UnderWatch(CombineParent(rec, resolvePath));
+                var combined = CombineParent(rec, resolvePath);
+                if (combined == null)
+                    NoteUnresolvedDelete(rec.ParentRef);
+                full = UnderWatch(combined);
             }
             else
             {
@@ -1168,6 +1249,31 @@ namespace TicTack
                 return new FileChangedEventArgs(ChangeType.Created, full);
             return new FileChangedEventArgs(type, full, oldPath);
         }
+
+        // Tree-delete signal: a delete whose parent was a TRACKED dir but
+        // no longer resolves means the parent chain vanished with the file
+        // still unnamed — the destination copy would linger silently until
+        // parity. Fires one rate-limited gap so the covering scan picks up
+        // the deletes. (Child deletes normally precede their parent dir's
+        // delete in journal order, so the parent is still tracked when they
+        // arrive. Untracked parents are outside-tree records, not losses —
+        // silent by design. Needs the prefilter: membership is the signal.)
+        internal void NoteUnresolvedDelete(ulong parentRef)
+        {
+            if (!_resolveGap || !_prefilterActive || !_watchDirFrns.Contains(parentRef)) return;
+            var now = DateTime.UtcNow;
+            if (now - _lastResolveGapUtc < ResolveGapCooldown) return;
+            _lastResolveGapUtc = now;
+            _log?.Info("USN delete with unresolvable tracked parent, covering scan picks up the deletes.");
+            SignalGap();
+        }
+
+        // Checkpoint decision (pure, for tests): replay the stored cursor
+        // only when the journal is the same one and the cursor sits behind
+        // the current head. Anything else (recreation, trimmed cursor,
+        // clock weirdness) starts at head like before.
+        internal static bool CheckpointCoversGap(ulong storedId, long storedUsn, ulong journalId, long headUsn) =>
+            storedId == journalId && storedUsn >= 0 && storedUsn < headUsn;
 
         private string? CombineParent(UsnRecord rec, Func<ulong, string?> resolvePath)
         {
@@ -1195,7 +1301,8 @@ namespace TicTack
             if (fh == InvalidHandle || fh == IntPtr.Zero) { Interlocked.Increment(ref ResolveFailures); return null; }
             try
             {
-                var sb = new StringBuilder(512);
+                var sb = _resolvePathBuf;
+                sb.Length = 0;
                 var len = GetFinalPathNameByHandle(fh, sb, (uint)sb.Capacity, 0);
                 if (len == 0 || len >= (uint)sb.Capacity) { Interlocked.Increment(ref ResolveFailures); return null; }
                 var p = sb.ToString();
@@ -1256,27 +1363,38 @@ namespace TicTack
         // Seeds the ParentRef pre-filter: the FRN of the watched root plus
         // every directory beneath it. Runs before the journal head is
         // captured, so dirs created in between still deliver CREATE records
-        // at/after the head and join via the maintain rules below. An empty
-        // result (root missing, lookup failing) disables the pre-filter for
-        // the run: skipping everything would be blindness, not filtering.
+        // at/after the head and join via the maintain rules below. Any
+        // failure (aborted enumeration, failed lookup) deactivates the
+        // filter for the run: a partial set with the filter active would
+        // blind real subtrees until restart, while resolving everything is
+        // merely slower. An empty result (root missing) deactivates too:
+        // skipping everything would be blindness, not filtering.
         internal void SeedWatchDirs()
         {
             _watchDirFrns.Clear();
             _prefilterActive = false;
             if (!_parentPrefilter) return;
-            IEnumerable<string> dirs;
             try
             {
-                dirs = Directory.EnumerateDirectories(_path, "*", SearchOption.AllDirectories)
-                    .Prepend(_path);
+                foreach (var d in Directory.EnumerateDirectories(_path, "*", SearchOption.AllDirectories)
+                    .Prepend(_path))
+                {
+                    ulong? frn;
+                    try { frn = FrnOfPath(d); }
+                    catch (Exception ex)
+                    {
+                        _watchDirFrns.Clear();
+                        _log?.Warn("USN prefilter seed failed on '" + d + "', prefilter off for this run: " + ex.Message);
+                        return;
+                    }
+                    if (frn != null) _watchDirFrns.Add(frn.Value);
+                }
             }
-            catch { return; }
-            foreach (var d in dirs)
+            catch (Exception ex)
             {
-                ulong? frn;
-                try { frn = FrnOfPath(d); }
-                catch { continue; }
-                if (frn != null) _watchDirFrns.Add(frn.Value);
+                _watchDirFrns.Clear();
+                _log?.Warn("USN prefilter seed aborted, prefilter off for this run: " + ex.Message);
+                return;
             }
             _prefilterActive = _watchDirFrns.Count > 0;
         }
@@ -1340,7 +1458,7 @@ namespace TicTack
 
         // Baked into the failure message so a pasted line proves which
         // binary produced it. Bump when the probe changes.
-        private const string ProbeMarker = "probe-v4";
+        private const string ProbeMarker = "probe-v5";
 
         // In-probe control: the trivial ioctl on the same handle. If it
         // fails too, the handle/environment is broken — USN exonerated.
@@ -1455,6 +1573,71 @@ namespace TicTack
             finally { Marshal.FreeHGlobal(ptr); }
         }
 
+        // Offline-window replay: reads [storedUsn, head) through the normal
+        // batch path and dispatches it, so changes made while the service
+        // was stopped arrive as events instead of depending solely on the
+        // initial walk. Returns the cursor to resume from. Best-effort and
+        // bounded (100k records / 60s): anything past the bounds, and any
+        // read failure (trimmed cursor, recreated journal), lands on head.
+        // No gap is fired here — the initial walk covers the same window,
+        // so a covering scan would only duplicate it. Duplicates from a
+        // stale checkpoint are absorbed downstream (path-keyed dedup +
+        // comparer re-validation, same as journal redelivery).
+        private long TryCatchUpOffline(IntPtr volume, ulong journalId, long headUsn, byte[] buf)
+        {
+            if (!_checkpointEnabled || _checkpointStore == null) return headUsn;
+            (ulong journalId, long lastUsn)? cp;
+            try { cp = _checkpointStore.GetUsnCheckpoint(); }
+            catch (Exception ex)
+            {
+                _log?.Debug("USN checkpoint unreadable, starting at head: " + ex.Message);
+                return headUsn;
+            }
+            if (cp == null || !CheckpointCoversGap(cp.Value.journalId, cp.Value.lastUsn, journalId, headUsn))
+                return headUsn;
+            var lastUsn = cp.Value.lastUsn;
+            var replayed = 0;
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+            try
+            {
+                while (!_stopping && lastUsn < headUsn && replayed < 100000 && DateTime.UtcNow < deadline)
+                {
+                    var batch = ReadJournal(volume, journalId, ref lastUsn, buf, out _);
+                    if (batch.Count == 0) break;
+                    foreach (var rec in batch)
+                    {
+                        if (_stopping) break;
+                        Dispatch(rec);
+                        replayed++;
+                    }
+                }
+            }
+            catch (UsnJournalReadException ex)
+            {
+                _log?.Info("USN offline catch-up abandoned (Win32 " + ex.Win32Code + "), starting at head.");
+                return headUsn;
+            }
+            if (lastUsn < headUsn)
+                _log?.Debug("USN offline catch-up hit its bounds after " + replayed + " record(s), resuming at head.");
+            else if (replayed > 0)
+                _log?.Debug("USN offline catch-up replayed " + replayed + " record(s).");
+            return lastUsn;
+        }
+
+        // Live cursor pair for Stop()'s final write, plus the 30s periodic
+        // persist. A crash loses at most 30s of cursor, which replays as
+        // harmless duplicates on the next start (see above).
+        private void WriteCheckpointIfDue(ulong journalId, long lastUsn)
+        {
+            if (!_checkpointEnabled || _checkpointStore == null) return;
+            lock (_cursorLock) { _cursorJournalId = journalId; _cursorUsn = lastUsn; }
+            var now = DateTime.UtcNow;
+            if (now - _lastCheckpointWriteUtc < TimeSpan.FromSeconds(30)) return;
+            _lastCheckpointWriteUtc = now;
+            try { _checkpointStore.SetUsnCheckpoint(journalId, lastUsn); }
+            catch (Exception ex) { _log?.Debug("USN checkpoint write failed: " + ex.Message); }
+        }
+
         private void FireChanged(ChangeType type, string path, string? oldPath = null)
         {
             var handler = Changed;
@@ -1478,10 +1661,26 @@ namespace TicTack
 
         public void Stop()
         {
+            // Final checkpoint first, while the cursor is fresh: a clean
+            // stop restarts with ~zero replay. Never throws (a failed write
+            // just costs the next start a bounded re-read).
+            if (_checkpointEnabled && _checkpointStore != null)
+            {
+                try
+                {
+                    ulong j;
+                    long u;
+                    lock (_cursorLock) { j = _cursorJournalId; u = _cursorUsn; }
+                    if (j != 0) _checkpointStore.SetUsnCheckpoint(j, u);
+                }
+                catch { }
+            }
             _stopping = true;
             _armed.Set();
             _wake.Set();
-            var h = _volumeHandle;
+            // Exchange for the same reason as the worker finally below:
+            // whoever wins closes exactly once.
+            var h = Interlocked.Exchange(ref _volumeHandle, IntPtr.Zero);
             // Cancel the blocked DeviceIoControl before closing: closing a
             // handle with a pending synchronous read can stall in a filter
             // driver (same reason FileWatcherMonitor cancels first).
@@ -1490,7 +1689,6 @@ namespace TicTack
                 try { CancelIoEx(h, IntPtr.Zero); } catch { }
                 try { CloseHandle(h); } catch { }
             }
-            _volumeHandle = IntPtr.Zero;
             var worker = _worker;
             _worker = null;
             try { worker?.Join(TimeSpan.FromSeconds(10)); } catch { }

@@ -8,6 +8,8 @@ using Microsoft.Data.Sqlite;
 
 namespace TicTack
 {
+    // Thread-safe: every public member serializes through the gate, so
+    // concurrent sources and parallel callers share one instance.
     public sealed class StateDb : IDisposable
     {
         private SqliteConnection _conn = null!;
@@ -160,55 +162,6 @@ namespace TicTack
             _conn = await SqliteBootstrap.OpenAsync(_dbPath, SqliteSchema.State).ConfigureAwait(false);
         }
 
-        public Dictionary<string, (long size, long mtime)> LoadAll()
-        {
-            Enter();
-            try
-            {
-                EnsureConnected();
-                var result = new Dictionary<string, (long, long)>(CountInternal(), StringComparer.OrdinalIgnoreCase);
-                using (var cmd = _conn.CreateCommand())
-                {
-                    cmd.CommandText = "SELECT path, size, mtime FROM state";
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            var path = reader.GetString(0);
-                            var size = reader.GetInt64(1);
-                            var mtime = reader.GetInt64(2);
-                            result[path] = (size, mtime);
-                        }
-                    }
-                }
-                return result;
-            }
-            finally { _gate.Release(); }
-        }
-
-        public async Task<Dictionary<string, (long size, long mtime)>> LoadAllAsync()
-        {
-            await EnterAsync().ConfigureAwait(false);
-            try
-            {
-                await EnsureConnectedAsync().ConfigureAwait(false);
-                var result = new Dictionary<string, (long, long)>(await CountInternalAsync().ConfigureAwait(false), StringComparer.OrdinalIgnoreCase);
-                using (var cmd = _conn.CreateCommand())
-                {
-                    cmd.CommandText = "SELECT path, size, mtime FROM state";
-                    using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
-                    {
-                        while (await reader.ReadAsync().ConfigureAwait(false))
-                        {
-                            result[reader.GetString(0)] = (reader.GetInt64(1), reader.GetInt64(2));
-                        }
-                    }
-                }
-                return result;
-            }
-            finally { _gate.Release(); }
-        }
-
         // Identity/hashes are optional and sticky: a 3-arg upsert from an
         // old call site must never wipe a stored file_id/ctime/hash, so
         // unknown fields (null id/hash, 0 ctime) keep the existing values.
@@ -219,27 +172,6 @@ namespace TicTack
             file_id = COALESCE(excluded.file_id, state.file_id),
             ctime = CASE WHEN excluded.ctime <> 0 THEN excluded.ctime ELSE state.ctime END,
             hash = COALESCE(excluded.hash, state.hash)";
-
-        public void Upsert(string path, long size, long mtime, string? fileId = null, long ctime = 0, string? hash = null)
-        {
-            Enter();
-            try
-            {
-                EnsureConnected();
-                using (var cmd = _conn.CreateCommand())
-                {
-                    cmd.CommandText = UpsertStateSql;
-                    cmd.Parameters.AddWithValue("@p", path);
-                    cmd.Parameters.AddWithValue("@s", size);
-                    cmd.Parameters.AddWithValue("@m", mtime);
-                    cmd.Parameters.AddWithValue("@f", (object?)fileId ?? DBNull.Value);
-                    cmd.Parameters.AddWithValue("@c", ctime);
-                    cmd.Parameters.AddWithValue("@h", (object?)hash ?? DBNull.Value);
-                    cmd.ExecuteNonQuery();
-                }
-            }
-            finally { _gate.Release(); }
-        }
 
         public async Task UpsertAsync(string path, long size, long mtime, string? fileId = null, long ctime = 0, string? hash = null)
         {
@@ -262,7 +194,7 @@ namespace TicTack
             finally { _gate.Release(); }
         }
 
-        // Old call sites (and tests) keep compiling: unknown identity.
+        // Unknown identity: seed callers that have no file_id/ctime/hash.
         public void UpsertBatch(IEnumerable<(string path, long size, long mtime)> entries) =>
             UpsertBatch(entries.Select(e => (e.path, e.size, e.mtime, (string?)null, 0L, (string?)null)));
 
@@ -383,22 +315,6 @@ namespace TicTack
             finally { _gate.Release(); }
         }
 
-        public void Delete(string path)
-        {
-            Enter();
-            try
-            {
-                EnsureConnected();
-                using (var cmd = _conn.CreateCommand())
-                {
-                    cmd.CommandText = "DELETE FROM state WHERE path = @p";
-                    cmd.Parameters.AddWithValue("@p", path);
-                    cmd.ExecuteNonQuery();
-                }
-            }
-            finally { _gate.Release(); }
-        }
-
         public async Task DeleteAsync(string path)
         {
             await EnterAsync().ConfigureAwait(false);
@@ -415,31 +331,6 @@ namespace TicTack
             finally { _gate.Release(); }
         }
 
-        public void UpdatePrefix(string oldPrefix, string newPrefix)
-        {
-            if (string.IsNullOrEmpty(oldPrefix)) return;
-            Enter();
-            try
-            {
-                EnsureConnected();
-                using (var cmd = _conn.CreateCommand())
-                {
-                    // ESCAPE: a renamed folder like "My_Documents" must not let
-                    // _ or % match unrelated rows.
-                    // OR REPLACE: a rename onto already-tracked rows (folder
-                    // merge, rename back-and-forth) must replace the losers,
-                    // not abort the whole statement with UNIQUE constraint.
-                    cmd.CommandText = "UPDATE OR REPLACE state SET path = @new || SUBSTR(path, LENGTH(@old) + 1) WHERE path LIKE @oldLike || @sep || '%' ESCAPE '\\'";
-                    cmd.Parameters.AddWithValue("@old", oldPrefix);
-                    cmd.Parameters.AddWithValue("@oldLike", EscapeLike(oldPrefix));
-                    cmd.Parameters.AddWithValue("@new", newPrefix);
-                    cmd.Parameters.AddWithValue("@sep", SepLike);
-                    cmd.ExecuteNonQuery();
-                }
-            }
-            finally { _gate.Release(); }
-        }
-
         public async Task UpdatePrefixAsync(string oldPrefix, string newPrefix)
         {
             if (string.IsNullOrEmpty(oldPrefix)) return;
@@ -451,8 +342,8 @@ namespace TicTack
                 {
                     // ESCAPE: a renamed folder like "My_Documents" must not let
                     // _ or % match unrelated rows.
-                    // OR REPLACE: same merge-rename rule as the sync twin —
-                    // collisions replace, never abort with UNIQUE constraint.
+                    // OR REPLACE: collisions replace, never abort with
+                    // UNIQUE constraint (folder merge, rename back-and-forth).
                     cmd.CommandText = "UPDATE OR REPLACE state SET path = @new || SUBSTR(path, LENGTH(@old) + 1) WHERE path LIKE @oldLike || @sep || '%' ESCAPE '\\'";
                     cmd.Parameters.AddWithValue("@old", oldPrefix);
                     cmd.Parameters.AddWithValue("@oldLike", EscapeLike(oldPrefix));
@@ -464,7 +355,11 @@ namespace TicTack
             finally { _gate.Release(); }
         }
 
-        public long? GetSize(string path)
+        // USN journal checkpoint: (journal id, cursor) from the previous run,
+        // so startup can replay the offline window. Single row (id = 1),
+        // self-migrating like the job counters. The id rides as TEXT:
+        // NTFS ids are 64-bit and SQLite integers are 63-bit.
+        public void SetUsnCheckpoint(ulong journalId, long lastUsn)
         {
             Enter();
             try
@@ -472,10 +367,40 @@ namespace TicTack
                 EnsureConnected();
                 using (var cmd = _conn.CreateCommand())
                 {
-                    cmd.CommandText = "SELECT size FROM state WHERE path = @p";
-                    cmd.Parameters.AddWithValue("@p", path);
-                    var r = cmd.ExecuteScalar();
-                    return r == null || r is DBNull ? (long?)null : (long)r;
+                    cmd.CommandText = "CREATE TABLE IF NOT EXISTS usn_checkpoint (id INTEGER PRIMARY KEY, journal_id TEXT NOT NULL, last_usn INTEGER NOT NULL)";
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "INSERT OR REPLACE INTO usn_checkpoint (id, journal_id, last_usn) VALUES (1, @j, @u)";
+                    cmd.Parameters.AddWithValue("@j", journalId.ToString());
+                    cmd.Parameters.AddWithValue("@u", lastUsn);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            finally { _gate.Release(); }
+        }
+
+        public (ulong journalId, long lastUsn)? GetUsnCheckpoint()
+        {
+            Enter();
+            try
+            {
+                EnsureConnected();
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "CREATE TABLE IF NOT EXISTS usn_checkpoint (id INTEGER PRIMARY KEY, journal_id TEXT NOT NULL, last_usn INTEGER NOT NULL)";
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT journal_id, last_usn FROM usn_checkpoint WHERE id = 1";
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (!reader.Read()) return null;
+                        if (!ulong.TryParse(reader.GetString(0), out var journalId)) return null;
+                        return (journalId, reader.GetInt64(1));
+                    }
                 }
             }
             finally { _gate.Release(); }
@@ -493,26 +418,6 @@ namespace TicTack
                     cmd.Parameters.AddWithValue("@p", path);
                     var r = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
                     return r == null || r is DBNull ? (long?)null : (long)r;
-                }
-            }
-            finally { _gate.Release(); }
-        }
-
-        public async Task<(long size, long mtime)?> TryGetStateAsync(string path)
-        {
-            await EnterAsync().ConfigureAwait(false);
-            try
-            {
-                await EnsureConnectedAsync().ConfigureAwait(false);
-                using (var cmd = _conn.CreateCommand())
-                {
-                    cmd.CommandText = "SELECT size, mtime FROM state WHERE path = @p";
-                    cmd.Parameters.AddWithValue("@p", path);
-                    using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
-                    {
-                        if (!await reader.ReadAsync().ConfigureAwait(false)) return null;
-                        return (reader.GetInt64(0), reader.GetInt64(1));
-                    }
                 }
             }
             finally { _gate.Release(); }
@@ -561,21 +466,6 @@ namespace TicTack
             }
         }
 
-        public long Count()
-        {
-            Enter();
-            try
-            {
-                EnsureConnected();
-                using (var cmd = _conn.CreateCommand())
-                {
-                    cmd.CommandText = "SELECT COUNT(*) FROM state";
-                    return (long)(cmd.ExecuteScalar() ?? 0L);
-                }
-            }
-            finally { _gate.Release(); }
-        }
-
         public async Task<long> CountAsync()
         {
             await EnterAsync().ConfigureAwait(false);
@@ -612,28 +502,6 @@ namespace TicTack
             }
             finally { _gate.Release(); }
             return paths;
-        }
-
-        // Capacity seed only; cap it so an absurdly large state table cannot
-        // overflow the int conversion or over-allocate the dictionary up front.
-        private int CountInternal()
-        {
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT COUNT(*) FROM state";
-                var count = (long)(cmd.ExecuteScalar() ?? 0L);
-                return count > 1_000_000 ? 1_000_000 : (int)count;
-            }
-        }
-
-        private async Task<int> CountInternalAsync()
-        {
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT COUNT(*) FROM state";
-                var count = (long)(await cmd.ExecuteScalarAsync().ConfigureAwait(false) ?? 0L);
-                return count > 1_000_000 ? 1_000_000 : (int)count;
-            }
         }
 
         private static string EscapeLike(string value) =>

@@ -42,7 +42,7 @@ public sealed class CompleterTests : IDisposable
         for (int i = 0; i < count; i++)
         {
             var rel = $"file{i:D5}.bin";
-            var s = await db.TryGetStateAsync(rel);
+            var s = await db.GetFullStateAsync(rel);
             Assert.True(s.HasValue, "missing state row: " + rel);
             rows[rel] = (s.Value.size, s.Value.mtime);
         }

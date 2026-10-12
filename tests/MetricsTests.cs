@@ -84,29 +84,18 @@ public class MetricsTests : IDisposable
     }
 
     [Fact]
-    public async Task Metrics_CopyAction_EmitsCopyTime()
+    public async Task Metrics_CopyAction_EmitsCopyAndFsyncTime()
     {
-        using var catcher = new CounterCatcher("copy-time-ms", d => CounterCatcher.AtLeast(d, "Count", 1));
+        using var copyCatcher = new CounterCatcher("copy-time-ms", d => CounterCatcher.AtLeast(d, "Count", 1));
+        using var fsyncCatcher = new CounterCatcher("fsync-time-ms", d => CounterCatcher.AtLeast(d, "Count", 1));
         File.WriteAllText(Path.Combine(_srcDir, "a.txt"), "metrics copy test");
         var action = new CopyAction(_accessor);
         var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Created, Path.Combine(_srcDir, "a.txt")), _srcDir, _dstDir);
         var result = await action.ExecuteAsync(args, CancellationToken.None);
 
         Assert.True(result.Success);
-        Assert.True(catcher.Wait(), "no copy-time-ms sample within 15s: " + catcher.Dump());
-    }
-
-    [Fact]
-    public async Task Metrics_CopyAction_EmitsFsyncTime()
-    {
-        using var catcher = new CounterCatcher("fsync-time-ms", d => CounterCatcher.AtLeast(d, "Count", 1));
-        File.WriteAllText(Path.Combine(_srcDir, "b.txt"), "metrics fsync test");
-        var action = new CopyAction(_accessor);
-        var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Created, Path.Combine(_srcDir, "b.txt")), _srcDir, _dstDir);
-        var result = await action.ExecuteAsync(args, CancellationToken.None);
-
-        Assert.True(result.Success);
-        Assert.True(catcher.Wait(), "no fsync-time-ms sample within 15s: " + catcher.Dump());
+        Assert.True(copyCatcher.Wait(), "no copy-time-ms sample within 15s: " + copyCatcher.Dump());
+        Assert.True(fsyncCatcher.Wait(), "no fsync-time-ms sample within 15s: " + fsyncCatcher.Dump());
     }
 
     // NoInlining so `owner` is unreachable once this returns; the only thing

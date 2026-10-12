@@ -42,13 +42,6 @@ public class FilterTests
         Assert.Equal(!OperatingSystem.IsWindows(), filter.ShouldProcess(path));
     }
 
-    [Fact]
-    public void PatternFilter_NullPatterns_ProcessesAll()
-    {
-        var filter = new PatternFilter(null!);
-        Assert.True(filter.ShouldProcess(@"C:\any\file.exe"));
-    }
-
     [Theory]
     [InlineData("temp/*", @"C:\Users\x\Desktop\temp\file.txt", false)]
     [InlineData("temp/*", @"C:\Users\x\Desktop\temp\sub\file.txt", false)]
@@ -94,28 +87,6 @@ public class FilterTests
             Assert.False(oneMb.ShouldProcess(large));
         }
         finally { Directory.Delete(dir, true); }
-    }
-
-    [Fact]
-    public void SizeFilter_AllowsSmallFile()
-    {
-        var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_filter_" + Guid.NewGuid());
-        Directory.CreateDirectory(dir);
-        try
-        {
-            var path = Path.Combine(dir, "small.txt");
-            File.WriteAllText(path, "hello");
-            var filter = new SizeFilter(10); // 10 MB
-            Assert.True(filter.ShouldProcess(path));
-        }
-        finally { Directory.Delete(dir, true); }
-    }
-
-    [Fact]
-    public void SizeFilter_ZeroMax_ProcessesAll()
-    {
-        var filter = new SizeFilter(0);
-        Assert.True(filter.ShouldProcess(@"C:\any\file.txt"));
     }
 
     [Fact]

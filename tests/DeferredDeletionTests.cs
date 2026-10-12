@@ -31,14 +31,13 @@ public class DeferredDeletionTests
             // One indexed store (b deduped across batches), one result.
             Assert.True(File.Exists(DbFile(dir, "tictack-deferred-test")));
             Assert.Empty(Directory.GetFiles(dir, "tictack-deferred-test-*.json"));
-            var action = dd.Check();
+            var chunk = dd.TakeExpiredChunk();
 
-            Assert.Equal(DeferredActionType.Proceed, action.Type);
-            Assert.NotNull(action.Files);
-            Assert.Equal(3, action.Files!.Count);
-            Assert.Contains(a, action.Files);
-            Assert.Contains(b, action.Files);
-            Assert.Contains(c, action.Files);
+            Assert.Equal(3, chunk.Files.Count);
+            Assert.Contains(a, chunk.Files);
+            Assert.Contains(b, chunk.Files);
+            Assert.Contains(c, chunk.Files);
+            Assert.Equal(3, dd.ConfirmClaimed(chunk.Files));
             // Delete-on-clear: store file gone, no file means no pending.
             Assert.False(File.Exists(DbFile(dir, "tictack-deferred-test")));
             Assert.False(dd.HasPending);
@@ -78,25 +77,6 @@ public class DeferredDeletionTests
     }
 
     [Fact]
-    public void RecordPending_PureDupes_CreatesNoNewRows()
-    {
-        var dir = TestDir();
-        Directory.CreateDirectory(dir);
-        try
-        {
-            var log = new RecordingLogger();
-            using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 7, log);
-            var a = Path.Combine(dir, "a.txt");
-            dd.RecordPending(new List<string> { a }, dir);
-            dd.RecordPending(new List<string> { a }, dir);
-
-            Assert.Equal(1, dd.PendingCount);
-            Assert.True(File.Exists(DbFile(dir, "tictack-deferred-test")));
-        }
-        finally { try { Directory.Delete(dir, true); } catch { } }
-    }
-
-    [Fact]
     public void Batches_ExpireOnTheirOwnClocks()
     {
         var dir = TestDir();
@@ -113,11 +93,10 @@ public class DeferredDeletionTests
             using var dd = new DeferredDeletion(dir, prefix, 7, new RecordingLogger());
             dd.RecordPending(new List<string> { newFile }, dir);
 
-            var action = dd.Check();
-
             // Only the expired batch proceeds; the fresh one keeps waiting.
-            Assert.Equal(DeferredActionType.Proceed, action.Type);
-            Assert.Equal(oldFile, Assert.Single(action.Files!));
+            var chunk = dd.TakeExpiredChunk();
+            Assert.Equal(oldFile, Assert.Single(chunk.Files));
+            Assert.Equal(1, dd.ConfirmClaimed(chunk.Files));
             Assert.True(dd.HasPending);
             Assert.Equal(1, dd.PendingCount);
         }
@@ -138,28 +117,6 @@ public class DeferredDeletionTests
             dd.RecordPending(new List<string> { Path.Combine(dir, "gone.txt") });
 
             Assert.Contains(log.Messages, m => m.Contains("could not be saved"));
-        }
-        finally { try { Directory.Delete(dir, true); } catch { } }
-    }
-
-    [Fact]
-    public void Check_ExpiredHold_ProceedsWithMissingFiles()
-    {
-        var dir = TestDir();
-        Directory.CreateDirectory(dir);
-        try
-        {
-            using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 0, new RecordingLogger());
-            var a = Path.Combine(dir, "gone-a.txt");
-            var b = Path.Combine(dir, "gone-b.txt");
-            dd.RecordPending(new List<string> { a, b }, dir);
-
-            var action = dd.Check();
-
-            Assert.Equal(DeferredActionType.Proceed, action.Type);
-            Assert.Equal(2, action.Files!.Count);
-            Assert.False(dd.HasPending);
-            Assert.False(File.Exists(DbFile(dir, "tictack-deferred-test")));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -323,7 +280,7 @@ public class DeferredDeletionTests
     }
 
     [Fact]
-    public void Check_WithinHold_WaitsAndWarns()
+    public void CheckWarnings_WithinHold_WaitsAndWarns()
     {
         var dir = TestDir();
         Directory.CreateDirectory(dir);
@@ -333,9 +290,7 @@ public class DeferredDeletionTests
             using var dd = new DeferredDeletion(dir, "tictack-deferred-test", 7, log);
             dd.RecordPending(new List<string> { Path.Combine(dir, "held.txt") }, dir);
 
-            var action = dd.Check();
-
-            Assert.Equal(DeferredActionType.Waiting, action.Type);
+            Assert.Equal(DeferredActionType.Waiting, dd.CheckWarnings());
             Assert.True(dd.HasPending);
             Assert.Contains(log.Messages, m => m.Contains("remaining"));
             // Warning touched metadata only: no JSON batch files, one .db.
@@ -449,10 +404,10 @@ public class DeferredDeletionTests
             var gone = Path.Combine(dir, "gone.txt");
             dd.RecordPending(new List<string> { gone }, dir);
 
-            var action = dd.Check();
+            var chunk = dd.TakeExpiredChunk();
 
-            Assert.Equal(DeferredActionType.Proceed, action.Type);
-            Assert.Equal(gone, Assert.Single(action.Files!));
+            Assert.Equal(gone, Assert.Single(chunk.Files));
+            Assert.Equal(1, dd.ConfirmClaimed(chunk.Files));
             // Corrupt evidence preserved, and its load failure was logged.
             Assert.True(File.Exists(corrupt));
             Assert.Contains(log.Messages, m => m.Contains("could not be loaded") && m.Contains(corrupt));
@@ -516,11 +471,10 @@ public class DeferredDeletionTests
                 Path.Combine(dir, "A.txt")
             }, dir);
 
-            var action = dd.Check();
+            var chunk = dd.TakeExpiredChunk();
 
             var expected = OperatingSystem.IsWindows() ? 1 : 2;
-            Assert.Equal(DeferredActionType.Proceed, action.Type);
-            Assert.Equal(expected, action.Files!.Count);
+            Assert.Equal(expected, chunk.Files.Count);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

@@ -162,11 +162,20 @@ public class DeletionTests : IDisposable
     }
 
     [Fact]
-    public void Factory_CreatesArchive_WithCustomPath()
+    public async Task Factory_CreatesArchive_WithCustomPath()
     {
+        var custom = Path.Combine(_baseDir, "custom-archive");
         var deletion = DeletionStrategyFactory.Create(
-            new DeletionConfig { Mode = "archive", Path = _archiveDir }, _dstDir);
-        Assert.IsType<ArchiveDeletion>(deletion);
+            new DeletionConfig { Mode = "archive", Path = custom }, _dstDir);
+        File.WriteAllText(Dst("c.txt"), "custom");
+        var result = await deletion.HandleDeletionAsync(
+            Path.Combine(_srcDir, "c.txt"), Dst("c.txt"), CancellationToken.None);
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.False(File.Exists(Dst("c.txt")));
+        var archived = Assert.Single(Directory.EnumerateFiles(custom, "*", SearchOption.AllDirectories));
+        Assert.Equal("custom", File.ReadAllText(archived));
+        Assert.Empty(Directory.EnumerateFiles(_archiveDir, "*", SearchOption.AllDirectories));
     }
 
     [Fact]

@@ -53,6 +53,16 @@ public class MoveReplayTests : IDisposable
         }
     }
 
+    private static async Task WaitForAsync(Func<Task<bool>> cond, string what)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!await cond())
+        {
+            if (DateTime.UtcNow > deadline) throw new TimeoutException("Timed out waiting for " + what);
+            await Task.Delay(20);
+        }
+    }
+
     [Fact]
     public async Task ScanMoveReplay_MovesInsteadOfCopying()
     {
@@ -60,7 +70,7 @@ public class MoveReplayTests : IDisposable
         var a = Path.Combine(_srcDir, "a.txt");
         File.WriteAllText(a, "move-me");
         _monitor.Fire(ChangeType.Created, a);
-        WaitFor(() => db.LoadAll().ContainsKey("a.txt"), "state update");
+        await WaitForAsync(async () => await db.GetSizeAsync("a.txt") != null, "state update");
         WaitFor(() => File.Exists(Path.Combine(_dstDir, "a.txt")), "dest copy");
 
         _copy.Calls.Clear();
@@ -85,7 +95,7 @@ public class MoveReplayTests : IDisposable
         var file = Path.Combine(_srcDir, "id.txt");
         File.WriteAllText(file, "identify-me");
         _monitor.Fire(ChangeType.Created, file);
-        WaitFor(() => db.LoadAll().ContainsKey("id.txt"), "state update");
+        await WaitForAsync(async () => await db.GetSizeAsync("id.txt") != null, "state update");
 
         var row = await db.GetFullStateAsync("id.txt");
         Assert.True(row.HasValue);

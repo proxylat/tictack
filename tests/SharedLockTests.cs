@@ -58,4 +58,24 @@ public class SharedLockTests : IDisposable
         using var excl = new SrcLock(_lockPath, _log);
         Assert.True(excl.IsHeld);
     }
+
+    [Fact]
+    public void Exclusive_QuietFailure_NoWarn_ReportsBlocker()
+    {
+        using var shared = new SrcLock(_lockPath, _log, mode: LockMode.Shared);
+        Assert.True(shared.IsHeld);
+        using var excl = new SrcLock(_lockPath, _log, mode: LockMode.Exclusive, quietFailure: true);
+        Assert.False(excl.IsHeld);
+        Assert.DoesNotContain(_log.Messages, m => m.StartsWith("WRN"));
+        Assert.Contains(Environment.MachineName, excl.BlockerSummary);
+    }
+
+    [Fact]
+    public void Exclusive_FailFast_StillWarns()
+    {
+        using var shared = new SrcLock(_lockPath, _log, mode: LockMode.Shared);
+        using var excl = new SrcLock(_lockPath, _log);
+        Assert.False(excl.IsHeld);
+        Assert.Contains(_log.Messages, m => m.StartsWith("WRN"));
+    }
 }

@@ -55,13 +55,13 @@ public class StateIdentityTests : IDisposable
     }
 
     [Fact]
-    public void Migration_OldDatabase_KeepsRowsAndGainsColumns()
+    public async Task Migration_OldDatabase_KeepsRowsAndGainsColumns()
     {
         var path = NewDbPath("mig");
         CreateOldSchema(path);
 
         var db = Open(path);
-        var all = db.LoadAll();
+        var all = await db.GetStatesAsync(new[] { "old.txt" });
         Assert.Single(all);
         Assert.Equal((100L, 1000L), all["old.txt"]);
     }
@@ -130,11 +130,6 @@ public class StateIdentityTests : IDisposable
         Assert.True(ctime1 > 0);
         Assert.True(FileIdentity.TryGet(file, out var id2, out _));
         Assert.Equal(id1, id2);
-    }
-
-    [Fact]
-    public void FileIdentity_MissingFile_ReturnsFalse()
-    {
         Assert.False(FileIdentity.TryGet(Path.Combine(_dir, "nope.txt"), out _, out _));
     }
 }

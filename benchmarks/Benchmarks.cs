@@ -151,13 +151,13 @@ public class StateDbBenchmarks
     // Production initial-sync path: indexed point lookup per file,
     // 90% hits + 10% misses like a warm restart scan.
     [Benchmark(OperationsPerInvoke = 1000)]
-    public async Task<int> TryGetHit1000()
+    public async Task<int> GetFullHit1000()
     {
         var n = 0;
         for (var i = 0; i < 1000; i++)
         {
             var key = i % 10 == 9 ? $"/data/missing{i:D6}.txt" : $"/data/file{i:D6}.txt";
-            if (await _db.TryGetStateAsync(key).ConfigureAwait(false) != null) n++;
+            if (await _db.GetFullStateAsync(key).ConfigureAwait(false) != null) n++;
         }
         return n;
     }
@@ -166,10 +166,10 @@ public class StateDbBenchmarks
 [MemoryDiagnoser]
 [MediumRunJob]
 // Warm-noop path decomposition, per file: src stat (TryRead) vs state
-// point lookup (TryGetStateAsync) vs skip check (AreEqual with the
+// point lookup (GetFullStateAsync) vs skip check (AreEqual with the
 // production date_and_size comparer). Sum ~= warm per-file cost. Run on
 // the Windows box to settle SQLite-vs-file-stat before batching lookups:
-// implement chunked IN-queries ONLY if TryGet dominates TryRead+AreEqual.
+// implement chunked IN-queries ONLY if GetFull dominates TryRead+AreEqual.
 public class WarmPathBenchmarks
 {
     private const int N = 1000;
@@ -219,11 +219,11 @@ public class WarmPathBenchmarks
     }
 
     [Benchmark(OperationsPerInvoke = N)]
-    public async Task<int> TryGetLoop()
+    public async Task<int> GetFullLoop()
     {
         var n = 0;
         foreach (var (s, _, _) in _files)
-            if (await _db.TryGetStateAsync(s).ConfigureAwait(false) != null) n++;
+            if (await _db.GetFullStateAsync(s).ConfigureAwait(false) != null) n++;
         return n;
     }
 

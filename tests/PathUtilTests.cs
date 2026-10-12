@@ -3,17 +3,10 @@ namespace TicTack;
 public class PathUtilTests
 {
     [Fact]
-    public void EnsureExtended_ReturnsInputOnCurrentPlatform()
+    public void EnsureExtended_DispatchMatchesCurrentPlatform()
     {
         var path = Path.Combine(Path.GetTempPath(), "some", "file.txt");
-        if (OperatingSystem.IsWindows()) return; // Windows branch pinned below
-        Assert.Equal(path, PathUtil.EnsureExtended(path));
-    }
-
-    [Fact]
-    public void WindowsBranch_ShortPath_Unchanged()
-    {
-        Assert.Equal(@"C:\a.txt", PathUtil.EnsureExtended(@"C:\a.txt", true));
+        Assert.Equal(PathUtil.EnsureExtended(path, OperatingSystem.IsWindows()), PathUtil.EnsureExtended(path));
     }
 
     [Fact]

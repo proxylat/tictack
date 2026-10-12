@@ -30,8 +30,6 @@ namespace TicTack
     public class FileActionArgs
     {
         public FileChangedEventArgs ChangeEvent { get; }
-        public string SourceBase { get; }
-        public string DestBase { get; }
         public string DestPath { get; }
         public string? OldDestPath { get; }
         public FileSnapshot? SourceSnapshot { get; }
@@ -39,8 +37,6 @@ namespace TicTack
         public FileActionArgs(FileChangedEventArgs changeEvent, string sourceBase, string destBase, FileSnapshot? sourceSnapshot = null)
         {
             ChangeEvent = changeEvent;
-            SourceBase = sourceBase;
-            DestBase = destBase;
             DestPath = MapPath(sourceBase, destBase, changeEvent.FullPath);
             SourceSnapshot = sourceSnapshot;
             if (changeEvent.ChangeType == ChangeType.Renamed && changeEvent.OldFullPath != null)

@@ -38,7 +38,8 @@ namespace TicTack
                 VolumeResolver.ResolveConfig(cfg);
 
                 var logDir = Path.GetDirectoryName(_configPath) ?? AppDomain.CurrentDomain.BaseDirectory;
-                _log = LoggerFactory.Create(cfg.Logging, logDir, console: cfg.Logging.Console, eventLog: true);
+                _log = LoggerFactory.Create(cfg.Logging, logDir, console: cfg.Logging.Console, eventLog: true,
+                    backupDir: Program.StateDbRoot(cfg));
 
                 if (!VolumeResolver.EnsureResolved(cfg, cfg.VolumeWaitMinutes, _log))
                     throw new InvalidOperationException("Volume(s) not available; see log for labels.");

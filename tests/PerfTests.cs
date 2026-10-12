@@ -121,7 +121,7 @@ public sealed class PerfTests
                 Assert.True(File.Exists(Path.Combine(dst, $"file{i:D5}.txt")));
             using (var db = new StateDb(statePath))
             {
-                var s = await db.TryGetStateAsync("file00000.txt");
+                var s = await db.GetFullStateAsync("file00000.txt");
                 Assert.True(s.HasValue);
             }
         }
@@ -301,24 +301,32 @@ public sealed class PerfTests
     }
 
     [Fact]
-    public void StateDb_LoadAll151kRows_AllocationPerRowBounded()
+    public async Task StateDb_GetStates151kRows_AllocationPerRowBounded()
     {
         var dir = TestDir();
         try
         {
             using var db = new StateDb(Path.Combine(dir, "state.db"));
             var rows = new List<(string path, long size, long mtime)>(151_000);
+            var keys = new List<string>(151_000);
             for (int i = 0; i < 151_000; i++)
-                rows.Add(($"/p/file{i:D6}.txt", i * 1024L, 637000000000000000L + i));
+            {
+                var p = $"/p/file{i:D6}.txt";
+                rows.Add((p, i * 1024L, 637000000000000000L + i));
+                keys.Add(p);
+            }
             db.UpsertBatch(rows);
 
             var allocBefore = GC.GetTotalAllocatedBytes(true);
-            var all = db.LoadAll();
+            var all = await db.GetStatesAsync(keys);
             var alloc = GC.GetTotalAllocatedBytes(true) - allocBefore;
 
             Assert.Equal(151_000, all.Count);
-            Assert.Equal(5 * 1024L, db.GetSize("/p/file000005.txt"));
-            Assert.True(alloc < 32 * 1024 * 1024, $"LoadAll allocated {alloc} bytes");
+            Assert.Equal(5 * 1024L, await db.GetSizeAsync("/p/file000005.txt"));
+            // ~59MB measured (302 batched IN-queries x 500 params + result
+            // dict); trips on 2x regressions (double materialization,
+            // per-row queries), not on runtime-version wobble.
+            Assert.True(alloc < 96 * 1024 * 1024, $"GetStates allocated {alloc} bytes");
         }
         finally { TryDelete(dir); }
     }
@@ -410,8 +418,11 @@ public sealed class PerfTests
                 Assert.True(File.Exists(Path.Combine(dst, $"file{i:D5}.txt")),
                     $"file{i:D5}.txt was not copied");
             Assert.Equal(files, copy.Calls.Count);
-            // Fallback path: probe + copy + classic validator src re-read.
-            Assert.Equal(3 * files, accessor.SrcOpens);
+            // Fallback path: probe + copy + classic validator src re-read, at
+            // most. A fix making the fast path work through wrappers must not
+            // fail this test, so this is an upper bound, not an exact count.
+            Assert.True(accessor.SrcOpens <= 3 * files,
+                $"expected at most {3 * files} source opens, saw {accessor.SrcOpens}");
         }
         finally { TryDelete(dir); }
     }

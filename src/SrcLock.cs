@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
@@ -26,11 +27,19 @@ namespace TicTack
 
         public bool IsHeld { get; private set; }
 
+        // Identities of the holders that blocked a failed acquisition ("" when
+        // none or when the attempt succeeded). Lets a best-effort caller say
+        // who is in the way instead of a bare "unavailable".
+        public string BlockerSummary { get; private set; } = "";
+
+        private readonly bool _quietFailure;
+
         public SrcLock(string path, ILogger log, TimeSpan? retryTimeout = null, TimeSpan? refreshInterval = null,
-            LockMode mode = LockMode.Exclusive)
+            LockMode mode = LockMode.Exclusive, bool quietFailure = false)
         {
             _path = path;
             _log = log;
+            _quietFailure = quietFailure;
             _identity = Environment.MachineName + ":" + Process.GetCurrentProcess().Id;
             var deadline = retryTimeout.HasValue ? DateTime.UtcNow + retryTimeout.Value : DateTime.MinValue;
             var refresh = refreshInterval ?? TimeSpan.FromSeconds(30);
@@ -83,8 +92,9 @@ namespace TicTack
             while (true)
             {
                 // A live shared roster blocks exclusive; stale ones are swept.
-                if (LiveRosterCount(staleAfter) > 0)
+                if (LiveRosterCount(staleAfter, out var holders) > 0)
                 {
+                    BlockerSummary = holders.Count > 0 ? string.Join(", ", holders) : "unknown shared holder";
                     if (!WaitOne("shared holders", deadline, retryTimeout, ref waited, ref attempt))
                         return null;
                     continue;
@@ -109,6 +119,7 @@ namespace TicTack
                         try { File.Delete(_path); continue; }
                         catch (Exception ex) { _log.Debug("Stale lock delete failed: " + ex.Message); }
                     }
+                    BlockerSummary = content;
                     if (!WaitOne("lock held by " + content, deadline, retryTimeout, ref waited, ref attempt))
                         return null;
                 }
@@ -123,6 +134,7 @@ namespace TicTack
             {
                 if (LiveExclusive(staleAfter, out var holder))
                 {
+                    BlockerSummary = holder;
                     if (!WaitOne("exclusive lock held by " + holder, deadline, retryTimeout, ref waited, ref attempt))
                         return null;
                     continue;
@@ -172,8 +184,9 @@ namespace TicTack
             catch { return false; }
         }
 
-        private int LiveRosterCount(TimeSpan staleAfter)
+        private int LiveRosterCount(TimeSpan staleAfter, out List<string> holders)
         {
+            holders = new List<string>();
             var count = 0;
             try
             {
@@ -189,6 +202,7 @@ namespace TicTack
                             try { File.Delete(f); } catch { }
                             continue;
                         }
+                        holders.Add(ReadIdentitySafe(f));
                         count++;
                     }
                     catch { }
@@ -221,9 +235,18 @@ namespace TicTack
         {
             if (DateTime.UtcNow >= deadline)
             {
-                var waitedFor = retryTimeout.HasValue ? $" after {retryTimeout.Value.TotalSeconds:F0}s" : "";
-                _log.Warn("Lock held by " + what + " — lock acquisition failed" + waitedFor
-                          + "; stop the other TicTack instance or raise lock_wait_seconds");
+                if (_quietFailure)
+                {
+                    // Best-effort callers (destructive sweeps) log their own
+                    // skip line; a Warn here would just duplicate it.
+                    _log.Debug("Lock unavailable (best-effort): held by " + what);
+                }
+                else
+                {
+                    var waitedFor = retryTimeout.HasValue ? $" after {retryTimeout.Value.TotalSeconds:F0}s" : "";
+                    _log.Warn("Lock held by " + what + " — lock acquisition failed" + waitedFor
+                              + "; stop the other TicTack instance or raise lock_wait_seconds");
+                }
                 return false;
             }
             attempt++;

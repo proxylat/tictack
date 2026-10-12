@@ -56,4 +56,27 @@ public sealed class PipelineHealthTests
         Assert.NotNull(fault);
         Assert.Contains("dead", fault);
     }
+
+    [Fact]
+    public void PastDue_WithBackoffFloor_ClampsToFloor()
+    {
+        // The deferred-check hot loop: a past-due deadline plus no progress
+        // must re-arm at the floor, never zero.
+        Assert.Equal(TimeSpan.FromSeconds(60),
+            SyncPipeline.ClampReArmDelay(Now.AddMinutes(-5), Now, TimeSpan.FromSeconds(60)));
+    }
+
+    [Fact]
+    public void PastDue_NoFloor_ClampsToZero()
+    {
+        Assert.Equal(TimeSpan.Zero,
+            SyncPipeline.ClampReArmDelay(Now.AddMinutes(-5), Now, TimeSpan.Zero));
+    }
+
+    [Fact]
+    public void FutureDue_KeepsItsOwnDelay()
+    {
+        Assert.Equal(TimeSpan.FromMinutes(3),
+            SyncPipeline.ClampReArmDelay(Now.AddMinutes(3), Now, TimeSpan.FromSeconds(60)));
+    }
 }

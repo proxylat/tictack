@@ -191,6 +191,152 @@ public class UsnMonitorTests : IDisposable
     }
 
     [Fact]
+    public void Prefilter_SeedLookupFailure_Deactivates()
+    {
+        // Fail closed: a partial FRN set with the filter active would blind
+        // real subtrees until restart. Deactivation resolves everything
+        // (slower, never blind) and warns.
+        var sub = Path.Combine(_dir, "sub");
+        Directory.CreateDirectory(sub);
+        var log = new RecordingLogger();
+        var m = new UsnJournalMonitor(_dir, 10, 200, true, log);
+        try
+        {
+            m.FrnOfPath = p => throw new IOException("boom");
+            m.SeedWatchDirs();
+            Assert.False(m._prefilterActive);
+            Assert.Contains(log.Messages, msg => msg.Contains("prefilter off for this run"));
+            // Inactive = everything passes to the resolve path (fail closed).
+            Assert.True(m.IsWatchedParent(0xB0));
+        }
+        finally { m.Dispose(); }
+    }
+
+    [Fact]
+    public void Prefilter_SeedEnumerationAbort_Deactivates()
+    {
+        // Enumerating a file (not a dir) aborts the seed walk outright.
+        var file = Path.Combine(_dir, "notadir.txt");
+        File.WriteAllText(file, "x");
+        var log = new RecordingLogger();
+        var m = new UsnJournalMonitor(file, 10, 200, true, log);
+        try
+        {
+            m.SeedWatchDirs();
+            Assert.False(m._prefilterActive);
+            Assert.Contains(log.Messages, msg => msg.Contains("prefilter off for this run"));
+        }
+        finally { m.Dispose(); }
+    }
+
+    [Fact]
+    public void ResolveGap_TrackedParentUnresolved_FiresOncePerCooldown()
+    {
+        var m = new UsnJournalMonitor(_dir);
+        try
+        {
+            m.FrnOfPath = p => p == _dir ? (ulong?)0xA0 : null;
+            m.SeedWatchDirs();
+            var gaps = 0;
+            m.GapDetected += (_, _) => gaps++;
+            var helper = new RecordsForTest(m);
+            string? DeadParent(ulong fr) => null; // parent chain gone
+            Assert.Null(helper.Translate(0xF1, 0xA0, 1, FileDelete | Close, 0x80, "gone.txt", DeadParent));
+            Assert.Equal(1, gaps);
+            // Immediate second: cooldown suppresses.
+            Assert.Null(helper.Translate(0xF2, 0xA0, 2, FileDelete | Close, 0x80, "gone2.txt", DeadParent));
+            Assert.Equal(1, gaps);
+            // Past the cooldown: fires again.
+            m.ResolveGapCooldown = TimeSpan.Zero;
+            Assert.Null(helper.Translate(0xF3, 0xA0, 3, FileDelete | Close, 0x80, "gone3.txt", DeadParent));
+            Assert.Equal(2, gaps);
+        }
+        finally { m.Dispose(); }
+    }
+
+    [Fact]
+    public void ResolveGap_DisabledOrUntracked_StaysSilent()
+    {
+        // Toggle off: no signal even for tracked unresolvable parents.
+        var off = new UsnJournalMonitor(_dir, 10, 200, true, null, resolveGap: false);
+        try
+        {
+            off.FrnOfPath = p => p == _dir ? (ulong?)0xA0 : null;
+            off.SeedWatchDirs();
+            var gaps = 0;
+            off.GapDetected += (_, _) => gaps++;
+            var helper = new RecordsForTest(off);
+            Assert.Null(helper.Translate(0xF1, 0xA0, 1, FileDelete | Close, 0x80, "gone.txt", _ => null));
+            Assert.Equal(0, gaps);
+        }
+        finally { off.Dispose(); }
+        // Untracked (outside-tree) parent: not a loss, silent by design.
+        var m = new UsnJournalMonitor(_dir);
+        try
+        {
+            m.FrnOfPath = p => p == _dir ? (ulong?)0xA0 : null;
+            m.SeedWatchDirs();
+            var gaps = 0;
+            m.GapDetected += (_, _) => gaps++;
+            var helper = new RecordsForTest(m);
+            Assert.Null(helper.Translate(0xF1, 0xB0, 1, FileDelete | Close, 0x80, "x.txt", _ => null));
+            Assert.Equal(0, gaps);
+        }
+        finally { m.Dispose(); }
+    }
+
+    [Theory]
+    [InlineData(9UL, 100L, 9UL, 200L, true)]    // same journal, behind head
+    [InlineData(9UL, 200L, 9UL, 200L, false)]   // already at head: nothing to replay
+    [InlineData(9UL, 300L, 9UL, 200L, false)]   // ahead of head: clock weirdness
+    [InlineData(8UL, 100L, 9UL, 200L, false)]   // recreated journal: ids differ
+    [InlineData(9UL, -1L, 9UL, 200L, false)]    // negative cursor: corrupt row
+    public void CheckpointCoversGap_Matrix(ulong storedId, long storedUsn, ulong journalId, long head, bool expected)
+    {
+        Assert.Equal(expected, UsnJournalMonitor.CheckpointCoversGap(storedId, storedUsn, journalId, head));
+    }
+
+    [Theory]
+    [InlineData("NTFS", false)]
+    [InlineData("ntfs", false)]
+    [InlineData("ReFS", true)]
+    [InlineData("FAT32", true)]
+    [InlineData("exFAT", true)]
+    [InlineData(null, false)]  // unknown: proceed, the query is the backstop
+    [InlineData("", false)]
+    public void RequiresNtfsSkip_Matrix(string? fsName, bool expected)
+    {
+        Assert.Equal(expected, UsnJournalMonitor.RequiresNtfsSkip(fsName));
+    }
+
+    [Fact]
+    public void Rename_StashEvictsOldestFirst()
+    {
+        // 5000 pairs against a 4096 cap: every pairing resolves (pending
+        // never exceeds one live entry), and redelivery distinguishes
+        // kept (silent) from evicted (graceful Created) by age — no
+        // clear-all cliff where the whole window vanishes at once.
+        using var helper = NewMonitor();
+        string Resolver(ulong fr) => _dir;
+        for (int i = 0; i < 5000; i++)
+        {
+            var frn = 0x1000UL + (ulong)i;
+            Assert.Null(helper.Translate(frn, 0xA0, i * 2L, RenameOld | Close, 0x80, "old" + i, Resolver));
+            var paired = helper.Translate(frn, 0xA0, i * 2L + 1, RenameNew | Close, 0x80, "new" + i, Resolver);
+            Assert.NotNull(paired);
+            Assert.Equal(ChangeType.Renamed, paired!.ChangeType);
+        }
+        // FRN_2000 is inside the 4096 window (5000 - 4096 = 904 < 2000):
+        // redelivery stays silent as a recognized duplicate.
+        var recent = helper.Translate(0x1000UL + 2000, 0xA0, 99991, RenameNew | Close, 0x80, "new2000", Resolver);
+        Assert.Null(recent);
+        // FRN_500 aged out: graceful Created, not a phantom, not a crash.
+        var aged = helper.Translate(0x1000UL + 500, 0xA0, 99992, RenameNew | Close, 0x80, "new500", Resolver);
+        Assert.NotNull(aged);
+        Assert.Equal(ChangeType.Created, aged!.ChangeType);
+    }
+
+    [Fact]
     public void Translate_RenamePairsOldAndNew()
     {
         using var helper = NewMonitor();

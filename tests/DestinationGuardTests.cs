@@ -89,10 +89,14 @@ public class DestinationGuardTests : IDisposable
     }
 
     [Fact]
-    public void NeverThrows_OnReadOnlyParent()
+    public void NeverThrows_WhenDirectoryCreationFails()
     {
-        // Best-effort by contract: must not fail startup. Read-only root
-        // makes the ACL write fail; Enforce must swallow it as Warn.
-        DestinationGuard.Enforce(_dir, _log);
+        // Best-effort by contract: must not fail startup. A file in place
+        // of the parent makes creation fail; Enforce must swallow it as Warn.
+        var blocker = Path.Combine(_dir, "blocker");
+        File.WriteAllText(blocker, "not a directory");
+        DestinationGuard.Enforce(Path.Combine(blocker, "child"), _log);
+
+        Assert.Contains(_log.Messages, m => m.Contains("Destination protection failed"));
     }
 }

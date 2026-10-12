@@ -29,9 +29,16 @@ public class PowerGuardTests : IDisposable
         var sourceFile = Path.Combine(_srcDir, "recovered.txt");
         File.WriteAllText(sourceFile, "recoverable data");
         File.Copy(sourceFile, tmpFile);
+        var src2 = Path.Combine(Path.GetDirectoryName(_srcDir)!, "src2");
+        var dst2 = Path.Combine(Path.GetDirectoryName(_dstDir)!, "dst2");
+        Directory.CreateDirectory(src2);
+        Directory.CreateDirectory(dst2);
+        File.WriteAllText(Path.Combine(src2, "second.txt"), "second data");
+        File.Copy(Path.Combine(src2, "second.txt"), Path.Combine(dst2, "second.txt.tictack.tmp"));
 
         var cfg = new TicTackConfig();
         cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
+        cfg.Sources.Add(new SourceConfig { Path = src2, Destination = dst2 });
 
         PowerGuard.Cleanup(cfg, _log);
 
@@ -39,6 +46,10 @@ public class PowerGuardTests : IDisposable
         Assert.True(File.Exists(recovered));
         Assert.False(File.Exists(tmpFile));
         Assert.Equal("recoverable data", File.ReadAllText(recovered));
+        Assert.Equal("second data", File.ReadAllText(Path.Combine(dst2, "second.txt")));
+
+        try { Directory.Delete(src2, true); } catch { }
+        try { Directory.Delete(dst2, true); } catch { }
     }
 
     [Fact]
@@ -76,55 +87,16 @@ public class PowerGuardTests : IDisposable
     }
 
     [Fact]
-    public void Cleanup_ProcessesAllSources()
-    {
-        var dst2 = Path.Combine(Path.GetDirectoryName(_dstDir)!, "dst2");
-        var src2 = Path.Combine(Path.GetDirectoryName(_srcDir)!, "src2");
-        Directory.CreateDirectory(dst2);
-        Directory.CreateDirectory(src2);
-
-        var tmp1 = Path.Combine(_dstDir, "f1.txt.tictack.tmp");
-        var tmp2 = Path.Combine(dst2, "f2.txt.tictack.tmp");
-        File.WriteAllText(Path.Combine(_srcDir, "f1.txt"), "data1");
-        File.WriteAllText(Path.Combine(src2, "f2.txt"), "data2");
-        File.Copy(Path.Combine(_srcDir, "f1.txt"), tmp1);
-        File.Copy(Path.Combine(src2, "f2.txt"), tmp2);
-
-        var cfg = new TicTackConfig();
-        cfg.Sources.Add(new SourceConfig { Path = _srcDir, Destination = _dstDir });
-        cfg.Sources.Add(new SourceConfig { Path = src2, Destination = dst2 });
-
-        PowerGuard.Cleanup(cfg, _log);
-
-        Assert.Equal("data1", File.ReadAllText(Path.Combine(_dstDir, "f1.txt")));
-        Assert.Equal("data2", File.ReadAllText(Path.Combine(dst2, "f2.txt")));
-        Assert.False(File.Exists(tmp1));
-        Assert.False(File.Exists(tmp2));
-
-        try { Directory.Delete(dst2, true); } catch { }
-    }
-
-    [Fact]
-    public void Cleanup_NullConfig_DoesNotThrow()
-    {
-        Assert.Null(Record.Exception(() => PowerGuard.Cleanup(null, _log)));
-    }
-
-    [Fact]
-    public void Cleanup_NullSources_DoesNotThrow()
-    {
-        var cfg = new TicTackConfig();
-        cfg.Sources = null!;
-        Assert.Null(Record.Exception(() => PowerGuard.Cleanup(cfg, _log)));
-    }
-
-    [Fact]
-    public void Cleanup_HandlesVersionDir()
+    public void Cleanup_HandlesVersionAndDeletionDirs()
     {
         var versionDir = Path.Combine(Path.GetDirectoryName(_srcDir)!, "versions");
         Directory.CreateDirectory(versionDir);
         var tmp = Path.Combine(versionDir, "v1.txt.tictack.tmp");
         File.WriteAllText(tmp, "version data");
+        var delDir = Path.Combine(Path.GetDirectoryName(_srcDir)!, "deleted");
+        Directory.CreateDirectory(delDir);
+        var delTmp = Path.Combine(delDir, "d1.txt.tictack.tmp");
+        File.WriteAllText(delTmp, "deleted data");
 
         var cfg = new TicTackConfig();
         cfg.Sources.Add(new SourceConfig
@@ -133,7 +105,8 @@ public class PowerGuardTests : IDisposable
             Destination = _dstDir,
             Sync = new SyncConfig
             {
-                Versioning = new VersioningConfig { Path = versionDir }
+                Versioning = new VersioningConfig { Path = versionDir },
+                Deletion = new DeletionConfig { Path = delDir }
             }
         });
 
@@ -141,6 +114,8 @@ public class PowerGuardTests : IDisposable
 
         Assert.False(File.Exists(Path.Combine(versionDir, "v1.txt")));
         Assert.False(File.Exists(tmp));
+        Assert.False(File.Exists(Path.Combine(delDir, "d1.txt")));
+        Assert.False(File.Exists(delTmp));
     }
 
     [Fact]
@@ -191,31 +166,6 @@ public class PowerGuardTests : IDisposable
 
         Assert.False(File.Exists(Path.Combine(_dstDir, "orphan.txt")));
         Assert.False(File.Exists(tmpFile));
-    }
-
-    [Fact]
-    public void Cleanup_HandlesDeletionDir()
-    {
-        var delDir = Path.Combine(Path.GetDirectoryName(_srcDir)!, "deleted");
-        Directory.CreateDirectory(delDir);
-        var tmp = Path.Combine(delDir, "d1.txt.tictack.tmp");
-        File.WriteAllText(tmp, "deleted data");
-
-        var cfg = new TicTackConfig();
-        cfg.Sources.Add(new SourceConfig
-        {
-            Path = _srcDir,
-            Destination = _dstDir,
-            Sync = new SyncConfig
-            {
-                Deletion = new DeletionConfig { Path = delDir }
-            }
-        });
-
-        PowerGuard.Cleanup(cfg, _log);
-
-        Assert.False(File.Exists(Path.Combine(delDir, "d1.txt")));
-        Assert.False(File.Exists(tmp));
     }
 
     [Fact]

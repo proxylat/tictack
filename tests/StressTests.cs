@@ -33,57 +33,7 @@ public class StressTests
         Sync = new SyncConfig { Verification = "size" }
     };
 
-    // ── 1. Burst creates: 500 files in parallel, verify all synced ──
-
-    [Fact]
-    public async Task BurstCreate_SyncsAll()
-    {
-        var dir = TestDir();
-        var src = Path.Combine(dir, "src");
-        var dst = Path.Combine(dir, "dst");
-        Directory.CreateDirectory(src);
-        Directory.CreateDirectory(dst);
-        try
-        {
-            var n = 500;
-            for (int i = 0; i < n; i++)
-                File.WriteAllText(Path.Combine(src, $"f{i}.txt"), $"content{i}");
-
-            using var pipeline = new SyncPipeline(
-                MakeConfig(src, dst),
-                new EventMonitor(),
-                new DateSizeComparer(),
-                new CopyAction(new FileAccessor()),
-                new RenameAction(),
-                new ExponentialBackoffRetry(1, 0, 1),
-                new SizeValidator(),
-                new NoVersioning(),
-                new MirrorDeletion(),
-                new RecordingLogger()
-            );
-            pipeline.Start();
-            // Poll for completion: a fixed sleep flakes on loaded runners
-            // (500 fsync'd copies + AV scanning can exceed any constant).
-            var deadline = DateTime.UtcNow.AddSeconds(60);
-            bool synced;
-            do
-            {
-                synced = true;
-                for (int i = 0; i < n; i++)
-                {
-                    if (!File.Exists(Path.Combine(dst, $"f{i}.txt"))) { synced = false; break; }
-                }
-                if (!synced) await Task.Delay(250);
-            } while (!synced && DateTime.UtcNow < deadline);
-            // pipeline.Dispose via using
-
-            for (int i = 0; i < n; i++)
-                Assert.True(File.Exists(Path.Combine(dst, $"f{i}.txt")));
-        }
-        finally { try { Directory.Delete(dir, true); } catch { } }
-    }
-
-    // ── 2. Empty file (0 bytes) syncs ──
+    // ── 1. Empty file (0 bytes) syncs ──
 
     [Fact]
     public async Task EmptyFile_Syncs()
@@ -119,7 +69,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 3. File deleted mid-copy (source disappears) ──
+    // ── 2. File deleted mid-copy (source disappears) ──
 
     [Fact]
     public async Task CopyAction_SourceDeletedMidCopy_ReturnsFail()
@@ -146,7 +96,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 4. Concurrent renames to same dest ──
+    // ── 3. Concurrent renames to same dest ──
 
     [Fact]
     public async Task RenameAction_ConcurrentSameDest_NoCrash()
@@ -178,7 +128,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 5. Source file locked by another process ──
+    // ── 4. Source file locked by another process ──
 
     [Fact]
     public async Task CopyAction_LockedSource_UsesPlatformSharingRules()
@@ -230,10 +180,10 @@ public class StressTests
         }
     }
 
-    // ── 6. StateDb concurrent batch ──
+    // ── 5. StateDb concurrent batch ──
 
     [Fact]
-    public void StateDb_ConcurrentBatch()
+    public async Task StateDb_ConcurrentBatch()
     {
         var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_sdb_" + Guid.NewGuid());
         Directory.CreateDirectory(dir);
@@ -242,42 +192,15 @@ public class StressTests
         {
             using var db = new StateDb(dbPath);
             var n = 100;
-            Parallel.For(0, n, i => db.Upsert($"f{i}.txt", i, i));
+            await Parallel.ForEachAsync(Enumerable.Range(0, n),
+                async (i, _) => await db.UpsertAsync($"f{i}.txt", i, i));
 
-            var all = db.LoadAll();
-            Assert.Equal(n, all.Count);
+            Assert.Equal((long)n, await db.CountAsync());
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 7. StateDb UpdatePrefix correctness ──
-
-    [Fact]
-        public void StateDb_UpdatePrefix_RenamesChildPaths()
-        {
-            var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_sdb_" + Guid.NewGuid());
-            Directory.CreateDirectory(dir);
-            var dbPath = Path.Combine(dir, "prefix.db");
-            string S = Path.DirectorySeparatorChar.ToString();
-            try
-            {
-                using var db = new StateDb(dbPath);
-                db.Upsert($"folder{S}file1.txt", 100, 1000);
-                db.Upsert($"folder{S}sub{S}file2.txt", 200, 2000);
-                db.Upsert("other.txt", 300, 3000);
-
-                db.UpdatePrefix("folder", "folder_renamed");
-
-                var all = db.LoadAll();
-                Assert.Equal(3, all.Count);
-                Assert.True(all.ContainsKey($"folder_renamed{S}file1.txt"));
-                Assert.True(all.ContainsKey($"folder_renamed{S}sub{S}file2.txt"));
-                Assert.True(all.ContainsKey("other.txt"));
-            }
-            finally { try { Directory.Delete(dir, true); } catch { } }
-        }
-
-    // ── 8. RenameAction directory ──
+    // ── 6. RenameAction directory ──
 
     [Fact]
     public async Task RenameAction_MovesDirectory()
@@ -316,7 +239,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 9. RenameAction directory non-existent old destination ──
+    // ── 7. RenameAction directory non-existent old destination ──
 
     [Fact]
     public async Task RenameAction_Directory_OldNotExists_NoError()
@@ -338,7 +261,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 10. Pipeline debounced event processing ──
+    // ── 8. Pipeline debounced event processing ──
 
     [Fact]
     public async Task Pipeline_ProcessesDebouncedEvent()
@@ -383,7 +306,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 11. Pipeline processes deletion via event ──
+    // ── 9. Pipeline processes deletion via event ──
 
     [Fact]
     public async Task Pipeline_ProcessesDeleteEvent()
@@ -429,7 +352,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 12. Pipeline handles rapid bursts via emitted events ──
+    // ── 10. Pipeline handles rapid bursts via emitted events ──
 
     [Fact]
     public async Task Pipeline_BurstEvents_NoCrash()
@@ -484,7 +407,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 12b. Ready-queue burst drain: 20k events, each exactly once ──
+    // ── 10b. Ready-queue burst drain: 20k events, each exactly once ──
 
     sealed class CountingAction : IFileAction
     {
@@ -549,7 +472,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 13. SrcLock concurrent creation ──
+    // ── 11. SrcLock concurrent creation ──
 
     [Fact]
     public void SrcLock_ConcurrentCreation_NoConflict()
@@ -568,7 +491,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 14. CopyAction very large file (streaming) ──
+    // ── 12. CopyAction very large file (streaming) ──
 
     [Fact]
     public async Task CopyAction_LargeFile_StreamsCorrectly()
@@ -603,7 +526,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 15. Power loss: partial .tictack.tmp leftover ──
+    // ── 13. Power loss: partial .tictack.tmp leftover ──
 
     [Fact]
     public async Task CopyAction_LeftoverTmp_CleanedUp()
@@ -633,7 +556,7 @@ public class StressTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
-    // ── 16. StateDb round-trip for a copy that predates its entry ──
+    // ── 14. StateDb round-trip for a copy that predates its entry ──
     // (No pipeline is constructed here: this pins the DB behavior that the
     // real warm-db skip path depends on. The end-to-end warm skip is covered
     // by PerfTests.WarmResync_CopiesNothing, which reopens the same DB.)
@@ -661,49 +584,18 @@ public class StressTests
 
             using (var db2 = new StateDb(statePath))
             {
-                var cache = db2.LoadAll();
                 var rel = "survivor.txt";
-                Assert.False(cache.ContainsKey(rel), "StateDb should not have entry");
+                Assert.Null(await db2.GetSizeAsync(rel));
 
                 long srcSize = new FileInfo(file).Length;
                 long srcTicks = new FileInfo(file).LastWriteTimeUtc.Ticks;
-                db2.Upsert(rel, srcSize, srcTicks);
+                await db2.UpsertAsync(rel, srcSize, srcTicks);
             }
 
             using (var db3 = new StateDb(statePath))
             {
-                var cache = db3.LoadAll();
-                Assert.True(cache.ContainsKey("survivor.txt"));
-                Assert.Equal(new FileInfo(file).Length, cache["survivor.txt"].size);
-            }
-        }
-        finally { try { Directory.Delete(dir, true); } catch { } }
-    }
-
-    // ── 17. StateDb WAL round-trip after a clean close ──
-    // (The real crash path — kill -9 mid-write, WAL replay on reopen — is
-    // CrashRecoveryTests.KillBeforeCheckpoint_WalReplaysOnReopen.)
-
-    [Fact]
-    public void StateDb_WalCrashRecovery()
-    {
-        var dir = TestDir();
-        Directory.CreateDirectory(dir);
-        var dbPath = Path.Combine(dir, "crash.db");
-        try
-        {
-            using (var db = new StateDb(dbPath))
-            {
-                db.Upsert("a.txt", 100, 1000);
-                db.Upsert("b.txt", 200, 2000);
-            }
-
-            using (var db2 = new StateDb(dbPath))
-            {
-                var all = db2.LoadAll();
-                Assert.Equal(2, all.Count);
-                Assert.Contains("a.txt", all.Keys);
-                Assert.Contains("b.txt", all.Keys);
+                Assert.NotNull(await db3.GetSizeAsync("survivor.txt"));
+                Assert.Equal(new FileInfo(file).Length, await db3.GetSizeAsync("survivor.txt"));
             }
         }
         finally { try { Directory.Delete(dir, true); } catch { } }

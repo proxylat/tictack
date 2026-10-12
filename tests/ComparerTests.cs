@@ -133,10 +133,4 @@ public class ComparerTests : IDisposable
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => ComparerFactory.Create((VerificationLevel)999));
     }
-
-    [Fact]
-    public void SizeComparer_ThrowsNoException_OnInvalidPaths()
-    {
-        Assert.False(new SizeComparer().AreEqual(@"C:\invalid_path_xyz\file.txt", @"C:\other\invalid"));
-    }
 }

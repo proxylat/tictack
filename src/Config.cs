@@ -13,6 +13,7 @@ namespace TicTack
         public MonitorConfig Monitor { get; set; }
         public LoggingConfig Logging { get; set; }
         public List<JobConfig> Jobs { get; set; }
+        public JobsDefaultsConfig JobsDefaults { get; set; }
         public WatchdogConfig Watchdog { get; set; }
         public ExternalDrivesConfig ExternalDrives { get; set; }
 
@@ -35,6 +36,7 @@ namespace TicTack
             Monitor = new MonitorConfig();
             Logging = new LoggingConfig();
             Jobs = new List<JobConfig>();
+            JobsDefaults = new JobsDefaultsConfig();
             Watchdog = new WatchdogConfig();
             ExternalDrives = new ExternalDrivesConfig();
             VolumeWaitMinutes = 2;
@@ -180,12 +182,23 @@ namespace TicTack
 
     public class VersioningConfig
     {
-        public int MaxVersions { get; set; }
+        // Legacy flat cap. Nullable so "absent" is detectable: when any
+        // keep_* policy is set, an absent MaxVersions does not silently cap
+        // the result. Null + no keep_* policies = default keep-last 10.
+        public int? MaxVersions { get; set; }
         public string? Path { get; set; }
+        // Restic-style retention, OR-semantics per file: a version survives
+        // when ANY policy keeps it. Durations use the same "30d"/"12h"
+        // spelling as the job keys (see Config.TryParseDuration).
+        public int? KeepLast { get; set; }
+        public string? KeepWithin { get; set; }
+        public int? KeepDaily { get; set; }
+        public int? KeepWeekly { get; set; }
+        public int? KeepMonthly { get; set; }
 
         public VersioningConfig()
         {
-            MaxVersions = 10;
+            MaxVersions = null;
         }
     }
 
@@ -210,8 +223,20 @@ namespace TicTack
         // USN only: skip journal records whose parent dir is outside the
         // watched tree before any path resolve (volume-wide journal tax).
         // UnderWatch stays the authority, so false entries only cost
-        // resolves, never wrong events. Default on.
+        // resolves, never wrong events. Default on. Doubles as the
+        // membership signal for usn_resolve_gap: with the prefilter off,
+        // tree-deletes lose their gap signal (parity still covers them).
         public bool UsnParentPrefilter { get; set; }
+        // USN only: fire a rate-limited covering gap when a delete's
+        // tracked parent no longer resolves (tree-delete safety net:
+        // without it the unnamed deletes linger silently until parity).
+        // Default on; set false if pathological churn causes scan spam.
+        public bool UsnResolveGap { get; set; }
+        // USN only: persist (journal id, cursor) across restarts so startup
+        // replays the offline journal window instead of depending solely on
+        // the initial walk. Best-effort and bounded (100k records / 60s);
+        // any failure falls back to head + walk. Default on.
+        public bool UsnCheckpoint { get; set; }
         // Composite-only: also tap the NTFS USN journal as a third member.
         // Ignored for watcher/usn/polling types. Windows-only; on other
         // platforms or without elevation the member probe-skips with a warn.
@@ -232,6 +257,8 @@ namespace TicTack
             RestartDelaySeconds = 10;
             UsnPollIntervalMs = 200;
             UsnParentPrefilter = true;
+            UsnResolveGap = true;
+            UsnCheckpoint = true;
             Usn = false;
             PollingBackstop = true;
         }
@@ -261,6 +288,8 @@ namespace TicTack
         public string? Time { get; set; }
         public string? Command { get; set; }
         public string? WorkingDir { get; set; }
+        // 0 = unset: the scheduler resolves jobs_defaults.timeout_minutes,
+        // else 10. Negative is invalid (job skipped with a warning).
         public int TimeoutMinutes { get; set; }
         // Cadence: daily (default) | weekly | monthly. Weekly needs Day as a
         // weekday name (Monday-Sunday); monthly needs Day as 1-31 (clamped to
@@ -269,11 +298,48 @@ namespace TicTack
         public string? Schedule { get; set; }
         public string? Day { get; set; }
         public string? RunOnceOn { get; set; }
+        // Interval trigger ("6h", "15m", "30s", "1d"): fires every span after
+        // the previous run finished. Never combined with schedule/day/time/
+        // run_once_on — a job is calendar, one-shot, or interval.
+        public string? Every { get; set; }
+        // Weekly mask ("days: [mon, wed, fri]"): fires on each listed weekday.
+        // Only valid with schedule weekly; mutually exclusive with day.
+        public List<string> Days { get; set; }
+        // Missed-run policy: catch_up | skip. Falls back to
+        // jobs_defaults.missed_run, else catch_up (today's behavior).
+        public string? MissedRun { get; set; }
+        // Overlap policy: skip (stand down while the previous run is active)
+        // or queue (wait, then run). Default skip.
+        public string? Overlap { get; set; }
+        // Jitter ("15m"): random 0..span delay before each fire so jobs do
+        // not align into I/O storms at boot or midnight.
+        public string? Jitter { get; set; }
+        // Hooks: pre_command gates the run (non-zero skips the main command),
+        // post_command runs after the main command whenever it ran,
+        // on_failure runs when pre or main fails. Same working dir, same
+        // {source} substitution, each with the full timeout budget.
+        public string? PreCommand { get; set; }
+        public string? PostCommand { get; set; }
+        public string? OnFailure { get; set; }
+        // Laptop trio: idle CPU priority, skip while on battery, hold a
+        // sleep inhibitor for the run. All default false.
+        public bool LowPriority { get; set; }
+        public bool OnAcOnly { get; set; }
+        public bool PreventSleep { get; set; }
 
         public JobConfig()
         {
-            TimeoutMinutes = 10;
+            TimeoutMinutes = 0;
+            Days = new List<string>();
         }
+    }
+
+    // Shared job defaults: per-job values override these. Only the keys worth
+    // sharing live here — triggers and commands stay per job.
+    public class JobsDefaultsConfig
+    {
+        public string? MissedRun { get; set; }
+        public int? TimeoutMinutes { get; set; }
     }
 
     public class WatchdogConfig
@@ -574,5 +640,47 @@ namespace TicTack
 
         static string? NormalizeVerification(string? value) =>
             value != null ? value.ToLowerInvariant().Replace("_", "").Replace("-", "") : null;
+
+        // Duration spelling shared by every/keep_within/jitter: "30s", "15m",
+        // "6h", "30d", compounds ("1h30m"), optional whitespace. A bare number
+        // is rejected — the unit is the documentation. Zero ("0s") is valid
+        // (means off); negatives are rejected.
+        public static bool TryParseDuration(string? value, out TimeSpan duration)
+        {
+            duration = TimeSpan.Zero;
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            var s = value.Trim().ToLowerInvariant();
+            if (s.StartsWith('-')) return false;
+            long totalSeconds = 0;
+            int i = 0, parsed = 0;
+            while (i < s.Length)
+            {
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                int numStart = i;
+                while (i < s.Length && char.IsDigit(s[i])) i++;
+                if (i == numStart) return false;
+                if (!long.TryParse(s.Substring(numStart, i - numStart), out var num)) return false;
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                int unitStart = i;
+                while (i < s.Length && char.IsLetter(s[i])) i++;
+                if (i == unitStart) return false;
+                var unit = s.Substring(unitStart, i - unitStart);
+                long mult = unit switch
+                {
+                    "s" or "sec" or "secs" or "second" or "seconds" => 1,
+                    "m" or "min" or "mins" or "minute" or "minutes" => 60,
+                    "h" or "hr" or "hrs" or "hour" or "hours" => 3600,
+                    "d" or "day" or "days" => 86400,
+                    _ => -1,
+                };
+                if (mult < 0) return false;
+                totalSeconds += num * mult;
+                parsed++;
+                if (totalSeconds > 3660L * 86400) return false; // >10y: typo guard
+            }
+            if (parsed == 0) return false;
+            duration = TimeSpan.FromSeconds(totalSeconds);
+            return true;
+        }
     }
 }

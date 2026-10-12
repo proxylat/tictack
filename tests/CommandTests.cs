@@ -147,4 +147,68 @@ public class CommandTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    [Fact]
+    public async Task DeferredCancel_Alias_ClearsHoldsKeepsFiles()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-deferredcli-" + Guid.NewGuid().ToString("N"));
+        var source = Path.Combine(root, "a", "Desktop");
+        Directory.CreateDirectory(source);
+        try
+        {
+            var src = new SourceConfig { Path = source, Destination = Path.Combine(root, "dst") };
+            var stem = Program.DeferredFilePrefix(src);
+            using (var dd = new DeferredDeletion(root, stem, 7, new RecordingLogger()))
+                dd.RecordPending(new List<string> { Path.Combine(source, "x.txt") }, source);
+
+            var log = new RecordingLogger();
+            var rc = await Program.RunDeferredAsync(DeferredCfg(Path.Combine(root, "tictack.log"), src), log, false, "--deferred-cancel", stem);
+            Assert.Equal(0, rc);
+            Assert.Contains(log.Messages, m => m.Contains("kept"));
+            using var dd2 = new DeferredDeletion(root, stem, 7, new RecordingLogger());
+            Assert.False(dd2.HasPending);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task DeferredCheck_WithHolds_ReturnsZeroAndKeepsHold()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-deferredcli-" + Guid.NewGuid().ToString("N"));
+        var source = Path.Combine(root, "a", "Desktop");
+        Directory.CreateDirectory(source);
+        try
+        {
+            var src = new SourceConfig { Path = source, Destination = Path.Combine(root, "dst") };
+            var stem = Program.DeferredFilePrefix(src);
+            using (var dd = new DeferredDeletion(root, stem, 7, new RecordingLogger()))
+                dd.RecordPending(new List<string> { Path.Combine(source, "x.txt") }, source);
+
+            var log = new RecordingLogger();
+            var rc = await Program.RunDeferredAsync(DeferredCfg(Path.Combine(root, "tictack.log"), src), log, false, "--deferred-check", stem);
+            Assert.Equal(0, rc);
+            using var dd2 = new DeferredDeletion(root, stem, 7, new RecordingLogger());
+            Assert.True(dd2.HasPending);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task DeferredCheck_NoHolds_ReportsEmpty()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tictack-deferredcli-" + Guid.NewGuid().ToString("N"));
+        var source = Path.Combine(root, "a", "Desktop");
+        Directory.CreateDirectory(source);
+        try
+        {
+            var src = new SourceConfig { Path = source, Destination = Path.Combine(root, "dst") };
+            var stem = Program.DeferredFilePrefix(src);
+
+            var log = new RecordingLogger();
+            var rc = await Program.RunDeferredAsync(DeferredCfg(Path.Combine(root, "tictack.log"), src), log, false, "--deferred-check", stem);
+            Assert.Equal(0, rc);
+            Assert.Contains(log.Messages, m => m.Contains("No deferred holds"));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }

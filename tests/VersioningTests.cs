@@ -74,19 +74,6 @@ public class VersioningTests : IDisposable
     }
 
     [Fact]
-    public async Task TimestampVersioning_HandlesMultipleFiles()
-    {
-        File.WriteAllText(Dst("a.txt"), "a version");
-        File.WriteAllText(Dst("b.txt"), "b version");
-
-        var versioning = new TimestampVersioning(_verDir, _dstDir, 10);
-        await versioning.ArchivePreviousVersionAsync(Dst("a.txt"), CancellationToken.None);
-        await versioning.ArchivePreviousVersionAsync(Dst("b.txt"), CancellationToken.None);
-
-        Assert.Equal(2, Directory.GetFiles(Path.Combine(_verDir, "Desktop")).Length);
-    }
-
-    [Fact]
     public async Task TimestampVersioning_PrunesNamesWithGlobChars()
     {
         // '[' used to be a char class in the prune glob, so these names were

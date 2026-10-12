@@ -7,6 +7,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # Elevated Windows tests self-skip without this (they also need a
+  # registered TicTackSv EventLog source + readable Application channel,
+  # probed at runtime). Harmless elsewhere: those tests skip off-Windows.
+  TICTACK_ELEVATED_TESTS: '1'
+
 jobs:
   test:
     strategy:
@@ -26,6 +32,9 @@ jobs:
           dotnet restore tests/TicTack.Tests.csproj
       - name: Build application
         run: dotnet build src/TicTack.csproj --configuration Release --no-restore
+      - name: Register EventLog source for elevated tests
+        if: matrix.os == 'windows-latest'
+        run: New-EventLog -LogName Application -Source TicTackSv -ErrorAction SilentlyContinue
       - name: Run tests
         shell: bash
         run: |
@@ -96,6 +105,8 @@ jobs:
           dotnet-version: 10.0.x
       - name: Restore
         run: dotnet restore tests/TicTack.Tests.csproj
+      - name: Register EventLog source for elevated tests
+        run: New-EventLog -LogName Application -Source TicTackSv -ErrorAction SilentlyContinue
       - name: Run Windows integration tests
         run: dotnet test tests/TicTack.Tests.csproj --configuration Release --no-restore --filter "Category=Windows" --blame-hang --blame-hang-timeout 180000 --blame-hang-dump-type mini
       - name: Analyze hang dumps

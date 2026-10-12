@@ -47,6 +47,39 @@ namespace TicTack
             }
         }
 
+        // Full-timestamp siblings for interval jobs: sub-daily cadences need
+        // time-of-day precision the date-only stamps above cannot hold. Same
+        // column (TEXT), longer format; the date readers still parse these
+        // rows (they truncate to .Date), so mixed use is safe.
+        public DateTime? GetLastRunAt(string name)
+        {
+            lock (_lock)
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT last_run FROM job_runs WHERE name = @n";
+                    cmd.Parameters.AddWithValue("@n", name);
+                    var r = cmd.ExecuteScalar();
+                    if (r == null || r is DBNull) return null;
+                    return DateTime.TryParse((string)r, out var d) ? d : (DateTime?)null;
+                }
+            }
+        }
+
+        public void SetLastRunAt(string name, DateTime stamp)
+        {
+            lock (_lock)
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = "INSERT OR REPLACE INTO job_runs (name, last_run) VALUES (@n, @d)";
+                    cmd.Parameters.AddWithValue("@n", name);
+                    cmd.Parameters.AddWithValue("@d", stamp.ToString("yyyy-MM-dd HH:mm:ss"));
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+
         // Integer counters sharing the same store (scrub shard index).
         // The table self-migrates: no bootstrap change needed.
         public int GetCounter(string name)

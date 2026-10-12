@@ -55,6 +55,16 @@ public class PipelineTests : IDisposable
         }
     }
 
+    private static async Task WaitForAsync(Func<Task<bool>> cond, string what)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!await cond())
+        {
+            if (DateTime.UtcNow > deadline) throw new TimeoutException("Timed out waiting for " + what);
+            await Task.Delay(20);
+        }
+    }
+
     [Fact]
     public async Task Start_Twice_OnlyStartsOnce()
     {
@@ -69,20 +79,20 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void Created_CopiesValidatesAndUpdatesState()
+    public async Task Created_CopiesValidatesAndUpdatesState()
     {
         var file = Path.Combine(_srcDir, "a.txt");
         File.WriteAllText(file, "x");
         _monitor.Fire(ChangeType.Created, file);
 
-        WaitFor(() => _db.LoadAll().ContainsKey("a.txt"), "state update");
+        await WaitForAsync(async () => await _db.GetSizeAsync("a.txt") != null, "state update");
 
         Assert.Equal(Path.Combine(_dstDir, "a.txt"), _copy.Calls.Single().DestPath);
         Assert.Equal(1, _validator.Calls);
     }
 
     [Fact]
-    public void Created_UsesFreshSnapshotAfterCopy()
+    public async Task Created_UsesFreshSnapshotAfterCopy()
     {
         var file = Path.Combine(_srcDir, "fresh.txt");
         var changed = false;
@@ -96,14 +106,14 @@ public class PipelineTests : IDisposable
         File.WriteAllText(file, "x");
         _monitor.Fire(ChangeType.Created, file);
 
-        WaitFor(() => _db.LoadAll().ContainsKey("fresh.txt"), "fresh state update");
+        await WaitForAsync(async () => await _db.GetSizeAsync("fresh.txt") != null, "fresh state update");
 
         Assert.Equal(2, _validator.LastSnapshot?.Length);
-        Assert.Equal(2, _db.LoadAll()["fresh.txt"].size);
+        Assert.Equal(2L, await _db.GetSizeAsync("fresh.txt"));
     }
 
     [Fact]
-    public void Created_WhenComparerEqual_SkipsCopy()
+    public async Task Created_WhenComparerEqual_SkipsCopy()
     {
         var file = Path.Combine(_srcDir, "same.txt");
         File.WriteAllText(file, "x");
@@ -114,14 +124,14 @@ public class PipelineTests : IDisposable
         _monitor.Fire(ChangeType.Created, control);
 
         // The control file must copy: proves the pipeline processed events promptly.
-        WaitFor(() => _db.LoadAll().ContainsKey("control.txt"), "control copy");
+        await WaitForAsync(async () => await _db.GetSizeAsync("control.txt") != null, "control copy");
 
         Assert.DoesNotContain(_copy.Calls, c => c.DestPath.EndsWith("same.txt"));
-        Assert.False(_db.LoadAll().ContainsKey("same.txt"));
+        Assert.Null(await _db.GetSizeAsync("same.txt"));
     }
 
     [Fact]
-    public void CopyFailure_LogsError_AndDoesNotUpdateState()
+    public async Task CopyFailure_LogsError_AndDoesNotUpdateState()
     {
         using var failingPipeline = new SyncPipeline(
             new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
@@ -136,7 +146,7 @@ public class PipelineTests : IDisposable
 
         WaitFor(() => _log.Messages.Any(m => m.StartsWith("ERR:Copy failed")), "error log");
 
-        Assert.Empty(_db.LoadAll());
+        Assert.Equal(0L, await _db.CountAsync());
     }
 
     [Fact]
@@ -149,7 +159,7 @@ public class PipelineTests : IDisposable
             File.WriteAllText(p, "x");
             _monitor.Fire(ChangeType.Created, p);
         }
-        WaitFor(() => _db.LoadAll().Count >= 3, "seed sync");
+        await WaitForAsync(async () => await _db.CountAsync() >= 3, "seed sync");
 
         // The gap the Modified-only watcher rescan cannot see: a delete
         // plus a create with no events fired for either.
@@ -175,13 +185,13 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void Deleted_InvokesDeletionStrategy_AndRemovesState()
+    public async Task Deleted_InvokesDeletionStrategy_AndRemovesState()
     {
-        _db.Upsert("gone.txt", 1, 1);
+        await _db.UpsertAsync("gone.txt", 1, 1);
         var file = Path.Combine(_srcDir, "gone.txt");
         _monitor.Fire(ChangeType.Deleted, file);
 
-        WaitFor(() => !_db.LoadAll().ContainsKey("gone.txt"), "state removal");
+        await WaitForAsync(async () => await _db.GetSizeAsync("gone.txt") == null, "state removal");
 
         Assert.Equal((file, Path.Combine(_dstDir, "gone.txt")), _deletion.Calls.Single());
     }
@@ -198,7 +208,7 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void Created_WhenSourceVanished_RemovesDestAndStateRow()
+    public async Task Created_WhenSourceVanished_RemovesDestAndStateRow()
     {
         // A Created/Modified event whose source is already gone must delete the
         // destination through TrackedDeleter, so the stale state row cannot
@@ -207,50 +217,50 @@ public class PipelineTests : IDisposable
         var srcPath = Path.Combine(_srcDir, rel);
         var destPath = Path.Combine(_dstDir, rel);
         File.WriteAllText(destPath, "orphan");
-        _db.Upsert(rel, 6, 1);
+        await _db.UpsertAsync(rel, 6, 1);
 
         _monitor.Fire(ChangeType.Created, srcPath);
 
-        WaitFor(() => !_db.LoadAll().ContainsKey(rel), "state row removal");
+        await WaitForAsync(async () => await _db.GetSizeAsync(rel) == null, "state row removal");
 
         Assert.Equal((srcPath, destPath), _deletion.Calls.Single());
         Assert.False(File.Exists(destPath));
     }
 
     [Fact]
-    public void Renamed_MovesDestFile_AndUpdatesState()
+    public async Task Renamed_MovesDestFile_AndUpdatesState()
     {
         var oldSrc = Path.Combine(_srcDir, "old.txt");
         var newSrc = Path.Combine(_srcDir, "new.txt");
         File.WriteAllText(newSrc, "x");
         var oldDest = Path.Combine(_dstDir, "old.txt");
         File.WriteAllText(oldDest, "x");
-        _db.Upsert("old.txt", 1, 1);
+        await _db.UpsertAsync("old.txt", 1, 1);
 
         _monitor.Fire(ChangeType.Renamed, newSrc, oldSrc);
 
-        WaitFor(() => _db.LoadAll().ContainsKey("new.txt"), "state rename");
+        await WaitForAsync(async () => await _db.GetSizeAsync("new.txt") != null, "state rename");
 
         var call = _rename.Calls.Single();
         Assert.Equal(oldDest, call.OldDestPath);
         Assert.Equal(Path.Combine(_dstDir, "new.txt"), call.DestPath);
-        Assert.False(_db.LoadAll().ContainsKey("old.txt"));
+        Assert.Null(await _db.GetSizeAsync("old.txt"));
     }
 
     [Fact]
-    public void Renamed_WhenTargetDisappears_SkipsStateMetadataWithoutError()
+    public async Task Renamed_WhenTargetDisappears_SkipsStateMetadataWithoutError()
     {
         var oldSrc = Path.Combine(_srcDir, "old.txt");
         var newSrc = Path.Combine(_srcDir, "new.txt");
-        _db.Upsert("old.txt", 1, 1);
+        await _db.UpsertAsync("old.txt", 1, 1);
 
         _monitor.Fire(ChangeType.Renamed, newSrc, oldSrc);
 
         WaitFor(() => _log.Messages.Any(m => m.Contains("Renamed: " + oldSrc)), "rename processing");
 
         Assert.DoesNotContain(_log.Messages, m => m.StartsWith("ERR:Processing"));
-        Assert.False(_db.LoadAll().ContainsKey("old.txt"));
-        Assert.False(_db.LoadAll().ContainsKey("new.txt"));
+        Assert.Null(await _db.GetSizeAsync("old.txt"));
+        Assert.Null(await _db.GetSizeAsync("new.txt"));
     }
 
     [Fact]
@@ -273,7 +283,7 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void Created_ExcludedPattern_IsNotCopied()
+    public async Task Created_ExcludedPattern_IsNotCopied()
     {
         _pipeline.Dispose();
         StartPipeline(c => c.Filter.Exclude.Add("*.tmp"));
@@ -286,7 +296,7 @@ public class PipelineTests : IDisposable
         _monitor.Fire(ChangeType.Created, control);
 
         // The control file must copy: proves the pipeline processed events promptly.
-        WaitFor(() => _db.LoadAll().ContainsKey("ok.txt"), "control copy");
+        await WaitForAsync(async () => await _db.GetSizeAsync("ok.txt") != null, "control copy");
 
         Assert.DoesNotContain(_copy.Calls, c => c.DestPath.EndsWith("skip.tmp"));
     }
@@ -418,13 +428,13 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void DeleteThreshold_Size_BlocksBatch()
+    public async Task DeleteThreshold_Size_BlocksBatch()
     {
         _pipeline.Dispose();
         StartPipeline(c => c.Sync.DeleteThresholdSizeGb = 1);
 
         // Sizes come from the state DB, so no real 2 GB file is needed.
-        _db.Upsert("big.bin", 2L * 1024 * 1024 * 1024, DateTime.UtcNow.Ticks);
+        await _db.UpsertAsync("big.bin", 2L * 1024 * 1024 * 1024, DateTime.UtcNow.Ticks);
         var dest = Path.Combine(_dstDir, "big.bin");
         File.WriteAllText(dest, "small");
         _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "big.bin"));
@@ -436,7 +446,7 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void DeleteThreshold_Percent_BlocksAboveFloor()
+    public async Task DeleteThreshold_Percent_BlocksAboveFloor()
     {
         _pipeline.Dispose();
         // DeleteThresholdSizeGb keeps its 50 GB default: the percent branch
@@ -444,7 +454,7 @@ public class PipelineTests : IDisposable
         StartPipeline(c => c.Sync.DeleteThresholdPercent = 1);
 
         for (int i = 0; i < 51; i++)
-            _db.Upsert($"p{i}.txt", 1, 1);
+            await _db.UpsertAsync($"p{i}.txt", 1, 1);
         var dest = Path.Combine(_dstDir, "p0.txt");
         File.WriteAllText(dest, "x");
         _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "p0.txt"));
@@ -456,27 +466,27 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void DeleteThreshold_Percent_FloorLetsSmallStateThrough()
+    public async Task DeleteThreshold_Percent_FloorLetsSmallStateThrough()
     {
         _pipeline.Dispose();
         StartPipeline(c => c.Sync.DeleteThresholdPercent = 1);
 
         for (int i = 0; i < 50; i++)
-            _db.Upsert($"q{i}.txt", 1, 1);
+            await _db.UpsertAsync($"q{i}.txt", 1, 1);
         _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "q0.txt"));
 
         WaitFor(() => _deletion.Calls.Count == 1, "deletion");
     }
 
     [Fact]
-    public void DeleteThreshold_Percent_ExactBoundaryBlocks()
+    public async Task DeleteThreshold_Percent_ExactBoundaryBlocks()
     {
         _pipeline.Dispose();
         // 1/64*100 is exactly 1.5625 in binary: >= blocks, > would not.
         StartPipeline(c => c.Sync.DeleteThresholdPercent = 1.5625);
 
         for (int i = 0; i < 64; i++)
-            _db.Upsert($"r{i}.txt", 1, 1);
+            await _db.UpsertAsync($"r{i}.txt", 1, 1);
         _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, "r0.txt"));
 
         WaitFor(() => _log.Messages.Any(m => m.Contains("Delete guard")), "guard");
@@ -485,7 +495,7 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void DeleteThreshold_Percent_StaleBaselineFlagsSuspect()
+    public async Task DeleteThreshold_Percent_StaleBaselineFlagsSuspect()
     {
         _pipeline.Dispose();
         StartPipeline(c => c.DebounceSeconds = 0.5);
@@ -494,7 +504,7 @@ public class PipelineTests : IDisposable
         // (dead rows accumulate via renames/orphans). Still fails closed,
         // but the log must say the baseline is suspect, not print 116%.
         for (int i = 0; i < 60; i++)
-            _db.Upsert($"s{i}.txt", 1, 1);
+            await _db.UpsertAsync($"s{i}.txt", 1, 1);
         for (int i = 0; i < 70; i++)
             _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, $"ghost{i}.txt"));
 
@@ -527,7 +537,7 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void DeleteThreshold_LocalizedBatch_ProceedsAsCleanup()
+    public async Task DeleteThreshold_LocalizedBatch_ProceedsAsCleanup()
     {
         _pipeline.Dispose();
         StartPipeline(c =>
@@ -544,7 +554,7 @@ public class PipelineTests : IDisposable
         Directory.CreateDirectory(Path.Combine(_dstDir, sub));
         for (int i = 0; i < 12; i++)
         {
-            _db.Upsert(Path.Combine(sub, $"f{i}.txt"), 1, 1);
+            await _db.UpsertAsync(Path.Combine(sub, $"f{i}.txt"), 1, 1);
             File.WriteAllText(Path.Combine(_dstDir, sub, $"f{i}.txt"), "x");
         }
         for (int i = 0; i < 12; i++)
@@ -558,7 +568,7 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
-    public void DeleteThreshold_ScatteredBatch_HoldsWithWarn()
+    public async Task DeleteThreshold_ScatteredBatch_HoldsWithWarn()
     {
         _pipeline.Dispose();
         StartPipeline(c =>
@@ -576,7 +586,7 @@ public class PipelineTests : IDisposable
             Directory.CreateDirectory(Path.Combine(_dstDir, sub));
             for (int i = 0; i < 2; i++)
             {
-                _db.Upsert(Path.Combine(sub, $"f{i}.txt"), 1, 1);
+                await _db.UpsertAsync(Path.Combine(sub, $"f{i}.txt"), 1, 1);
                 File.WriteAllText(Path.Combine(_dstDir, sub, $"f{i}.txt"), "x");
                 _monitor.Fire(ChangeType.Deleted, Path.Combine(_srcDir, sub, $"f{i}.txt"));
             }

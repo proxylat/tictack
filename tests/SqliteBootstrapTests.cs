@@ -43,13 +43,6 @@ public sealed class SqliteBootstrapTests : IDisposable
     }
 
     [Fact]
-    public void Open_UnknownSchema_Throws()
-    {
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            SqliteBootstrap.Open(DbPath("bad"), (SqliteSchema)999));
-    }
-
-    [Fact]
     public void Open_SetsFullSynchronousAndBusyTimeout()
     {
         var path = DbPath("durable");

@@ -12,23 +12,18 @@ public sealed class SerialConsoleCollection { }
 public class LoggingTests
 {
     [Theory]
-    [InlineData("debug", LogLevel.Debug)]
-    [InlineData("info", LogLevel.Info)]
-    [InlineData("warn", LogLevel.Warn)]
-    [InlineData("warning", LogLevel.Warn)]
-    [InlineData("error", LogLevel.Error)]
-    [InlineData(null, LogLevel.Info)]
-    [InlineData("unknown", LogLevel.Info)]
-    [InlineData("", LogLevel.Info)]
-    public void LogLevelParser_ParsesCorrectly(string? input, LogLevel expected)
+    [InlineData("debug", LogLevel.Info, LogLevel.Debug)]
+    [InlineData("info", LogLevel.Info, LogLevel.Info)]
+    [InlineData("warn", LogLevel.Info, LogLevel.Warn)]
+    [InlineData("warning", LogLevel.Info, LogLevel.Warn)]
+    [InlineData("error", LogLevel.Info, LogLevel.Error)]
+    [InlineData(null, LogLevel.Info, LogLevel.Info)]
+    [InlineData("unknown", LogLevel.Info, LogLevel.Info)]
+    [InlineData("", LogLevel.Info, LogLevel.Info)]
+    [InlineData(null, LogLevel.Debug, LogLevel.Debug)]
+    public void LogLevelParser_ParsesCorrectly(string? input, LogLevel defaultLevel, LogLevel expected)
     {
-        Assert.Equal(expected, LogLevelParser.Parse(input));
-    }
-
-    [Fact]
-    public void LogLevelParser_UsesDefault()
-    {
-        Assert.Equal(LogLevel.Debug, LogLevelParser.Parse(null, LogLevel.Debug));
+        Assert.Equal(expected, LogLevelParser.Parse(input, defaultLevel));
     }
 
     [Fact]
@@ -196,5 +191,83 @@ public class LoggingTests
             Assert.Contains("buffered message", File.ReadAllText(path));
         }
         finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void FileLogger_CollapsesConsecutiveRepeats()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            using var logger = new FileLogger(path, LogLevel.Debug);
+            logger.Warn("same storm");
+            logger.Warn("same storm");
+            logger.Warn("same storm");
+            logger.Info("after");
+
+            var content = File.ReadAllText(path);
+            // First occurrence + one closing count line; the two middle
+            // repeats never hit disk.
+            Assert.Equal(2, Regex.Matches(content, "same storm").Count);
+            Assert.Contains("(repeated 2x)", content);
+            Assert.Contains("after", content);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void FileLogger_FlushesStreakOnDispose()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var logger = new FileLogger(path, LogLevel.Debug))
+            {
+                logger.Warn("tail storm");
+                logger.Warn("tail storm");
+            }
+            Assert.Contains("(repeated 1x)", File.ReadAllText(path));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void DailyBackupLogger_SameDay_AppendsWithoutRolling()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            var logger = new DailyBackupLogger(path, LogLevel.Info);
+            logger.Info("a");
+            logger.Info("b");
+
+            Assert.False(File.Exists(path + ".1"));
+            var content = File.ReadAllText(path);
+            Assert.Contains("a", content);
+            Assert.Contains("b", content);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void DailyBackupLogger_NewDay_RollsPreviousToBackup()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_bak_" + Guid.NewGuid());
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "tictack.log.bak");
+        try
+        {
+            File.WriteAllText(path, "yesterday\n");
+            File.SetLastWriteTime(path, DateTime.Now.AddDays(-1));
+
+            var logger = new DailyBackupLogger(path, LogLevel.Info);
+            logger.Info("today");
+
+            Assert.True(File.Exists(path + ".1"));
+            Assert.Contains("yesterday", File.ReadAllText(path + ".1"));
+            Assert.Contains("today", File.ReadAllText(path));
+            Assert.DoesNotContain("yesterday", File.ReadAllText(path));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 }

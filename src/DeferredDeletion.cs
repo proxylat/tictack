@@ -473,36 +473,6 @@ namespace TicTack
             }
         }
 
-        // Small-scale/test compat: warnings plus a full drain. Production
-        // uses CheckWarnings + TakeExpiredChunk in a loop instead. Confirms
-        // everything it drains so the store empties like the old
-        // delete-at-claim behavior did.
-        public DeferredAction Check()
-        {
-            var waiting = CheckWarnings() == DeferredActionType.Waiting;
-            var proceed = new List<string>();
-            var cancelled = 0;
-            while (true)
-            {
-                var chunk = TakeExpiredChunk(ChunkSize);
-                proceed.AddRange(chunk.Files);
-                cancelled += chunk.Cancelled;
-                var toConfirm = new List<string>(chunk.Files.Count + chunk.CancelledPaths.Count);
-                toConfirm.AddRange(chunk.Files);
-                toConfirm.AddRange(chunk.CancelledPaths);
-                if (toConfirm.Count > 0)
-                    ConfirmClaimed(toConfirm);
-                if (chunk.Files.Count == 0) break;
-            }
-            if (proceed.Count > 0)
-                return new DeferredAction { Type = DeferredActionType.Proceed, Files = proceed };
-            if (waiting)
-                return new DeferredAction { Type = DeferredActionType.Waiting };
-            if (cancelled > 0)
-                return new DeferredAction { Type = DeferredActionType.Cancel, Files = new List<string>() };
-            return new DeferredAction { Type = DeferredActionType.None };
-        }
-
         public bool HasPending
         {
             get { lock (_lock) { return _hasPending; } }
@@ -924,12 +894,6 @@ namespace TicTack
         public DateTime BlockedAt;
         public DateTime LastWarningAt;
         public int Files;
-    }
-
-    public class DeferredAction
-    {
-        public DeferredActionType Type { get; set; }
-        public List<string>? Files { get; set; }
     }
 
     public enum DeferredActionType

@@ -39,6 +39,9 @@ namespace TicTack
         private int _scanRunning;
         private readonly List<Task> _deferredTasks = new List<Task>();
         private readonly object _taskLock = new object();
+        // Re-arm floor when a deferred-check attempt made no progress: without
+        // it a held exclusive lock plus a past-due deadline spins the timer.
+        private static readonly TimeSpan DeferredRetryBackoff = TimeSpan.FromSeconds(60);
         private Timer? _startRetryTimer;
         private Timer? _deferredCheckTimer;
         private SrcLock? _lock;
@@ -155,7 +158,7 @@ namespace TicTack
                 syncCfg != null && syncCfg.SpikeRenames > 0 ? syncCfg.SpikeRenames : 10000,
                 _log, null,
                 () => !_churnArmed || (_initialSync != null && !_initialSync.IsCompleted));
-            _deletions = new DeletionGuard(_config, stateDb, _deleter, _deferred, log, ArmDeferredCheckTimer, _churn);
+            _deletions = new DeletionGuard(_config, stateDb, _deleter, _deferred, log, () => ArmDeferredCheckTimer(), _churn);
             // Own cadence file, not the scheduler's jobs.db: keyed per source
             // like the state DB name. Carries the full-verify stamp and the
             // scrub shard index. Failures fall back to always-verify.
@@ -424,7 +427,7 @@ namespace TicTack
         private async Task<bool> ScanAndSyncAsync(string reason)
         {
             if (!_directoryExists(_config.Path)) return false;
-            // No snapshot: per-file point lookups via TryGetStateAsync keep
+            // No snapshot: batched point lookups via GetStatesAsync keep
             // startup memory flat no matter how large the state table grows.
             var sourcePaths = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
             var pendingState = new List<(string path, long size, long mtime, string? fileId, long ctime, string? hash)>();
@@ -1246,7 +1249,9 @@ namespace TicTack
         // One-shot deadline timer: fires once at the next hold expiry or
         // due daily warning, then re-arms. Nothing pending means disarmed —
         // zero wake-ups, zero scans, zero disk writes while waiting.
-        private void ArmDeferredCheckTimer()
+        // minDelay floors the re-arm so a failed attempt (e.g. the exclusive
+        // sweep could not get the lock) cannot re-arm at zero and spin.
+        private void ArmDeferredCheckTimer(TimeSpan minDelay = default)
         {
             lock (_taskLock)
             {
@@ -1259,8 +1264,7 @@ namespace TicTack
                     try { _deferredCheckTimer?.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
                     return;
                 }
-                var delay = due.Value - DateTime.UtcNow;
-                if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
+                var delay = ClampReArmDelay(due.Value, DateTime.UtcNow, minDelay);
                 if (_deferredCheckTimer == null)
                     _deferredCheckTimer = new Timer(_ => CheckDeferredDeletions(), null, delay, Timeout.InfiniteTimeSpan);
                 else
@@ -1270,6 +1274,15 @@ namespace TicTack
             }
         }
 
+        // Re-arm floor: a past-due deadline with no progress (minDelay > 0)
+        // must not return zero, or the timer fires immediately in a loop.
+        internal static TimeSpan ClampReArmDelay(DateTime due, DateTime now, TimeSpan minDelay)
+        {
+            var delay = due - now;
+            if (delay < minDelay) delay = minDelay;
+            return delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
+        }
+
         private void CheckDeferredDeletions()
         {
             lock (_taskLock)
@@ -1277,9 +1290,13 @@ namespace TicTack
                 if (_disposed || _cts == null || _cts.IsCancellationRequested) return;
                 var task = Task.Run(async () =>
                 {
-                    try { await CheckDeferredDeletionsAsync(); }
+                    var progressed = true;
+                    try { progressed = await CheckDeferredDeletionsAsync(); }
                     catch (Exception ex) { _log.Error("Deferred deletion check failed", ex); }
-                    finally { ArmDeferredCheckTimer(); }
+                    // No progress (lock held elsewhere / churn hold) must not
+                    // re-arm at zero: the due deadline is still in the past and
+                    // would fire again immediately, spinning this timer.
+                    finally { ArmDeferredCheckTimer(progressed ? TimeSpan.Zero : DeferredRetryBackoff); }
                 });
                 _deferredTasks.Add(task);
             }
@@ -1296,10 +1313,11 @@ namespace TicTack
             {
                 _lock?.Dispose();
                 _lock = null;
-                _lock = new SrcLock(path, _log, null, mode: LockMode.Exclusive);
+                _lock = new SrcLock(path, _log, null, mode: LockMode.Exclusive, quietFailure: true);
                 if (!_lock.IsHeld)
                 {
-                    _log.Warn("Exclusive lock unavailable, skipping destructive sweep");
+                    var who = _lock.BlockerSummary.Length > 0 ? _lock.BlockerSummary : "unknown";
+                    _log.Warn("Exclusive lock unavailable (held by: " + who + "), skipping destructive sweep");
                     return;
                 }
                 await work();
@@ -1320,20 +1338,23 @@ namespace TicTack
 
         // Expiry drains in bounded 500-path chunks so a 2M-file hold never
         // materializes a second in-memory list; warnings are metadata-only.
-        private async Task CheckDeferredDeletionsAsync()
+        // Returns false when nothing could be done (exclusive lock held, or a
+        // churn hold is active) so the caller can back off instead of hot-loop.
+        private async Task<bool> CheckDeferredDeletionsAsync()
         {
             _deferred.CheckWarnings();
             if (_churn.IsHeld())
             {
                 _log.Debug("Spike hold active, deferred drain paused");
-                return;
+                return false;
             }
             var (ran, total, cancelled) = await DrainExpiredAsync();
-            if (!ran) return;
+            if (!ran) return false;
             if (total > 0)
                 _log.Warn("Deferred deletion: proceeding with " + total + " files");
             else if (cancelled > 0)
                 _log.Info("Deferred deletion: cancelled, files reappeared");
+            return true;
         }
 
         // On-demand expiry drain for --deferred-approve: same bounded
