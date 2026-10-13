@@ -8,7 +8,8 @@ using TicTack;
 namespace Corpus
 {
     // System imaging CLI (system-image-future.md). Verbs: image a block
-    // source, export/verify/list snapshots, validate config.
+    // source, export/verify/list snapshots, build WinPE recovery media,
+    // restore a snapshot to a disk/file, list disks, validate config.
     static class Program
     {
         static int Main(string[] args)
@@ -25,6 +26,21 @@ namespace Corpus
             string? parentArg = null;
             var forceFull = false;
             var chain = false;
+            string? adkDir = null;
+            string? includeStore = null;
+            string? dbPath = null;
+            var drivers = new List<string>();
+            string? stagingDir = null;
+            string? usbDrive = null;
+            string? isoPath = null;
+            var initialize = false;
+            string? target = null;
+            string? storeFlag = null;
+            string? indexFlag = null;
+            string? confirmToken = null;
+            var allowBootDisk = false;
+            var skipVerify = false;
+            var dryRun = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -111,6 +127,60 @@ namespace Corpus
                     case "--chain":
                         chain = true;
                         break;
+                    case "--build-media":
+                        verb = "build-media";
+                        break;
+                    case "--restore":
+                        verb = "restore";
+                        break;
+                    case "--list-disks":
+                        verb = "list-disks";
+                        break;
+                    case "--adk":
+                        if (i + 1 < args.Length) adkDir = args[++i];
+                        break;
+                    case "--include-store":
+                        if (i + 1 < args.Length) includeStore = args[++i];
+                        break;
+                    case "--db":
+                        if (i + 1 < args.Length) dbPath = args[++i];
+                        break;
+                    case "--driver":
+                        if (i + 1 < args.Length) drivers.Add(args[++i]);
+                        break;
+                    case "--staging-dir":
+                        if (i + 1 < args.Length) stagingDir = args[++i];
+                        break;
+                    case "--usb":
+                        if (i + 1 < args.Length) usbDrive = args[++i];
+                        break;
+                    case "--iso":
+                        if (i + 1 < args.Length) isoPath = args[++i];
+                        break;
+                    case "--initialize":
+                        initialize = true;
+                        break;
+                    case "--target":
+                        if (i + 1 < args.Length) target = args[++i];
+                        break;
+                    case "--store":
+                        if (i + 1 < args.Length) storeFlag = args[++i];
+                        break;
+                    case "--index":
+                        if (i + 1 < args.Length) indexFlag = args[++i];
+                        break;
+                    case "--confirm-type":
+                        if (i + 1 < args.Length) confirmToken = args[++i];
+                        break;
+                    case "--allow-boot-disk":
+                        allowBootDisk = true;
+                        break;
+                    case "--skip-verify":
+                        skipVerify = true;
+                        break;
+                    case "--dry-run":
+                        dryRun = true;
+                        break;
                     default:
                         Console.Error.WriteLine("Unknown argument: " + args[i]);
                         PrintHelp();
@@ -134,6 +204,8 @@ namespace Corpus
                 {
                     case "vss-list":
                         return VssList(baseDir);
+                    case "list-disks":
+                        return RunListDisks(log);
                     case "vss-snap":
                     case "vss-read":
                     case "vss-dump":
@@ -243,6 +315,11 @@ namespace Corpus
                                 Console.WriteLine(id + (id == keys.CurrentKeyId ? " [current]" : ""));
                         }
                         return 0;
+                    case "build-media":
+                        MediaBuilder.Build(new MediaBuildOptions(adkDir, includeStore, dbPath, drivers.ToArray(), stagingDir, usbDrive, isoPath, initialize), log);
+                        return 0;
+                    case "restore":
+                        return RunRestore(cfg, baseDir, snapshotArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
                     default:
                         return 1;
                 }
@@ -281,6 +358,50 @@ namespace Corpus
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.ChunkMib, cfg.Compression.Level, log,
                 new KeyStore(cfg.StorePath));
+        }
+
+        private static int RunListDisks(ILogger log)
+        {
+            var disks = DiskInventory.ListDisks();
+            if (disks.Count == 0)
+                log.Info("no physical disks enumerated (Linux returns empty; on Windows run elevated)");
+            foreach (var d in disks)
+                Console.WriteLine(d.Number + " " + d.DevicePath + " " + d.Size + (d.IsBoot ? " boot" : ""));
+            return 0;
+        }
+
+        // --restore: --store wins, else the baked config; relative store
+        // paths resolve beside the exe (the stick's store_path is 'store').
+        // Index: --index, else the media db copy, else StateRoot. The id.key
+        // check runs BEFORE new Store — restore must never mint a key.
+        private static int RunRestore(CorpusConfig cfg, string baseDir, string? snapshotArg, string? target,
+            string? storeFlag, string? indexFlag, string? confirmToken, bool allowBootDisk, bool skipVerify, bool dryRun, ILogger log)
+        {
+            if (!TrySnapshot(snapshotArg, log, out var gen) || string.IsNullOrEmpty(target))
+            {
+                log.Error("--restore requires --snapshot <gen> --target <disk#|\\\\.\\PhysicalDriveN|file>");
+                return 1;
+            }
+            var storePath = !string.IsNullOrEmpty(storeFlag) ? storeFlag : cfg.StorePath;
+            if (string.IsNullOrEmpty(storePath))
+            {
+                log.Error("--restore needs --store <path> (or store_path in config)");
+                return 1;
+            }
+            if (!Path.IsPathRooted(storePath))
+                storePath = Path.GetFullPath(Path.Combine(baseDir, storePath));
+            if (!RestoreOrchestrator.HasIdentityKey(storePath))
+            {
+                log.Error($"no id.key in {storePath} (restore never creates one — check --store)");
+                return 1;
+            }
+            var mediaDb = Path.Combine(storePath, "corpus-chunks.db");
+            var indexPath = !string.IsNullOrEmpty(indexFlag) ? indexFlag
+                : File.Exists(mediaDb) ? mediaDb
+                : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, new KeyStore(storePath));
+            var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
+            return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
         }
 
         // Drive-letter-colon ("T:") images the live volume through VSS;
@@ -466,6 +587,11 @@ namespace Corpus
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
             Console.WriteLine("  --gen-key                              Generate an encryption key and activate it (existing snapshots stay as-is; only new images encrypt)");
             Console.WriteLine("  --key-list                             List encryption keys (\"<id> [current]\" lines)");
+            Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
+            Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
+            Console.WriteLine("  --list-disks                           List physical disks (Windows; empty on Linux)");
+            Console.WriteLine("  --restore --snapshot <gen> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
+            Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore a snapshot");
             Console.WriteLine("  --validate             Check config_corpus.yaml and exit");
             Console.WriteLine("  --config <path>        Config file (default: config_corpus.yaml beside the exe)");
             Console.WriteLine("  --version              Print version and exit");
@@ -474,6 +600,9 @@ namespace Corpus
             Console.WriteLine("  incrementals reuse the parent's clean chunks without re-reading; any doubt → full re-image");
             Console.WriteLine("  encryption covers new images only; existing snapshots stay as-is");
             Console.WriteLine("  keys are raw 32-byte files at keys/<keyid>.key, active key named by keys/current");
+            Console.WriteLine("  restore streams chunk-by-chunk, then re-reads the whole target to verify:");
+            Console.WriteLine("    wall time is ~2x sequential device speed; --confirm-type is required always");
+            Console.WriteLine("    (even --dry-run); a refused run names the want-TOKEN to re-run with");
         }
     }
 }

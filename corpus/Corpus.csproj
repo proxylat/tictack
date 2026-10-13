@@ -27,6 +27,9 @@
     <PackageReference Include="ZstdSharp" Version="0.7.2" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="recovery\assets\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- One-way source link: Corpus consumes TicTack utilities via the same
          Compile-Include pattern the test project uses. TicTack builds
          unchanged and never references Corpus. -->

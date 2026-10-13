@@ -31,6 +31,12 @@
     <Compile Include="../ChunkId.cs" Link="corpus/ChunkId.cs" />
     <Compile Include="../Compression.cs" Link="corpus/Compression.cs" />
     <Compile Include="../IBlockSource.cs" Link="corpus/IBlockSource.cs" />
+    <Compile Include="../IBlockTarget.cs" Link="corpus/IBlockTarget.cs" />
+    <Compile Include="../recovery/BootDiskGuard.cs" Link="corpus/recovery/BootDiskGuard.cs" />
+    <Compile Include="../recovery/DiskInventory.cs" Link="corpus/recovery/DiskInventory.cs" />
+    <Compile Include="../recovery/MediaBuilder.cs" Link="corpus/recovery/MediaBuilder.cs" />
+    <Compile Include="../recovery/MediaLayout.cs" Link="corpus/recovery/MediaLayout.cs" />
+    <Compile Include="../recovery/RestoreOrchestrator.cs" Link="corpus/recovery/RestoreOrchestrator.cs" />
     <Compile Include="../PackWriter.cs" Link="corpus/PackWriter.cs" />
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
     <Compile Include="../ChangeSource.cs" Link="corpus/ChangeSource.cs" />
@@ -43,6 +49,7 @@
     <Compile Include="../VolumeBitmap.cs" Link="corpus/VolumeBitmap.cs" />
     <Compile Include="../VssBlockSource.cs" Link="corpus/VssBlockSource.cs" />
     <Compile Include="../../src/Interfaces.cs" Link="shared/Interfaces.cs" />
+    <Compile Include="../../src/ProcessRunner.cs" Link="shared/ProcessRunner.cs" />
     <Compile Include="../../src/PathUtil.cs" Link="shared/PathUtil.cs" />
     <Compile Include="../../src/SqliteBootstrap.cs" Link="shared/SqliteBootstrap.cs" />
   </ItemGroup>

@@ -303,9 +303,9 @@ namespace Corpus
         public void Export(int generation, string outPath)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var manifest = LoadGeneration(generation);
+            var manifest = GetManifest(generation);
             using var output = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read);
-            WriteSnapshotToStream(manifest, output);
+            ExportToStream(generation, output);
             output.SetLength(manifest.VolumeLength);
             _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to {outPath}");
         }
@@ -316,16 +316,30 @@ namespace Corpus
         public void ExportVhdx(int generation, string outPath)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var manifest = LoadGeneration(generation);
-            VhdxExporter.Export(outPath, manifest.VolumeLength, content => WriteSnapshotToStream(manifest, content));
+            var manifest = GetManifest(generation);
+            VhdxExporter.Export(outPath, manifest.VolumeLength, content => ExportToStream(generation, content));
             _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to VHDX {outPath}");
         }
 
-        private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output)
+        // Manifest read for restore preflight/verify (HMAC-checked).
+        public SnapshotManifest GetManifest(int generation) => LoadGeneration(generation);
+
+        // Streamed export for restore: the same decoded bytes as Export,
+        // chunk by chunk, with cumulative logical-byte progress (holes
+        // included, so the final report equals VolumeLength).
+        public void ExportToStream(int generation, Stream output, IProgress<long>? progress = null)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(output);
+            WriteSnapshotToStream(LoadGeneration(generation), output, progress);
+        }
+
+        private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output, IProgress<long>? progress = null)
+        {
+            var reported = 0L;
             foreach (var entry in manifest.Chunks)
             {
-                if (entry.IsHole) { output.Seek(entry.Size, SeekOrigin.Current); continue; }
+                if (entry.IsHole) { output.Seek(entry.Size, SeekOrigin.Current); reported += entry.Size; progress?.Report(reported); continue; }
                 var digest = Convert.FromHexString(entry.DigestHex);
                 if (!_index.TryGet(digest, out var row))
                     throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
@@ -335,6 +349,8 @@ namespace Corpus
                     output.Seek(plain.Length, SeekOrigin.Current);
                 else
                     output.Write(plain, 0, plain.Length);
+                reported += plain.Length;
+                progress?.Report(reported);
             }
         }
 

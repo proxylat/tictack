@@ -22,3 +22,7 @@ logging:
   # Empty = corpus.log beside the exe.
   path: ''
   console: false
+
+# Restore (recovery stick): --restore --snapshot <gen> --target <disk#|\\.\PhysicalDriveN|file>
+# --confirm-type is required always (even --dry-run); a refused run names the want-TOKEN.
+# Baked stick configs use store_path 'store' (resolved beside Corpus.exe); any other store via --store <path>.
