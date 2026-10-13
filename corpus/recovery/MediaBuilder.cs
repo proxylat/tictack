@@ -64,7 +64,10 @@ namespace Corpus
                     var build = AdkBuild(adk);
                     if (build < MediaLayout.AdksMinBuild)
                         throw new InvalidDataException($"ADK build {build} is below the floor {MediaLayout.AdksMinBuild} — install the Windows 11 24H2+ ADK + WinPE add-on");
-                    var peWork = Directory.CreateTempSubdirectory("corpus-pe-").FullName;
+                    // copype refuses an existing destination: reserve the temp
+                    // NAME without creating it (CreateTempSubdirectory would
+                    // make copype fail every time).
+                    var peWork = Path.Combine(Path.GetTempPath(), "corpus-pe-" + Guid.NewGuid().ToString("N"));
                     try
                     {
                         RunCopype(adk, peWork, log);
@@ -384,7 +387,9 @@ namespace Corpus
                 throw new InvalidDataException($"copype output has no firmware files (looked in {peParent}\\bootbins and {peParent}\\fwfiles) (copype drift fails closed)");
             var bootData = $"-bootdata:2#p0,e,b\"{Path.Combine(fwDir, "etfsboot.com")}\"#pEF,e,b\"{Path.Combine(fwDir, "efisys.bin")}\"";
             log.Info($"writing ISO {isoPath}");
-            var r = ProcessRunner.RunAsync($"\"{oscdimg}\" -m -o -u2 -udfver102 {bootData} \"{mediaDir}\" \"{isoPath}\"",
+            // `call` prefix: cmd /c strips a LEADING quoted program path
+            // (`C:\Program Files...`), mis-parsing it as a command.
+            var r = ProcessRunner.RunAsync($"call \"{oscdimg}\" -m -o -u2 -udfver102 {bootData} \"{mediaDir}\" \"{isoPath}\"",
                 peParent, redirect: true, timeoutMs: 600000).GetAwaiter().GetResult();
             if (r.TimedOut || r.ExitCode != 0)
                 throw new InvalidDataException($"oscdimg failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
