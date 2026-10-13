@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Reflection;
+using System.Security.Cryptography;
 using TicTack;
 
 namespace Corpus
@@ -44,11 +45,29 @@ namespace Corpus
                     case "--export":
                         verb = "export";
                         break;
+                    case "--export-vhdx":
+                        verb = "export-vhdx";
+                        break;
                     case "--verify":
                         verb = "verify";
                         break;
                     case "--list":
                         verb = "list";
+                        break;
+                    case "--vss-list":
+                        verb = "vss-list";
+                        break;
+                    case "--vss-snap":
+                        verb = "vss-snap";
+                        break;
+                    case "--vss-read":
+                        verb = "vss-read";
+                        break;
+                    case "--vss-dump":
+                        verb = "vss-dump";
+                        break;
+                    case "--bitmap-stats":
+                        verb = "bitmap-stats";
                         break;
                     case "--volume":
                         if (i + 1 < args.Length) volume = args[++i];
@@ -79,9 +98,29 @@ namespace Corpus
             var log = CreateLogger(cfg, baseDir);
             try
             {
+                // Probes are config-free diagnostics: they run before the
+                // store-config gate so a bare exe can check VSS health.
+                switch (verb)
+                {
+                    case "vss-list":
+                        return VssList(baseDir);
+                    case "vss-snap":
+                    case "vss-read":
+                    case "vss-dump":
+                    case "bitmap-stats":
+                        var probeVol = ProbeVolume(volume, log);
+                        if (probeVol == null) return 1;
+                        return RunProbe(verb, probeVol, log);
+                    default:
+                        break;
+                }
+
                 if (cfg == null)
                 {
-                    log.Error("config not found or invalid: " + cfgPath);
+                    if (!File.Exists(cfgPath))
+                        log.Error("config not found: " + cfgPath + " (copy config_corpus.yaml.example to config_corpus.yaml beside Corpus.exe, or pass --config <path>)");
+                    else
+                        log.Error("config invalid (empty?): " + cfgPath);
                     return 1;
                 }
                 if (!CorpusConfig.Validate(cfg, log))
@@ -102,7 +141,7 @@ namespace Corpus
                             return 1;
                         }
                         using (var store = CreateStore(cfg, log))
-                        using (var source = new FileBlockSource(volume))
+                        using (var source = OpenSource(volume, log))
                         {
                             var m = store.Image(source, name);
                             log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
@@ -116,6 +155,15 @@ namespace Corpus
                         }
                         using (var store = CreateStore(cfg, log))
                             store.Export(exportGen, outPath);
+                        return 0;
+                    case "export-vhdx":
+                        if (!TrySnapshot(snapshotArg, log, out var vhdxGen) || string.IsNullOrEmpty(outPath))
+                        {
+                            log.Error("--export-vhdx requires --snapshot <gen> --out <path>");
+                            return 1;
+                        }
+                        using (var store = CreateStore(cfg, log))
+                            store.ExportVhdx(vhdxGen, outPath);
                         return 0;
                     case "verify":
                         if (!TrySnapshot(snapshotArg, log, out var verifyGen))
@@ -171,6 +219,114 @@ namespace Corpus
                 cfg.ChunkMib, cfg.Compression.Level, log);
         }
 
+        // Drive-letter-colon ("T:") images the live volume through VSS;
+        // anything else is a file path for FileBlockSource.
+        private static IBlockSource OpenSource(string volume, ILogger log) =>
+            volume.Length == 2 && volume[1] == ':' && char.IsAsciiLetter(volume[0])
+                ? new VssBlockSource(volume, log)
+                : new FileBlockSource(volume);
+
+        private static string? ProbeVolume(string? volume, ILogger log)
+        {
+            if (string.IsNullOrEmpty(volume))
+            {
+                log.Error("needs --volume <drive, e.g. T:>");
+                return null;
+            }
+            return volume;
+        }
+
+        private static int VssList(string baseDir)
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                Console.Error.WriteLine("--vss-list needs Windows");
+                return 1;
+            }
+            var r = ProcessRunner.RunAsync("vssadmin list writers", baseDir, true).GetAwaiter().GetResult();
+            Console.WriteLine(r.Stdout);
+            if (r.TimedOut) Console.Error.WriteLine("vssadmin timed out");
+            if (!string.IsNullOrEmpty(r.Stderr)) Console.Error.WriteLine(r.Stderr);
+            return r.TimedOut ? 1 : r.ExitCode;
+        }
+
+        private static int RunProbe(string verb, string volume, ILogger log)
+        {
+            // Probes never Complete: AbortBackup is the honest teardown for
+            // reads that capture nothing (see VssSnapshot).
+            switch (verb)
+            {
+                case "vss-snap":
+                    using (var s = VssSnapshot.Create(volume, log))
+                        log.Info("device: " + s.DeviceObject);
+                    return 0;
+                case "vss-read":
+                    using (var s = VssSnapshot.Create(volume, log))
+                    {
+                        var dev = s.DeviceObject.TrimEnd('\\');
+                        using var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                        // True device length (not MaxValue): the segment
+                        // reader sizes fills from it, and an overlong Length
+                        // would overread past EOF into a short-read throw.
+                        // Callback unobserved (probes never Complete).
+                        using var fs = new VssReadStream(raw, VssBlockSource.DeviceLength(volume, dev), () => { });
+                        var buf = new byte[64 * 1024];
+                        var filled = 0;
+                        int n;
+                        while (filled < buf.Length && (n = fs.Read(buf, filled, buf.Length - filled)) > 0)
+                            filled += n;
+                        using var sha = SHA256.Create();
+                        log.Info($"read {filled} bytes: sha256={Convert.ToHexString(sha.ComputeHash(buf, 0, filled))} head={Convert.ToHexString(buf, 0, Math.Min(8, filled))}");
+                    }
+                    return 0;
+                case "vss-dump":
+                    // Transport-vs-isolation probe: ONE snapshot, read TWICE
+                    // end to end (same chunker shape as imaging). Differing
+                    // hashes = unreliable snapshot reads; matching hashes
+                    // that differ from live = VSS isolation failure.
+                    using (var s = VssSnapshot.Create(volume, log))
+                    {
+                        var dev = s.DeviceObject.TrimEnd('\\');
+                        var vlen = VssBlockSource.DeviceLength(volume, dev);
+                        string h1, h2;
+                        using (var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                        using (var fs = new VssReadStream(raw, vlen, () => { }))
+                            h1 = HashStream(fs);
+                        using (var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                        using (var fs = new VssReadStream(raw, vlen, () => { }))
+                            h2 = HashStream(fs);
+                        log.Info($"vss-dump {volume} pass1={h1} pass2={h2} stable={h1 == h2}");
+                    }
+                    return 0;
+                case "bitmap-stats":
+                    using (var s = VssSnapshot.Create(volume, log))
+                    {
+                        var bpc = VolumeBitmap.BytesPerCluster(volume + "\\");
+                        var total = VolumeBitmap.TotalBytes(volume + "\\");
+                        var runs = VolumeBitmap.ReadRuns(s.DeviceObject.TrimEnd('\\'), total / bpc);
+                        long used = 0;
+                        foreach (var r in runs) used += r.Count;
+                        log.Info($"{volume} {used}/{total / bpc} clusters used ({used * bpc}/{total} bytes) in {runs.Count} runs");
+                        for (var i = 0; i < Math.Min(5, runs.Count); i++)
+                            log.Info($"  run {i}: LCN {runs[i].Start} +{runs[i].Count}");
+                    }
+                    return 0;
+                default:
+                    return 1;
+            }
+        }
+
+        private static string HashStream(Stream s)
+        {
+            using var sha = SHA256.Create();
+            var buf = new byte[1024 * 1024];
+            int n;
+            while ((n = s.Read(buf, 0, buf.Length)) > 0)
+                sha.TransformBlock(buf, 0, n, null, 0);
+            sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+            return Convert.ToHexString(sha.Hash!);
+        }
+
         private static bool TrySnapshot(string? arg, ILogger log, out int generation)
         {
             generation = 0;
@@ -193,8 +349,14 @@ namespace Corpus
         {
             Console.WriteLine("Corpus — system imaging");
             Console.WriteLine();
-            Console.WriteLine("  --image --volume <path> --name <snap>   Image a block source as a snapshot");
+            Console.WriteLine("  --image --volume <path|X:> --name <snap>   Image a file, or live volume X: via VSS");
             Console.WriteLine("  --export --snapshot <gen> --out <path>  Export a snapshot to a file");
+            Console.WriteLine("  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX");
+            Console.WriteLine("  --vss-list                   Relay 'vssadmin list writers' (Windows)");
+            Console.WriteLine("  --vss-snap --volume <X:>     Create+delete a VSS snapshot probe (Windows, elevated)");
+            Console.WriteLine("  --vss-read --volume <X:>     Read a 64 KiB extent via snapshot probe (Windows, elevated)");
+            Console.WriteLine("  --vss-dump --volume <X:>     Hash one snapshot twice (read-stability probe)");
+            Console.WriteLine("  --bitmap-stats --volume <X:> Used-cluster stats over a snapshot (Windows, elevated)");
             Console.WriteLine("  --verify --snapshot <gen>              Verify a snapshot (exit 1 on failure)");
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
             Console.WriteLine("  --validate             Check config_corpus.yaml and exit");

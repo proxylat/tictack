@@ -10,10 +10,15 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <NoWarn>$(NoWarn);NU1903</NoWarn>
   </PropertyGroup>
+  <!-- Segment-reader unit tests exercise VssReadStream over MemoryStream. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Corpus.Tests" />
+  </ItemGroup>
   <ItemGroup>
     <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="LTRData.DiscUtils.Vhdx" Version="1.0.90" />
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
@@ -30,5 +35,6 @@
     <Compile Include="../src/SqliteBootstrap.cs" Link="shared/SqliteBootstrap.cs" />
     <Compile Include="../src/Logging.cs" Link="shared/Logging.cs" />
     <Compile Include="../src/DesktopAlert.cs" Link="shared/DesktopAlert.cs" />
+    <Compile Include="../src/ProcessRunner.cs" Link="shared/ProcessRunner.cs" />
   </ItemGroup>
 </Project>

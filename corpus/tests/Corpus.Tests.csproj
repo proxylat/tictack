@@ -18,6 +18,7 @@
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="ZstdSharp" Version="0.7.2" />
+    <PackageReference Include="LTRData.DiscUtils.Vhdx" Version="1.0.90" />
   </ItemGroup>
 
   <ItemGroup>
@@ -34,6 +35,10 @@
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
     <Compile Include="../Manifest.cs" Link="corpus/Manifest.cs" />
     <Compile Include="../Store.cs" Link="corpus/Store.cs" />
+    <Compile Include="../Vhdx.cs" Link="corpus/Vhdx.cs" />
+    <Compile Include="../Vss.cs" Link="corpus/Vss.cs" />
+    <Compile Include="../VolumeBitmap.cs" Link="corpus/VolumeBitmap.cs" />
+    <Compile Include="../VssBlockSource.cs" Link="corpus/VssBlockSource.cs" />
     <Compile Include="../../src/Interfaces.cs" Link="shared/Interfaces.cs" />
     <Compile Include="../../src/PathUtil.cs" Link="shared/PathUtil.cs" />
     <Compile Include="../../src/SqliteBootstrap.cs" Link="shared/SqliteBootstrap.cs" />

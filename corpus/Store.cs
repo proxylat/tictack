@@ -55,7 +55,7 @@ namespace Corpus
             // without this set intra-image duplicates pack twice and the
             // index ends up pointing at the last copy. Cleared on every
             // flush (≤500 entries — never grows with volume size).
-            var packedThisImage = new HashSet<string>();
+            var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
             var newChunks = 0;
             var totalBytes = 0L;
             using (var pack = new PackWriter(_packsDir))
@@ -98,11 +98,29 @@ namespace Corpus
             ObjectDisposedException.ThrowIf(_disposed, this);
             var manifest = LoadGeneration(generation);
             using var output = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            WriteSnapshotToStream(manifest, output);
+            output.SetLength(manifest.VolumeLength);
+            _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to {outPath}");
+        }
+
+        // VHDX edge render: same decoded bytes as Export, written into a
+        // dynamic VHDX Content stream. Zero chunks seek past (no allocation);
+        // no SetLength — capacity was fixed at create, tail reads as zero.
+        public void ExportVhdx(int generation, string outPath)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var manifest = LoadGeneration(generation);
+            VhdxExporter.Export(outPath, manifest.VolumeLength, content => WriteSnapshotToStream(manifest, content));
+            _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to VHDX {outPath}");
+        }
+
+        private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output)
+        {
             foreach (var entry in manifest.Chunks)
             {
                 var digest = Convert.FromHexString(entry.DigestHex);
                 if (!_index.TryGet(digest, out var row))
-                    throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {generation} missing from index");
+                    throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
                 var payload = PackReader.ReadPayload(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
                 var plain = Compression.Decode(payload, ReadCodec(Path.Combine(_packsDir, row.Pack), row.PackOffset));
                 if (IsAllZero(plain))
@@ -110,8 +128,6 @@ namespace Corpus
                 else
                     output.Write(plain, 0, plain.Length);
             }
-            output.SetLength(manifest.VolumeLength);
-            _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to {outPath}");
         }
 
         // Full re-read: index → pack → decode → id compare. Never throws;
