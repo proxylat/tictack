@@ -1067,16 +1067,16 @@ namespace TicTack
                             // code in the error line is the diagnosis (wrap
                             // vs deletion vs access denied), never a guess.
                             FireError(jex);
-                            _log?.Info("USN journal unreadable (Win32 " + jex.Win32Code + "), re-baselining at new head"
-                                + " (gap covered by on-demand rescan).");
+                            _log?.Info("USN journal unreadable (Win32 " + jex.Win32Code + ") on " + _volumeDevice
+                                + ", re-baselining at new head (gap covered by on-demand rescan).");
                             SignalGap();
                             break;
                         }
                         catch (Exception ex)
                         {
                             FireError(ex);
-                            _log?.Info("USN journal read failed, re-baselining at new head"
-                                + " (gap covered by on-demand rescan).");
+                            _log?.Info("USN journal read failed on " + _volumeDevice
+                                + ", re-baselining at new head (gap covered by on-demand rescan).");
                             SignalGap();
                             break;
                         }

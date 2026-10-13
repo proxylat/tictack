@@ -185,7 +185,7 @@ namespace Corpus
                 if (gen == generation)
                     return ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{name}.json"), _key);
             }
-            throw new InvalidDataException($"snapshot generation {generation} not found");
+            throw new InvalidDataException($"snapshot generation {generation} not found in {_manifestsDir}");
         }
 
         // Codec lives at header byte 8 (see PackWriter layout); the index row
