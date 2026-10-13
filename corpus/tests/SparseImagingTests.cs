@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using DiscUtils.Vhdx;
@@ -172,6 +173,38 @@ public sealed class SparseImagingTests : IDisposable
         Assert.False(loaded.Chunks[0].IsHole);
         Assert.Equal(digest, loaded.Chunks[0].DigestHex);
         Assert.Equal(1048576L, loaded.Chunks[0].Size);
+    }
+
+    [Fact]
+    public void Manifest_DenseJson_ByteStableGolden()
+    {
+        // The HMAC covers exact serialization bytes, so pin them: member
+        // order/set/spacing must never drift. Clock + HMAC vary by design;
+        // their presence/shape is asserted, values normalized away.
+        var key = new byte[32]; // fixed: determinism is the point
+        var manDir = Path.Combine(_dir, "man4");
+        var digest = new string('d', 64);
+        var m = ManifestStore.Build(1, "dense", Mib, 1, 3, "key-1", "",
+            new List<ManifestEntry> { new(digest, Mib) });
+        var json = File.ReadAllText(ManifestStore.Save(manDir, m, key));
+        var created = ExtractJsonString(json, "CreatedUtc");
+        var hmac = ExtractJsonString(json, "Hmac");
+        Assert.True(DateTime.TryParse(created, null, DateTimeStyles.RoundtripKind, out _));
+        Assert.Matches("^[0-9a-f]{64}$", hmac);
+        var normalized = json.Replace(created, "TS", StringComparison.Ordinal)
+            .Replace(hmac, "HMAC", StringComparison.Ordinal);
+        var expected = $$"""{"Generation":1,"Name":"dense","CreatedUtc":"TS","VolumeLength":1048576,"ChunkMib":1,"CompressionLevel":3,"KeyId":"key-1","PrevDigest":"","Chunks":[{"DigestHex":"{{digest}}","Size":1048576}],"Hmac":"HMAC"}""";
+        Assert.Equal(expected, normalized);
+    }
+
+    private static string ExtractJsonString(string json, string member)
+    {
+        var key = "\"" + member + "\":\"";
+        var start = json.IndexOf(key, StringComparison.Ordinal) + key.Length;
+        Assert.InRange(start, key.Length, json.Length);
+        var end = json.IndexOf('"', start);
+        Assert.InRange(end, start + 1, json.Length);
+        return json.Substring(start, end - start);
     }
 
     [Fact]
