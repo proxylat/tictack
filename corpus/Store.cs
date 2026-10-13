@@ -17,10 +17,14 @@ namespace Corpus
         private readonly int _zstdLevel;
         private readonly ILogger _log;
         private readonly byte[] _key;
+        private readonly KeyStore? _keys;
+        private readonly byte[]? _encKey;
+        private readonly string? _encKeyId;
+        private readonly HashSet<string> _mixedKeyNoted = new(StringComparer.Ordinal);
         private readonly ChunkIndex _index;
         private bool _disposed;
 
-        public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log)
+        public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log, KeyStore? keys = null)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
@@ -33,6 +37,18 @@ namespace Corpus
             _zstdLevel = zstdLevel;
             _log = log;
             _key = ChunkId.EnsureKey(storeRoot);
+            _keys = keys;
+            if (keys != null && keys.HasCurrent)
+            {
+                _encKey = keys.CurrentKey;
+                _encKeyId = keys.CurrentKeyId;
+            }
+            else if (keys != null && keys.AllKeys.Count > 0)
+            {
+                // Pointer deleted by hand: keys exist but none is current —
+                // image unencrypted rather than guess (never silent-pick).
+                _log.Warn("encryption keys present but no current key selected, new images will be unencrypted");
+            }
             _index = new ChunkIndex(dbPath);
         }
 
@@ -60,7 +76,7 @@ namespace Corpus
             var totalBytes = 0L;
             var holes = 0;
             var chunkBytes = _chunkMib * 1024 * 1024;
-            using (var pack = new PackWriter(_packsDir))
+            using (var pack = new PackWriter(_packsDir, v2: _encKey != null))
             using (var stream = source.OpenRead())
             {
                 bool[]? holeMap = null;
@@ -79,14 +95,22 @@ namespace Corpus
                         holes++;
                         continue;
                     }
-                    var digest = ChunkId.ComputeId(chunk.Data, _key);
+                    var digest = ChunkId.ComputeId(chunk.Data, _key, _encKey);
                     var hex = ChunkId.ToHex(digest);
                     entries.Add(new ManifestEntry(hex, chunk.Data.Length));
                     totalBytes += chunk.Data.Length;
                     if (packedThisImage.Contains(hex) || _index.TryGet(digest, out _))
                         continue;
                     var (payload, codec) = Compression.Encode(chunk.Data, _zstdLevel);
-                    var (packName, offset) = pack.Add(digest, payload, chunk.Data.Length, codec);
+                    byte[]? nonce = null;
+                    if (_encKey != null)
+                    {
+                        // Random 96-bit nonce per blob: no counter state to
+                        // crash-lose (counter reuse across crashes is fatal).
+                        nonce = RandomNumberGenerator.GetBytes(ChunkCrypto.NonceBytes);
+                        payload = ChunkCrypto.Encrypt(payload, _encKey, nonce);
+                    }
+                    var (packName, offset) = pack.Add(digest, payload, chunk.Data.Length, codec, nonce);
                     pending.Add(new ChunkRow(digest, chunk.Data.Length, payload.Length, packName, offset));
                     packedThisImage.Add(hex);
                     newChunks++;
@@ -103,7 +127,7 @@ namespace Corpus
 
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
-                ChunkId.KeyId(_key), prevDigest, entries);
+                ChunkId.KeyId(_key), prevDigest, entries, encKeyId: _encKeyId);
             ManifestStore.Save(_manifestsDir, manifest, _key);
             _log.Info($"imaged '{name}' gen {generation}: {entries.Count} chunks ({holes} holes), {newChunks} new, {totalBytes} bytes");
             return manifest;
@@ -138,13 +162,82 @@ namespace Corpus
                 var digest = Convert.FromHexString(entry.DigestHex);
                 if (!_index.TryGet(digest, out var row))
                     throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
-                var payload = PackReader.ReadPayload(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes, out var codec);
-                var plain = Compression.Decode(payload, codec);
+                var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                var plain = DecodeEntry(entry, row, blob, manifest.EncKeyId);
                 if (IsAllZero(plain))
                     output.Seek(plain.Length, SeekOrigin.Current);
                 else
                     output.Write(plain, 0, plain.Length);
             }
+        }
+
+        // Per-chunk decode shared by export + verify: decrypt (manifest key
+        // first, then every other known key for rotated-incremental children
+        // that mix scopes) then decompress. Holes never reach here.
+        private byte[] DecodeEntry(ManifestEntry e, ChunkRow row, PackBlob blob, string? manifestEncKeyId)
+        {
+            if (blob.Nonce.Length == 0)
+                return Compression.Decode(blob.Payload, blob.Codec);
+            if (string.IsNullOrEmpty(manifestEncKeyId))
+                throw new InvalidDataException($"chunk {e.DigestHex}: encrypted blob but manifest declares no encryption key");
+            var primary = ResolveKey(manifestEncKeyId);
+            try
+            {
+                return Compression.Decode(ChunkCrypto.Decrypt(blob.Payload, primary, blob.Nonce), blob.Codec);
+            }
+            catch (CryptographicException)
+            {
+                // Rotation fallback: a post-rotation incremental reuses clean
+                // parent chunks under the OLD key — try each retained key.
+                if (_keys != null)
+                {
+                    foreach (var (id, key) in _keys.AllKeys)
+                    {
+                        if (id == manifestEncKeyId)
+                            continue;
+                        try
+                        {
+                            var plain = Compression.Decode(ChunkCrypto.Decrypt(blob.Payload, key, blob.Nonce), blob.Codec);
+                            if (_mixedKeyNoted.Add(manifestEncKeyId))
+                                _log.Debug($"snapshot mixes encryption keys (manifest key {manifestEncKeyId}), trying known keys");
+                            return plain;
+                        }
+                        catch (CryptographicException)
+                        {
+                            // Wrong retained key — keep trying.
+                        }
+                    }
+                }
+                throw;
+            }
+        }
+
+        private byte[] ResolveKey(string keyId)
+        {
+            if (_keys != null && _keys.TryGet(keyId, out var key))
+                return key;
+            throw new InvalidDataException($"encryption key {keyId} unavailable (need keys/{keyId}.key in the store)");
+        }
+
+        // Digest re-check for encrypted chunks: the digest binds the chunk's
+        // own key, so try the manifest key first, then retained keys. Key
+        // count is ~ones — bounded, no per-chunk resolve caching needed.
+        private bool VerifyDigest(byte[] plain, byte[] digest, string? manifestEncKeyId)
+        {
+            if (manifestEncKeyId != null && _keys != null && _keys.TryGet(manifestEncKeyId, out var primary)
+                && CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key, primary), digest))
+                return true;
+            if (_keys != null)
+            {
+                foreach (var (id, key) in _keys.AllKeys)
+                {
+                    if (id == manifestEncKeyId)
+                        continue;
+                    if (CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key, key), digest))
+                        return true;
+                }
+            }
+            return false;
         }
 
         // Full re-read: index → pack → decode → id compare. Never throws;
@@ -174,10 +267,23 @@ namespace Corpus
                         continue;
                     }
                     byte[] plain;
+                    PackBlob blob;
                     try
                     {
-                        var payload = PackReader.ReadPayload(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes, out var codec);
-                        plain = Compression.Decode(payload, codec);
+                        blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                        plain = DecodeEntry(entry, row, blob, manifest.EncKeyId);
+                    }
+                    catch (CryptographicException)
+                    {
+                        failed = true;
+                        if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: decrypt failed (wrong key or tampered)");
+                        continue;
+                    }
+                    catch (InvalidDataException ex) when (ex.Message.Contains("unavailable", StringComparison.Ordinal))
+                    {
+                        failed = true;
+                        if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: {ex.Message}");
+                        continue;
                     }
                     // Broad catch: zstd throws plain System.Exception on corrupt
                     // frames, IO/pack faults throw their own — all mean failure.
@@ -187,7 +293,10 @@ namespace Corpus
                         if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: unreadable ({ex.Message})");
                         continue;
                     }
-                    if (plain.Length != entry.Size || !CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key), digest))
+                    var verified = plain.Length == entry.Size && (blob.Nonce.Length == 0
+                        ? CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key), digest)
+                        : VerifyDigest(plain, digest, manifest.EncKeyId));
+                    if (!verified)
                     {
                         failed = true;
                         if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: content mismatch");

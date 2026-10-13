@@ -33,6 +33,8 @@
     <Compile Include="../IBlockSource.cs" Link="corpus/IBlockSource.cs" />
     <Compile Include="../PackWriter.cs" Link="corpus/PackWriter.cs" />
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
+    <Compile Include="../Crypto.cs" Link="corpus/Crypto.cs" />
+    <Compile Include="../KeyStore.cs" Link="corpus/KeyStore.cs" />
     <Compile Include="../Manifest.cs" Link="corpus/Manifest.cs" />
     <Compile Include="../Store.cs" Link="corpus/Store.cs" />
     <Compile Include="../Vhdx.cs" Link="corpus/Vhdx.cs" />

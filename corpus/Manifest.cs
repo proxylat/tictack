@@ -24,6 +24,14 @@ namespace Corpus
         public int CompressionLevel { get; set; }
         public string KeyId { get; set; } = "";
         public string PrevDigest { get; set; } = "";
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public int ParentGeneration { get; set; }        // 0 = full image
+        // Plaintext provenance (journal id + USN — not sensitive), readable
+        // without encryption keys so --list/planning never need key access.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? ChangeCursor { get; set; }        // null = none/full
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? EncKeyId { get; set; }            // null = unencrypted
         public List<ManifestEntry> Chunks { get; set; } = new();
         public string Hmac { get; set; } = "";
     }
@@ -34,7 +42,8 @@ namespace Corpus
     // is detectable.
     public static class ManifestStore
     {
-        public static SnapshotManifest Build(int generation, string name, long volumeLength, int chunkMib, int compressionLevel, string keyId, string prevDigest, List<ManifestEntry> chunks)
+        public static SnapshotManifest Build(int generation, string name, long volumeLength, int chunkMib, int compressionLevel, string keyId, string prevDigest, List<ManifestEntry> chunks,
+            int parentGeneration = 0, string? changeCursor = null, string? encKeyId = null)
         {
             return new SnapshotManifest
             {
@@ -45,6 +54,9 @@ namespace Corpus
                 CompressionLevel = compressionLevel,
                 KeyId = keyId,
                 PrevDigest = prevDigest,
+                ParentGeneration = parentGeneration,
+                ChangeCursor = changeCursor,
+                EncKeyId = encKeyId,
                 Chunks = chunks,
             };
         }

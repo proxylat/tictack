@@ -56,6 +56,12 @@ namespace Corpus
                     case "--list":
                         verb = "list";
                         break;
+                    case "--gen-key":
+                        verb = "gen-key";
+                        break;
+                    case "--key-list":
+                        verb = "key-list";
+                        break;
                     case "--vss-list":
                         verb = "vss-list";
                         break;
@@ -190,6 +196,26 @@ namespace Corpus
                                 Console.WriteLine(gen + " " + snap);
                         }
                         return 0;
+                    case "gen-key":
+                        {
+                            var (keyId, _) = KeyStore.Generate(cfg.StorePath);
+                            Console.WriteLine($"encryption key {keyId} active (existing snapshots unchanged)");
+                        }
+                        return 0;
+                    case "key-list":
+                        {
+                            var keys = new KeyStore(cfg.StorePath);
+                            var all = new List<(string KeyId, byte[] Key)>(keys.AllKeys);
+                            if (all.Count == 0)
+                            {
+                                Console.WriteLine("no encryption keys (store is unencrypted)");
+                                return 0;
+                            }
+                            all.Sort((a, b) => string.Compare(a.KeyId, b.KeyId, StringComparison.Ordinal));
+                            foreach (var (id, _) in all)
+                                Console.WriteLine(id + (id == keys.CurrentKeyId ? " [current]" : ""));
+                        }
+                        return 0;
                     default:
                         return 1;
                 }
@@ -226,7 +252,8 @@ namespace Corpus
             return new Store(
                 cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
-                cfg.ChunkMib, cfg.Compression.Level, log);
+                cfg.ChunkMib, cfg.Compression.Level, log,
+                new KeyStore(cfg.StorePath));
         }
 
         // Drive-letter-colon ("T:") images the live volume through VSS;
@@ -399,10 +426,15 @@ namespace Corpus
             Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
             Console.WriteLine("  --verify --snapshot <gen>              Verify a snapshot (exit 1 on failure)");
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
+            Console.WriteLine("  --gen-key                              Generate an encryption key and activate it (existing snapshots stay as-is; only new images encrypt)");
+            Console.WriteLine("  --key-list                             List encryption keys (\"<id> [current]\" lines)");
             Console.WriteLine("  --validate             Check config_corpus.yaml and exit");
             Console.WriteLine("  --config <path>        Config file (default: config_corpus.yaml beside the exe)");
             Console.WriteLine("  --version              Print version and exit");
             Console.WriteLine("  --help                 This text");
+            Console.WriteLine();
+            Console.WriteLine("  encryption covers new images only; existing snapshots stay as-is");
+            Console.WriteLine("  keys are raw 32-byte files at keys/<keyid>.key, active key named by keys/current");
         }
     }
 }
