@@ -8,3 +8,5 @@ Corpus recovery (offline, no network): boot this stick, you land here.
 7. System volume restored? Run: bcdboot W:\Windows /s S: /f UEFI (fix letters first).
 8. Physical possession of this stick = access to the store (id.key travels with it).
 9. If verify reports offsets, do NOT boot it: re-run restore; --skip-verify is last resort.
+10. Whole disk: --restore-disk --layout GEN --target DISK# --confirm-type TOKEN restores every non-skipped extent at its recorded offset (MSR gaps untouched, target table must already exist).
+11. Bare disk first: same command with --dry-run prints the diskpart script and writes <target>.diskpart.txt; review and apply it by hand (v1 never partitions automatically), then run the real restore.

@@ -17,6 +17,16 @@ namespace Corpus
         bool SkipVerify = false,
         bool DryRun = false);
 
+    public sealed record DiskRestoreOptions(
+        int LayoutGen,
+        string Target,
+        string? StorePath = null,
+        string? IndexPath = null,
+        string? ConfirmToken = null,
+        bool AllowBootDisk = false,
+        bool SkipVerify = false,
+        bool DryRun = false);
+
     // PE restore orchestration: preflight -> safety gate -> stream -> full
     // verify. Returns 0/1 matching the Verify exit posture. Never mints
     // keys: the id.key check runs before the injected Store is touched, and
@@ -113,7 +123,7 @@ namespace Corpus
             try
             {
                 using (var stream = target.OpenWrite())
-                    _store.ExportToStream(opts.Generation, stream, new ThrottledProgress(_log, manifest.VolumeLength, sw, progress));
+                    _store.ExportToStream(opts.Generation, stream, new ThrottledProgress(_log, manifest.VolumeLength, sw, progress), fillGaps: true);
                 if (target is FileBlockTarget file)
                     FixFileLength(file.Path, manifest.VolumeLength);
             }
@@ -153,6 +163,222 @@ namespace Corpus
             sw.Stop();
             _log.Info($"restored snapshot {manifest.Generation}: {manifest.VolumeLength} bytes written and verified in {sw.Elapsed.TotalSeconds:F1}s");
             return 0;
+        }
+
+        // Whole-disk restore (disk-spec §6): the existing 5 phases per
+        // extent at its recorded offset. Skipped (MSR) extents are never
+        // written and never verified (their contents are undefined by
+        // design — writing zeros would fake a fidelity capture never had).
+        // v1 does NOT partition: the target table must already exist (see
+        // DiskpartScript for the reviewed manual prep); boot repair stays a
+        // printed bcdboot line, no FAT32 parsing.
+        public int RestoreDisk(DiskRestoreOptions opts, IProgress<long>? progress = null)
+        {
+            ArgumentNullException.ThrowIfNull(opts);
+            // 1. No-key-mint pre-check, before the store is even touched.
+            if (!string.IsNullOrEmpty(opts.StorePath) && !HasIdentityKey(opts.StorePath))
+            {
+                _log.Error($"refusing disk restore: no id.key in {opts.StorePath} (restore never creates one — check --store)");
+                return 1;
+            }
+            if (string.IsNullOrEmpty(opts.StorePath))
+            {
+                _log.Error("refusing disk restore: no store path (check --store)");
+                return 1;
+            }
+            DiskLayout layout;
+            try
+            {
+                layout = LoadLayout(opts.StorePath, opts.LayoutGen);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"cannot load disk layout {opts.LayoutGen}", ex);
+                return 1;
+            }
+            var extents = new List<PartitionRecord>();
+            foreach (var p in layout.Partitions)
+            {
+                if (!p.Skipped)
+                    extents.Add(p);
+            }
+            using var target = _targets(opts.Target);
+            // 2. Preflight before any write: max extent end, then locked BitLocker.
+            var need = 0L;
+            foreach (var p in extents)
+                need = Math.Max(need, p.OffsetBytes + p.LengthBytes);
+            if (target.Capacity < need)
+            {
+                _log.Error($"refusing disk restore: target {target.DisplayName} holds {target.Capacity} bytes, layout {opts.LayoutGen} needs {need} (no bytes written)");
+                return 1;
+            }
+            if (RefuseLockedBitLocker(target))
+                return 1;
+            // 3. Safety gate: the token is REQUIRED always (even --dry-run).
+            var expected = BootDiskGuard.TargetToken(target.DisplayName, target.Capacity);
+            var supplied = opts.ConfirmToken;
+            if (string.IsNullOrEmpty(supplied) && !Console.IsInputRedirected && !Console.IsOutputRedirected)
+            {
+                Console.Write($"Type '{expected}' to confirm disk restore to {target.DisplayName}: ");
+                supplied = Console.ReadLine()?.Trim();
+            }
+            _log.Info($"disk restore confirm token: '{supplied}'");
+            if (!BootDiskGuard.Confirm(supplied, expected))
+            {
+                _log.Error($"refusing disk restore: --confirm-type must equal '{expected}'");
+                return 1;
+            }
+            if (!opts.AllowBootDisk && BootDiskGuard.IsBootDisk(target, out var boot))
+            {
+                _log.Error($"refusing disk restore: {target.DisplayName} is the boot disk ({boot}) — re-run with --allow-boot-disk and --confirm-type '{expected}'");
+                return 1;
+            }
+            _log.Info($"restore disk layout {layout.Generation} ({extents.Count} partitions, {layout.DiskSizeBytes} bytes) -> {target.DisplayName} [{expected}]");
+            if (opts.DryRun)
+            {
+                var script = DiskpartScript.Generate(layout);
+                _log.Info("dry run: plan only, no bytes written");
+                _log.Info(script.TrimEnd());
+                PrintBootRepair(layout);
+                File.WriteAllText(DiskpartPath(target), script);
+                return 0;
+            }
+            // 4. Grow file targets once (never truncate: gaps keep prefill);
+            // raw targets already passed the fit preflight.
+            if (target is FileBlockTarget grown)
+                GrowFile(grown.Path, layout.DiskSizeBytes);
+            // 5. Stream partition-by-partition in on-disk order through
+            // extent windows, one cumulative ThrottledProgress over the disk
+            // total (sync forwarding keeps progress monotonic).
+            var sw = Stopwatch.StartNew();
+            var throttle = new ThrottledProgress(_log, layout.DiskSizeBytes, sw, progress);
+            var done = 0L;
+            var manifests = new List<(PartitionRecord Part, SnapshotManifest Manifest)>();
+            try
+            {
+                foreach (var part in extents)
+                {
+                    SnapshotManifest manifest;
+                    try
+                    {
+                        manifest = _store.GetManifest(part.SnapshotGeneration);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error($"disk restore failed: layout {opts.LayoutGen} partition {part.PartitionNumber} needs snapshot {part.SnapshotGeneration}", ex);
+                        return 1;
+                    }
+                    using var window = new OffsetBlockTarget(target, part.OffsetBytes);
+                    using (var stream = window.OpenWrite())
+                        _store.ExportToStream(part.SnapshotGeneration, stream, new OffsetForwarder(throttle, done), fillGaps: true);
+                    manifests.Add((part, manifest));
+                    done += manifest.VolumeLength;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error("disk restore streaming failed before any offsets could verify", ex);
+                return 1;
+            }
+            // 6. Post-restore extent-vs-layout compare, then FULL re-read
+            // verify per extent unless --skip-verify.
+            foreach (var (part, manifest) in manifests)
+            {
+                if (manifest.VolumeLength != part.LengthBytes)
+                    _log.Warn($"partition {part.PartitionNumber}: layout length {part.LengthBytes} != snapshot {manifest.Generation} length {manifest.VolumeLength}");
+                else
+                    _log.Info($"partition {part.PartitionNumber}: {part.LengthBytes} bytes at offset {part.OffsetBytes} <- snapshot {manifest.Generation}");
+            }
+            if (opts.SkipVerify)
+            {
+                _log.Warn("skipping post-restore verify (--skip-verify)");
+            }
+            else
+            {
+                var bad = new List<long>();
+                try
+                {
+                    foreach (var (part, manifest) in manifests)
+                    {
+                        using var window = new OffsetBlockTarget(target, part.OffsetBytes);
+                        bad.AddRange(VerifyTarget(window, manifest, opts.StorePath));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Error("disk restore verify failed to re-read the target", ex);
+                    return 1;
+                }
+                if (bad.Count > 0)
+                {
+                    for (var i = 0; i < Math.Min(5, bad.Count); i++)
+                        _log.Error($"disk restore verify mismatch at offset {bad[i]}");
+                    _log.Error($"disk restore verify failed: {bad.Count} corrupt ranges (re-run restore; do not boot this target)");
+                    return 1;
+                }
+            }
+            sw.Stop();
+            _log.Info($"restored disk layout {layout.Generation}: {extents.Count} partitions written and verified in {sw.Elapsed.TotalSeconds:F1}s");
+            PrintBootRepair(layout);
+            return 0;
+        }
+
+        // Layout lookup by generation: the file name carries the source disk
+        // number ({gen:D6}-disk{N}.json) which the restore target may not
+        // share, so match on the generation prefix and require exactly one.
+        private static DiskLayout LoadLayout(string storeRoot, int layoutGen)
+        {
+            var layoutsDir = Path.Combine(storeRoot, "layouts");
+            var matches = Directory.Exists(layoutsDir)
+                ? Directory.GetFiles(layoutsDir, $"{layoutGen:D6}-disk*.json")
+                : Array.Empty<string>();
+            if (matches.Length == 0)
+                throw new InvalidDataException($"disk layout {layoutGen} not found in {layoutsDir}");
+            if (matches.Length > 1)
+                throw new InvalidDataException($"disk layout {layoutGen} is ambiguous in {layoutsDir} ({matches.Length} matches)");
+            return LayoutStore.Load(matches[0], File.ReadAllBytes(Path.Combine(storeRoot, "id.key")));
+        }
+
+        // Grow-only (FixFileLength reuse for the extend; never truncate —
+        // gaps outside extents keep whatever the target already held).
+        private static void GrowFile(string path, long diskSize)
+        {
+            if (!File.Exists(path))
+            {
+                using var created = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+                created.SetLength(diskSize);
+                return;
+            }
+            if (new FileInfo(path).Length < diskSize)
+                FixFileLength(path, diskSize); // extend zero-fills
+        }
+
+        // Boot repair stays a printed line (disk-spec §6): one bcdboot per
+        // NTFS partition with its layout-derived size, letters fixed by hand.
+        private void PrintBootRepair(DiskLayout layout)
+        {
+            foreach (var p in layout.Partitions)
+            {
+                if (p.Skipped || !string.Equals(p.Filesystem, "ntfs", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                _log.Info($"boot repair for partition {p.PartitionNumber} ({p.LengthBytes} bytes): bcdboot W:\\Windows /s S: /f UEFI (fix drive letters first)");
+            }
+        }
+
+        // <target>.diskpart.txt: beside file targets; raw device names are
+        // not valid file names, so those land sanitized in the cwd.
+        private static string DiskpartPath(IBlockTarget target)
+        {
+            if (target is FileBlockTarget file)
+                return file.Path + ".diskpart.txt";
+            var chars = (target.DisplayName + ".diskpart.txt").ToCharArray();
+            for (var i = 0; i < chars.Length; i++)
+            {
+                var c = chars[i];
+                if (!(char.IsAsciiLetterOrDigit(c) || c == '.' || c == '-' || c == '_'))
+                    chars[i] = '_';
+            }
+            return new string(chars);
         }
 
         // Best-effort locked-BitLocker refuse (Windows file targets only):
@@ -210,6 +436,11 @@ namespace Corpus
                 keys = null; // unreadable key files: unencrypted still verifies, encrypted fails closed below
             }
             var bad = new List<long>();
+            // Per-extent offset: positions stay extent-relative, the window
+            // base is added at seek/report time (the offset-0 path is the
+            // BaseOffset==0 case — single-gen restores pass plain targets
+            // and behave byte-identically to before).
+            var baseOffset = target is IPartitionTarget window ? window.BaseOffset : 0L;
             using var read = OpenTargetRead(target);
             var buf = new byte[4 * 1024 * 1024];
             var position = 0L;
@@ -217,35 +448,35 @@ namespace Corpus
             {
                 if (entry.IsHole)
                 {
-                    if (!ReadZeros(read, position, entry.Size, buf))
-                        bad.Add(position);
+                    if (!ReadZeros(read, position, entry.Size, buf, baseOffset))
+                        bad.Add(baseOffset + position);
                 }
-                else if (!VerifyRange(read, position, entry, manifest.EncKeyId, idKey, keys, buf))
+                else if (!VerifyRange(read, position, entry, manifest.EncKeyId, idKey, keys, buf, baseOffset))
                 {
-                    bad.Add(position);
+                    bad.Add(baseOffset + position);
                 }
                 position += entry.Size;
             }
             return bad;
         }
 
-        private static bool VerifyRange(Stream read, long position, ManifestEntry entry, string? encKeyId, byte[] idKey, KeyStore? keys, byte[] buf)
+        private static bool VerifyRange(Stream read, long position, ManifestEntry entry, string? encKeyId, byte[] idKey, KeyStore? keys, byte[] buf, long baseOffset = 0)
         {
             var digest = Convert.FromHexString(entry.DigestHex);
             if (string.IsNullOrEmpty(encKeyId))
-                return CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, null, buf), digest);
+                return CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, null, buf, baseOffset), digest);
             // Encrypted: manifest key first, then retained keys — a
             // post-rotation incremental mixes scopes (same as Store.Verify).
             if (keys != null)
             {
                 if (keys.TryGet(encKeyId, out var primary)
-                    && CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, primary, buf), digest))
+                    && CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, primary, buf, baseOffset), digest))
                     return true;
                 foreach (var (id, key) in keys.AllKeys)
                 {
                     if (id == encKeyId)
                         continue;
-                    if (CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, key, buf), digest))
+                    if (CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, key, buf, baseOffset), digest))
                         return true;
                 }
             }
@@ -254,16 +485,18 @@ namespace Corpus
 
         // ChunkId.ComputeId incrementally (O(1) memory): SHA-256 over
         // plaintext, then idKey, then encKey — the same append order.
-        private static byte[] HashRange(Stream read, long position, long size, byte[] idKey, byte[]? encKey, byte[] buf)
+        // position is extent-relative; baseOffset shifts the seek so extent
+        // windows re-read their own bytes (0 for single-gen restores).
+        private static byte[] HashRange(Stream read, long position, long size, byte[] idKey, byte[]? encKey, byte[] buf, long baseOffset = 0)
         {
-            read.Seek(position, SeekOrigin.Begin);
+            read.Seek(baseOffset + position, SeekOrigin.Begin);
             using var h = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             var left = size;
             while (left > 0)
             {
                 var n = read.Read(buf, 0, (int)Math.Min(buf.Length, left));
                 if (n <= 0)
-                    throw new IOException($"short target read at offset {position + (size - left)}: target smaller than the snapshot");
+                    throw new IOException($"short target read at offset {baseOffset + position + (size - left)}: target smaller than the snapshot");
                 h.AppendData(buf, 0, n);
                 left -= n;
             }
@@ -273,9 +506,9 @@ namespace Corpus
             return h.GetHashAndReset();
         }
 
-        private static bool ReadZeros(Stream read, long position, long size, byte[] buf)
+        private static bool ReadZeros(Stream read, long position, long size, byte[] buf, long baseOffset = 0)
         {
-            read.Seek(position, SeekOrigin.Begin);
+            read.Seek(baseOffset + position, SeekOrigin.Begin);
             var left = size;
             while (left > 0)
             {
@@ -295,6 +528,8 @@ namespace Corpus
         private static Stream OpenTargetRead(IBlockTarget target)
         {
             ArgumentNullException.ThrowIfNull(target);
+            if (target is OffsetBlockTarget window)
+                return OpenTargetRead(window.Inner); // offsets apply at seek time, not here
             if (target is FileBlockTarget file)
                 return new FileStream(file.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             if (target is RawDiskTarget raw)
@@ -305,6 +540,21 @@ namespace Corpus
         // Synchronous fan-out: forward every cumulative report, log % + MB/s
         // at most every 500 ms (plus the final report). Sync delivery keeps
         // progress monotonic — Progress<T> would hop threads and reorder.
+        private sealed class OffsetForwarder : IProgress<long>
+        {
+            private readonly IProgress<long> _inner;
+            private readonly long _base;
+
+            public OffsetForwarder(IProgress<long> inner, long completedBefore)
+            {
+                _inner = inner;
+                _base = completedBefore;
+            }
+
+            // Per-extent cumulative (from zero) shifted into disk-cumulative.
+            public void Report(long bytes) => _inner.Report(_base + bytes);
+        }
+
         private sealed class ThrottledProgress : IProgress<long>
         {
             private readonly ILogger _log;

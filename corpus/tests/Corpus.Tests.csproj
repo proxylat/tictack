@@ -37,6 +37,8 @@
     <Compile Include="../recovery/MediaBuilder.cs" Link="corpus/recovery/MediaBuilder.cs" />
     <Compile Include="../recovery/MediaLayout.cs" Link="corpus/recovery/MediaLayout.cs" />
     <Compile Include="../recovery/RestoreOrchestrator.cs" Link="corpus/recovery/RestoreOrchestrator.cs" />
+    <Compile Include="../recovery/OffsetTarget.cs" Link="corpus/recovery/OffsetTarget.cs" />
+    <Compile Include="../recovery/DiskpartScript.cs" Link="corpus/recovery/DiskpartScript.cs" />
     <Compile Include="../PackWriter.cs" Link="corpus/PackWriter.cs" />
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
     <Compile Include="../Gc.cs" Link="corpus/Gc.cs" />
@@ -44,11 +46,15 @@
     <Compile Include="../Crypto.cs" Link="corpus/Crypto.cs" />
     <Compile Include="../KeyStore.cs" Link="corpus/KeyStore.cs" />
     <Compile Include="../Manifest.cs" Link="corpus/Manifest.cs" />
+    <Compile Include="../LayoutStore.cs" Link="corpus/LayoutStore.cs" />
+    <Compile Include="../DiskImager.cs" Link="corpus/DiskImager.cs" />
     <Compile Include="../Store.cs" Link="corpus/Store.cs" />
     <Compile Include="../Vhdx.cs" Link="corpus/Vhdx.cs" />
     <Compile Include="../Vss.cs" Link="corpus/Vss.cs" />
     <Compile Include="../VolumeBitmap.cs" Link="corpus/VolumeBitmap.cs" />
     <Compile Include="../VssBlockSource.cs" Link="corpus/VssBlockSource.cs" />
+    <Compile Include="../PartitionTable.cs" Link="corpus/PartitionTable.cs" />
+    <Compile Include="../EspLiveSource.cs" Link="corpus/EspLiveSource.cs" />
     <Compile Include="../../src/Interfaces.cs" Link="shared/Interfaces.cs" />
     <Compile Include="../../src/ProcessRunner.cs" Link="shared/ProcessRunner.cs" />
     <Compile Include="../../src/PathUtil.cs" Link="shared/PathUtil.cs" />

@@ -365,6 +365,117 @@ public sealed class GcTests : IDisposable
     }
 
     [Fact]
+    public void Gc_PrunesLayoutWithLastRef()
+    {
+        ImageGens(3);
+        var key = ChunkId.EnsureKey(_storeRoot);
+        var layoutsDir = Path.Combine(_storeRoot, "layouts");
+        // A refs {1,2}: gen 2 lives under keep-last 2 → survives.
+        // B refs {1}: all referenced gens drop → drops.
+        var a = LayoutStore.Save(layoutsDir, Layout(2, 0, (1, 1), (2, 2)), key);
+        var b = LayoutStore.Save(layoutsDir, Layout(1, 1, (1, 1)), key);
+
+        var gc = NewGc(Keep(2), new TestLogger());
+        var plan = gc.Plan();
+        AssertDrops(plan, 1);
+        Assert.Equal(new[] { b }, plan.DropLayouts);
+        gc.Execute(plan);
+        Assert.True(File.Exists(a));
+        Assert.False(File.Exists(b));
+
+        // Corrupt layout aborts with store untouched (mirrors CorruptAbortsClean).
+        var json = File.ReadAllText(a);
+        var chars = json.ToCharArray();
+        chars[json.Length / 2] = chars[json.Length / 2] == 'a' ? 'b' : 'a';
+        File.WriteAllText(a, new string(chars));
+        var before = StoreTreeHash();
+        var beforeCount = IndexCount();
+        Assert.Throws<InvalidDataException>(() => NewGc(Keep(1), new TestLogger()).Plan());
+        Assert.Equal(before, StoreTreeHash());
+        Assert.Equal(beforeCount, IndexCount());
+        Assert.Equal(2, Directory.GetFiles(Path.Combine(_storeRoot, "manifests"), "*.json").Length);
+    }
+
+    [Fact]
+    public void Gc_LayoutDropsAfterRetentionTightens()
+    {
+        // Survive-then-drop across runs: layout A refs {1,2}; under
+        // keep-last 2 gen 2 lives so A survives; tightening to keep-last 1
+        // drops gen 2 as well, and A follows.
+        ImageGens(3);
+        var key = ChunkId.EnsureKey(_storeRoot);
+        var layoutsDir = Path.Combine(_storeRoot, "layouts");
+        var a = LayoutStore.Save(layoutsDir, Layout(3, 0, (1, 1), (2, 2)), key);
+
+        var gc = NewGc(Keep(2), new TestLogger());
+        var plan = gc.Plan();
+        Assert.Empty(plan.DropLayouts); // gen 2 retained → A survives
+        Assert.True(File.Exists(a));
+
+        var gc2 = NewGc(Keep(1), new TestLogger());
+        var plan2 = gc2.Plan();
+        Assert.Equal(new[] { a }, plan2.DropLayouts);
+        gc2.Execute(plan2);
+        Assert.False(File.Exists(a));
+    }
+
+    private static DiskLayout Layout(int generation, int diskNumber, params (int Part, int Gen)[] refs)
+    {
+        var layout = new DiskLayout
+        {
+            Generation = generation,
+            DiskNumber = diskNumber,
+            DiskGuid = Guid.NewGuid().ToString("d"),
+            DiskSizeBytes = 100 * Mib,
+            SectorSizeBytes = 512,
+            Style = "gpt",
+        };
+        foreach (var (part, gen) in refs)
+        {
+            var unique = Guid.NewGuid().ToString("d");
+            layout.Partitions.Add(new PartitionRecord
+            {
+                PartitionNumber = part,
+                Name = "p" + part,
+                TypeGuid = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
+                UniqueGuid = unique,
+                FirstLba = part * 2048,
+                LastLba = part * 2048 + 100,
+                OffsetBytes = part * 2048 * 512,
+                LengthBytes = 101 * 512,
+                Filesystem = "ntfs",
+                SnapshotGeneration = gen,
+                PartitionKey = $"disk{diskNumber}p{part}:{unique}",
+            });
+        }
+        return layout;
+    }
+
+    [Fact]
+    public void Cli_ImageDisk_RejectsVolumeCombo()
+    {
+        ImageGens(1);
+        var cfg = WriteCliConfig(console: true);
+        var (exit, stdout, stderr) = RunCorpus("--config", cfg,
+            "--image-disk", "--disk", "0", "--volume", "C:", "--name", "snap");
+        Assert.Equal(1, exit);
+        var output = stdout + stderr;
+        Assert.Contains("--volume", output);
+        Assert.Contains("--disk", output);
+    }
+
+    [Fact]
+    public void Cli_RestoreDisk_RequiresLayout()
+    {
+        ImageGens(1);
+        var cfg = WriteCliConfig(console: true);
+        var (exit, stdout, stderr) = RunCorpus("--config", cfg,
+            "--restore-disk", "--target", Path.Combine(_dir, "rd.img"));
+        Assert.Equal(1, exit);
+        Assert.Contains("--layout", stdout + stderr);
+    }
+
+    [Fact]
     public void TmpUntouched()
     {
         ImageGens(2);
@@ -411,7 +522,7 @@ public sealed class GcTests : IDisposable
         Assert.Equal(before, StoreTreeHash()); // refused run deletes nothing
     }
 
-    private string WriteCliConfig()
+    private string WriteCliConfig(bool console = false)
     {
         var cfg = Path.Combine(_dir, "corpus.yaml");
         File.WriteAllText(cfg,
@@ -420,7 +531,7 @@ public sealed class GcTests : IDisposable
             "chunk_mib: 1\n" +
             "retention:\n  keep_last: 1\n" + // non-empty plan over the seeded gens
             "compression:\n  level: 3\n" +
-            "logging:\n  level: info\n  path: '" + Path.Combine(_dir, "corpus.log") + "'\n  console: false\n");
+            "logging:\n  level: info\n  path: '" + Path.Combine(_dir, "corpus.log") + "'\n  console: " + (console ? "true" : "false") + "\n");
         return cfg;
     }
 

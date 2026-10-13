@@ -13,6 +13,7 @@ namespace Corpus
     {
         private readonly string _packsDir;
         private readonly string _manifestsDir;
+        private readonly string _layoutsDir;
         private readonly int _chunkMib;
         private readonly int _zstdLevel;
         private readonly ILogger _log;
@@ -31,6 +32,7 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(log);
             _packsDir = Path.Combine(storeRoot, "packs");
             _manifestsDir = Path.Combine(storeRoot, "manifests");
+            _layoutsDir = Path.Combine(storeRoot, "layouts");
             Directory.CreateDirectory(_packsDir);
             Directory.CreateDirectory(_manifestsDir);
             _chunkMib = chunkMib;
@@ -300,6 +302,122 @@ namespace Corpus
             return data;
         }
 
+        // Whole-disk image (spec §1.2/§5): one ordinary manifest per
+        // non-skipped partition (own generation, own ParentGeneration chain
+        // via the existing Image path with an explicit per-partition parent)
+        // plus one sealed layout sidecar in layouts/. Real-disk enumeration
+        // (GPT+VSS+ESP) arrives via DiskImager.CapturePlan; without it there
+        // is nothing to enumerate — fail loud, never an empty layout.
+        public DiskLayout ImageDisk(int diskNumber, string name, DiskImageOptions opts)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(name);
+            ArgumentNullException.ThrowIfNull(opts);
+            var capture = DiskImager.CapturePlan?.Invoke(diskNumber, _log)
+                ?? throw new InvalidOperationException($"disk {diskNumber}: no capture backend (elevated Windows GPT path not wired; Linux disk verbs exit 1)");
+            DiskImager.RefuseIfLocked(diskNumber, capture.Partitions, _log);
+            return ImageDisk(diskNumber, name, opts, capture);
+        }
+
+        internal DiskLayout ImageDisk(int diskNumber, string name, DiskImageOptions opts, DiskCapturePlan plan)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(name);
+            ArgumentNullException.ThrowIfNull(opts);
+            ArgumentNullException.ThrowIfNull(plan);
+            var layout = new DiskLayout
+            {
+                SchemaVersion = 1,
+                DiskNumber = diskNumber,
+                DiskGuid = plan.DiskGuid,
+                DiskSizeBytes = plan.DiskSizeBytes,
+                SectorSizeBytes = plan.SectorSizeBytes,
+                Style = "gpt",
+            };
+            var maxGen = 0;
+            foreach (var part in plan.Partitions)
+            {
+                var key = DiskImager.PartitionKey(diskNumber, part.PartitionNumber, part.UniqueGuid);
+                var record = new PartitionRecord
+                {
+                    PartitionNumber = part.PartitionNumber,
+                    Name = part.Name,
+                    TypeGuid = part.TypeGuid,
+                    UniqueGuid = part.UniqueGuid,
+                    FirstLba = part.FirstLba,
+                    LastLba = part.LastLba,
+                    OffsetBytes = part.OffsetBytes,
+                    LengthBytes = part.LengthBytes,
+                    Filesystem = part.Filesystem,
+                    Skipped = part.Skipped,
+                    SkipReason = part.SkipReason,
+                    SnapshotGeneration = 0,
+                    PartitionKey = key,
+                };
+                layout.Partitions.Add(record);
+                if (part.Skipped || part.Source == null)
+                    continue;
+                SnapshotManifest? parent = null;
+                if (!opts.ForceFull)
+                {
+                    if (opts.ParentLayoutGen > 0)
+                    {
+                        // --parent: newest manifest for this key at/below the
+                        // layout gen; a key the old layout never had images
+                        // full for that partition.
+                        foreach (var (gen, snap) in ManifestStore.List(_manifestsDir))
+                        {
+                            if (gen > opts.ParentLayoutGen)
+                                continue;
+                            var candidate = ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{snap}.json"), _key);
+                            if (string.Equals(candidate.PartitionKey, key, StringComparison.Ordinal)
+                                && (parent == null || candidate.Generation > parent.Generation))
+                                parent = candidate;
+                        }
+                    }
+                    else if (opts.Incremental)
+                    {
+                        parent = FindPartitionParent(key);
+                    }
+                }
+                var imageOpts = parent != null
+                    ? new ImageOptions(ParentGeneration: parent.Generation, Incremental: true, ChangeSource: part.ChangeSource)
+                    : new ImageOptions(ChangeSource: part.ChangeSource);
+                var manifest = Image(part.Source, name, imageOpts);
+                // Stamp partition identity post-hoc: the Image path is shared
+                // with volume snapshots so its options carry no partition
+                // fields. Same gen+name → same file, overwritten sealed.
+                manifest.PartitionKey = key;
+                manifest.DiskNumber = diskNumber;
+                manifest.PartitionNumber = part.PartitionNumber;
+                ManifestStore.Save(_manifestsDir, manifest, _key);
+                record.SnapshotGeneration = manifest.Generation;
+                if (manifest.Generation > maxGen)
+                    maxGen = manifest.Generation;
+            }
+            layout.Generation = maxGen;
+            LayoutStore.Save(_layoutsDir, layout, _key);
+            _log.Info($"imaged disk {diskNumber} '{name}': {layout.Partitions.Count} partitions, layout gen {maxGen}");
+            return layout;
+        }
+
+        // Newest manifest with equal PartitionKey. Loads are HMAC-checked,
+        // corrupt → throw like Image today. Resized partitions fall back to
+        // full via the existing CheckParent length gate (no code here); ESP
+        // (ChangeCursor null) falls back via a null Plan (no code here).
+        private SnapshotManifest? FindPartitionParent(string partitionKey)
+        {
+            SnapshotManifest? best = null;
+            foreach (var (gen, snap) in ManifestStore.List(_manifestsDir))
+            {
+                var candidate = ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{snap}.json"), _key);
+                if (string.Equals(candidate.PartitionKey, partitionKey, StringComparison.Ordinal)
+                    && (best == null || candidate.Generation > best.Generation))
+                    best = candidate;
+            }
+            return best;
+        }
+
         public void Export(int generation, string outPath)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -326,31 +444,71 @@ namespace Corpus
 
         // Streamed export for restore: the same decoded bytes as Export,
         // chunk by chunk, with cumulative logical-byte progress (holes
-        // included, so the final report equals VolumeLength).
-        public void ExportToStream(int generation, Stream output, IProgress<long>? progress = null)
+        // included, so the final report equals VolumeLength). fillGaps
+        // writes zeros explicitly instead of seeking past holes/zero
+        // chunks — required on target REUSE (raw disks, second restores),
+        // where stale bytes would survive the seek and fail verify.
+        // Export/ExportVhdx keep sparse seeks (dynamic VHDX relies on them
+        // for non-allocation); only restore passes true.
+        public void ExportToStream(int generation, Stream output, IProgress<long>? progress = null, bool fillGaps = false)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentNullException.ThrowIfNull(output);
-            WriteSnapshotToStream(LoadGeneration(generation), output, progress);
+            WriteSnapshotToStream(LoadGeneration(generation), output, progress, fillGaps);
         }
 
-        private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output, IProgress<long>? progress = null)
+        private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output, IProgress<long>? progress = null, bool fillGaps = false)
         {
             var reported = 0L;
+            byte[]? zeros = null;
             foreach (var entry in manifest.Chunks)
             {
-                if (entry.IsHole) { output.Seek(entry.Size, SeekOrigin.Current); reported += entry.Size; progress?.Report(reported); continue; }
+                if (entry.IsHole)
+                {
+                    if (fillGaps)
+                    {
+                        zeros ??= new byte[1024 * 1024];
+                        WriteZeros(output, entry.Size, zeros);
+                    }
+                    else
+                    {
+                        output.Seek(entry.Size, SeekOrigin.Current);
+                    }
+                    reported += entry.Size; progress?.Report(reported); continue;
+                }
                 var digest = Convert.FromHexString(entry.DigestHex);
                 if (!_index.TryGet(digest, out var row))
                     throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
                 var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
                 var plain = DecodeEntry(entry, row, blob, manifest.EncKeyId);
                 if (IsAllZero(plain))
-                    output.Seek(plain.Length, SeekOrigin.Current);
+                {
+                    if (fillGaps)
+                    {
+                        zeros ??= new byte[1024 * 1024];
+                        WriteZeros(output, plain.Length, zeros);
+                    }
+                    else
+                    {
+                        output.Seek(plain.Length, SeekOrigin.Current);
+                    }
+                }
                 else
+                {
                     output.Write(plain, 0, plain.Length);
+                }
                 reported += plain.Length;
                 progress?.Report(reported);
+            }
+        }
+
+        private static void WriteZeros(Stream output, long count, byte[] scratch)
+        {
+            while (count > 0)
+            {
+                var n = (int)Math.Min(scratch.Length, count);
+                output.Write(scratch, 0, n);
+                count -= n;
             }
         }
 

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text.Json;
 using TicTack;
 
 namespace Corpus
@@ -37,6 +38,8 @@ namespace Corpus
             string? target = null;
             string? storeFlag = null;
             string? indexFlag = null;
+            string? diskArg = null;
+            string? layoutArg = null;
             string? confirmToken = null;
             var allowBootDisk = false;
             var skipVerify = false;
@@ -64,6 +67,15 @@ namespace Corpus
                         break;
                     case "--image":
                         verb = "image";
+                        break;
+                    case "--image-disk":
+                        verb = "image-disk";
+                        break;
+                    case "--disk-layout":
+                        verb = "disk-layout";
+                        break;
+                    case "--restore-disk":
+                        verb = "restore-disk";
                         break;
                     case "--export":
                         verb = "export";
@@ -170,6 +182,12 @@ namespace Corpus
                     case "--target":
                         if (i + 1 < args.Length) target = args[++i];
                         break;
+                    case "--disk":
+                        if (i + 1 < args.Length) diskArg = args[++i];
+                        break;
+                    case "--layout":
+                        if (i + 1 < args.Length) layoutArg = args[++i];
+                        break;
                     case "--store":
                         if (i + 1 < args.Length) storeFlag = args[++i];
                         break;
@@ -213,6 +231,8 @@ namespace Corpus
                         return VssList(baseDir);
                     case "list-disks":
                         return RunListDisks(log);
+                    case "disk-layout":
+                        return RunDiskLayout(diskArg, log);
                     case "vss-snap":
                     case "vss-read":
                     case "vss-dump":
@@ -332,6 +352,10 @@ namespace Corpus
                         return 0;
                     case "restore":
                         return RunRestore(cfg, baseDir, snapshotArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
+                    case "image-disk":
+                        return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, log);
+                    case "restore-disk":
+                        return RunRestoreDisk(cfg, baseDir, layoutArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
                     case "gc":
                         return RunGc(cfg, dryRun, confirm, log);
                     default:
@@ -384,6 +408,24 @@ namespace Corpus
             return 0;
         }
 
+        // --disk-layout: discovery verb (config-free, like --list-disks):
+        // live GPT read, capture nothing, JSON to stdout. Linux → exit 1.
+        private static int RunDiskLayout(string? diskArg, ILogger log)
+        {
+            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            {
+                log.Error("--disk-layout requires --disk <N> (non-negative disk number, got: " + diskArg + ")");
+                return 1;
+            }
+            if (!OperatingSystem.IsWindows())
+            {
+                Console.Error.WriteLine("--disk-layout needs Windows");
+                return 1;
+            }
+            Console.WriteLine(JsonSerializer.Serialize(PartitionTable.ReadDisk(diskNumber, log)));
+            return 0;
+        }
+
         // --restore: --store wins, else the baked config; relative store
         // paths resolve beside the exe (the stick's store_path is 'store').
         // Index: --index, else the media db copy, else StateRoot. The id.key
@@ -418,6 +460,88 @@ namespace Corpus
             return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
         }
 
+        // --image-disk: whole-disk capture via the store lane (one manifest
+        // per non-skipped partition + sealed layout sidecar). Volume verbs
+        // are untouched: --volume with --disk is rejected, never merged.
+        private static int RunImageDisk(CorpusConfig cfg, string? diskArg, string? volume, string? name,
+            bool incremental, string? parentArg, bool forceFull, ILogger log)
+        {
+            if (string.IsNullOrEmpty(diskArg) || string.IsNullOrEmpty(name))
+            {
+                log.Error("--image-disk requires --disk <N> --name <snapshot>");
+                return 1;
+            }
+            if (!string.IsNullOrEmpty(volume))
+            {
+                log.Error("--volume cannot be combined with --image-disk --disk (use --image for volumes)");
+                return 1;
+            }
+            if (incremental && parentArg != null)
+            {
+                log.Error("--incremental and --parent are mutually exclusive");
+                return 1;
+            }
+            if (!int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            {
+                log.Error("invalid --disk (want a non-negative disk number, got: " + diskArg + ")");
+                return 1;
+            }
+            var parentGen = 0;
+            if (parentArg != null && !TryParent(parentArg, log, out parentGen))
+                return 1;
+            if (!OperatingSystem.IsWindows())
+            {
+                Console.Error.WriteLine("--image-disk needs Windows");
+                return 1;
+            }
+            using (var store = CreateStore(cfg, log))
+            {
+                var layout = store.ImageDisk(diskNumber, name,
+                    new DiskImageOptions(Incremental: incremental, ForceFull: forceFull, ParentLayoutGen: parentGen));
+                log.Info($"disk image {layout.Generation:D6}-disk{diskNumber}: {layout.Partitions.Count} partitions");
+            }
+            return 0;
+        }
+
+        // --restore-disk: whole-disk restore via RestoreDisk (one manifest
+        // per non-skipped extent at its recorded offset). Store/index/token
+        // posture mirrors --restore; validation errors stay byte-identical
+        // to the stub this replaced (Cli_RestoreDisk_RequiresLayout pins them).
+        private static int RunRestoreDisk(CorpusConfig cfg, string baseDir, string? layoutArg, string? target,
+            string? storeFlag, string? indexFlag, string? confirmToken, bool allowBootDisk, bool skipVerify, bool dryRun, ILogger log)
+        {
+            if (string.IsNullOrEmpty(layoutArg) || string.IsNullOrEmpty(target))
+            {
+                log.Error("--restore-disk requires --layout <gen> --target <disk#|\\\\.\\PhysicalDriveN|file>");
+                return 1;
+            }
+            if (!int.TryParse(layoutArg, out var layoutGen) || layoutGen <= 0)
+            {
+                log.Error("invalid --layout (want a positive layout generation number, got: " + layoutArg + ")");
+                return 1;
+            }
+            var storePath = !string.IsNullOrEmpty(storeFlag) ? storeFlag : cfg.StorePath;
+            if (string.IsNullOrEmpty(storePath))
+            {
+                log.Error("--restore-disk needs --store <path> (or store_path in config)");
+                return 1;
+            }
+            if (!Path.IsPathRooted(storePath))
+                storePath = Path.GetFullPath(Path.Combine(baseDir, storePath));
+            if (!RestoreOrchestrator.HasIdentityKey(storePath))
+            {
+                log.Error($"no id.key in {storePath} (restore never creates one — check --store)");
+                return 1;
+            }
+            var mediaDb = Path.Combine(storePath, "corpus-chunks.db");
+            var indexPath = !string.IsNullOrEmpty(indexFlag) ? indexFlag
+                : File.Exists(mediaDb) ? mediaDb
+                : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, new KeyStore(storePath));
+            var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
+            return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
+        }
+
         // --gc: manual only, never automatic. Bare prints the plan and
         // asks for --confirm (exit 1); --dry-run plans without deleting
         // (exit 0); --confirm executes (exit 0).
@@ -433,7 +557,7 @@ namespace Corpus
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.Retention ?? new CorpusRetentionConfig(), log);
             var plan = gc.Plan();
-            if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0)
+            if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0 && plan.DropLayouts.Count == 0)
             {
                 Console.WriteLine("nothing to collect");
                 log.Info("nothing to collect");
@@ -442,6 +566,8 @@ namespace Corpus
             Console.WriteLine($"gc plan: drop {plan.DropManifests.Count} snapshots, {plan.DeadChunks} chunks, {plan.DeadBytes} bytes, {plan.DropPacks.Count} packs");
             foreach (var m in plan.DropManifests)
                 Console.WriteLine("  drop manifest: " + m);
+            foreach (var l in plan.DropLayouts)
+                Console.WriteLine("  drop layout: " + l);
             foreach (var p in plan.DropPacks)
                 Console.WriteLine("  drop pack: " + p);
             foreach (var n in plan.Notes)
@@ -649,11 +775,17 @@ namespace Corpus
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
             Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual only, never automatic)");
             Console.WriteLine("      retention: keep_last/keep_within_days/pin from config; exports outside the store are untouched");
+            Console.WriteLine("      retention pool is shared between volume and disk snapshots (use two stores for isolation)");
             Console.WriteLine("  --gen-key                              Generate an encryption key and activate it (existing snapshots stay as-is; only new images encrypt)");
             Console.WriteLine("  --key-list                             List encryption keys (\"<id> [current]\" lines)");
             Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
             Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
             Console.WriteLine("  --list-disks                           List physical disks (Windows; empty on Linux)");
+            Console.WriteLine("  --image-disk --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)");
+            Console.WriteLine("      --volume cannot be combined with --disk");
+            Console.WriteLine("  --disk-layout --disk <N>  Print DiskLayout JSON to stdout, capture nothing (Windows, elevated)");
+            Console.WriteLine("  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
+            Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore every non-skipped extent at its recorded offset");
             Console.WriteLine("  --restore --snapshot <gen> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
             Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore a snapshot");
             Console.WriteLine("  --validate             Check config_corpus.yaml and exit");

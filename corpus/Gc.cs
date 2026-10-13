@@ -9,12 +9,15 @@ namespace Corpus
     // recomputed next run). Reachability = union of retained manifests;
     // incremental manifests are self-contained so parent links are NEVER
     // walked — pruning a parent only breaks --chain provenance, never data.
+    // Disk layouts drop iff ALL referenced partition gens drop (a layout
+    // survives while any referenced partition is restorable).
     public sealed record GcPlan(
         List<string> DropManifests,
         List<string> DropPacks,
         long DeadChunks,
         long DeadBytes,
-        List<string> Notes);
+        List<string> Notes,
+        List<string> DropLayouts);
 
     public sealed class GarbageCollector
     {
@@ -43,13 +46,23 @@ namespace Corpus
         {
             var listed = ManifestStore.List(_manifestsDir);
             // Load EVERYTHING before any mutation: a corrupt (HMAC-failing)
-            // manifest throws here, leaving store + index untouched.
+            // manifest throws here, leaving store + index untouched. Layouts
+            // load here too (corrupt layout aborts the same clean way).
             var key = ChunkId.EnsureKey(_storeRoot);
             var manifests = new Dictionary<int, (string Path, SnapshotManifest Manifest)>();
             foreach (var (gen, name) in listed)
             {
                 var path = Path.Combine(_manifestsDir, $"{gen:D6}-{name}.json");
                 manifests[gen] = (path, ManifestStore.Load(path, key));
+            }
+            var layouts = new List<(string Path, DiskLayout Layout)>();
+            var layoutsDir = Path.Combine(_storeRoot, "layouts");
+            if (Directory.Exists(layoutsDir))
+            {
+                var layoutPaths = new List<string>(Directory.EnumerateFiles(layoutsDir, "*.json"));
+                layoutPaths.Sort(StringComparer.Ordinal);
+                foreach (var path in layoutPaths)
+                    layouts.Add((path, LayoutStore.Load(path, key)));
             }
 
             var notes = new List<string>();
@@ -89,6 +102,28 @@ namespace Corpus
             {
                 if (!roots.Contains(gen))
                     drops.Add(gen);
+            }
+            // Layout rule: L (referencing gens G1..Gn, SnapshotGeneration > 0;
+            // 0 = skipped/never, never restorable) drops iff every referenced
+            // gen is dropped or already gone. Retention roots are manifest
+            // gens only — the pool is shared between volume and disk snapshots.
+            var dropSet = new HashSet<int>(drops);
+            var dropLayouts = new List<string>();
+            foreach (var (layoutPath, layout) in layouts)
+            {
+                var survives = false;
+                foreach (var part in layout.Partitions)
+                {
+                    if (part.SnapshotGeneration > 0
+                        && manifests.ContainsKey(part.SnapshotGeneration)
+                        && !dropSet.Contains(part.SnapshotGeneration))
+                    {
+                        survives = true;
+                        break;
+                    }
+                }
+                if (!survives)
+                    dropLayouts.Add(layoutPath);
             }
             // Pruning a parent of a retained child: data unaffected (child is
             // self-contained), only --chain provenance gaps.
@@ -148,17 +183,20 @@ namespace Corpus
                 var dropManifests = new List<string>();
                 foreach (var drop in drops)
                     dropManifests.Add(manifests[drop].Path);
-                return new GcPlan(dropManifests, dropPacks, deadChunks, deadBytes, notes);
+                return new GcPlan(dropManifests, dropPacks, deadChunks, deadBytes, notes, dropLayouts);
             }
         }
 
         public void Execute(GcPlan plan)
         {
             ArgumentNullException.ThrowIfNull(plan);
-            // Crash-safe order: manifests first, then index rows, then pack
-            // files. A crash between steps only orphans pack bytes — never a
-            // live chunk. Single-writer assumption: no concurrent image/GC.
+            // Crash-safe order: manifests + layouts first, then index rows,
+            // then pack files. A crash between steps only orphans pack
+            // bytes — never a live chunk. Single-writer assumption: no
+            // concurrent image/GC.
             foreach (var path in plan.DropManifests)
+                File.Delete(path);
+            foreach (var path in plan.DropLayouts)
                 File.Delete(path);
             using (var index = new ChunkIndex(_dbPath))
                 index.SweepUnmarked();

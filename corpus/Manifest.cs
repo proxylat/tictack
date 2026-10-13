@@ -32,6 +32,15 @@ namespace Corpus
         public string? ChangeCursor { get; set; }        // null = none/full
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? EncKeyId { get; set; }            // null = unencrypted
+        // Whole-disk rung (spec §3): partition identity. Optional with
+        // WhenWritingDefault so old manifests load with defaults and volume
+        // verbs are byte-identical.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? PartitionKey { get; set; }        // null = volume snapshot
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public int DiskNumber { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public int PartitionNumber { get; set; }
         public List<ManifestEntry> Chunks { get; set; } = new();
         public string Hmac { get; set; } = "";
     }
@@ -43,7 +52,8 @@ namespace Corpus
     public static class ManifestStore
     {
         public static SnapshotManifest Build(int generation, string name, long volumeLength, int chunkMib, int compressionLevel, string keyId, string prevDigest, List<ManifestEntry> chunks,
-            int parentGeneration = 0, string? changeCursor = null, string? encKeyId = null)
+            int parentGeneration = 0, string? changeCursor = null, string? encKeyId = null,
+            string? partitionKey = null, int diskNumber = 0, int partitionNumber = 0)
         {
             return new SnapshotManifest
             {
@@ -57,6 +67,9 @@ namespace Corpus
                 ParentGeneration = parentGeneration,
                 ChangeCursor = changeCursor,
                 EncKeyId = encKeyId,
+                PartitionKey = partitionKey,
+                DiskNumber = diskNumber,
+                PartitionNumber = partitionNumber,
                 Chunks = chunks,
             };
         }
