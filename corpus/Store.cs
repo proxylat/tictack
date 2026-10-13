@@ -138,8 +138,8 @@ namespace Corpus
                 var digest = Convert.FromHexString(entry.DigestHex);
                 if (!_index.TryGet(digest, out var row))
                     throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
-                var payload = PackReader.ReadPayload(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
-                var plain = Compression.Decode(payload, ReadCodec(Path.Combine(_packsDir, row.Pack), row.PackOffset));
+                var payload = PackReader.ReadPayload(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes, out var codec);
+                var plain = Compression.Decode(payload, codec);
                 if (IsAllZero(plain))
                     output.Seek(plain.Length, SeekOrigin.Current);
                 else
@@ -176,8 +176,8 @@ namespace Corpus
                     byte[] plain;
                     try
                     {
-                        var payload = PackReader.ReadPayload(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
-                        plain = Compression.Decode(payload, ReadCodec(Path.Combine(_packsDir, row.Pack), row.PackOffset));
+                        var payload = PackReader.ReadPayload(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes, out var codec);
+                        plain = Compression.Decode(payload, codec);
                     }
                     // Broad catch: zstd throws plain System.Exception on corrupt
                     // frames, IO/pack faults throw their own — all mean failure.
@@ -232,17 +232,6 @@ namespace Corpus
                     return ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{name}.json"), _key);
             }
             throw new InvalidDataException($"snapshot generation {generation} not found in {_manifestsDir}");
-        }
-
-        // Codec lives at header byte 8 (see PackWriter layout); the index row
-        // doesn't carry it, so read the recorded byte rather than guessing.
-        private static byte ReadCodec(string packPath, long offset)
-        {
-            using var stream = new FileStream(packPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            stream.Seek(offset + 8, SeekOrigin.Begin);
-            var b = stream.ReadByte();
-            if (b < 0) throw new InvalidDataException("truncated pack blob header at offset " + offset);
-            return (byte)b;
         }
 
         private static bool IsAllZero(byte[] data)

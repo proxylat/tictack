@@ -135,7 +135,9 @@ namespace Corpus
 
     public static class PackReader
     {
-        public static byte[] ReadPayload(string packPath, long offset, int storedBytes)
+        // Single-open read: the 9-byte header prefix already carries the codec
+        // (byte 8), so report it instead of re-opening per chunk to re-read it.
+        public static byte[] ReadPayload(string packPath, long offset, int storedBytes, out byte codec)
         {
             if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
             if (storedBytes < 0) throw new ArgumentOutOfRangeException(nameof(storedBytes));
@@ -146,6 +148,7 @@ namespace Corpus
                 Fill(stream, header);
                 if (BinaryPrimitives.ReadUInt32LittleEndian(header) != (uint)storedBytes)
                     throw new InvalidDataException("stored length mismatch at offset " + offset);
+                codec = header[8];
                 stream.Seek(offset + PackWriter.BlobHeaderBytes, SeekOrigin.Begin);
                 var payload = new byte[storedBytes];
                 var filled = 0;

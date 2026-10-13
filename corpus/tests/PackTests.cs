@@ -37,7 +37,7 @@ public sealed class PackTests : IDisposable
             }
             writer.Complete();
             foreach (var (pack, offset, payload) in refs)
-                Assert.Equal(payload, PackReader.ReadPayload(Path.Combine(packsDir, pack), offset, payload.Length));
+                Assert.Equal(payload, PackReader.ReadPayload(Path.Combine(packsDir, pack), offset, payload.Length, out _));
         }
     }
 
@@ -91,6 +91,6 @@ public sealed class PackTests : IDisposable
         {
             (pack, offset) = writer.Add(Digest(7), payload, payload.Length, 1);
         }
-        Assert.Equal(payload, PackReader.ReadPayload(Path.Combine(packsDir, pack), offset, payload.Length));
+        Assert.Equal(payload, PackReader.ReadPayload(Path.Combine(packsDir, pack), offset, payload.Length, out _));
     }
 }
