@@ -378,4 +378,17 @@ public sealed class RecoveryTests : IDisposable
         Assert.False(BootDiskGuard.IsBootDisk(t, out var boot));
         Assert.Equal("unknown-linux", boot);
     }
+
+    [Fact]
+    public void NativeDisk_GetLengthBytes_BindsEntryPoint()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var probe = Path.Combine(_dir, "plain.bin");
+        File.WriteAllBytes(probe, new byte[4096]);
+        // IOCTL_DISK_GET_LENGTH_INFO on a plain file fails with IOException —
+        // but it must BIND first. A missing EntryPoint (DllImport naming a
+        // nonexistent kernel32 export) throws EntryPointNotFoundException
+        // instead (proven on-box 2026-10-13: --list-disks died in PE).
+        Assert.Throws<IOException>(() => NativeDisk.GetLengthBytes(probe));
+    }
 }

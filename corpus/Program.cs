@@ -35,6 +35,7 @@ namespace Corpus
             string? usbDrive = null;
             string? isoPath = null;
             var initialize = false;
+            string? payloadDir = null;
             string? target = null;
             string? storeFlag = null;
             string? indexFlag = null;
@@ -179,6 +180,9 @@ namespace Corpus
                     case "--initialize":
                         initialize = true;
                         break;
+                    case "--payload":
+                        if (i + 1 < args.Length) payloadDir = args[++i];
+                        break;
                     case "--target":
                         if (i + 1 < args.Length) target = args[++i];
                         break;
@@ -254,6 +258,11 @@ namespace Corpus
                         log.Error("config invalid (empty?): " + cfgPath);
                     return 1;
                 }
+                // Explicit --store overrides the baked config (recovery media
+                // ships store_path '' by design; the operator points at the
+                // store). Must precede Validate + index resolution below.
+                if (!string.IsNullOrEmpty(storeFlag))
+                    cfg.StorePath = storeFlag;
                 if (!CorpusConfig.Validate(cfg, log))
                     return 1;
                 if (confirm && verb != "gc")
@@ -348,7 +357,7 @@ namespace Corpus
                         }
                         return 0;
                     case "build-media":
-                        MediaBuilder.Build(new MediaBuildOptions(adkDir, includeStore, dbPath, drivers.ToArray(), stagingDir, usbDrive, isoPath, initialize), log);
+                        MediaBuilder.Build(new MediaBuildOptions(adkDir, includeStore, dbPath, drivers.ToArray(), stagingDir, usbDrive, isoPath, initialize, payloadDir), log);
                         return 0;
                     case "restore":
                         return RunRestore(cfg, baseDir, snapshotArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
@@ -426,6 +435,45 @@ namespace Corpus
             return 0;
         }
 
+        // Read-only media (DVD ISO-9660, write-protected USB): SQLite needs a
+        // writable db (WAL/journal live beside it) even for pure reads, so a
+        // media db copy is staged to temp. Missing db passes through — Store
+        // fails loud with its own message, never a confusing copy error.
+        private static string EnsureWritableIndex(string indexPath, ILogger log)
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(indexPath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                    var probe = Path.Combine(dir, ".corpus-write-probe");
+                    File.WriteAllText(probe, "");
+                    File.Delete(probe);
+                }
+                return indexPath;
+            }
+            catch when (File.Exists(indexPath))
+            {
+                // The DVD copy carries the read-only attribute (ISO-9660) and
+                // File.Copy preserves it: a second restore in one boot would
+                // fail overwriting its own staged copy. Normalize + reset.
+                var tmp = Path.Combine(Path.GetTempPath(), "corpus-restore-index.db");
+                foreach (var p in new[] { tmp, tmp + "-wal", tmp + "-shm", tmp + "-journal" })
+                {
+                    if (File.Exists(p))
+                    {
+                        File.SetAttributes(p, FileAttributes.Normal);
+                        File.Delete(p);
+                    }
+                }
+                File.Copy(indexPath, tmp);
+                File.SetAttributes(tmp, FileAttributes.Normal);
+                log.Info($"index on read-only media, staged writable copy at {tmp}");
+                return tmp;
+            }
+        }
+
         // --restore: --store wins, else the baked config; relative store
         // paths resolve beside the exe (the stick's store_path is 'store').
         // Index: --index, else the media db copy, else StateRoot. The id.key
@@ -455,6 +503,7 @@ namespace Corpus
             var indexPath = !string.IsNullOrEmpty(indexFlag) ? indexFlag
                 : File.Exists(mediaDb) ? mediaDb
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            indexPath = EnsureWritableIndex(indexPath, log);
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, new KeyStore(storePath));
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
@@ -537,6 +586,7 @@ namespace Corpus
             var indexPath = !string.IsNullOrEmpty(indexFlag) ? indexFlag
                 : File.Exists(mediaDb) ? mediaDb
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            indexPath = EnsureWritableIndex(indexPath, log);
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, new KeyStore(storePath));
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
@@ -780,6 +830,7 @@ namespace Corpus
             Console.WriteLine("  --key-list                             List encryption keys (\"<id> [current]\" lines)");
             Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
             Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
+            Console.WriteLine("      [--payload <dir>]  Skip re-publish (ADK box without the SDK: publish dir)");
             Console.WriteLine("  --list-disks                           List physical disks (Windows; empty on Linux)");
             Console.WriteLine("  --image-disk --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)");
             Console.WriteLine("      --volume cannot be combined with --disk");

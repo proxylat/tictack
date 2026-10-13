@@ -9,6 +9,8 @@ namespace Corpus
 {
     // --build-media options: exactly one sink (--staging-dir | --usb |
     // --iso). Drivers repeatable. Initialize arms the --usb format path.
+    // PayloadDir skips the re-publish (ADK box without the SDK: hand it a
+    // `dotnet publish -r win-x64 --self-contained` dir; it is never deleted).
     public sealed record MediaBuildOptions(
         string? AdkDir = null,
         string? IncludeStore = null,
@@ -17,7 +19,8 @@ namespace Corpus
         string? StagingDir = null,
         string? UsbDrive = null,
         string? IsoPath = null,
-        bool Initialize = false);
+        bool Initialize = false,
+        string? PayloadDir = null);
 
     // WinPE recovery-media builder (fetch -> assemble -> write). Only
     // StagePayload is Linux-runnable (pure file copy + JSON); ISO/USB
@@ -31,7 +34,18 @@ namespace Corpus
             var sinks = (opts.StagingDir != null ? 1 : 0) + (opts.UsbDrive != null ? 1 : 0) + (opts.IsoPath != null ? 1 : 0);
             if (sinks != 1)
                 throw new InvalidDataException("exactly one of --staging-dir, --usb, --iso is required");
-            var publishDir = RunDotnetPublish(log);
+            string publishDir;
+            var ownPublish = opts.PayloadDir == null;
+            if (ownPublish)
+            {
+                publishDir = RunDotnetPublish(log);
+            }
+            else
+            {
+                publishDir = opts.PayloadDir!;
+                if (!File.Exists(Path.Combine(publishDir, "Corpus.exe")))
+                    throw new InvalidDataException($"--payload has no Corpus.exe in {publishDir} (want a `dotnet publish -r win-x64 --self-contained` dir)");
+            }
             try
             {
                 var stageDir = Directory.CreateTempSubdirectory("corpus-media-").FullName;
@@ -54,9 +68,25 @@ namespace Corpus
                     try
                     {
                         RunCopype(adk, peWork, log);
-                        foreach (var driver in opts.Drivers ?? [])
-                            AddDriver(peWork, driver, log);
-                        AppendStartnetHook(Path.Combine(peWork, "media", "Windows", "System32", "startnet.cmd"));
+                        // One WIM mount serves drivers + the startnet hook:
+                        // startnet.cmd lives INSIDE boot.wim (no Windows dir
+                        // exists at the copype media root).
+                        var wim = Path.Combine(peWork, "media", "sources", "boot.wim");
+                        var mount = MountBootWim(wim, peWork, log);
+                        try
+                        {
+                            foreach (var driver in opts.Drivers ?? [])
+                                AddDriverToMount(mount, driver, log);
+                            AppendStartnetHook(Path.Combine(mount, "Windows", "System32", "startnet.cmd"));
+                        }
+                        catch
+                        {
+                            // A failed image must never commit: best-effort
+                            // discard, then the original error propagates.
+                            UnmountBootWim(mount, peWork, commit: false, log);
+                            throw;
+                        }
+                        UnmountBootWim(mount, peWork, commit: true, log);
                         CopyDir(stageDir, Path.Combine(peWork, "media"));
                         // Record the real ADK build (staging bakes 0: no ADK there).
                         var mediaDir = Path.Combine(peWork, "media");
@@ -79,7 +109,9 @@ namespace Corpus
             }
             finally
             {
-                DeleteTree(publishDir);
+                // A handed-in --payload dir is the caller's: never delete it.
+                if (ownPublish)
+                    DeleteTree(publishDir);
             }
         }
 
@@ -135,7 +167,7 @@ namespace Corpus
             var adk = dir ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Windows Kits", "10", "Assessment and Deployment Kit");
             if (!Directory.Exists(adk))
                 throw new InvalidDataException($"ADK not found at {adk} (pass --adk <dir>; needs the ADK + WinPE add-on)");
-            foreach (var rel in new[] { Path.Combine("Deployment Tools", "amd64", "copype.cmd"), Path.Combine("Deployment Tools", "amd64", "Oscdimg", "oscdimg.exe") })
+            foreach (var rel in new[] { Path.Combine("Windows Preinstallation Environment", "copype.cmd"), Path.Combine("Deployment Tools", "amd64", "Oscdimg", "oscdimg.exe") })
             {
                 if (!File.Exists(Path.Combine(adk, rel)))
                     throw new InvalidDataException($"ADK at {adk} is missing {rel} — install the WinPE add-on (copype drift fails closed)");
@@ -265,53 +297,62 @@ namespace Corpus
             throw new InvalidDataException("Corpus.csproj not found above the exe — build media from a Corpus source checkout");
         }
 
+        // copype.cmd ships in the WinPE add-on subtree, NOT under
+        // Deployment Tools (older notes say otherwise; proven on-box).
+        internal static string CopypeCmd(string adk) =>
+            Path.Combine(adk, "Windows Preinstallation Environment", "copype.cmd");
+
         private static void RunCopype(string adk, string peWork, ILogger log)
         {
-            var copype = Path.Combine(adk, "Deployment Tools", "amd64", "copype.cmd");
+            var copype = CopypeCmd(adk);
+            // copype reads %WinPERoot%/%OSCDImgRoot%/%DISMROOT%: without the
+            // Deployment Tools env it fails to stage, so run it inside a
+            // DandISetEnv session (same box, same call).
+            var diEnv = Path.Combine(adk, "Deployment Tools", "DandISetEnv.bat");
+            if (!File.Exists(diEnv))
+                throw new InvalidDataException($"ADK at {adk} is missing Deployment Tools\\DandISetEnv.bat — reinstall the ADK");
             log.Info($"running copype amd64 {peWork}");
-            var r = ProcessRunner.RunAsync($"\"{copype}\" amd64 \"{peWork}\"",
-                Path.GetDirectoryName(copype)!, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
+            var r = ProcessRunner.RunAsync($"call \"{diEnv}\" >NUL && \"{copype}\" amd64 \"{peWork}\"",
+                Path.GetDirectoryName(diEnv)!, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
             if (r.TimedOut || r.ExitCode != 0 || !Directory.Exists(Path.Combine(peWork, "media")))
                 throw new InvalidDataException($"copype failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
         }
 
-        private static void AddDriver(string peWork, string driverDir, ILogger log)
+        private static string MountBootWim(string wim, string peWork, ILogger log)
+        {
+            if (!File.Exists(wim))
+                throw new InvalidDataException($"copype output missing {wim} (copype drift fails closed)");
+            var mount = Directory.CreateTempSubdirectory("corpus-mnt-").FullName;
+            log.Info($"mounting boot.wim {mount}");
+            var m = ProcessRunner.RunAsync($"dism /Mount-Image /ImageFile:\"{wim}\" /Index:1 /MountDir:\"{mount}\"",
+                peWork, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
+            if (m.TimedOut || m.ExitCode != 0)
+            {
+                DeleteTree(mount);
+                throw new InvalidDataException($"dism mount failed (exit {m.ExitCode}): {Tail(m.Stderr + m.Stdout)} (needs elevation)");
+            }
+            return mount;
+        }
+
+        private static void UnmountBootWim(string mount, string peWork, bool commit, ILogger log)
+        {
+            var verb = commit ? "/Commit" : "/Discard";
+            var u = ProcessRunner.RunAsync($"dism /Unmount-Image /MountDir:\"{mount}\" {verb}",
+                peWork, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
+            DeleteTree(mount);
+            if (u.TimedOut || u.ExitCode != 0)
+                throw new InvalidDataException($"dism unmount/{verb.TrimStart('/').ToLowerInvariant()} failed (exit {u.ExitCode}): {Tail(u.Stderr + u.Stdout)}");
+        }
+
+        private static void AddDriverToMount(string mount, string driverDir, ILogger log)
         {
             if (!Directory.Exists(driverDir))
                 throw new InvalidDataException($"--driver missing: {driverDir}");
-            var wim = Path.Combine(peWork, "media", "sources", "boot.wim");
-            var mount = Directory.CreateTempSubdirectory("corpus-mnt-").FullName;
-            try
-            {
-                log.Info($"injecting driver {driverDir} into boot.wim");
-                var m = ProcessRunner.RunAsync($"dism /Mount-Image /ImageFile:\"{wim}\" /Index:1 /MountDir:\"{mount}\"",
-                    peWork, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
-                if (m.TimedOut || m.ExitCode != 0)
-                    throw new InvalidDataException($"dism mount failed (exit {m.ExitCode}): {Tail(m.Stderr + m.Stdout)} (needs elevation)");
-                try
-                {
-                    var a = ProcessRunner.RunAsync($"dism /Image:\"{mount}\" /Add-Driver /Driver:\"{driverDir}\" /Recurse",
-                        peWork, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
-                    if (a.TimedOut || a.ExitCode != 0)
-                        throw new InvalidDataException($"dism add-driver failed (exit {a.ExitCode}): {Tail(a.Stderr + a.Stdout)}");
-                }
-                catch
-                {
-                    // A failed image must never commit: best-effort discard,
-                    // then the original error propagates.
-                    ProcessRunner.RunAsync($"dism /Unmount-Image /MountDir:\"{mount}\" /Discard",
-                        peWork, redirect: true, timeoutMs: 120000).GetAwaiter().GetResult();
-                    throw;
-                }
-                var u = ProcessRunner.RunAsync($"dism /Unmount-Image /MountDir:\"{mount}\" /Commit",
-                    peWork, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
-                if (u.TimedOut || u.ExitCode != 0)
-                    throw new InvalidDataException($"dism unmount/commit failed (exit {u.ExitCode}): {Tail(u.Stderr + u.Stdout)}");
-            }
-            finally
-            {
-                DeleteTree(mount);
-            }
+            log.Info($"injecting driver {driverDir} into boot.wim");
+            var a = ProcessRunner.RunAsync($"dism /Image:\"{mount}\" /Add-Driver /Driver:\"{driverDir}\" /Recurse",
+                Path.GetDirectoryName(mount)!, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
+            if (a.TimedOut || a.ExitCode != 0)
+                throw new InvalidDataException($"dism add-driver failed (exit {a.ExitCode}): {Tail(a.Stderr + a.Stdout)}");
         }
 
         // Spec-verbatim hook: scan C..Z for \Corpus\restore.cmd, call it.
@@ -327,12 +368,21 @@ namespace Corpus
         {
             var oscdimg = Path.Combine(adk, "Deployment Tools", "amd64", "Oscdimg", "oscdimg.exe");
             var peParent = Directory.GetParent(mediaDir)!.FullName;
-            foreach (var boot in new[] { Path.Combine(peParent, "fwfiles", "etfsboot.com"), Path.Combine(peParent, "fwfiles", "efisys.bin") })
+            // 24H2 copype stages firmware files under bootbins\; older ADKs
+            // used fwfiles\. Prefer the new layout, accept the old.
+            string? fwDir = null;
+            foreach (var d in new[] { "bootbins", "fwfiles" })
             {
-                if (!File.Exists(boot))
-                    throw new InvalidDataException($"copype output missing {boot} (copype drift fails closed)");
+                var cand = Path.Combine(peParent, d);
+                if (File.Exists(Path.Combine(cand, "etfsboot.com")) && File.Exists(Path.Combine(cand, "efisys.bin")))
+                {
+                    fwDir = cand;
+                    break;
+                }
             }
-            var bootData = $"-bootdata:2#p0,e,b\"{Path.Combine(peParent, "fwfiles", "etfsboot.com")}\"#pEF,e,b\"{Path.Combine(peParent, "fwfiles", "efisys.bin")}\"";
+            if (fwDir == null)
+                throw new InvalidDataException($"copype output has no firmware files (looked in {peParent}\\bootbins and {peParent}\\fwfiles) (copype drift fails closed)");
+            var bootData = $"-bootdata:2#p0,e,b\"{Path.Combine(fwDir, "etfsboot.com")}\"#pEF,e,b\"{Path.Combine(fwDir, "efisys.bin")}\"";
             log.Info($"writing ISO {isoPath}");
             var r = ProcessRunner.RunAsync($"\"{oscdimg}\" -m -o -u2 -udfver102 {bootData} \"{mediaDir}\" \"{isoPath}\"",
                 peParent, redirect: true, timeoutMs: 600000).GetAwaiter().GetResult();
