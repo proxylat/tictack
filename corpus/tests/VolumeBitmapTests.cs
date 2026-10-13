@@ -45,4 +45,35 @@ public sealed class VolumeBitmapTests
         VolumeBitmap.AppendRuns(runs, 8, new byte[] { 0x02 }, 0, 1, 8);
         Assert.Equal([(0L, 8L), (9L, 1L)], runs);
     }
+
+    [Theory]
+    // ok, bitmapSize, ret -> returned bits. MORE_DATA (ok=false) ignores
+    // BitmapSize (total remaining) and counts the filled prefix instead.
+    [InlineData(true, 8000L, 1016, 8000L)]    // success: BitmapSize rules
+    [InlineData(true, 0L, 16, 0L)]            // success, empty: caller breaks
+    [InlineData(true, 9000L, 1016, 8000L)]    // success: clamped to capacity
+    [InlineData(false, 16532991L, 1024, 8064L)]  // MORE_DATA 1KB prefix
+    [InlineData(false, 16532991L, 131088, 1048576L)] // MORE_DATA 128KB window
+    public void WindowBits_MoreData_CountsPrefix(bool ok, long bitmapSize, int ret, long expected)
+    {
+        Assert.Equal(expected, VolumeBitmap.WindowBits(ok, bitmapSize, ret));
+    }
+
+    [Fact]
+    public void WriteRuns_GoldenText()
+    {
+        // Text shape is the harness contract (--bitmap-dump consumers parse
+        // it in PowerShell): header comment + "startLcns count" lines.
+        var path = Path.Combine(Path.GetTempPath(), "CorpusTest_runs_" + Guid.NewGuid() + ".txt");
+        try
+        {
+            VolumeBitmap.WriteRuns(path, 4096, 100, new List<(long, long)> { (0, 256), (512, 128) });
+            var text = File.ReadAllText(path).Replace("\r\n", "\n");
+            Assert.Equal("# bpc=4096 totalClusters=100 runs=2\n0 256\n512 128\n", text);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
 }

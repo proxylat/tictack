@@ -57,6 +57,17 @@ namespace Corpus
             return BitConverter.ToInt64(outBuf, 0);
         }
 
+        // Runs dump for harness-side masked compares (see --bitmap-dump):
+        // header comment + "startLcn clusterCount" lines. Pure file write,
+        // Linux-testable; the text shape is the harness contract.
+        public static void WriteRuns(string path, long bytesPerCluster, long totalClusters, List<(long Start, long Count)> runs)
+        {
+            using var w = new StreamWriter(path, false, System.Text.Encoding.ASCII);
+            w.WriteLine($"# bpc={bytesPerCluster} totalClusters={totalClusters} runs={runs.Count}");
+            foreach (var (s, c) in runs)
+                w.WriteLine(s + " " + c);
+        }
+
         // Merged allocated runs as (startLcn, clusterCount), ascending.
         public static List<(long Start, long Count)> ReadRuns(string devicePath, long totalClusters)
         {
@@ -69,16 +80,31 @@ namespace Corpus
             while (lcn < totalClusters)
             {
                 var inBuf = BitConverter.GetBytes(lcn);
-                if (!DeviceIoControl(fs.SafeFileHandle, FsctlGetVolumeBitmap, inBuf, 8, outBuf, outBuf.Length, out var ret, IntPtr.Zero))
-                    throw new IOException($"FSCTL_GET_VOLUME_BITMAP @LCN {lcn} failed: {Marshal.GetLastWin32Error()}");
+                var ok = DeviceIoControl(fs.SafeFileHandle, FsctlGetVolumeBitmap, inBuf, 8, outBuf, outBuf.Length, out var ret, IntPtr.Zero);
+                // 234 ERROR_MORE_DATA: buffer too small for start→end-of-volume,
+                // but it holds a valid filled-to-capacity prefix (proven on-box:
+                // ret == outLen, BitmapSize == total remaining). Parse the prefix
+                // and resume past it — the window stays bounded at any volume size.
+                var err = ok ? 0 : Marshal.GetLastWin32Error();
+                if (!ok && err != 234)
+                    throw new IOException($"FSCTL_GET_VOLUME_BITMAP @LCN {lcn} failed: {err}");
+                if (ret < 16)
+                    throw new IOException($"FSCTL_GET_VOLUME_BITMAP @LCN {lcn} short header: {ret} bytes");
                 var start = BitConverter.ToInt64(outBuf, 0);
-                var bits = BitConverter.ToInt64(outBuf, 8);
-                if (bits == 0) break;
-                AppendRuns(runs, start, outBuf, 16, ret - 16, bits);
-                lcn = start + bits;
+                var size = BitConverter.ToInt64(outBuf, 8);
+                var valid = WindowBits(ok, size, ret);
+                if (valid == 0) break;
+                AppendRuns(runs, start, outBuf, 16, ret - 16, valid);
+                lcn = start + valid;
             }
             return runs;
         }
+
+        // Returned bit count per window. On success BitmapSize is authoritative
+        // (clamped to what fits); on MORE_DATA BitmapSize is the total remaining,
+        // so the count comes from the filled prefix instead. Pure for tests.
+        internal static long WindowBits(bool ok, long bitmapSize, int ret) =>
+            ok ? Math.Min(bitmapSize, (long)(ret - 16) * 8) : (long)(ret - 16) * 8;
 
         // Pure bit→run parser: buf holds bitmap bytes for validBits clusters
         // starting at startLcn, LSB-first per NTFS.

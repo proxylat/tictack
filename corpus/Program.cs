@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -19,6 +20,7 @@ namespace Corpus
             string? name = null;
             string? snapshotArg = null;
             string? outPath = null;
+            string? device = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -69,6 +71,12 @@ namespace Corpus
                     case "--bitmap-stats":
                         verb = "bitmap-stats";
                         break;
+                    case "--bitmap-dump":
+                        verb = "bitmap-dump";
+                        break;
+                    case "--device":
+                        if (i + 1 < args.Length) device = args[++i];
+                        break;
                     case "--volume":
                         if (i + 1 < args.Length) volume = args[++i];
                         break;
@@ -111,6 +119,8 @@ namespace Corpus
                         var probeVol = ProbeVolume(volume, log);
                         if (probeVol == null) return 1;
                         return RunProbe(verb, probeVol, log);
+                    case "bitmap-dump":
+                        return RunBitmapDump(volume, device, outPath, log);
                     default:
                         break;
                 }
@@ -316,6 +326,35 @@ namespace Corpus
             }
         }
 
+        // Runs dump for harness-side masked compares. --volume gives geometry
+        // (identical on live root and its shadows); --device reads an existing
+        // frozen device instead of snapshotting (zero skew vs a hashed shadow).
+        private static int RunBitmapDump(string? volume, string? device, string? outPath, ILogger log)
+        {
+            if (string.IsNullOrEmpty(outPath))
+            {
+                log.Error("--bitmap-dump requires --out <path>");
+                return 1;
+            }
+            var vol = ProbeVolume(volume, log);
+            if (vol == null) return 1;
+            var bpc = VolumeBitmap.BytesPerCluster(vol + "\\");
+            var total = VolumeBitmap.TotalBytes(vol + "\\");
+            List<(long Start, long Count)> runs;
+            if (!string.IsNullOrEmpty(device))
+            {
+                runs = VolumeBitmap.ReadRuns(device, total / bpc);
+            }
+            else
+            {
+                using var s = VssSnapshot.Create(vol, log);
+                runs = VolumeBitmap.ReadRuns(s.DeviceObject.TrimEnd('\\'), total / bpc);
+            }
+            VolumeBitmap.WriteRuns(outPath, bpc, total / bpc, runs);
+            log.Info($"bitmap-dump {vol}: {runs.Count} runs -> {outPath}");
+            return 0;
+        }
+
         private static string HashStream(Stream s)
         {
             using var sha = SHA256.Create();
@@ -357,6 +396,7 @@ namespace Corpus
             Console.WriteLine("  --vss-read --volume <X:>     Read a 64 KiB extent via snapshot probe (Windows, elevated)");
             Console.WriteLine("  --vss-dump --volume <X:>     Hash one snapshot twice (read-stability probe)");
             Console.WriteLine("  --bitmap-stats --volume <X:> Used-cluster stats over a snapshot (Windows, elevated)");
+            Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
             Console.WriteLine("  --verify --snapshot <gen>              Verify a snapshot (exit 1 on failure)");
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
             Console.WriteLine("  --validate             Check config_corpus.yaml and exit");
