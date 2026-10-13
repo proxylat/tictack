@@ -174,7 +174,6 @@ public sealed class EncryptionTests : IDisposable
         Assert.Equal(File.ReadAllBytes(_volPath), File.ReadAllBytes(outPath));
     }
 
-#if false // PENDING rung A (ChangeSource.cs): needs FakeChangeSource + ImageOptions. Restore verbatim in Phase 2.
     [Fact]
     public void Encrypt_RotatedIncremental_MixedKeysVerify()
     {
@@ -211,7 +210,6 @@ public sealed class EncryptionTests : IDisposable
         store2.Export(2, outPath);
         Assert.Equal(File.ReadAllBytes(vol), File.ReadAllBytes(outPath));
     }
-#endif
 
     [Fact]
     public void Encrypt_MissingKey_FailsLoud()

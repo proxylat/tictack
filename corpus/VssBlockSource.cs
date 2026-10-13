@@ -10,7 +10,7 @@ namespace Corpus
     // the shadow. Completion-aware: the read wrapper reports a full-length
     // read so writers get BackupComplete on success, AbortBackup on any
     // short or failed read (probes must never Complete — see VssSnapshot).
-    public sealed class VssBlockSource : ISparseBlockSource
+    public sealed class VssBlockSource : ISparseBlockSource, IVolumeHandleProvider
     {
         private readonly VssSnapshot _snap;
         private readonly string _device;
@@ -43,6 +43,10 @@ namespace Corpus
 
         public IReadOnlyList<(long Start, long Count)> GetAllocatedRuns()
             => VolumeBitmap.ReadRuns(_device, Length / BytesPerCluster);
+
+        // USN planning reads the journal + MFT from the SAME frozen shadow
+        // the bytes come from (never live — skew would tear the manifest).
+        string IVolumeHandleProvider.SnapshotDevicePath => _device;
 
         public Stream OpenRead()
         {

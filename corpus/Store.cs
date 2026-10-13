@@ -52,20 +52,102 @@ namespace Corpus
             _index = new ChunkIndex(dbPath);
         }
 
-        public SnapshotManifest Image(IBlockSource source, string name)
+        public SnapshotManifest Image(IBlockSource source, string name) =>
+            Image(source, name, new ImageOptions());
+
+        public SnapshotManifest Image(IBlockSource source, string name, ImageOptions opts)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(source);
+            ArgumentNullException.ThrowIfNull(opts);
             var generation = ManifestStore.NextGeneration(_manifestsDir);
-            var prevDigest = "";
             var existing = ManifestStore.List(_manifestsDir);
+            SnapshotManifest? latest = null;
             if (existing.Count > 0)
             {
-                var latest = existing[existing.Count - 1];
-                var latestPath = Path.Combine(_manifestsDir, $"{latest.Generation:D6}-{latest.Name}.json");
-                prevDigest = ManifestStore.Load(latestPath, _key).Hmac;
+                var (gen, snap) = existing[existing.Count - 1];
+                latest = ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{snap}.json"), _key);
             }
+            var prevDigest = latest?.Hmac ?? "";
+            SnapshotManifest? parent = null;
+            if (!opts.ForceFull && (opts.Incremental || opts.ParentGeneration > 0))
+            {
+                int? wantGen = opts.ParentGeneration > 0 ? opts.ParentGeneration : latest?.Generation;
+                if (wantGen == null)
+                {
+                    _log.Info($"no parent snapshot, full image ('{name}' will be gen {generation})");
+                }
+                else if (latest != null && wantGen.Value == latest.Generation)
+                {
+                    parent = CheckParent(latest, source);
+                }
+                else
+                {
+                    string? parentName = null;
+                    foreach (var (gen, snap) in existing)
+                    {
+                        if (gen == wantGen.Value)
+                        {
+                            parentName = snap;
+                            break;
+                        }
+                    }
+                    if (parentName == null)
+                    {
+                        if (opts.ParentGeneration > 0)
+                            throw new InvalidDataException($"--parent gen {wantGen.Value} not found in {_manifestsDir}");
+                        _log.Info($"parent gen {wantGen.Value} missing, full image");
+                    }
+                    else
+                    {
+                        // HMAC-checked; corrupt → throw (never image onto a corrupt parent).
+                        parent = CheckParent(ManifestStore.Load(Path.Combine(_manifestsDir, $"{wantGen.Value:D6}-{parentName}.json"), _key), source);
+                    }
+                }
+            }
+            if (parent != null)
+            {
+                var plan = (opts.ChangeSource ?? DefaultChangeSource()).Plan(parent, source, _chunkMib * 1024 * 1024, _log);
+                if (plan != null)
+                    return ImageIncremental(source, name, generation, prevDigest, parent, plan);
+            }
+            return ImageFull(source, name, generation, prevDigest);
+        }
 
-            var entries = new List<ManifestEntry>();
+        private static IChangeSource DefaultChangeSource() => new UsnChangeSource();
+
+        // Parent usability gate: resize / re-chunk / grid drift → log the
+        // reason and return null (caller falls back to full re-read).
+        private SnapshotManifest? CheckParent(SnapshotManifest parent, IBlockSource source)
+        {
+            if (parent.VolumeLength != source.Length)
+            {
+                _log.Info($"full image: parent gen {parent.Generation} volume length {parent.VolumeLength} != source length {source.Length}");
+                return null;
+            }
+            if (parent.ChunkMib != _chunkMib)
+            {
+                _log.Info($"full image: parent gen {parent.Generation} chunk {parent.ChunkMib} MiB != current {_chunkMib} MiB");
+                return null;
+            }
+            var grid = GridCount(source.Length, _chunkMib);
+            if (parent.Chunks.Count != grid)
+            {
+                _log.Info($"full image: parent gen {parent.Generation} has {parent.Chunks.Count} chunks, current grid is {grid}");
+                return null;
+            }
+            return parent;
+        }
+
+        private static int GridCount(long volumeLength, int chunkMib)
+        {
+            var chunkBytes = (long)chunkMib * 1024 * 1024;
+            return (int)((volumeLength + chunkBytes - 1) / chunkBytes);
+        }
+
+        private SnapshotManifest ImageFull(IBlockSource source, string name, int generation, string prevDigest)
+        {
+            var entries = new List<ManifestEntry>(GridCount(source.Length, _chunkMib));
             var pending = new List<ChunkRow>();
             // Digests packed but not yet flushed: TryGet can't see them, so
             // without this set intra-image duplicates pack twice and the
@@ -127,10 +209,95 @@ namespace Corpus
 
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
-                ChunkId.KeyId(_key), prevDigest, entries, encKeyId: _encKeyId);
+                ChunkId.KeyId(_key), prevDigest, entries,
+                changeCursor: UsnChangeSource.TryCurrentCursor(source, _log), encKeyId: _encKeyId);
             ManifestStore.Save(_manifestsDir, manifest, _key);
             _log.Info($"imaged '{name}' gen {generation}: {entries.Count} chunks ({holes} holes), {newChunks} new, {totalBytes} bytes");
             return manifest;
+        }
+
+        // Incremental capture: clean chunks reuse the parent's digests with
+        // ZERO reads; only dirty chunks are seek-read, hashed, and packed.
+        // The child manifest is self-contained (full chunk list) — export
+        // and standalone verify never touch the parent.
+        private SnapshotManifest ImageIncremental(IBlockSource source, string name, int generation, string prevDigest, SnapshotManifest parent, IncrementalPlan plan)
+        {
+            var chunkBytes = _chunkMib * 1024 * 1024;
+            var grid = GridCount(source.Length, _chunkMib);
+            var entries = new List<ManifestEntry>(parent.Chunks.Count);
+            var pending = new List<ChunkRow>();
+            var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
+            var reread = 0;
+            var newChunks = 0;
+            using (var pack = new PackWriter(_packsDir, v2: _encKey != null))
+            using (var stream = source.OpenRead())
+            {
+                bool[]? holeMap = null;
+                if (source is ISparseBlockSource sparse)
+                    holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
+                for (var i = 0; i < grid; i++)
+                {
+                    if (holeMap != null && i < holeMap.Length && holeMap[i])
+                    {
+                        entries.Add(ManifestEntry.Hole(Math.Min((long)chunkBytes, source.Length - i * (long)chunkBytes)));
+                        continue; // hole wins over dirty — no read either way
+                    }
+                    if (!plan.DirtyChunks.Contains(i))
+                    {
+                        entries.Add(parent.Chunks[i]); // clean: reuse digest, ZERO reads
+                        continue;
+                    }
+                    var data = ReadChunkAt(stream, i, chunkBytes, source.Length);
+                    reread++;
+                    var digest = ChunkId.ComputeId(data, _key, _encKey);
+                    var hex = ChunkId.ToHex(digest);
+                    entries.Add(new ManifestEntry(hex, data.Length));
+                    if (packedThisImage.Contains(hex) || _index.TryGet(digest, out _))
+                        continue;
+                    var (payload, codec) = Compression.Encode(data, _zstdLevel);
+                    byte[]? nonce = null;
+                    if (_encKey != null)
+                    {
+                        // Random 96-bit nonce per blob: no counter state to
+                        // crash-lose (counter reuse across crashes is fatal).
+                        nonce = RandomNumberGenerator.GetBytes(ChunkCrypto.NonceBytes);
+                        payload = ChunkCrypto.Encrypt(payload, _encKey, nonce);
+                    }
+                    var (packName, offset) = pack.Add(digest, payload, data.Length, codec, nonce);
+                    pending.Add(new ChunkRow(digest, data.Length, payload.Length, packName, offset));
+                    packedThisImage.Add(hex);
+                    newChunks++;
+                    if (pending.Count >= 500)
+                    {
+                        _index.UpsertBatch(pending);
+                        pending.Clear();
+                        packedThisImage.Clear();
+                    }
+                }
+                _index.UpsertBatch(pending);
+                pending.Clear();
+            }
+
+            var manifest = ManifestStore.Build(
+                generation, name, source.Length, _chunkMib, _zstdLevel,
+                ChunkId.KeyId(_key), prevDigest, entries, parent.Generation, plan.NewCursor, _encKeyId);
+            ManifestStore.Save(_manifestsDir, manifest, _key);
+            _log.Info($"incremental gen {generation} from parent {parent.Generation}: {reread}/{grid} chunks re-read, {newChunks} new");
+            return manifest;
+        }
+
+        private static byte[] ReadChunkAt(Stream stream, long index, int chunkBytes, long volumeLength)
+        {
+            stream.Seek(index * (long)chunkBytes, SeekOrigin.Begin);
+            var want = (int)Math.Min((long)chunkBytes, volumeLength - index * (long)chunkBytes);
+            var data = new byte[want];
+            var filled = 0;
+            int n;
+            while (filled < want && (n = stream.Read(data, filled, want - filled)) > 0)
+                filled += n;
+            if (filled != want)
+                throw new IOException($"short read at chunk {index}: {filled} of {want}");
+            return data;
         }
 
         public void Export(int generation, string outPath)
@@ -242,7 +409,10 @@ namespace Corpus
 
         // Full re-read: index → pack → decode → id compare. Never throws;
         // every failure path logs and returns false for CLI exit codes.
-        public bool Verify(int generation)
+        // chain=true additionally walks ParentGeneration links to genesis
+        // (HMAC loads + PrevDigest linkage; chunk bytes re-read for the
+        // target alone — ancestors are provenance, not data).
+        public bool Verify(int generation, bool chain = false)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             try
@@ -309,6 +479,8 @@ namespace Corpus
                     failed = true;
                     _log.Error($"snapshot {generation} verify failed: size sum {total} != volume length {manifest.VolumeLength}");
                 }
+                if (chain && !VerifyChainLinks(generation))
+                    failed = true;
                 if (!failed)
                     _log.Info($"snapshot {generation} verified: {manifest.Chunks.Count} chunks OK");
                 return !failed;
@@ -324,6 +496,48 @@ namespace Corpus
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             return ManifestStore.List(_manifestsDir);
+        }
+
+        // Chain provenance: walk ParentGeneration to genesis, HMAC-loading
+        // each link and checking PrevDigest linkage. A gap fails loud
+        // (provenance is unverifiable); the target's standalone result is
+        // unaffected — it was computed from the target manifest alone.
+        private bool VerifyChainLinks(int generation)
+        {
+            var known = new HashSet<int>();
+            foreach (var (gen, _) in ManifestStore.List(_manifestsDir))
+                known.Add(gen);
+            var current = LoadGeneration(generation);
+            while (current.ParentGeneration > 0)
+            {
+                var parentGen = current.ParentGeneration;
+                if (!known.Contains(parentGen))
+                {
+                    _log.Error($"snapshot {generation} chain: provenance gap (parent gen {parentGen} of gen {current.Generation} missing; standalone verify of the target still passes)");
+                    return false;
+                }
+                SnapshotManifest parent;
+                try
+                {
+                    parent = LoadGeneration(parentGen);
+                }
+                catch (InvalidDataException ex)
+                {
+                    _log.Error($"snapshot {generation} chain: gen {parentGen} unreadable ({ex.Message})");
+                    return false;
+                }
+                // PrevDigest seals ADJACENT generations (each manifest carries the
+                // previous HMAC); an explicit older --parent skips gens, so
+                // linkage is enforced only across adjacent links. Every
+                // visited manifest is still HMAC-authenticated by the load.
+                if (current.Generation == parentGen + 1 && current.PrevDigest != parent.Hmac)
+                {
+                    _log.Error($"snapshot {generation} chain: gen {current.Generation} PrevDigest does not match parent gen {parentGen} HMAC");
+                    return false;
+                }
+                current = parent;
+            }
+            return true;
         }
 
         public void Dispose()

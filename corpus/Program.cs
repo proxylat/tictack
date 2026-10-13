@@ -21,6 +21,10 @@ namespace Corpus
             string? snapshotArg = null;
             string? outPath = null;
             string? device = null;
+            var incremental = false;
+            string? parentArg = null;
+            var forceFull = false;
+            var chain = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -95,6 +99,18 @@ namespace Corpus
                     case "--out":
                         if (i + 1 < args.Length) outPath = args[++i];
                         break;
+                    case "--incremental":
+                        incremental = true;
+                        break;
+                    case "--parent":
+                        if (i + 1 < args.Length) parentArg = args[++i];
+                        break;
+                    case "--full":
+                        forceFull = true;
+                        break;
+                    case "--chain":
+                        chain = true;
+                        break;
                     default:
                         Console.Error.WriteLine("Unknown argument: " + args[i]);
                         PrintHelp();
@@ -156,10 +172,21 @@ namespace Corpus
                             log.Error("--image requires --volume <path> --name <snapshot>");
                             return 1;
                         }
+                        if (incremental && parentArg != null)
+                        {
+                            log.Error("--incremental and --parent are mutually exclusive");
+                            return 1;
+                        }
+                        var parentGen = 0;
+                        if (parentArg != null && !TryParent(parentArg, log, out parentGen))
+                            return 1;
                         using (var store = CreateStore(cfg, log))
                         using (var source = OpenSource(volume, log))
                         {
-                            var m = store.Image(source, name);
+                            // UsnChangeSource passed unconditionally: it
+                            // returns null on Linux internally, keeping this
+                            // branch-free (null plan → full re-read).
+                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new UsnChangeSource()));
                             log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
                         }
                         return 0;
@@ -188,7 +215,7 @@ namespace Corpus
                             return 1;
                         }
                         using (var store = CreateStore(cfg, log))
-                            return store.Verify(verifyGen) ? 0 : 1;
+                            return store.Verify(verifyGen, chain) ? 0 : 1;
                     case "list":
                         using (var store = CreateStore(cfg, log))
                         {
@@ -404,6 +431,17 @@ namespace Corpus
             return true;
         }
 
+        private static bool TryParent(string? arg, ILogger log, out int generation)
+        {
+            generation = 0;
+            if (string.IsNullOrEmpty(arg) || !int.TryParse(arg, out generation) || generation <= 0)
+            {
+                log.Error("invalid --parent (want a positive generation number, got: " + arg + ")");
+                return false;
+            }
+            return true;
+        }
+
         static void PrintVersion()
         {
             var asm = Assembly.GetExecutingAssembly();
@@ -415,7 +453,7 @@ namespace Corpus
         {
             Console.WriteLine("Corpus — system imaging");
             Console.WriteLine();
-            Console.WriteLine("  --image --volume <path|X:> --name <snap>   Image a file, or live volume X: via VSS");
+            Console.WriteLine("  --image --volume <path|X:> --name <snap> [--incremental | --parent <gen>] [--full]   Image a file, or live volume X: via VSS");
             Console.WriteLine("  --export --snapshot <gen> --out <path>  Export a snapshot to a file");
             Console.WriteLine("  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX");
             Console.WriteLine("  --vss-list                   Relay 'vssadmin list writers' (Windows)");
@@ -424,7 +462,7 @@ namespace Corpus
             Console.WriteLine("  --vss-dump --volume <X:>     Hash one snapshot twice (read-stability probe)");
             Console.WriteLine("  --bitmap-stats --volume <X:> Used-cluster stats over a snapshot (Windows, elevated)");
             Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
-            Console.WriteLine("  --verify --snapshot <gen>              Verify a snapshot (exit 1 on failure)");
+            Console.WriteLine("  --verify --snapshot <gen> [--chain]              Verify a snapshot (exit 1 on failure; --chain also walks parent links to genesis, a gap fails loud even if the target alone verifies)");
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
             Console.WriteLine("  --gen-key                              Generate an encryption key and activate it (existing snapshots stay as-is; only new images encrypt)");
             Console.WriteLine("  --key-list                             List encryption keys (\"<id> [current]\" lines)");
@@ -433,6 +471,7 @@ namespace Corpus
             Console.WriteLine("  --version              Print version and exit");
             Console.WriteLine("  --help                 This text");
             Console.WriteLine();
+            Console.WriteLine("  incrementals reuse the parent's clean chunks without re-reading; any doubt → full re-image");
             Console.WriteLine("  encryption covers new images only; existing snapshots stay as-is");
             Console.WriteLine("  keys are raw 32-byte files at keys/<keyid>.key, active key named by keys/current");
         }
