@@ -39,6 +39,7 @@
     <Compile Include="../recovery/RestoreOrchestrator.cs" Link="corpus/recovery/RestoreOrchestrator.cs" />
     <Compile Include="../PackWriter.cs" Link="corpus/PackWriter.cs" />
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
+    <Compile Include="../Gc.cs" Link="corpus/Gc.cs" />
     <Compile Include="../ChangeSource.cs" Link="corpus/ChangeSource.cs" />
     <Compile Include="../Crypto.cs" Link="corpus/Crypto.cs" />
     <Compile Include="../KeyStore.cs" Link="corpus/KeyStore.cs" />

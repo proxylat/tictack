@@ -81,6 +81,47 @@ namespace Corpus
             return cmd.ExecuteNonQuery();
         }
 
+        // GC mark: single transaction, input walked in 500s (bounded
+        // statement burst per inner loop, one commit for the whole batch).
+        public void MarkBatch(List<byte[]> digests)
+        {
+            if (digests.Count == 0) return;
+            using var tx = _conn.BeginTransaction();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE chunks SET mark = 1 WHERE digest = $d";
+            var pDigest = cmd.Parameters.Add("$d", SqliteType.Blob);
+            for (var start = 0; start < digests.Count; start += 500)
+            {
+                var end = Math.Min(start + 500, digests.Count);
+                for (var i = start; i < end; i++)
+                {
+                    pDigest.Value = digests[i];
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            tx.Commit();
+        }
+
+        public List<string> LivePacks()
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT DISTINCT pack FROM chunks WHERE mark = 1";
+            var packs = new List<string>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+                packs.Add(reader.GetString(0));
+            return packs;
+        }
+
+        public (long Count, long StoredBytes) UnmarkedStats()
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*), COALESCE(SUM(stored_bytes), 0) FROM chunks WHERE mark = 0";
+            using var reader = cmd.ExecuteReader();
+            reader.Read();
+            return (reader.GetInt64(0), reader.GetInt64(1));
+        }
+
         public void Dispose()
         {
             if (_disposed) return;

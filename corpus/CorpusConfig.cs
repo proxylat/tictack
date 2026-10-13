@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using TicTack;
 using YamlDotNet.Serialization;
@@ -29,6 +30,19 @@ namespace Corpus
         }
     }
 
+    public class CorpusRetentionConfig
+    {
+        public int KeepLast { get; set; }
+        public int KeepWithinDays { get; set; }
+        public List<int> Pin { get; set; } = new();
+
+        public CorpusRetentionConfig()
+        {
+            KeepLast = 4;
+            KeepWithinDays = 0;
+        }
+    }
+
     public class CorpusConfig
     {
         // Chunk packs + manifests live here. Required.
@@ -38,6 +52,8 @@ namespace Corpus
         public int ChunkMib { get; set; }
         public CorpusCompressionConfig Compression { get; set; }
         public CorpusLoggingConfig Logging { get; set; }
+        // GC roots: union of keep-last-N, keep-within-days, pinned gens.
+        public CorpusRetentionConfig Retention { get; set; }
 
         public CorpusConfig()
         {
@@ -46,6 +62,7 @@ namespace Corpus
             ChunkMib = 4;
             Compression = new CorpusCompressionConfig();
             Logging = new CorpusLoggingConfig();
+            Retention = new CorpusRetentionConfig();
         }
 
         public static CorpusConfig? Load(string path)
@@ -79,6 +96,26 @@ namespace Corpus
             {
                 log.Error("compression.level must be 1..22 (got: " + level + ")");
                 valid = false;
+            }
+            var retention = cfg.Retention ?? new CorpusRetentionConfig();
+            if (retention.KeepLast < 1)
+            {
+                log.Error("retention.keep_last must be >= 1 (got: " + retention.KeepLast + ")");
+                valid = false;
+            }
+            if (retention.KeepWithinDays < 0)
+            {
+                log.Error("retention.keep_within_days must be >= 0 (got: " + retention.KeepWithinDays + ")");
+                valid = false;
+            }
+            foreach (var pin in retention.Pin ?? new List<int>())
+            {
+                if (pin <= 0)
+                {
+                    log.Error("retention.pin must hold positive generation numbers (got: " + pin + ")");
+                    valid = false;
+                    break;
+                }
             }
             return valid;
         }

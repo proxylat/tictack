@@ -23,6 +23,15 @@ logging:
   path: ''
   console: false
 
+# GC retention: roots are the UNION of newest keep_last generations,
+# snapshots imaged within keep_within_days (0 = off, by CreatedUtc),
+# and explicitly pinned generations. Unknown pins warn and are ignored.
+# GC is manual only (--gc --confirm); nothing is ever deleted implicitly.
+retention:
+  keep_last: 4
+  keep_within_days: 0
+  pin: []
+
 # Restore (recovery stick): --restore --snapshot <gen> --target <disk#|\\.\PhysicalDriveN|file>
 # --confirm-type is required always (even --dry-run); a refused run names the want-TOKEN.
 # Baked stick configs use store_path 'store' (resolved beside Corpus.exe); any other store via --store <path>.

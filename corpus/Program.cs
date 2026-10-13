@@ -41,6 +41,7 @@ namespace Corpus
             var allowBootDisk = false;
             var skipVerify = false;
             var dryRun = false;
+            var confirm = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -75,6 +76,12 @@ namespace Corpus
                         break;
                     case "--list":
                         verb = "list";
+                        break;
+                    case "--gc":
+                        verb = "gc";
+                        break;
+                    case "--confirm":
+                        confirm = true;
                         break;
                     case "--gen-key":
                         verb = "gen-key";
@@ -229,6 +236,11 @@ namespace Corpus
                 }
                 if (!CorpusConfig.Validate(cfg, log))
                     return 1;
+                if (confirm && verb != "gc")
+                {
+                    log.Error("--confirm is only valid with --gc");
+                    return 1;
+                }
 
                 switch (verb)
                 {
@@ -320,6 +332,8 @@ namespace Corpus
                         return 0;
                     case "restore":
                         return RunRestore(cfg, baseDir, snapshotArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
+                    case "gc":
+                        return RunGc(cfg, dryRun, confirm, log);
                     default:
                         return 1;
                 }
@@ -402,6 +416,54 @@ namespace Corpus
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, new KeyStore(storePath));
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
+        }
+
+        // --gc: manual only, never automatic. Bare prints the plan and
+        // asks for --confirm (exit 1); --dry-run plans without deleting
+        // (exit 0); --confirm executes (exit 0).
+        private static int RunGc(CorpusConfig cfg, bool dryRun, bool confirm, ILogger log)
+        {
+            if (dryRun && confirm)
+            {
+                log.Error("--dry-run and --confirm are mutually exclusive");
+                return 1;
+            }
+            var gc = new GarbageCollector(
+                cfg.StorePath,
+                Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
+                cfg.Retention ?? new CorpusRetentionConfig(), log);
+            var plan = gc.Plan();
+            if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0)
+            {
+                Console.WriteLine("nothing to collect");
+                log.Info("nothing to collect");
+                return 0;
+            }
+            Console.WriteLine($"gc plan: drop {plan.DropManifests.Count} snapshots, {plan.DeadChunks} chunks, {plan.DeadBytes} bytes, {plan.DropPacks.Count} packs");
+            foreach (var m in plan.DropManifests)
+                Console.WriteLine("  drop manifest: " + m);
+            foreach (var p in plan.DropPacks)
+                Console.WriteLine("  drop pack: " + p);
+            foreach (var n in plan.Notes)
+            {
+                Console.WriteLine("  note: " + n);
+                log.Warn(n);
+            }
+            if (confirm)
+            {
+                gc.Execute(plan);
+                // Mirrors the Execute summary: plan lines print to stdout,
+                // so the result must too (log-only is invisible console:false).
+                Console.WriteLine($"gc: dropped {plan.DropManifests.Count} snapshots, {plan.DeadChunks} chunks, {plan.DeadBytes} bytes, {plan.DropPacks.Count} packs");
+                return 0;
+            }
+            if (dryRun)
+            {
+                Console.WriteLine("marks only, no deletes");
+                return 0;
+            }
+            Console.WriteLine("re-run with --confirm");
+            return 1;
         }
 
         // Drive-letter-colon ("T:") images the live volume through VSS;
@@ -585,6 +647,8 @@ namespace Corpus
             Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
             Console.WriteLine("  --verify --snapshot <gen> [--chain]              Verify a snapshot (exit 1 on failure; --chain also walks parent links to genesis, a gap fails loud even if the target alone verifies)");
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
+            Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual only, never automatic)");
+            Console.WriteLine("      retention: keep_last/keep_within_days/pin from config; exports outside the store are untouched");
             Console.WriteLine("  --gen-key                              Generate an encryption key and activate it (existing snapshots stay as-is; only new images encrypt)");
             Console.WriteLine("  --key-list                             List encryption keys (\"<id> [current]\" lines)");
             Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
