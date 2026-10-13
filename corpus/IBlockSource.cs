@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace Corpus
@@ -11,6 +12,12 @@ namespace Corpus
     {
         long Length { get; }
         Stream OpenRead();
+    }
+
+    public interface ISparseBlockSource : IBlockSource
+    {
+        long BytesPerCluster { get; }
+        IReadOnlyList<(long Start, long Count)> GetAllocatedRuns();
     }
 
     public sealed class FileBlockSource : IBlockSource

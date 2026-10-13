@@ -4,10 +4,15 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Corpus
 {
-    public sealed record ManifestEntry(string DigestHex, long Size);
+    public sealed record ManifestEntry(string DigestHex, long Size,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsHole = false)
+    {
+        public static ManifestEntry Hole(long size) => new("", size, true);
+    }
 
     public sealed class SnapshotManifest
     {

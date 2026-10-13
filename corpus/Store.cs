@@ -58,11 +58,27 @@ namespace Corpus
             var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
             var newChunks = 0;
             var totalBytes = 0L;
+            var holes = 0;
+            var chunkBytes = _chunkMib * 1024 * 1024;
             using (var pack = new PackWriter(_packsDir))
             using (var stream = source.OpenRead())
             {
-                foreach (var chunk in Chunker.Read(stream, _chunkMib * 1024 * 1024))
+                bool[]? holeMap = null;
+                if (source is ISparseBlockSource sparse)
+                    holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
+                var enumerable = holeMap != null
+                    ? Chunker.ReadSparse(stream, chunkBytes, i => i < holeMap.Length && holeMap[i])
+                    : Chunker.Read(stream, chunkBytes);
+                foreach (var chunk in enumerable)
                 {
+                    if (chunk.IsHole)
+                    {
+                        var holeSize = Math.Min((long)chunkBytes, source.Length - chunk.Offset);
+                        entries.Add(ManifestEntry.Hole(holeSize));
+                        totalBytes += holeSize;
+                        holes++;
+                        continue;
+                    }
                     var digest = ChunkId.ComputeId(chunk.Data, _key);
                     var hex = ChunkId.ToHex(digest);
                     entries.Add(new ManifestEntry(hex, chunk.Data.Length));
@@ -89,7 +105,7 @@ namespace Corpus
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries);
             ManifestStore.Save(_manifestsDir, manifest, _key);
-            _log.Info($"imaged '{name}' gen {generation}: {entries.Count} chunks, {newChunks} new, {totalBytes} bytes");
+            _log.Info($"imaged '{name}' gen {generation}: {entries.Count} chunks ({holes} holes), {newChunks} new, {totalBytes} bytes");
             return manifest;
         }
 
@@ -118,6 +134,7 @@ namespace Corpus
         {
             foreach (var entry in manifest.Chunks)
             {
+                if (entry.IsHole) { output.Seek(entry.Size, SeekOrigin.Current); continue; }
                 var digest = Convert.FromHexString(entry.DigestHex);
                 if (!_index.TryGet(digest, out var row))
                     throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
@@ -143,6 +160,12 @@ namespace Corpus
                 for (var i = 0; i < manifest.Chunks.Count; i++)
                 {
                     var entry = manifest.Chunks[i];
+                    if (entry.IsHole)
+                    {
+                        if (entry.DigestHex != "" || entry.Size <= 0 || entry.Size > manifest.ChunkMib * 1024 * 1024)
+                        { failed = true; if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: corrupt hole entry"); }
+                        continue;
+                    }
                     var digest = Convert.FromHexString(entry.DigestHex);
                     if (!_index.TryGet(digest, out var row))
                     {
@@ -169,6 +192,13 @@ namespace Corpus
                         failed = true;
                         if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: content mismatch");
                     }
+                }
+                var total = 0L;
+                foreach (var e in manifest.Chunks) total += e.Size;
+                if (total != manifest.VolumeLength)
+                {
+                    failed = true;
+                    _log.Error($"snapshot {generation} verify failed: size sum {total} != volume length {manifest.VolumeLength}");
                 }
                 if (!failed)
                     _log.Info($"snapshot {generation} verified: {manifest.Chunks.Count} chunks OK");

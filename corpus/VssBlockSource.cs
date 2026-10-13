@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using TicTack;
 
@@ -9,7 +10,7 @@ namespace Corpus
     // the shadow. Completion-aware: the read wrapper reports a full-length
     // read so writers get BackupComplete on success, AbortBackup on any
     // short or failed read (probes must never Complete — see VssSnapshot).
-    public sealed class VssBlockSource : IBlockSource
+    public sealed class VssBlockSource : ISparseBlockSource
     {
         private readonly VssSnapshot _snap;
         private readonly string _device;
@@ -21,6 +22,7 @@ namespace Corpus
             _snap = VssSnapshot.Create(drive, log);
             _device = _snap.DeviceObject.TrimEnd('\\');
             Length = DeviceLength(drive, _device);
+            BytesPerCluster = VolumeBitmap.BytesPerCluster(drive + "\\");
         }
 
         // Length is the FS-readable total, NOT the IOCTL partition
@@ -36,6 +38,11 @@ namespace Corpus
         }
 
         public long Length { get; }
+
+        public long BytesPerCluster { get; }
+
+        public IReadOnlyList<(long Start, long Count)> GetAllocatedRuns()
+            => VolumeBitmap.ReadRuns(_device, Length / BytesPerCluster);
 
         public Stream OpenRead()
         {
@@ -79,7 +86,6 @@ namespace Corpus
         private long _segStart = -1;
         private int _segLen;
         private long _pos;
-        private long _read;
         private bool _fired;
 
         public VssReadStream(Stream inner, long length, Action onFull)
@@ -133,9 +139,8 @@ namespace Corpus
                 count -= take;
                 _pos += take;
                 total += take;
-                _read += take;
             }
-            if (_read >= _length && !_fired)
+            if (_pos >= _length && !_fired)
             {
                 _fired = true;
                 _onFull();
