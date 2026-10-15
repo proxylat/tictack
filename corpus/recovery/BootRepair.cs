@@ -156,6 +156,20 @@ namespace Corpus
     {
         public static int Repair(DiskLayout layout, IBootRepairRunner runner, ILogger log)
         {
+            // One-shot composition (PE callers): apply first, bootloader
+            // after. RestoreDisk calls the phases separately so bytes
+            // stream between them — the table MUST be recreated before
+            // streaming (diskpart clean wipes the old table; streaming
+            // first would be destroyed).
+            var rc = ApplyPhase(layout, runner, log);
+            return rc != 0 ? rc : BootloaderPhase(layout, runner, log);
+        }
+
+        // Pre-stream: checks + firmware gate + partition-table recreate.
+        // The script is the no-format variant (payload ranges stream next;
+        // formatting here would wipe what restore is about to write).
+        public static int ApplyPhase(DiskLayout layout, IBootRepairRunner runner, ILogger log)
+        {
             ArgumentNullException.ThrowIfNull(layout);
             ArgumentNullException.ThrowIfNull(runner);
             ArgumentNullException.ThrowIfNull(log);
@@ -173,8 +187,26 @@ namespace Corpus
                     log.Error($"refusing boot repair: firmware is {firmware}, layout is GPT (Legacy+GPT is unbootable; the MBR2GPT path is a staged follow-up)");
                     return 1;
                 }
-                runner.ApplyLayout(DiskpartScript.Generate(layout));
+                runner.ApplyLayout(DiskpartScript.Generate(layout, formatPartitions: false));
                 log.Info("boot repair: partition layout recreated");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                log.Error("boot repair failed", ex);
+                return 1;
+            }
+        }
+
+        // Post-verify: bootloader reinstall + boot-file check. Runs only
+        // after the restored bytes verified (never boot a corrupt target).
+        public static int BootloaderPhase(DiskLayout layout, IBootRepairRunner runner, ILogger log)
+        {
+            ArgumentNullException.ThrowIfNull(layout);
+            ArgumentNullException.ThrowIfNull(runner);
+            ArgumentNullException.ThrowIfNull(log);
+            try
+            {
                 var (win, esp) = runner.LocateVolumes();
                 log.Info($"boot repair: OS at {win}, ESP at {esp}");
                 runner.InstallBootloader(win, esp);

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using TicTack;
 
 namespace Corpus
@@ -37,15 +38,66 @@ namespace Corpus
                 throw new PlatformNotSupportedException("offline driver inject needs Windows (DISM).");
             ArgumentNullException.ThrowIfNull(offlineWindowsDir);
             ArgumentNullException.ThrowIfNull(driverDir);
-            // DISM wants the image root (D:\), not D:\Windows.
+            // DISM wants the image root (D:\), not D:\Windows. Quote
+            // argv-safe: a root's trailing backslash would escape the
+            // closing quote ("/Image:"S:\"" → DISM "missing a required
+            // servicing command" — VM-proven on an applied image).
             var image = Path.GetDirectoryName(offlineWindowsDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
             if (string.IsNullOrEmpty(image))
                 throw new InvalidDataException($"cannot derive the image root from {offlineWindowsDir}");
             _log.Info($"injecting storage drivers from {driverDir} into {image}");
-            var r = ProcessRunner.RunAsync($"dism /Image:\"{image}\" /Add-Driver /Driver:\"{driverDir}\" /Recurse",
+            var r = ProcessRunner.RunAsync($"dism /Image:{ProcessRunner.QuoteArg(image)} /Add-Driver /Driver:{ProcessRunner.QuoteArg(driverDir)} /Recurse",
                 Path.GetTempPath(), redirect: true, timeoutMs: 600000).GetAwaiter().GetResult();
-            if (r.TimedOut || r.ExitCode != 0)
+            if (r.TimedOut || (r.ExitCode != 0 && r.ExitCode != 50))
                 throw new InvalidDataException($"dism add-driver failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
+            // Exit 50 (completed-with-errors) is normal for /Recurse over a
+            // broad dir: inapplicable INFs fail while applicable ones land.
+            // Judge by parsed per-driver lines, not the exit code: zero
+            // landed (or unparseable output) fails loud, never silent.
+            var (installed, failed) = ParseAddDriverResult(r.Stdout + "\n" + r.Stderr);
+            if (r.ExitCode == 0)
+            {
+                _log.Info(installed > 0
+                    ? $"dism add-driver: {installed} driver(s) installed into {image}"
+                    : $"dism add-driver clean (exit 0) into {image}");
+                return;
+            }
+            if (installed == 0)
+                throw new InvalidDataException($"dism add-driver completed with errors and installed nothing ({failed.Count} failed: {FirstFails(failed)}): {Tail(r.Stderr + r.Stdout)}");
+            _log.Warn($"dism add-driver partial: {installed} installed, {failed.Count} failed ({FirstFails(failed)}); see C:\\Windows\\Logs\\DISM\\dism.log");
+        }
+
+        private static string FirstFails(List<(string Inf, string Reason)> failed)
+        {
+            if (failed.Count == 0) return "none parsed (localized DISM output?)";
+            var names = string.Join(", ", failed.Take(10).Select(f => f.Inf));
+            return failed.Count > 10 ? names + $" +{failed.Count - 10} more" : names;
+        }
+
+        // Parses /Add-Driver /Recurse stdout (English DISM):
+        //   "Installing 8 of 731 - x.inf: The driver package was successfully installed."
+        //   "Installing 187 of 731 - y.inf: Error - <reason>"
+        // Unparseable (localized DISM, empty) yields (0, []) — the caller
+        // fails loud on exit 50, never claims a silent success.
+        internal static (int Installed, List<(string Inf, string Reason)> Failed) ParseAddDriverResult(string output)
+        {
+            var failed = new List<(string Inf, string Reason)>();
+            var installed = 0;
+            if (string.IsNullOrEmpty(output)) return (installed, failed);
+            foreach (var raw in output.Split('\n'))
+            {
+                var line = raw.TrimEnd('\r');
+                if (!line.StartsWith("Installing ", StringComparison.Ordinal)) continue;
+                var dash = line.IndexOf(" - ", StringComparison.Ordinal);
+                var colon = dash >= 0 ? line.IndexOf(": ", dash + 3, StringComparison.Ordinal) : -1;
+                if (dash < 0 || colon < 0) continue;
+                var rest = line.Substring(colon + 2);
+                if (rest.Contains("successfully installed", StringComparison.Ordinal))
+                    installed++;
+                else if (rest.StartsWith("Error - ", StringComparison.Ordinal))
+                    failed.Add((line.Substring(dash + 3, colon - dash - 3).Trim(), rest.Substring("Error - ".Length).Trim()));
+            }
+            return (installed, failed);
         }
 
         private static string Tail(string s) =>

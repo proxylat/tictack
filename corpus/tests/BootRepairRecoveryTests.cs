@@ -168,6 +168,108 @@ public sealed class BootRepairRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void Generate_NoFormat_SkipsFormatKeepsExactOffsets()
+    {
+        var script = DiskpartScript.Generate(GoodLayout(), formatPartitions: false);
+        Assert.Contains("create partition efi size=260 offset=1024", script);
+        Assert.Contains("create partition msr size=16 offset=267264", script);
+        Assert.Contains("create partition primary size=6 offset=283648", script);
+        Assert.DoesNotContain("format", script);
+    }
+
+    [Fact]
+    public void Generate_Default_FormatsPrimaries()
+    {
+        var script = DiskpartScript.Generate(GoodLayout());
+        Assert.Contains("format fs=fat32 quick", script);
+        Assert.Contains("format fs=ntfs quick", script);
+    }
+
+    [Fact]
+    public void Generate_NonAlignedRefusesLoud()
+    {
+        var oddLen = GoodLayout();
+        oddLen.Partitions[2].LengthBytes = 6L * Mib + 512;
+        var ex = Assert.Throws<InvalidDataException>(() => DiskpartScript.Generate(oddLen));
+        Assert.Contains("MiB-exact", ex.Message);
+        var oddOff = GoodLayout();
+        oddOff.Partitions[2].OffsetBytes = 277L * Mib + 512;
+        var ex2 = Assert.Throws<InvalidDataException>(() => DiskpartScript.Generate(oddOff));
+        Assert.Contains("KiB-exact", ex2.Message);
+    }
+
+    // Shared event list pins the load-bearing order: diskpart clean
+    // rewrites the table, so ApplyLayout MUST precede the first byte
+    // streamed (streaming first would be destroyed by the recreate).
+    private sealed class OrderRunner : IBootRepairRunner
+    {
+        private readonly List<string> _events;
+        public OrderRunner(List<string> events) => _events = events;
+        public void ApplyLayout(string diskpartScript) => _events.Add("apply");
+        public (string WindowsDir, string EspDir) LocateVolumes() => ("D:\\Windows", "S:");
+        public void InstallBootloader(string windowsDir, string espDir) { }
+        public string FirmwareType() => "UEFI";
+        public void CheckBootFiles(string espDir) { }
+    }
+
+    private sealed class OrderTarget : IBlockTarget
+    {
+        private readonly FileBlockTarget _inner;
+        private readonly List<string> _events;
+        public OrderTarget(string path, List<string> events) { _inner = new FileBlockTarget(path); _events = events; }
+        public string DisplayName => _inner.DisplayName;
+        public long Capacity => _inner.Capacity;
+        public Stream OpenWrite() { _events.Add("openwrite"); return _inner.OpenWrite(); }
+        public void Dispose() => _inner.Dispose();
+    }
+
+    [Fact]
+    public void RestoreDisk_RepairBoot_AppliesLayoutBeforeFirstByte()
+    {
+        var espPath = Path.Combine(_dir, "oesp.img");
+        var sysPath = Path.Combine(_dir, "osys.img");
+        File.WriteAllBytes(espPath, new byte[1 * Mib]);
+        File.WriteAllBytes(sysPath, new byte[2 * Mib]);
+        DiskLayout layout;
+        using (var store = new Store(_storeRoot, _dbPath, 1, 3, new TestLogger()))
+        using (var esp = new FileBlockSource(espPath))
+        using (var sys = new FileBlockSource(sysPath))
+        {
+            layout = store.ImageDisk(0, "disk0", new DiskImageOptions(), new DiskCapturePlan("guid-order", 232L * Mib, 512,
+                new List<PartitionImageInput>
+                {
+                    new(1, "EFI system partition", "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+                        Guid.NewGuid().ToString("D"), 2048, 411647, Mib, 200L * Mib, "fat32", false, null, esp, null),
+                    new(2, "Microsoft reserved partition", "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+                        Guid.NewGuid().ToString("D"), 411648, 444415, 201L * Mib, 16L * Mib, "none", true, "msr-reserved", null, null),
+                    new(3, "Basic data partition", "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
+                        Guid.NewGuid().ToString("D"), 444416, 448511, 217L * Mib, 2L * Mib, "ntfs", false, null, sys, null),
+                }));
+        }
+
+        var target = Path.Combine(_dir, "odisk.img");
+        using (var f = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.Read))
+            f.SetLength(232L * Mib);
+        var log = new TestLogger();
+        var events = new List<string>();
+        using (var store = new Store(_storeRoot, _dbPath, 1, 3, log))
+        {
+            var orch = new RestoreOrchestrator(store, log, path => new OrderTarget(path, events));
+            using var t = new FileBlockTarget(target);
+            var rc = orch.RestoreDisk(new DiskRestoreOptions(
+                LayoutGen: layout.Generation, Target: target, StorePath: _storeRoot, IndexPath: _dbPath,
+                ConfirmToken: BootDiskGuard.TargetToken(t.DisplayName, t.Capacity),
+                AllowBootDisk: false, SkipVerify: true, DryRun: false, RepairBoot: true, BootRunner: new OrderRunner(events)));
+            Assert.Equal(0, rc);
+        }
+        var apply = events.IndexOf("apply");
+        var firstWrite = events.FindIndex(e => e == "openwrite");
+        Assert.True(apply >= 0, "ApplyLayout never ran: " + string.Join(",", events));
+        Assert.True(firstWrite >= 0, "no bytes streamed: " + string.Join(",", events));
+        Assert.True(apply < firstWrite, "layout applied after streaming started: " + string.Join(",", events));
+    }
+
+    [Fact]
     public void WindowsRunner_Linux_ThrowsPlatform()
     {
         if (OperatingSystem.IsWindows())

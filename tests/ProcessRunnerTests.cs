@@ -84,4 +84,13 @@ public sealed class ProcessRunnerTests
 
         Assert.True(result.TimedOut);
     }
+
+    [Theory]
+    [InlineData("S:\\", "\"S:\\\\\"")]       // drive root: trailing slash doubled
+    [InlineData("D:\\wim-mount", "\"D:\\wim-mount\"")]
+    [InlineData("C:\\my drivers", "\"C:\\my drivers\"")]
+    public void QuoteArg_EscapesTrailingBackslash(string input, string expected)
+    {
+        Assert.Equal(expected, ProcessRunner.QuoteArg(input));
+    }
 }

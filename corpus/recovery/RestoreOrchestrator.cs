@@ -250,11 +250,21 @@ namespace Corpus
                 File.WriteAllText(DiskpartPath(target), script);
                 return 0;
             }
-            // 4. Grow file targets once (never truncate: gaps keep prefill);
+            // 4. RepairBoot ordering: the partition table MUST be recreated
+            // BEFORE bytes stream (diskpart clean wipes the old table; the
+            // no-format script rewrites entries only, never payload ranges).
+            IBootRepairRunner? repairRunner = null;
+            if (opts.RepairBoot)
+            {
+                repairRunner = opts.BootRunner ?? new WindowsBootRepairRunner(_log);
+                var applyRc = BootRepairOrchestrator.ApplyPhase(layout, repairRunner, _log);
+                if (applyRc != 0) return applyRc;
+            }
+            // 5. Grow file targets once (never truncate: gaps keep prefill);
             // raw targets already passed the fit preflight.
             if (target is FileBlockTarget grown)
                 GrowFile(grown.Path, layout.DiskSizeBytes);
-            // 5. Stream partition-by-partition in on-disk order through
+            // 6. Stream partition-by-partition in on-disk order through
             // extent windows, one cumulative ThrottledProgress over the disk
             // total (sync forwarding keeps progress monotonic).
             var sw = Stopwatch.StartNew();
@@ -287,7 +297,7 @@ namespace Corpus
                 _log.Error("disk restore streaming failed before any offsets could verify", ex);
                 return 1;
             }
-            // 6. Post-restore extent-vs-layout compare, then FULL re-read
+            // 7. Post-restore extent-vs-layout compare, then FULL re-read
             // verify per extent unless --skip-verify.
             foreach (var (part, manifest) in manifests)
             {
@@ -326,20 +336,13 @@ namespace Corpus
             }
             sw.Stop();
             _log.Info($"restored disk layout {layout.Generation}: {extents.Count} partitions written and verified in {sw.Elapsed.TotalSeconds:F1}s");
+            // 8. Bootloader only after verify passes (never boot a target
+            // whose bytes didn't verify). The null runner means RepairBoot
+            // was false — ApplyPhase above always sets it otherwise.
             if (opts.RepairBoot)
-                return RepairBootStep(layout, opts);
+                return BootRepairOrchestrator.BootloaderPhase(layout, repairRunner!, _log);
             PrintBootRepair(layout);
             return 0;
-        }
-
-        // Item 5: orchestrated tail — layout checks + recreate + bcdboot +
-        // boot-file verify. The injected fake serves tests/Linux; null means
-        // the Windows real runner (which throws off Windows — the real path
-        // is Windows-gated by construction).
-        private int RepairBootStep(DiskLayout layout, DiskRestoreOptions opts)
-        {
-            IBootRepairRunner runner = opts.BootRunner ?? new WindowsBootRepairRunner(_log);
-            return BootRepairOrchestrator.Repair(layout, runner, _log);
         }
 
         // Item 5 dry-run: checks run for real (a layout that would not repair

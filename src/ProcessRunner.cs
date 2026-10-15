@@ -12,6 +12,18 @@ namespace TicTack
     {
         public const int TimeoutMs = 600000;
 
+        // argv-safe quote for a path embedded in a command string: the child
+        // parses with CommandLineToArgvW rules, where \" is an escaped quote
+        // — so a backslash-terminated path (a drive root like "S:\") must
+        // double it or the closing quote is eaten (dism then reports
+        // "missing a required servicing command" — VM-proven). Use for every
+        // quoted path arg; harmless when no trailing slash is present.
+        public static string QuoteArg(string value)
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            return "\"" + value + (value.EndsWith('\\') ? "\\" : "") + "\"";
+        }
+
         public static ProcessStartInfo CreateStartInfo(string command, string workingDir, bool redirect)
         {
             var psi = new ProcessStartInfo

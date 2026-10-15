@@ -197,4 +197,43 @@ public sealed class UniversalRestoreRecoveryTests : IDisposable
         var injector = new WindowsDismDriverInjector(new TestLogger());
         Assert.Throws<PlatformNotSupportedException>(() => injector.Inject("D:\\Windows", _dir));
     }
+
+    [Fact]
+    public void ParseAddDriverResult_AllSuccess()
+    {
+        var (installed, failed) = WindowsDismDriverInjector.ParseAddDriverResult(
+            "Installing 1 of 2 - a.inf: The driver package was successfully installed.\n" +
+            "Installing 2 of 2 - b.inf: The driver package was successfully installed.\n");
+        Assert.Equal(2, installed);
+        Assert.Empty(failed);
+    }
+
+    [Fact]
+    public void ParseAddDriverResult_Mixed_NamesFailures()
+    {
+        // Real shapes from an on-box /Recurse run (exit 50): 4 unsigned
+        // boot-critical failures among hundreds of installs, plus a
+        // continuation line and the footer — all must parse or skip clean.
+        var (installed, failed) = WindowsDismDriverInjector.ParseAddDriverResult(
+            "Installing 8 of 731 - xboxgipsynthetic.inf: The driver package was successfully installed.\n" +
+            "Installing 187 of 731 - hidcfu.inf: Error - The driver package contains x64 boot-critical drivers, but the drivers are not properly signed.\n" +
+            "Use the /forceunsigned option to install the drivers.\n" +
+            "Installing 623 of 731 - storfwupdate.inf: Error - The driver package contains x64 boot-critical drivers, but the drivers are not properly signed.\n" +
+            "Error: 50\n");
+        Assert.Equal(1, installed);
+        Assert.Equal(2, failed.Count);
+        Assert.Equal("hidcfu.inf", failed[0].Inf);
+        Assert.Contains("not properly signed", failed[0].Reason);
+        Assert.Equal("storfwupdate.inf", failed[1].Inf);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("unrelated output\n")]
+    public void ParseAddDriverResult_Unparseable_YieldsZero(string output)
+    {
+        var (installed, failed) = WindowsDismDriverInjector.ParseAddDriverResult(output);
+        Assert.Equal(0, installed);
+        Assert.Empty(failed);
+    }
 }

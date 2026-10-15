@@ -352,7 +352,7 @@ namespace Corpus
             if (!Directory.Exists(driverDir))
                 throw new InvalidDataException($"--driver missing: {driverDir}");
             log.Info($"injecting driver {driverDir} into boot.wim");
-            var a = ProcessRunner.RunAsync($"dism /Image:\"{mount}\" /Add-Driver /Driver:\"{driverDir}\" /Recurse",
+            var a = ProcessRunner.RunAsync($"dism /Image:{ProcessRunner.QuoteArg(mount)} /Add-Driver /Driver:{ProcessRunner.QuoteArg(driverDir)} /Recurse",
                 Path.GetDirectoryName(mount)!, redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
             if (a.TimedOut || a.ExitCode != 0)
                 throw new InvalidDataException($"dism add-driver failed (exit {a.ExitCode}): {Tail(a.Stderr + a.Stdout)}");
