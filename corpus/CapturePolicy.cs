@@ -6,11 +6,10 @@ namespace Corpus
 {
     // Items 1-minimal/2/3/4: capture-policy core. Pure helpers + seams, so every
     // rule is Linux-provable with fakes. Windows-only extent resolution (MFT
-    // path→LCN, retrieval pointers) plugs into the seams later — until then the
+    // path→LCN, retrieval pointers) plugs into the seams: MftExclusionResolver
+    // (MftReader.cs) over the shared MFT reader. Until the CLI passes it, the
     // CLI images unexcluded and incrementals carry no fingerprint (guards
     // abstain on null, never false-positive).
-    // shortcut: production exclusion extents need a Windows MFT path→LCN
-    // resolver; upgrade when item-13 (USN vs MFT-digest) lands the MFT reader.
     public interface ILayoutFingerprintProvider
     {
         string? LayoutFingerprint();

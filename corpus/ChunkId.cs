@@ -4,23 +4,18 @@ using System.Security.Cryptography;
 
 namespace Corpus
 {
-    // Content identity: SHA-256(plaintext ‖ idKey ‖ encKey?). The
-    // store-wide key keeps ids opaque to anyone holding only the store
-    // files; mixing the encryption key into the digest makes cross-key
-    // dedup impossible BY CONSTRUCTION (same plaintext + different key =
-    // different digest = different index row). This function is the ONLY
-    // place key scope enters identity — GC/verify/dedup compare digest
+    // Content identity: SHA-256(plaintext ‖ idKey). The store-wide key
+    // keeps ids opaque to anyone holding only the store files. Per-pack
+    // encryption is an external shell hook (see PackHook) applied after
+    // sealing — it never enters identity, so GC/verify/dedup compare digest
     // strings and need no key threading.
     public static class ChunkId
     {
-        // encKey null → byte-identical to the unkeyed digest.
-        public static byte[] ComputeId(byte[] plaintext, byte[] idKey, byte[]? encKey = null)
+        public static byte[] ComputeId(byte[] plaintext, byte[] idKey)
         {
             using var h = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             h.AppendData(plaintext);
             h.AppendData(idKey);
-            if (encKey != null)
-                h.AppendData(encKey);
             return h.GetHashAndReset();
         }
 

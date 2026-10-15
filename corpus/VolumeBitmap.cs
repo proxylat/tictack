@@ -68,6 +68,28 @@ namespace Corpus
                 w.WriteLine(s + " " + c);
         }
 
+        // Bitmap safety net (item 13): parent hole map (persisted, chunk
+        // grid) vs current allocated runs → chunks whose hole-state flipped
+        // either way re-capture. Catches freed-cluster reuse the MFT scan
+        // skips (a dead slot has no live record to digest). Null on grid
+        // drift → full re-read (defensive; Store gates the grid already).
+        public static HashSet<long>? HoleFlipChunks(IReadOnlyList<ManifestEntry> parentChunks,
+            IReadOnlyList<(long Start, long Count)> currentRuns, long bytesPerCluster, long volumeLength, int chunkBytes)
+        {
+            ArgumentNullException.ThrowIfNull(parentChunks);
+            ArgumentNullException.ThrowIfNull(currentRuns);
+            var current = Chunker.BuildHoleMap(currentRuns, bytesPerCluster, volumeLength, chunkBytes);
+            if (parentChunks.Count != current.Length)
+                return null;
+            var dirty = new HashSet<long>();
+            for (var i = 0; i < current.Length; i++)
+            {
+                if (parentChunks[i].IsHole != current[i])
+                    dirty.Add(i);
+            }
+            return dirty;
+        }
+
         // Merged allocated runs as (startLcn, clusterCount), ascending.
         public static List<(long Start, long Count)> ReadRuns(string devicePath, long totalClusters)
         {

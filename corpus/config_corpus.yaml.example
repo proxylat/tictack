@@ -48,3 +48,13 @@ retention:
 # Restore (recovery stick): --restore --snapshot <gen> --target <disk#|\\.\PhysicalDriveN|file>
 # --confirm-type is required always (even --dry-run); a refused run names the want-TOKEN.
 # Baked stick configs use store_path 'store' (resolved beside Corpus.exe); any other store via --store <path>.
+
+# Per-pack encryption hook (Corpus ships zero builtin crypto): shell command
+# with {input}/{output} substitution (same shape as TicTack jobs). Empty =
+# stored unencrypted. Runs per sealed pack, never per chunk; a hook failure
+# fails the job loud and deletes the plaintext pack.
+#encrypt: 'age -r AGE-RECIPIENT -o "{output}" "{input}"'
+
+# Scheduled GC/optimize cadence (service host only; manual --gc is unchanged).
+#gc_daily_at: '02:00'
+#optimize_every: '00:15:00'

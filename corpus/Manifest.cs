@@ -30,8 +30,6 @@ namespace Corpus
         // without encryption keys so --list/planning never need key access.
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? ChangeCursor { get; set; }        // null = none/full
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public string? EncKeyId { get; set; }            // null = unencrypted
         // Whole-disk rung (spec §3): partition identity. Optional with
         // WhenWritingDefault so old manifests load with defaults and volume
         // verbs are byte-identical.
@@ -49,6 +47,13 @@ namespace Corpus
         // none (omitted → old/dense JSON byte-identical).
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public List<string>? SkippedExclusions { get; set; }
+        // Item 13: MFT group digests (SHA-256 hex per image-chunk-sized band
+        // of the $MFT stream) + the record size that shaped them. Null/0 on
+        // old manifests → digest path abstains to the USN hint.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public List<string>? MftChunkDigests { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public int MftRecordBytes { get; set; }
         public List<ManifestEntry> Chunks { get; set; } = new();
         public string Hmac { get; set; } = "";
     }
@@ -60,9 +65,10 @@ namespace Corpus
     public static class ManifestStore
     {
         public static SnapshotManifest Build(int generation, string name, long volumeLength, int chunkMib, int compressionLevel, string keyId, string prevDigest, List<ManifestEntry> chunks,
-            int parentGeneration = 0, string? changeCursor = null, string? encKeyId = null,
+            int parentGeneration = 0, string? changeCursor = null,
             string? partitionKey = null, int diskNumber = 0, int partitionNumber = 0,
-            string? layoutFingerprint = null, List<string>? skippedExclusions = null)
+            string? layoutFingerprint = null, List<string>? skippedExclusions = null,
+            List<string>? mftChunkDigests = null, int mftRecordBytes = 0)
         {
             return new SnapshotManifest
             {
@@ -75,12 +81,13 @@ namespace Corpus
                 PrevDigest = prevDigest,
                 ParentGeneration = parentGeneration,
                 ChangeCursor = changeCursor,
-                EncKeyId = encKeyId,
                 PartitionKey = partitionKey,
                 DiskNumber = diskNumber,
                 PartitionNumber = partitionNumber,
                 LayoutFingerprint = layoutFingerprint,
                 SkippedExclusions = skippedExclusions,
+                MftChunkDigests = mftChunkDigests,
+                MftRecordBytes = mftRecordBytes,
                 Chunks = chunks,
             };
         }

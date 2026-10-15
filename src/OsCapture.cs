@@ -72,4 +72,85 @@ namespace TicTack
             }
         }
     }
+
+    // Item 11 wiring: tree-level capture/restore over the single-file
+    // mechanism above + the CLI/scheduling surface (TicTack --os-capture /
+    // --os-restore, invocable from jobs:). Boundary with corpus item 5:
+    // TicTack restores FILES and prints the bootloader line; orchestrated
+    // layout recreate + bootloader reinstall (diskpart/mountvol/firmware
+    // checks) lives in corpus BootRepairOrchestrator and is never
+    // reimplemented here.
+    public static class OsCaptureRunner
+    {
+        // Whole-tree capture through the caller's accessor (direct or VSS).
+        // Per-file failures warn-and-continue (one locked OS file must not
+        // kill the run); the failed count fails the CLI exit code instead.
+        public static async Task<(int Captured, int Failed)> CaptureTreeAsync(
+            IFileAccessor accessor, string sourceDir, string captureDir, ILogger log, CancellationToken ct)
+        {
+            ArgumentNullException.ThrowIfNull(accessor);
+            ArgumentNullException.ThrowIfNull(sourceDir);
+            ArgumentNullException.ThrowIfNull(captureDir);
+            ArgumentNullException.ThrowIfNull(log);
+            var captured = 0;
+            var failed = 0;
+            var boot = 0;
+            foreach (var file in Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories))
+            {
+                ct.ThrowIfCancellationRequested();
+                var rel = Path.GetRelativePath(sourceDir, file);
+                if (OsCapture.IsBootFile(rel)) boot++;
+                try
+                {
+                    await OsCapture.CaptureAsync(accessor, file, Path.Combine(captureDir, rel), ct);
+                    captured++;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    log.Warn("os-capture: skipping " + rel + ": " + ex.Message);
+                }
+            }
+            log.Info($"os-capture: {captured} files captured ({boot} boot-critical), {failed} failed");
+            return (captured, failed);
+        }
+
+        // Whole-tree restore from a capture. Ends with the bootloader line
+        // for the operator (see the item-5 boundary above).
+        public static async Task<(int Restored, int Failed)> RestoreTreeAsync(
+            string captureDir, string destDir, ILogger log, CancellationToken ct)
+        {
+            ArgumentNullException.ThrowIfNull(captureDir);
+            ArgumentNullException.ThrowIfNull(destDir);
+            ArgumentNullException.ThrowIfNull(log);
+            var restored = 0;
+            var failed = 0;
+            foreach (var file in Directory.EnumerateFiles(captureDir, "*", SearchOption.AllDirectories))
+            {
+                ct.ThrowIfCancellationRequested();
+                var rel = Path.GetRelativePath(captureDir, file);
+                try
+                {
+                    await OsCapture.RestoreAsync(file, Path.Combine(destDir, rel), ct);
+                    restored++;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    log.Warn("os-restore: skipping " + rel + ": " + ex.Message);
+                }
+            }
+            log.Info($"os-restore: {restored} files restored, {failed} failed");
+            LogBootloaderHint(destDir, log);
+            return (restored, failed);
+        }
+
+        internal static void LogBootloaderHint(string destDir, ILogger log)
+        {
+            if (OperatingSystem.IsWindows())
+                log.Info("bootloader: run bcdboot \"" + Path.Combine(destDir, "Windows") + "\" /s <ESP> /f UEFI (or corpus --restore-disk for orchestrated repair)");
+            else
+                log.Info("bootloader: reinstall GRUB to the ESP targeting " + destDir + " (file restore only — layout repair is corpus item 5)");
+        }
+    }
 }

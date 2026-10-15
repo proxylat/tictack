@@ -63,12 +63,18 @@ namespace Corpus
         public CorpusRetentionConfig Retention { get; set; }
         // Item 4 exclusion names; null Skip = CapturePolicy defaults.
         public CorpusExclusionsConfig Exclusions { get; set; }
+        // Per-pack encryption hook: shell command with {input}/{output}
+        // substitution (same shape as TicTack jobs). Empty = stored
+        // unencrypted. Runs per pack after sealing, never per chunk; a hook
+        // failure fails the job loud. Corpus ships zero builtin crypto.
+        public string Encrypt { get; set; }
 
         public CorpusConfig()
         {
             StorePath = string.Empty;
             StateDbPath = string.Empty;
             ChunkMib = 4;
+            Encrypt = string.Empty;
             Compression = new CorpusCompressionConfig();
             Logging = new CorpusLoggingConfig();
             Retention = new CorpusRetentionConfig();

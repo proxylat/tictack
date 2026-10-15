@@ -18,7 +18,8 @@ namespace Corpus
         ILayoutFingerprintProvider? Layout = null,   // item 1-minimal guard seam (null = abstain)
         IExclusionResolver? Exclusions = null);      // item 4 zero-ranges seam (null = none)
 
-    public sealed record IncrementalPlan(HashSet<long> DirtyChunks, string NewCursor);
+    public sealed record IncrementalPlan(HashSet<long> DirtyChunks, string NewCursor,
+        List<string>? NewMftDigests = null, int NewMftRecordBytes = 0);
 
     public interface IChangeSource
     {
@@ -220,8 +221,9 @@ namespace Corpus
         }
 
         // Expected unavailability → null (full re-read), never throw;
-        // anything else is an IO fault → throw (fail loud).
-        private static bool IsExpectedUsnError(int err) =>
+        // anything else is an IO fault → throw (fail loud). Shared by the
+        // USN + MFT ioctl paths (same Win32 error space).
+        internal static bool IsExpectedVolumeError(int err) =>
             err is ErrInvalidFunction or ErrAccessDenied or ErrInvalidParameter
                 or ErrJournalDeleteInProgress or ErrJournalNotActive or ErrJournalEntryDeleted;
 
@@ -258,7 +260,7 @@ namespace Corpus
             if (!DeviceIoControl(handle, FsctlQueryUsnJournal, null, 0, output, output.Length, out var ret, IntPtr.Zero))
             {
                 var err = Marshal.GetLastWin32Error();
-                if (!IsExpectedUsnError(err))
+                if (!IsExpectedVolumeError(err))
                     throw new IOException($"FSCTL_QUERY_USN_JOURNAL({device}) failed: {err}");
                 return null;
             }
@@ -267,19 +269,19 @@ namespace Corpus
             return (BitConverter.ToInt64(output, 0), BitConverter.ToInt64(output, 8), BitConverter.ToInt64(output, 16));
         }
 
-        private static (int BytesPerCluster, int BytesPerRecord)? QueryVolumeData(SafeFileHandle handle, string device)
+        internal static (int BytesPerCluster, int BytesPerRecord, long MftValidDataLength)? QueryVolumeData(SafeFileHandle handle, string device)
         {
             var output = new byte[96];
             if (!DeviceIoControl(handle, FsctlGetNtfsVolumeData, null, 0, output, output.Length, out var ret, IntPtr.Zero))
             {
                 var err = Marshal.GetLastWin32Error();
-                if (!IsExpectedUsnError(err))
+                if (!IsExpectedVolumeError(err))
                     throw new IOException($"FSCTL_GET_NTFS_VOLUME_DATA({device}) failed: {err}");
                 return null;
             }
-            if (ret < 56)
+            if (ret < 64)
                 throw new IOException($"FSCTL_GET_NTFS_VOLUME_DATA({device}) short reply: {ret} bytes");
-            return (BitConverter.ToInt32(output, 44), BitConverter.ToInt32(output, 48));
+            return (BitConverter.ToInt32(output, 44), BitConverter.ToInt32(output, 48), BitConverter.ToInt64(output, 56));
         }
 
         // LCN range → chunk grid range (CapturePolicy: byte offsets, sparse
@@ -316,7 +318,7 @@ namespace Corpus
                 if (!DeviceIoControl(handle, FsctlReadUsnJournal, input, input.Length, buf, buf.Length, out var ret, IntPtr.Zero))
                 {
                     var err = Marshal.GetLastWin32Error();
-                    if (!IsExpectedUsnError(err))
+                    if (!IsExpectedVolumeError(err))
                         throw new IOException($"FSCTL_READ_USN_JOURNAL({device}) failed: {err}");
                     log.Info($"USN journal read stopped on {device}, full image (win32 {err})");
                     return null;
@@ -379,7 +381,7 @@ namespace Corpus
         // skipSequenceCheck is for synthetic FRNs (system 0..15, seq 0):
         // live records always carry seq ≥ 1, so the check would reject
         // them all; magic + in-use still filter unused slots.
-        internal static List<(long StartLcn, long ClusterCount)>? GetDataRuns(SafeFileHandle volume, ulong fileRef, int bytesPerCluster, int bytesPerRecord, List<(long StartLcn, long ClusterCount)> mftRuns, bool skipSequenceCheck = false)
+        internal static List<(long StartLcn, long ClusterCount)>? GetDataRuns(SafeFileHandle volume, ulong fileRef, int bytesPerCluster, int bytesPerRecord, IReadOnlyList<(long StartLcn, long ClusterCount)> mftRuns, bool skipSequenceCheck = false)
         {
             var record = ReadFileRecord(volume, fileRef, bytesPerRecord);
             return ParseRecordExtents(record, fileRef, bytesPerCluster, bytesPerRecord, mftRuns, skipSequenceCheck);
@@ -395,7 +397,7 @@ namespace Corpus
         // still RETURN their (reused) record bytes and get filtered by the
         // seq/in-use checks below — so a failed call throws → caller falls
         // back to full (never silently skip a live change).
-        private static byte[] ReadFileRecord(SafeFileHandle volume, ulong fileRef, int bytesPerRecord)
+        internal static byte[] ReadFileRecord(SafeFileHandle volume, ulong fileRef, int bytesPerRecord)
         {
             var input = BitConverter.GetBytes(fileRef);
             var output = new byte[12 + bytesPerRecord];
@@ -411,7 +413,7 @@ namespace Corpus
             return record;
         }
 
-        internal static List<(long StartLcn, long ClusterCount)>? ParseRecordExtents(byte[] record, ulong fileRef, int bytesPerCluster, int bytesPerRecord, List<(long StartLcn, long ClusterCount)> mftRuns, bool skipSequenceCheck = false)
+        internal static List<(long StartLcn, long ClusterCount)>? ParseRecordExtents(byte[] record, ulong fileRef, int bytesPerCluster, int bytesPerRecord, IReadOnlyList<(long StartLcn, long ClusterCount)> mftRuns, bool skipSequenceCheck = false, bool includeRecordCluster = true)
         {
             if (record.Length < 48)
                 throw new InvalidDataException("MFT record truncated");
@@ -441,12 +443,16 @@ namespace Corpus
                     throw new InvalidDataException("MFT run offset outside attribute");
                 extents.AddRange(DecodeDataRuns(record.AsSpan(off + runOff, (int)len - runOff)));
             }
-            // The file's own record cluster (see class comment).
-            var recordNumber = (long)(fileRef & 0xFFFF_FFFF_FFFF);
-            var lcn = MapMftOffsetToLcn(recordNumber * (long)bytesPerRecord, bytesPerCluster, mftRuns);
-            if (lcn == null)
-                throw new InvalidDataException("MFT record offset unmappable");
-            extents.Add((lcn.Value, 1));
+            // The file's own record cluster (see class comment). Excluded by
+            // the item-4 resolver (shared clusters would wipe neighbors).
+            if (includeRecordCluster)
+            {
+                var recordNumber = (long)(fileRef & 0xFFFF_FFFF_FFFF);
+                var lcn = MapMftOffsetToLcn(recordNumber * (long)bytesPerRecord, bytesPerCluster, mftRuns);
+                if (lcn == null)
+                    throw new InvalidDataException("MFT record offset unmappable");
+                extents.Add((lcn.Value, 1));
+            }
             return extents;
         }
 
@@ -479,11 +485,16 @@ namespace Corpus
             var off = (int)firstAttr;
             while (true)
             {
-                if (off + 8 > end)
+                // End marker is 4 bytes (0xFFFFFFFF); real records may pack
+                // it tight with no slack, so accept it before demanding the
+                // full 8-byte header.
+                if (off + 4 > end)
                     throw new InvalidDataException("MFT attribute header truncated");
                 var type = BitConverter.ToUInt32(record, off);
                 if (type == 0xFFFFFFFF)
                     break;
+                if (off + 8 > end)
+                    throw new InvalidDataException("MFT attribute header truncated");
                 var len = BitConverter.ToUInt32(record, off + 4);
                 if (len < 8 || off + len > end)
                     throw new InvalidDataException("MFT attribute truncated");
@@ -532,7 +543,7 @@ namespace Corpus
 
         // $MFT byte offset → volume LCN through the MFT's own runs (the MFT
         // itself fragments; MftStartLcn alone would mislocalize). Pure.
-        internal static long? MapMftOffsetToLcn(long mftOffset, int bytesPerCluster, List<(long StartLcn, long ClusterCount)> mftRuns)
+        internal static long? MapMftOffsetToLcn(long mftOffset, int bytesPerCluster, IReadOnlyList<(long StartLcn, long ClusterCount)> mftRuns)
         {
             var vcn = mftOffset / bytesPerCluster;
             foreach (var (start, count) in mftRuns)

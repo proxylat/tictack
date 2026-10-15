@@ -46,6 +46,7 @@ namespace Corpus
             var skipVerify = false;
             var dryRun = false;
             var confirm = false;
+            var inline = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -96,11 +97,8 @@ namespace Corpus
                     case "--confirm":
                         confirm = true;
                         break;
-                    case "--gen-key":
-                        verb = "gen-key";
-                        break;
-                    case "--key-list":
-                        verb = "key-list";
+                    case "--inline":
+                        inline = true;
                         break;
                     case "--vss-list":
                         verb = "vss-list";
@@ -286,6 +284,23 @@ namespace Corpus
                             log.Error("--image requires --volume <path> --name <snapshot>");
                             return 1;
                         }
+                        if (!inline)
+                        {
+                            // Default: fast landing capture (always full).
+                            // Classic packed capture (+ incrementals) via --inline.
+                            if (incremental || parentArg != null || forceFull)
+                            {
+                                log.Error("--incremental/--parent/--full need --inline (fast capture is always full)");
+                                return 1;
+                            }
+                            using (var store = CreateStore(cfg, log))
+                            using (var source = OpenSource(volume, log))
+                            {
+                                var m = store.ImageFast(source, name);
+                                log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks (landing, optimize pending)");
+                            }
+                            return 0;
+                        }
                         if (incremental && parentArg != null)
                         {
                             log.Error("--incremental and --parent are mutually exclusive");
@@ -297,10 +312,9 @@ namespace Corpus
                         using (var store = CreateStore(cfg, log))
                         using (var source = OpenSource(volume, log))
                         {
-                            // UsnChangeSource passed unconditionally: it
-                            // returns null on Linux internally, keeping this
-                            // branch-free (null plan → full re-read).
-                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new UsnChangeSource()));
+                            // MFT-digest default (USN hint inside for
+                            // pre-digest parents and non-MFT sources).
+                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource()));
                             log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
                         }
                         return 0;
@@ -335,26 +349,6 @@ namespace Corpus
                         {
                             foreach (var (gen, snap) in store.ListSnapshots())
                                 Console.WriteLine(gen + " " + snap);
-                        }
-                        return 0;
-                    case "gen-key":
-                        {
-                            var (keyId, _) = KeyStore.Generate(cfg.StorePath);
-                            Console.WriteLine($"encryption key {keyId} active (existing snapshots unchanged)");
-                        }
-                        return 0;
-                    case "key-list":
-                        {
-                            var keys = new KeyStore(cfg.StorePath);
-                            var all = new List<(string KeyId, byte[] Key)>(keys.AllKeys);
-                            if (all.Count == 0)
-                            {
-                                Console.WriteLine("no encryption keys (store is unencrypted)");
-                                return 0;
-                            }
-                            all.Sort((a, b) => string.Compare(a.KeyId, b.KeyId, StringComparison.Ordinal));
-                            foreach (var (id, _) in all)
-                                Console.WriteLine(id + (id == keys.CurrentKeyId ? " [current]" : ""));
                         }
                         return 0;
                     case "build-media":
@@ -405,7 +399,7 @@ namespace Corpus
                 cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.ChunkMib, cfg.Compression.Level, log,
-                new KeyStore(cfg.StorePath));
+                cfg.Encrypt);
         }
 
         private static int RunListDisks(ILogger log)
@@ -505,7 +499,7 @@ namespace Corpus
                 : File.Exists(mediaDb) ? mediaDb
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
             indexPath = EnsureWritableIndex(indexPath, log);
-            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, new KeyStore(storePath));
+            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt);
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
         }
@@ -588,7 +582,7 @@ namespace Corpus
                 : File.Exists(mediaDb) ? mediaDb
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
             indexPath = EnsureWritableIndex(indexPath, log);
-            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, new KeyStore(storePath));
+            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt);
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
         }
@@ -813,7 +807,8 @@ namespace Corpus
         {
             Console.WriteLine("Corpus — system imaging");
             Console.WriteLine();
-            Console.WriteLine("  --image --volume <path|X:> --name <snap> [--incremental | --parent <gen>] [--full]   Image a file, or live volume X: via VSS");
+            Console.WriteLine("  --image --volume <path|X:> --name <snap>   Fast landing capture (default, always full; run --gc/optimize to fold)");
+            Console.WriteLine("      --inline [--incremental | --parent <gen>] [--full]   Classic packed capture instead of landing");
             Console.WriteLine("  --export --snapshot <gen> --out <path>  Export a snapshot to a file");
             Console.WriteLine("  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX");
             Console.WriteLine("  --vss-list                   Relay 'vssadmin list writers' (Windows)");
@@ -827,8 +822,6 @@ namespace Corpus
             Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual only, never automatic)");
             Console.WriteLine("      retention: keep_last/keep_within_days/pin from config; exports outside the store are untouched");
             Console.WriteLine("      retention pool is shared between volume and disk snapshots (use two stores for isolation)");
-            Console.WriteLine("  --gen-key                              Generate an encryption key and activate it (existing snapshots stay as-is; only new images encrypt)");
-            Console.WriteLine("  --key-list                             List encryption keys (\"<id> [current]\" lines)");
             Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
             Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
             Console.WriteLine("      [--payload <dir>]  Skip re-publish (ADK box without the SDK: publish dir)");
@@ -846,8 +839,7 @@ namespace Corpus
             Console.WriteLine("  --help                 This text");
             Console.WriteLine();
             Console.WriteLine("  incrementals reuse the parent's clean chunks without re-reading; any doubt → full re-image");
-            Console.WriteLine("  encryption covers new images only; existing snapshots stay as-is");
-            Console.WriteLine("  keys are raw 32-byte files at keys/<keyid>.key, active key named by keys/current");
+            Console.WriteLine("  per-pack encryption is an external shell hook (encrypt: in config), never builtin crypto");
             Console.WriteLine("  restore streams chunk-by-chunk, then re-reads the whole target to verify:");
             Console.WriteLine("    wall time is ~2x sequential device speed; --confirm-type is required always");
             Console.WriteLine("    (even --dry-run); a refused run names the want-TOKEN to re-run with");

@@ -328,16 +328,14 @@ public sealed class GcTests : IDisposable
     }
 
     [Fact]
-    public void SkipsEncryptedScope()
+    public void NoKeyMaterialNeeded()
     {
-        KeyStore.Generate(_storeRoot);
-        using (var store = new Store(_storeRoot, _dbPath, 1, 3, new TestLogger(), new KeyStore(_storeRoot)))
+        using (var store = NewStore())
         using (var source = new FileBlockSource(SeedGenVolume(1)))
-            store.Image(source, "enc1");
-        using (var store = new Store(_storeRoot, _dbPath, 1, 3, new TestLogger(), new KeyStore(_storeRoot)))
+            store.Image(source, "gen1");
+        using (var store = NewStore())
         using (var source = new FileBlockSource(SeedGenVolume(2)))
-            store.Image(source, "enc2");
-        Directory.Delete(Path.Combine(_storeRoot, "keys"), true); // GC needs no keys
+            store.Image(source, "gen2");
         var gc = NewGc(Keep(1), new TestLogger());
         var plan = gc.Plan();
         AssertDrops(plan, 1);

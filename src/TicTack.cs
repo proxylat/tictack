@@ -59,6 +59,8 @@ namespace TicTack
             bool isVersionsList = false;
             string? versionsGlob = null, versionsLatest = null;
             string? pinVerb = null, pinTarget = null;
+            bool isOsCapture = false, isOsRestore = false;
+            string? osSource = null, osDest = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -115,6 +117,14 @@ namespace TicTack
                         if (i + 1 < args.Length) pinTarget = args[++i];
                         break;
                     case "--deferred-list": isDeferredList = true; break;
+                    case "--os-capture": isOsCapture = true; break;
+                    case "--os-restore": isOsRestore = true; break;
+                    case "--os-source":
+                        if (i + 1 < args.Length) osSource = args[++i];
+                        break;
+                    case "--os-dest":
+                        if (i + 1 < args.Length) osDest = args[++i];
+                        break;
                     case "--deferred-approve":
                     case "--deferred-check":
                     case "--reprove":
@@ -165,7 +175,7 @@ namespace TicTack
                 cfg.Logging.MaxSizeMb,
                 cfg.Logging.MaxFiles,
                 cfg.Logging.AlertPath,
-                console: isCli || isOnce || isValidate || isRebuild || isDeferredList || deferredVerb != null || isForget || isVersionsList || pinVerb != null || cfg.Logging.Console,
+                console: isCli || isOnce || isValidate || isRebuild || isDeferredList || deferredVerb != null || isForget || isVersionsList || pinVerb != null || isOsCapture || isOsRestore || cfg.Logging.Console,
                 eventLog: OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive),
                 backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"));
             rootLogger = log;
@@ -210,6 +220,11 @@ namespace TicTack
                 return RunVersionsPin(cfg, log, pinTarget, pin: pinVerb == "--versions-pin");
             }
 
+            if (isOsCapture || isOsRestore)
+            {
+                return await RunOsAsync(cfg, log, isOsRestore, osSource, osDest);
+            }
+
             if (isValidate)
             {
                 log.Info("Configuration OK");
@@ -234,7 +249,7 @@ namespace TicTack
                 return 0;
             }
 
-            log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --external-drives | --forget [--dry-run] | --versions-list [glob] | --versions-pin <file@ts> | --versions-unpin <file@ts> | --deferred-list | --deferred-approve <source> | --deferred-check <source> | --reprove <source> | --service | --help | --version | --config <path>");
+            log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --external-drives | --forget [--dry-run] | --versions-list [glob] | --versions-pin <file@ts> | --versions-unpin <file@ts> | --deferred-list | --deferred-approve <source> | --deferred-check <source> | --reprove <source> | --os-capture --os-source <dir> --os-dest <dir> | --os-restore --os-source <dir> --os-dest <dir> | --service | --help | --version | --config <path>");
             return 0;
             }
             catch (Exception ex)
@@ -368,6 +383,92 @@ namespace TicTack
             }
             log.Info("Once-off sync complete");
             return ran;
+        }
+
+        // Item 11: file-level OS capture/restore, runnable end-to-end and
+        // schedulable via jobs: (`command: TicTackSv --os-capture --os-source
+        // C:\ --os-dest D:\oscap`). Mechanism is OsCapture (locked-tolerant
+        // read, atomic write); the orchestrated bare-metal tail stays in
+        // corpus item 5 (BootRepairOrchestrator).
+        internal static async Task<int> RunOsAsync(TicTackConfig cfg, ILogger log, bool restore, string? source, string? dest)
+        {
+            var verb = restore ? "--os-restore" : "--os-capture";
+            if (string.IsNullOrEmpty(source) || string.IsNullOrEmpty(dest))
+            {
+                log.Error(verb + " requires --os-source <dir> --os-dest <dir>");
+                return 1;
+            }
+            if (!Directory.Exists(source))
+            {
+                log.Error(verb + ": source missing: " + source);
+                return 1;
+            }
+            // Writing into a subdir of the enumerated tree would feed the
+            // walk its own output (capture) or bury the target (restore).
+            if (OsDestInsideSource(source, dest))
+            {
+                log.Error(verb + ": --os-dest must not be inside --os-source: " + dest);
+                return 1;
+            }
+            if (restore)
+            {
+                var (restored, failed) = await OsCaptureRunner.RestoreTreeAsync(source, dest, log, CancellationToken.None);
+                return failed > 0 ? 1 : 0;
+            }
+            var accessor = CreateOsAccessor(cfg, log);
+            try
+            {
+                var (captured, failed) = await OsCaptureRunner.CaptureTreeAsync(accessor, source, dest, log, CancellationToken.None);
+                return failed > 0 ? 1 : 0;
+            }
+            finally
+            {
+                (accessor as IDisposable)?.Dispose();
+            }
+        }
+
+        internal static bool OsDestInsideSource(string source, string dest)
+        {
+            var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            string srcFull, dstFull;
+            try
+            {
+                srcFull = Path.GetFullPath(source).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                dstFull = Path.GetFullPath(dest).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+            catch
+            {
+                return false; // invalid paths fail later with their own message
+            }
+            return dstFull.Equals(srcFull, cmp)
+                || dstFull.StartsWith(srcFull + Path.DirectorySeparatorChar, cmp)
+                || dstFull.StartsWith(srcFull + Path.AltDirectorySeparatorChar, cmp);
+        }
+
+        // Same VSS-or-direct selection as BuildPipeline: VSS when any source
+        // asks for it (Windows + available), direct otherwise.
+        internal static IFileAccessor CreateOsAccessor(TicTackConfig cfg, ILogger log)
+        {
+            var wantVss = cfg.Sources != null && cfg.Sources.Exists(s =>
+                string.Equals(s.Sync != null ? s.Sync.FileAccess : null, "vss", StringComparison.OrdinalIgnoreCase));
+            if (!wantVss)
+                return new FileAccessor();
+            if (!OperatingSystem.IsWindows())
+            {
+                log.Warn("sync.file_access 'vss' is Windows-only; os-capture using direct access.");
+                return new FileAccessor();
+            }
+            try
+            {
+                var a = new VssFileAccessor(log);
+                a.Probe();
+                return a;
+            }
+            catch (Exception ex)
+            {
+                log.Warn("VSS unavailable (" + ex.Message + "); os-capture using direct access.");
+                return new FileAccessor();
+            }
         }
 
         internal static async Task RunRebuildAsync(TicTackConfig cfg, ILogger log)
@@ -617,6 +718,13 @@ namespace TicTack
             Console.WriteLine("  --deferred-approve <source>");
             Console.WriteLine("  --deferred-check <source>");
             Console.WriteLine("  --reprove <source>     Cancel the hold, keep destination files (--deferred-cancel)");
+            Console.WriteLine();
+            Console.WriteLine("OS capture (file-level; corpus item 5 owns the bare-metal tail):");
+            Console.WriteLine("  --os-capture --os-source <dir> --os-dest <dir>");
+            Console.WriteLine("                           Capture a live OS tree (locked-tolerant, atomic)");
+            Console.WriteLine("  --os-restore --os-source <cap> --os-dest <dir>");
+            Console.WriteLine("                           Restore a capture, then print the bootloader line");
+            Console.WriteLine("                           (schedulable: jobs: [{command: TicTackSv --os-capture ...}])");
             Console.WriteLine();
             Console.WriteLine("Other:");
             Console.WriteLine("  --help, -h             This text");

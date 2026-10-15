@@ -96,10 +96,97 @@ public sealed class UniversalRestoreRecoveryTests : IDisposable
     }
 
     [Fact]
-    public void StagedFollowUps_ListsNicAndGpu()
+    public void StageFirstBoot_BothStagesRun()
     {
-        Assert.Contains(UniversalRestore.StagedFollowUps, s => s.Contains("NIC"));
-        Assert.Contains(UniversalRestore.StagedFollowUps, s => s.Contains("GPU"));
+        var nic = Path.Combine(_dir, "nic");
+        var gpu = Path.Combine(_dir, "gpu");
+        var image = Path.Combine(_dir, "img", "Windows");
+        Directory.CreateDirectory(nic);
+        Directory.CreateDirectory(gpu);
+        Directory.CreateDirectory(image);
+        File.WriteAllText(Path.Combine(nic, "net.inf"), "fake");
+        File.WriteAllText(Path.Combine(gpu, "disp.inf"), "fake");
+        var log = new TestLogger();
+        var fake = new FakeFirstBootStager();
+
+        var rc = UniversalRestore.StageFirstBootDrivers(
+            new FirstBootOptions(nic, gpu, image), fake, log);
+
+        Assert.Equal(0, rc);
+        Assert.Equal(2, fake.Calls.Count);
+        Assert.Equal("Nic", fake.Calls[0].Category);
+        Assert.Equal("Gpu", fake.Calls[1].Category);
+        Assert.True(File.Exists(Path.Combine(image, "Drivers", "Install-FirstBoot-Drivers.cmd")));
+    }
+
+    [Fact]
+    public void StageFirstBoot_MissingDirs_SkipHonestly()
+    {
+        var log = new TestLogger();
+        var fake = new FakeFirstBootStager();
+
+        var rc = UniversalRestore.StageFirstBootDrivers(
+            new FirstBootOptions(Path.Combine(_dir, "no-nic"), null, Path.Combine(_dir, "img")),
+            fake, log);
+
+        Assert.Equal(0, rc);
+        Assert.Empty(fake.Calls);
+        Assert.Contains("missing", string.Join("\n", log.Messages));
+    }
+
+    [Fact]
+    public void StageFirstBoot_DryRun_PlansOnly()
+    {
+        var nic = Path.Combine(_dir, "nic");
+        var image = Path.Combine(_dir, "img", "Windows");
+        Directory.CreateDirectory(nic);
+        var log = new TestLogger();
+        var fake = new FakeFirstBootStager();
+
+        var rc = UniversalRestore.StageFirstBootDrivers(
+            new FirstBootOptions(nic, null, image, DryRun: true), fake, log);
+
+        Assert.Equal(0, rc);
+        Assert.Empty(fake.Calls);
+        Assert.False(Directory.Exists(Path.Combine(image, "Drivers")));
+    }
+
+    [Fact]
+    public void StageFirstBoot_RealCopy_Offline()
+    {
+        var nic = Path.Combine(_dir, "nic");
+        var sub = Path.Combine(nic, "x64");
+        var image = Path.Combine(_dir, "img", "Windows");
+        Directory.CreateDirectory(sub);
+        Directory.CreateDirectory(image);
+        File.WriteAllBytes(Path.Combine(sub, "net.inf"), new byte[] { 1, 2, 3 });
+        var log = new TestLogger();
+
+        var rc = UniversalRestore.StageFirstBootDrivers(
+            new FirstBootOptions(nic, null, image), new FileFirstBootStager(), log);
+
+        Assert.Equal(0, rc);
+        Assert.Equal(new byte[] { 1, 2, 3 },
+            File.ReadAllBytes(Path.Combine(image, "Drivers", "Nic", "x64", "net.inf")));
+    }
+
+    private sealed class ThrowingStager : IFirstBootStager
+    {
+        public void Stage(string offlineWindowsDir, string driverDir, string category) =>
+            throw new InvalidDataException("fake copy failure");
+    }
+
+    [Fact]
+    public void StageFirstBoot_Failure_ReturnsOne()
+    {
+        var nic = Path.Combine(_dir, "nic");
+        Directory.CreateDirectory(nic);
+        var log = new TestLogger();
+
+        var rc = UniversalRestore.StageFirstBootDrivers(
+            new FirstBootOptions(nic, null, Path.Combine(_dir, "img")), new ThrowingStager(), log);
+
+        Assert.Equal(1, rc);
     }
 
     [Fact]

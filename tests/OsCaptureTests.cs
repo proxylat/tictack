@@ -73,4 +73,106 @@ public sealed class OsCaptureTests : IDisposable
         Assert.Equal(1, accessor.Opens);
         Assert.Equal("snapshot-bytes", await File.ReadAllTextAsync(cap));
     }
+
+    static void SeedTree(string root)
+    {
+        Directory.CreateDirectory(Path.Combine(root, "Boot"));
+        Directory.CreateDirectory(Path.Combine(root, "Users"));
+        File.WriteAllText(Path.Combine(root, "Boot", "BCD"), "bcd-bytes");
+        File.WriteAllText(Path.Combine(root, "Users", "a.txt"), "user-bytes");
+    }
+
+    [Fact]
+    public async Task CaptureTree_CopiesWholeTree()
+    {
+        var live = Path.Combine(_dir, "live");
+        var cap = Path.Combine(_dir, "cap");
+        SeedTree(live);
+        var log = new RecordingLogger();
+
+        var (captured, failed) = await OsCaptureRunner.CaptureTreeAsync(
+            new FileAccessor(), live, cap, log, CancellationToken.None);
+
+        Assert.Equal((2, 0), (captured, failed));
+        Assert.Equal("bcd-bytes", File.ReadAllText(Path.Combine(cap, "Boot", "BCD")));
+        Assert.Equal("user-bytes", File.ReadAllText(Path.Combine(cap, "Users", "a.txt")));
+        Assert.Empty(Directory.GetFiles(cap, "*.tictack.tmp", SearchOption.AllDirectories));
+        Assert.Contains(log.Messages, m => m.Contains("1 boot-critical"));
+    }
+
+    [Fact]
+    public async Task CaptureTree_UsesCallerAccessor()
+    {
+        var live = Path.Combine(_dir, "live");
+        var cap = Path.Combine(_dir, "cap");
+        SeedTree(live);
+        var accessor = new MemoryAccessor(System.Text.Encoding.UTF8.GetBytes("snap"));
+
+        var (captured, failed) = await OsCaptureRunner.CaptureTreeAsync(
+            accessor, live, cap, new RecordingLogger(), CancellationToken.None);
+
+        Assert.Equal((2, 0), (captured, failed));
+        Assert.Equal(2, accessor.Opens);
+    }
+
+    [Fact]
+    public async Task RestoreTree_RoundTrip_LogsBootloaderHint()
+    {
+        var live = Path.Combine(_dir, "live");
+        var cap = Path.Combine(_dir, "cap");
+        var back = Path.Combine(_dir, "back");
+        SeedTree(live);
+        var log = new RecordingLogger();
+        await OsCaptureRunner.CaptureTreeAsync(new FileAccessor(), live, cap, log, CancellationToken.None);
+
+        var (restored, failed) = await OsCaptureRunner.RestoreTreeAsync(cap, back, log, CancellationToken.None);
+
+        Assert.Equal((2, 0), (restored, failed));
+        Assert.Equal("bcd-bytes", File.ReadAllText(Path.Combine(back, "Boot", "BCD")));
+        var hint = OperatingSystem.IsWindows() ? "bcdboot" : "GRUB";
+        Assert.Contains(log.Messages, m => m.Contains(hint));
+    }
+
+    static TicTackConfig OsCfg() => new() { Sources = new List<SourceConfig>() };
+
+    [Fact]
+    public async Task RunOsAsync_MissingArgs_ReturnsOne()
+    {
+        Assert.Equal(1, await Program.RunOsAsync(OsCfg(), new RecordingLogger(), false, null, null));
+        Assert.Equal(1, await Program.RunOsAsync(OsCfg(), new RecordingLogger(), false,
+            Path.Combine(_dir, "nope"), Path.Combine(_dir, "cap")));
+    }
+
+    [Fact]
+    public async Task RunOsAsync_DestInsideSource_Refuses()
+    {
+        var live = Path.Combine(_dir, "live");
+        SeedTree(live);
+        var log = new RecordingLogger();
+
+        var rc = await Program.RunOsAsync(OsCfg(), log, false, live, Path.Combine(live, "cap"));
+
+        Assert.Equal(1, rc);
+        Assert.Contains(log.Messages, m => m.Contains("must not be inside"));
+    }
+
+    [Fact]
+    public async Task RunOsAsync_Capture_Restore_RoundTrip()
+    {
+        var live = Path.Combine(_dir, "live");
+        var cap = Path.Combine(_dir, "cap");
+        var back = Path.Combine(_dir, "back");
+        SeedTree(live);
+        var log = new RecordingLogger();
+
+        Assert.Equal(0, await Program.RunOsAsync(OsCfg(), log, false, live, cap));
+        Assert.Equal(0, await Program.RunOsAsync(OsCfg(), log, true, cap, back));
+        Assert.Equal("user-bytes", File.ReadAllText(Path.Combine(back, "Users", "a.txt")));
+    }
+
+    [Fact]
+    public void CreateOsAccessor_DirectByDefault()
+    {
+        Assert.IsType<FileAccessor>(Program.CreateOsAccessor(OsCfg(), new RecordingLogger()));
+    }
 }

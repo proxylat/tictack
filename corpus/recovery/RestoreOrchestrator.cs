@@ -452,22 +452,13 @@ namespace Corpus
 
         // Verify-after-write: FULL re-read, per manifest entry in order —
         // target bytes hashed with ChunkId vs the manifest digest (holes:
-        // expect zeros). Keys come from the store dir (id.key + KeyStore);
-        // the injected Store is not involved, so this works for any target.
+        // expect zeros). The store id.key supplies identity; the injected
+        // Store is not involved, so this works for any target.
         private static List<long> VerifyTarget(IBlockTarget target, SnapshotManifest manifest, string? storeRoot)
         {
             if (string.IsNullOrEmpty(storeRoot) || !File.Exists(Path.Combine(storeRoot, "id.key")))
                 throw new InvalidDataException("post-restore verify needs the store id.key");
             var idKey = File.ReadAllBytes(Path.Combine(storeRoot, "id.key"));
-            KeyStore? keys = null;
-            try
-            {
-                keys = new KeyStore(storeRoot);
-            }
-            catch (Exception)
-            {
-                keys = null; // unreadable key files: unencrypted still verifies, encrypted fails closed below
-            }
             var bad = new List<long>();
             // Per-extent offset: positions stay extent-relative, the window
             // base is added at seek/report time (the offset-0 path is the
@@ -484,7 +475,7 @@ namespace Corpus
                     if (!ReadZeros(read, position, entry.Size, buf, baseOffset))
                         bad.Add(baseOffset + position);
                 }
-                else if (!VerifyRange(read, position, entry, manifest.EncKeyId, idKey, keys, buf, baseOffset))
+                else if (!VerifyRange(read, position, entry, idKey, buf, baseOffset))
                 {
                     bad.Add(baseOffset + position);
                 }
@@ -493,34 +484,17 @@ namespace Corpus
             return bad;
         }
 
-        private static bool VerifyRange(Stream read, long position, ManifestEntry entry, string? encKeyId, byte[] idKey, KeyStore? keys, byte[] buf, long baseOffset = 0)
+        private static bool VerifyRange(Stream read, long position, ManifestEntry entry, byte[] idKey, byte[] buf, long baseOffset = 0)
         {
             var digest = Convert.FromHexString(entry.DigestHex);
-            if (string.IsNullOrEmpty(encKeyId))
-                return CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, null, buf, baseOffset), digest);
-            // Encrypted: manifest key first, then retained keys — a
-            // post-rotation incremental mixes scopes (same as Store.Verify).
-            if (keys != null)
-            {
-                if (keys.TryGet(encKeyId, out var primary)
-                    && CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, primary, buf, baseOffset), digest))
-                    return true;
-                foreach (var (id, key) in keys.AllKeys)
-                {
-                    if (id == encKeyId)
-                        continue;
-                    if (CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, key, buf, baseOffset), digest))
-                        return true;
-                }
-            }
-            return false;
+            return CryptographicOperations.FixedTimeEquals(HashRange(read, position, entry.Size, idKey, buf, baseOffset), digest);
         }
 
         // ChunkId.ComputeId incrementally (O(1) memory): SHA-256 over
-        // plaintext, then idKey, then encKey — the same append order.
+        // plaintext, then idKey — the same append order.
         // position is extent-relative; baseOffset shifts the seek so extent
         // windows re-read their own bytes (0 for single-gen restores).
-        private static byte[] HashRange(Stream read, long position, long size, byte[] idKey, byte[]? encKey, byte[] buf, long baseOffset = 0)
+        private static byte[] HashRange(Stream read, long position, long size, byte[] idKey, byte[] buf, long baseOffset = 0)
         {
             read.Seek(baseOffset + position, SeekOrigin.Begin);
             using var h = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -534,8 +508,6 @@ namespace Corpus
                 left -= n;
             }
             h.AppendData(idKey);
-            if (encKey != null)
-                h.AppendData(encKey);
             return h.GetHashAndReset();
         }
 
