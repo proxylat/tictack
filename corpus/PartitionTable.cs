@@ -20,8 +20,13 @@ namespace Corpus
         private const int EntrySize = 128;
 
         private static readonly Guid EspType = new("c12a7328-f81f-11d2-ba4b-00a0c93ec93b");
-        private static readonly Guid MsrType = new("e3c9e316-0c5c-4db8-817d-f92df00215ae");
-        private static readonly Guid LdmType = new("5808c8aa-7e8f-42e0-85d3-e1e90434cfb3");
+        // Live-disk proven (VM disk0 partition 2): third group is 0B5C —
+        // 0C5C was a typo that unskipped every real MSR (repair always
+        // refused, image-disk captured the MSR as data).
+        private static readonly Guid MsrType = new("e3c9e316-0b5c-4db8-817d-f92df00215ae");
+        // UEFI spec: fourth group is 85D2 — 85D3 silently unrefused
+        // dynamic disks (block copy without LDM reassembly restores garbage).
+        private static readonly Guid LdmType = new("5808c8aa-7e8f-42e0-85d2-e1e90434cfb3");
 
         public static DiskLayout ReadDisk(int diskNumber, ILogger log)
         {
@@ -64,6 +69,7 @@ namespace Corpus
             var parts = ParseEntries(entriesBytes, entryCount);
             foreach (var p in parts)
                 p.PartitionKey = $"disk{diskNumber}p{p.PartitionNumber}:{p.UniqueGuid}";
+            SniffFilesystems(device, parts, log);
             var diskGuid = new Guid(header.AsSpan(56, 16)).ToString("d");
             log.Info($"disk {diskNumber} {diskGuid}: {parts.Count} partitions");
             return new DiskLayout
@@ -158,6 +164,71 @@ namespace Corpus
                 });
             }
             return parts;
+        }
+
+        // Boot-sector sniff: GPT type GUIDs don't name filesystems
+        // (basic-data spans NTFS/exFAT/BitLocker/raw), and CheckLayout + the
+        // diskpart plan need the real answer. One 512B read per unknown
+        // partition; unreadable stays "unknown", never throws.
+        private static void SniffFilesystems(string device, List<PartitionRecord> parts, ILogger log)
+        {
+            try
+            {
+                using var handle = NativeDisk.OpenHandle(device, read: true);
+                using var fs = new FileStream(handle, FileAccess.Read);
+                foreach (var p in parts)
+                {
+                    if (p.Skipped || !string.Equals(p.Filesystem, "unknown", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    try
+                    {
+                        var sector = new byte[SectorSize];
+                        fs.Seek(p.OffsetBytes, SeekOrigin.Begin);
+                        fs.ReadExactly(sector, 0, SectorSize);
+                        var sniffed = SniffFilesystem(sector);
+                        if (sniffed != "unknown")
+                        {
+                            p.Filesystem = sniffed;
+                            log.Debug($"partition {p.PartitionNumber}: filesystem {sniffed} (boot-sector sniff)");
+                        }
+                    }
+                    catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                    {
+                        log.Debug($"partition {p.PartitionNumber}: filesystem sniff skipped ({ex.Message})");
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                log.Debug("filesystem sniff skipped: " + ex.Message);
+            }
+        }
+
+        // Pure for tests. Only names filesystems we act on; BitLocker FVE
+        // ("-FVE-FS-"), short buffers, and anything else stay "unknown"
+        // (honest, never a guess CheckLayout would trust for the OS pick).
+        internal static string SniffFilesystem(byte[] sector)
+        {
+            ArgumentNullException.ThrowIfNull(sector);
+            if (MatchAscii(sector, 3, "NTFS    "))
+                return "ntfs";
+            if (MatchAscii(sector, 3, "EXFAT   "))
+                return "exfat";
+            if (MatchAscii(sector, 82, "FAT32   "))
+                return "fat32";
+            if (MatchAscii(sector, 54, "FAT12   "))
+                return "fat12";
+            if (MatchAscii(sector, 54, "FAT16   "))
+                return "fat16";
+            return "unknown";
+        }
+
+        private static bool MatchAscii(byte[] sector, int offset, string magic)
+        {
+            if (sector.Length < offset + magic.Length) return false;
+            for (var i = 0; i < magic.Length; i++)
+                if (sector[offset + i] != (byte)magic[i]) return false;
+            return true;
         }
 
         private static bool IsElevated()

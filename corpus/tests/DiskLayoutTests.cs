@@ -1,5 +1,6 @@
 namespace Corpus;
 
+using System.Text;
 using DiscUtils.Vhdx;
 
 // Whole-disk rung, store side (spec §7 tests 6–10). Lane A owns tests 1–5 in
@@ -82,7 +83,7 @@ public sealed class DiskLayoutTests : IDisposable
             new()
             {
                 PartitionNumber = 2, Name = "Microsoft reserved partition",
-                TypeGuid = "e3c9e316-0c5c-4db8-817d-f92df00215ae", UniqueGuid = NewGuid(),
+                TypeGuid = "e3c9e316-0b5c-4db8-817d-f92df00215ae", UniqueGuid = NewGuid(),
                 FirstLba = 206848, LastLba = 239615, OffsetBytes = 105906176, LengthBytes = 16777216,
                 Filesystem = "none", Skipped = true, SkipReason = "msr-reserved", PartitionKey = "disk0p2:msr",
             },
@@ -341,10 +342,10 @@ public sealed class DiskLayoutTests : IDisposable
     // Capture-enumeration tests (spec §1.1, lane A tests 1–5). All pin pure
     // parsers — Linux-runnable, no disk I/O.
     private static readonly Guid EspTypeGuid = new("c12a7328-f81f-11d2-ba4b-00a0c93ec93b");
-    private static readonly Guid MsrTypeGuid = new("e3c9e316-0c5c-4db8-817d-f92df00215ae");
+    private static readonly Guid MsrTypeGuid = new("e3c9e316-0b5c-4db8-817d-f92df00215ae");
     private static readonly Guid BasicTypeGuid = new("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7");
     private static readonly Guid RecoveryTypeGuid = new("de94bba4-06d1-4d40-a16a-bfd50179d6ac");
-    private static readonly Guid LdmTypeGuid = new("5808c8aa-7e8f-42e0-85d3-e1e90434cfb3");
+    private static readonly Guid LdmTypeGuid = new("5808c8aa-7e8f-42e0-85d2-e1e90434cfb3");
 
     private static byte[] BuildEntry(Guid type, Guid unique, long first, long last, string name)
     {
@@ -474,6 +475,58 @@ public sealed class DiskLayoutTests : IDisposable
         Assert.Equal(16777216, msr.LengthBytes);
     }
 
+    [Fact]
+    public void MsrGuid_MatchesLiveDisk_NotTestConst()
+    {
+        // Anti-typo pin: the literal GUID from a live disk0 (VM-proven)
+        // must skip even if the shared fixture const ever drifts again.
+        var parts = PartitionTable.ParseEntries(
+            BuildEntry(new Guid("e3c9e316-0b5c-4db8-817d-f92df00215ae"), Guid.NewGuid(), 206848, 239615, "Microsoft reserved partition"), 1);
+        var msr = Assert.Single(parts);
+        Assert.True(msr.Skipped);
+        Assert.Equal("msr-reserved", msr.SkipReason);
+        Assert.Equal("none", msr.Filesystem);
+    }
+
+    [Fact]
+    public void LdmGuid_MatchesUefiSpec_NotTestConst()
+    {
+        // Same pin for the dynamic-disk tripwire (spec §5.3.3: 85D2).
+        var entries = BuildEntry(new Guid("5808c8aa-7e8f-42e0-85d2-e1e90434cfb3"), Guid.NewGuid(), 4096, 8191, "LDM metadata");
+        var ex = Assert.Throws<InvalidDataException>(() => PartitionTable.ParseEntries(entries, 1));
+        Assert.Contains("ldm", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(3, "NTFS    ", "ntfs")]
+    [InlineData(3, "EXFAT   ", "exfat")]
+    [InlineData(82, "FAT32   ", "fat32")]
+    [InlineData(54, "FAT12   ", "fat12")]
+    [InlineData(54, "FAT16   ", "fat16")]
+    public void SniffFilesystem_NamesKnownVbrs(int offset, string magic, string expected)
+    {
+        var sector = new byte[512];
+        Encoding.ASCII.GetBytes(magic, 0, magic.Length, sector, offset);
+        Assert.Equal(expected, PartitionTable.SniffFilesystem(sector));
+    }
+
+    [Theory]
+    [InlineData(3, "NTTFS   ")]   // near-miss at the NTFS offset
+    [InlineData(4, "NTFS    ")]   // right magic, wrong offset
+    [InlineData(3, "-FVE-FS-")]   // BitLocker: opaque, never guessed
+    public void SniffFilesystem_Unknown_StaysUnknown(int offset, string magic)
+    {
+        var sector = new byte[512];
+        Encoding.ASCII.GetBytes(magic, 0, magic.Length, sector, offset);
+        Assert.Equal("unknown", PartitionTable.SniffFilesystem(sector));
+    }
+
+    [Fact]
+    public void SniffFilesystem_ShortSector_StaysUnknown()
+    {
+        Assert.Equal("unknown", PartitionTable.SniffFilesystem(new byte[64]));
+    }
+
     // Disk-restore tests (spec §7, lane D tests 12–15 + 17). All drive
     // RestoreDisk through FileBlockTarget file stand-ins (a prefilled .img
     // plays the disk); the MSR gap pins skipped-never-written.
@@ -540,7 +593,7 @@ public sealed class DiskLayoutTests : IDisposable
                 new List<PartitionImageInput>
                 {
                     Part(1, NewGuid(), aPath, "fat32", a, null),
-                    new PartitionImageInput(2, "Microsoft reserved partition", "e3c9e316-0c5c-4db8-817d-f92df00215ae",
+                    new PartitionImageInput(2, "Microsoft reserved partition", "e3c9e316-0b5c-4db8-817d-f92df00215ae",
                         NewGuid(), msrFirst, msrFirst + 32 - 1, msrFirst * 512, 32 * 512,
                         "none", true, "msr-reserved", null, null),
                     Part(3, NewGuid(), bPath, "ntfs", b, null),

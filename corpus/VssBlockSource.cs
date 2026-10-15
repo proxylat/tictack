@@ -10,19 +10,53 @@ namespace Corpus
     // the shadow. Completion-aware: the read wrapper reports a full-length
     // read so writers get BackupComplete on success, AbortBackup on any
     // short or failed read (probes must never Complete — see VssSnapshot).
-    public sealed class VssBlockSource : ISparseBlockSource, IVolumeHandleProvider
+    public sealed class VssBlockSource : ISparseBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume
     {
-        private readonly VssSnapshot _snap;
+        private readonly VssSnapshot? _snap;
+        private readonly BitLockerCaptureScope? _bitlocker;
         private readonly string _device;
+        private readonly Lazy<IMftVolume> _mft;
         private bool _fullyRead;
         private bool _disposed;
 
         public VssBlockSource(string drive, ILogger log)
+            : this(drive, log, ManageBdeBitLocker.Instance)
         {
-            _snap = VssSnapshot.Create(drive, log);
-            _device = _snap.DeviceObject.TrimEnd('\\');
-            Length = DeviceLength(drive, _device);
-            BytesPerCluster = VolumeBitmap.BytesPerCluster(drive + "\\");
+        }
+
+        // Item 12b: the scope arms BEFORE the snapshot freezes the volume
+        // (suspend-then-capture) and resumes AFTER teardown; the catch
+        // re-enables even when snapshot creation itself throws.
+        internal VssBlockSource(string drive, ILogger log, IBitLockerController bitlocker)
+        {
+            _bitlocker = BitLockerCaptureScope.Arm(drive, bitlocker, log);
+            try
+            {
+                _snap = VssSnapshot.Create(drive, log);
+                _device = _snap.DeviceObject.TrimEnd('\\');
+                Length = DeviceLength(drive, _device);
+                BytesPerCluster = VolumeBitmap.BytesPerCluster(drive + "\\");
+                _mft = new Lazy<IMftVolume>(() => new MftVolumeReader(_device));
+            }
+            catch
+            {
+                _bitlocker.Dispose();
+                throw;
+            }
+        }
+
+        // Test seam: no shadow (Linux-safe); the factory mirrors the
+        // production MftVolumeReader(device) open with a scripted fake.
+        internal VssBlockSource(string device, long length, long bytesPerCluster, Func<string, IMftVolume> mftFactory)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(device);
+            ArgumentNullException.ThrowIfNull(mftFactory);
+            _snap = null;
+            _bitlocker = null;
+            _device = device;
+            Length = length;
+            BytesPerCluster = bytesPerCluster;
+            _mft = new Lazy<IMftVolume>(() => mftFactory(device));
         }
 
         // Length is the FS-readable total, NOT the IOCTL partition
@@ -48,6 +82,40 @@ namespace Corpus
         // the bytes come from (never live — skew would tear the manifest).
         string IVolumeHandleProvider.SnapshotDevicePath => _device;
 
+        // IMftVolume over the FROZEN shadow (never live — the same
+        // device the bytes come from, mirroring TryOpenVolume). Lazy: an
+        // image that never touches the MFT never opens the handle. Open
+        // faults normalize to InvalidDataException so both MFT consumers
+        // degrade (baseline omitted, planner falls back to full) instead of
+        // faulting the image — mid-read IO faults still propagate.
+        private IMftVolume Mft
+        {
+            get
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                try
+                {
+                    return _mft.Value;
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    throw new InvalidDataException($"MFT unavailable on {_device} ({ex.Message})", ex);
+                }
+            }
+        }
+
+        public int BytesPerRecord => Mft.BytesPerRecord;
+
+        int IMftVolume.BytesPerCluster => Mft.BytesPerCluster;
+
+        public long RecordCount => Mft.RecordCount;
+
+        public IReadOnlyList<(long StartLcn, long ClusterCount)> MftRuns => Mft.MftRuns;
+
+        public IReadOnlyList<MftEnumEntry> Enumerate() => Mft.Enumerate();
+
+        public byte[] GetRecordBytes(ulong fileRef) => Mft.GetRecordBytes(fileRef);
+
         public Stream OpenRead()
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -59,9 +127,18 @@ namespace Corpus
         {
             if (_disposed) return;
             _disposed = true;
-            if (_fullyRead) _snap.Complete();
-            _snap.Dispose();
+            if (_mft.IsValueCreated)
+                _mft.Value.Dispose();
+            if (_fullyRead) _snap?.Complete();
+            _snap?.Dispose();
+            // Resume AFTER shadow teardown: the suspension covers teardown too.
+            _bitlocker?.Dispose();
         }
+
+        // IBitLockerVolume: the manifest records the capture-time state via
+        // the same `as`-pattern Store uses for the other optional providers.
+        string? IBitLockerVolume.BitLockerState => _bitlocker?.CaptureState;
+        List<string>? IBitLockerVolume.BitLockerKeyIds => _bitlocker?.CaptureKeyIds;
     }
 
     // Segment-buffered read passthrough over a shadow device. Two jobs:

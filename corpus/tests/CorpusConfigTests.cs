@@ -69,6 +69,39 @@ public sealed class CorpusConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_MinimalYaml_AppliesScheduleDefaults()
+    {
+        var cfg = CorpusConfig.Load(WriteYaml("store_path: /data/store\n"));
+        Assert.NotNull(cfg);
+        Assert.Equal("02:00", cfg!.GcDailyAt);
+        Assert.Equal("00:15:00", cfg.OptimizeEvery);
+    }
+
+    [Theory]
+    [InlineData("not-a-time")]
+    [InlineData("25:00")]
+    [InlineData("-01:00")]
+    public void Validate_BadGcDailyAt_Fails(string dailyAt)
+    {
+        var cfg = new CorpusConfig { StorePath = "/data/store", GcDailyAt = dailyAt };
+        var log = new TestLogger();
+        Assert.False(CorpusConfig.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("gc_daily_at"));
+    }
+
+    [Theory]
+    [InlineData("not-an-interval")]
+    [InlineData("00:00:00")]
+    [InlineData("-00:05:00")]
+    public void Validate_BadOptimizeEvery_Fails(string every)
+    {
+        var cfg = new CorpusConfig { StorePath = "/data/store", OptimizeEvery = every };
+        var log = new TestLogger();
+        Assert.False(CorpusConfig.Validate(cfg, log));
+        Assert.Contains(log.Messages, m => m.Contains("optimize_every"));
+    }
+
+    [Fact]
     public void StateRoot_ExplicitPath_Wins()
     {
         var cfg = new CorpusConfig { StateDbPath = "/custom/root" };

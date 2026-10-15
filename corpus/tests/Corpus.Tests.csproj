@@ -48,6 +48,7 @@
     <Compile Include="../PackHook.cs" Link="corpus/PackHook.cs" />
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
     <Compile Include="../Gc.cs" Link="corpus/Gc.cs" />
+    <Compile Include="../GcHost.cs" Link="corpus/GcHost.cs" />
     <Compile Include="../ChangeSource.cs" Link="corpus/ChangeSource.cs" />
     <Compile Include="../MftReader.cs" Link="corpus/MftReader.cs" />
     <Compile Include="../MftDigest.cs" Link="corpus/MftDigest.cs" />
@@ -59,6 +60,8 @@
     <Compile Include="../StoreTransfer.cs" Link="corpus/StoreTransfer.cs" />
     <Compile Include="../Vhdx.cs" Link="corpus/Vhdx.cs" />
     <Compile Include="../Vss.cs" Link="corpus/Vss.cs" />
+    <Compile Include="../BitLocker.cs" Link="corpus/BitLocker.cs" />
+    <Compile Include="../DiffFloor.cs" Link="corpus/DiffFloor.cs" />
     <Compile Include="../VolumeBitmap.cs" Link="corpus/VolumeBitmap.cs" />
     <Compile Include="../VssBlockSource.cs" Link="corpus/VssBlockSource.cs" />
     <Compile Include="../PartitionTable.cs" Link="corpus/PartitionTable.cs" />

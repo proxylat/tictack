@@ -4,6 +4,7 @@ using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Threading;
 using TicTack;
 
 namespace Corpus
@@ -51,6 +52,11 @@ namespace Corpus
             var dryRun = false;
             var confirm = false;
             var inline = false;
+            var repairBoot = false;
+            string? windowsDir = null;
+            string? nicDir = null;
+            string? gpuDir = null;
+            string? firmware = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -97,6 +103,36 @@ namespace Corpus
                         break;
                     case "--gc":
                         verb = "gc";
+                        break;
+                    case "--service":
+                        verb = "service";
+                        break;
+                    case "--locate-winre":
+                        verb = "locate-winre";
+                        break;
+                    case "--prepare-universal":
+                        verb = "prepare-universal";
+                        break;
+                    case "--check-boot-mode":
+                        verb = "check-boot-mode";
+                        break;
+                    case "--check-repair":
+                        verb = "check-repair";
+                        break;
+                    case "--repair-boot":
+                        repairBoot = true;
+                        break;
+                    case "--windows-dir":
+                        if (i + 1 < args.Length) windowsDir = args[++i];
+                        break;
+                    case "--nic-dir":
+                        if (i + 1 < args.Length) nicDir = args[++i];
+                        break;
+                    case "--gpu-dir":
+                        if (i + 1 < args.Length) gpuDir = args[++i];
+                        break;
+                    case "--firmware":
+                        if (i + 1 < args.Length) firmware = args[++i];
                         break;
                     case "--confirm":
                         confirm = true;
@@ -275,6 +311,14 @@ namespace Corpus
                         return RunProbe(verb, probeVol, log);
                     case "bitmap-dump":
                         return RunBitmapDump(volume, device, outPath, log);
+                    case "locate-winre":
+                        return RunLocateWinre(log);
+                    case "prepare-universal":
+                        return RunPrepareUniversal(windowsDir, drivers, nicDir, gpuDir, dryRun, log);
+                    case "check-boot-mode":
+                        return RunCheckBootMode(diskArg, firmware, log);
+                    case "check-repair":
+                        return RunCheckRepair(diskArg, log);
                     default:
                         break;
                 }
@@ -393,9 +437,11 @@ namespace Corpus
                     case "image-disk":
                         return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log);
                     case "restore-disk":
-                        return RunRestoreDisk(cfg, baseDir, layoutArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
+                        return RunRestoreDisk(cfg, baseDir, layoutArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, repairBoot, log);
                     case "gc":
                         return RunGc(cfg, dryRun, confirm, log);
+                    case "service":
+                        return RunService(cfg, log);
                     case "copy":
                     case "sync":
                         return RunTransfer(cfg, verb, fromFlag, toFlag, snapshotArg, chain, chainGen, log);
@@ -591,7 +637,7 @@ namespace Corpus
         // posture mirrors --restore; validation errors stay byte-identical
         // to the stub this replaced (Cli_RestoreDisk_RequiresLayout pins them).
         private static int RunRestoreDisk(CorpusConfig cfg, string baseDir, string? layoutArg, string? target,
-            string? storeFlag, string? indexFlag, string? confirmToken, bool allowBootDisk, bool skipVerify, bool dryRun, ILogger log)
+            string? storeFlag, string? indexFlag, string? confirmToken, bool allowBootDisk, bool skipVerify, bool dryRun, bool repairBoot, ILogger log)
         {
             if (string.IsNullOrEmpty(layoutArg) || string.IsNullOrEmpty(target))
             {
@@ -623,7 +669,7 @@ namespace Corpus
             indexPath = EnsureWritableIndex(indexPath, log);
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt);
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
-            return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
+            return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun, RepairBoot: repairBoot));
         }
 
         // --copy/--sync: git-like delta transfer between two stores (missing
@@ -742,6 +788,117 @@ namespace Corpus
             }
             Console.WriteLine("re-run with --confirm");
             return 1;
+        }
+
+        // Long-running host for scheduled GC + landing optimize: blocks
+        // until Ctrl+C. Manual --gc is untouched; the schedule comes from
+        // gc_daily_at/optimize_every (config-validated, refused loud here
+        // too since --service can run with an unvalidated config).
+        private static int RunService(CorpusConfig cfg, ILogger log)
+        {
+            if (!TimeSpan.TryParse(cfg.GcDailyAt, out var dailyAt) || dailyAt < TimeSpan.Zero || dailyAt >= TimeSpan.FromDays(1))
+            {
+                log.Error("gc_daily_at must be HH:mm within a day (got: " + cfg.GcDailyAt + ")");
+                return 1;
+            }
+            if (!TimeSpan.TryParse(cfg.OptimizeEvery, out var every) || every <= TimeSpan.Zero)
+            {
+                log.Error("optimize_every must be a positive interval (got: " + cfg.OptimizeEvery + ")");
+                return 1;
+            }
+            var level = cfg.Compression != null ? cfg.Compression.Level : 3;
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+            using var host = new GcHost(cfg.StorePath,
+                Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
+                cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, level,
+                new GcSchedule(dailyAt, every), cfg.Encrypt);
+            log.Info("service running: gc daily at " + cfg.GcDailyAt + ", optimize every " + cfg.OptimizeEvery + " (Ctrl+C to stop)");
+            host.Run(cts.Token);
+            return 0;
+        }
+
+        // Item 15a proof verb: locate winre.wim via reagentc + known path +
+        // partition scan. Prints "<source> <path>", exit 1 when absent (the
+        // caller falls back to the ADK path or refuses honestly).
+        private static int RunLocateWinre(ILogger log)
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                Console.Error.WriteLine("--locate-winre needs Windows");
+                return 1;
+            }
+            var found = WinReLocate.Locate(new WindowsWinReProbe(), log);
+            if (found == null) return 1;
+            Console.WriteLine(found.Source + " " + found.Path);
+            return 0;
+        }
+
+        // Item 6 proof verb: offline storage-driver inject (DISM) + NIC/GPU
+        // first-boot staging into a restored (offline) Windows tree. --driver
+        // is required (storage inject is the core); NIC/GPU dirs warn-and-skip
+        // when absent. Never runs against the live OS dir — offline only.
+        private static int RunPrepareUniversal(string? windowsDir, List<string> drivers, string? nicDir, string? gpuDir, bool dryRun, ILogger log)
+        {
+            if (string.IsNullOrEmpty(windowsDir) || !Directory.Exists(windowsDir))
+            {
+                log.Error("--prepare-universal requires --windows-dir <offline Windows dir> (got: " + windowsDir + ")");
+                return 1;
+            }
+            var rc = UniversalRestore.InjectStorageDrivers(new UniversalRestoreOptions(drivers.ToArray(), windowsDir, dryRun), new WindowsDismDriverInjector(log), log);
+            if (rc != 0) return rc;
+            return UniversalRestore.StageFirstBootDrivers(new FirstBootOptions(nicDir, gpuDir, windowsDir, dryRun), new FileFirstBootStager(), log);
+        }
+
+        // Item 6 boot-mode half: GPT wants UEFI, MBR wants BIOS. Firmware is
+        // explicit (no guessing the target box); layout is captured live.
+        private static int RunCheckBootMode(string? diskArg, string? firmware, ILogger log)
+        {
+            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            {
+                log.Error("--check-boot-mode requires --disk <N> (non-negative disk number, got: " + diskArg + ")");
+                return 1;
+            }
+            if (!string.Equals(firmware, "UEFI", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(firmware, "BIOS", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Error("--check-boot-mode requires --firmware <UEFI|BIOS> (got: " + firmware + ")");
+                return 1;
+            }
+            if (!OperatingSystem.IsWindows())
+            {
+                Console.Error.WriteLine("--check-boot-mode needs Windows");
+                return 1;
+            }
+            return UniversalRestore.CheckBootMode(PartitionTable.ReadDisk(diskNumber, log), firmware!, log);
+        }
+
+        // Item 5 proof verb: live-layout repair checks + diskpart/bcdboot
+        // plan. Read-only (ApplyLayout/InstallBootloader only run inside
+        // --restore-disk --repair-boot on the PE target) — safe on the
+        // live box. Exit 1 names the blocker (ESP floor, MSR, style).
+        private static int RunCheckRepair(string? diskArg, ILogger log)
+        {
+            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            {
+                log.Error("--check-repair requires --disk <N> (non-negative disk number, got: " + diskArg + ")");
+                return 1;
+            }
+            if (!OperatingSystem.IsWindows())
+            {
+                Console.Error.WriteLine("--check-repair needs Windows");
+                return 1;
+            }
+            var layout = PartitionTable.ReadDisk(diskNumber, log);
+            var blocked = BootRepairOrchestrator.CheckLayout(layout);
+            if (blocked != null)
+            {
+                log.Error(blocked);
+                return 1;
+            }
+            Console.WriteLine(BootRepairOrchestrator.Plan(layout).TrimEnd());
+            log.Info("repair checks passed (plan above, nothing applied)");
+            return 0;
         }
 
         // Drive-letter-colon ("T:") images the live volume through VSS;
@@ -926,9 +1083,16 @@ namespace Corpus
             Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
             Console.WriteLine("  --verify --snapshot <gen> [--chain]              Verify a snapshot (exit 1 on failure; --chain also walks parent links to genesis, a gap fails loud even if the target alone verifies)");
             Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
-            Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual only, never automatic)");
+            Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual; --service runs this on schedule)");
             Console.WriteLine("      retention: keep_last/keep_within_days/pin from config; exports outside the store are untouched");
             Console.WriteLine("      retention pool is shared between volume and disk snapshots (use two stores for isolation)");
+            Console.WriteLine("  --service                              Run scheduled GC (gc_daily_at) + landing optimize (optimize_every) until Ctrl+C");
+            Console.WriteLine("  --locate-winre                         Print winre.wim source+path (reagentc/known-path/partition-scan; exit 1 when absent)");
+            Console.WriteLine("  --restore-disk ... --repair-boot       Recreate layout + reinstall bootloader after restore (default: print manual steps)");
+            Console.WriteLine("  --prepare-universal --windows-dir <offline> --driver <dir>... [--nic-dir <d>] [--gpu-dir <d>] [--dry-run]");
+            Console.WriteLine("      Offline storage-driver inject (DISM) + NIC/GPU first-boot staging into a restored tree");
+            Console.WriteLine("  --check-boot-mode --disk <N> --firmware <UEFI|BIOS>  Refuse GPT-on-BIOS / MBR-on-UEFI with the conversion path");
+            Console.WriteLine("  --check-repair --disk <N>  Live-layout repair checks + diskpart/bcdboot plan (read-only, exit 1 names the blocker)");
             Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
             Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
             Console.WriteLine("      [--payload <dir>]  Skip re-publish (ADK box without the SDK: publish dir)");

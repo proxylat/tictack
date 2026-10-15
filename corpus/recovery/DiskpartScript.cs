@@ -9,7 +9,7 @@ namespace Corpus
     public static class DiskpartScript
     {
         private const string EspType = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
-        private const string MsrType = "e3c9e316-0c5c-4db8-817d-f92df00215ae";
+        private const string MsrType = "e3c9e316-0b5c-4db8-817d-f92df00215ae";
 
         public static string Generate(DiskLayout layout)
         {

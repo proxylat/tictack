@@ -54,6 +54,13 @@ namespace Corpus
         public List<string>? MftChunkDigests { get; set; }
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public int MftRecordBytes { get; set; }
+        // Item 12b: BitLocker state DURING capture (post-suspend — the
+        // on-disk state the image carries) + protector key IDs (IDs only,
+        // never key material). Null on old/file-source manifests.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? BitLockerState { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public List<string>? BitLockerKeyIds { get; set; }
         public List<ManifestEntry> Chunks { get; set; } = new();
         public string Hmac { get; set; } = "";
     }
@@ -68,7 +75,8 @@ namespace Corpus
             int parentGeneration = 0, string? changeCursor = null,
             string? partitionKey = null, int diskNumber = 0, int partitionNumber = 0,
             string? layoutFingerprint = null, List<string>? skippedExclusions = null,
-            List<string>? mftChunkDigests = null, int mftRecordBytes = 0)
+            List<string>? mftChunkDigests = null, int mftRecordBytes = 0,
+            string? bitLockerState = null, List<string>? bitLockerKeyIds = null)
         {
             return new SnapshotManifest
             {
@@ -88,6 +96,8 @@ namespace Corpus
                 SkippedExclusions = skippedExclusions,
                 MftChunkDigests = mftChunkDigests,
                 MftRecordBytes = mftRecordBytes,
+                BitLockerState = bitLockerState,
+                BitLockerKeyIds = bitLockerKeyIds,
                 Chunks = chunks,
             };
         }

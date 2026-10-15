@@ -44,7 +44,7 @@ public sealed class BootRepairRecoveryTests : IDisposable
             new()
             {
                 PartitionNumber = 2, Name = "Microsoft reserved partition",
-                TypeGuid = "e3c9e316-0c5c-4db8-817d-f92df00215ae", UniqueGuid = Guid.NewGuid().ToString("D"),
+                TypeGuid = "e3c9e316-0b5c-4db8-817d-f92df00215ae", UniqueGuid = Guid.NewGuid().ToString("D"),
                 FirstLba = 206848, LastLba = 239615, OffsetBytes = 261L * Mib, LengthBytes = 16L * Mib,
                 Filesystem = "none", Skipped = true, SkipReason = "msr-reserved", PartitionKey = "disk0p2:msr",
             },
@@ -138,7 +138,7 @@ public sealed class BootRepairRecoveryTests : IDisposable
                 {
                     new(1, "EFI system partition", "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
                         Guid.NewGuid().ToString("D"), 2048, 411647, Mib, 200L * Mib, "fat32", false, null, esp, null),
-                    new(2, "Microsoft reserved partition", "e3c9e316-0c5c-4db8-817d-f92df00215ae",
+                    new(2, "Microsoft reserved partition", "e3c9e316-0b5c-4db8-817d-f92df00215ae",
                         Guid.NewGuid().ToString("D"), 411648, 444415, 201L * Mib, 16L * Mib, "none", true, "msr-reserved", null, null),
                     new(3, "Basic data partition", "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
                         Guid.NewGuid().ToString("D"), 444416, 448511, 217L * Mib, 2L * Mib, "ntfs", false, null, sys, null),

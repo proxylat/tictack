@@ -174,7 +174,6 @@ namespace Corpus
     public sealed class VssSnapshot : IDisposable
     {
         private const int VssCtxBackup = 0;
-        private const long DiffHeadroomBytes = 1L * 1024 * 1024 * 1024;
 
         private readonly IVssBackupComponents _com;
         private readonly Guid _setId;
@@ -206,14 +205,11 @@ namespace Corpus
                 throw new ArgumentException("want a drive letter like \"T:\" (got: " + drive + ")", nameof(drive));
             if (!IsElevated())
                 throw new InvalidOperationException("VSS capture needs elevation — run Corpus.exe elevated.");
-            // Diff-area preflight, cheap rung: 1 GiB free, or half the volume
-            // when the volume itself is smaller (an absolute gate would ban
-            // every sub-gigabyte volume — the 100 MB test toy included).
-            // shortcut: true shadow-storage accounting (Win32_ShadowStorage
-            // free/max) replaces this when multi-hour captures exist; short
-            // loops never grow past this.
+            // Diff-area preflight, cheap rung: volume-proportional floor with
+            // documented-minimum clamps (see DiffFloor — a fixed floor bans
+            // small volumes outright, and half-the-volume bans full ones).
             var driveInfo = new DriveInfo(drive);
-            var headroom = Math.Min(DiffHeadroomBytes, driveInfo.TotalSize / 2);
+            var headroom = DiffFloor.RequiredHeadroomBytes(driveInfo.TotalSize);
             if (driveInfo.AvailableFreeSpace < headroom)
                 throw new InvalidOperationException($"volume {drive} has {driveInfo.AvailableFreeSpace} bytes free — VSS needs {headroom} bytes headroom for the diff area.");
 

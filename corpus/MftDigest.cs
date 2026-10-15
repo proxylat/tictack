@@ -81,7 +81,21 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(vol);
             ArgumentNullException.ThrowIfNull(parent);
             ArgumentNullException.ThrowIfNull(log);
-            if (vol.BytesPerRecord != parent.MftRecordBytes)
+            // The record-size probe is the first MFT touch: a dead snapshot
+            // device fails here, before ComputeGroups' own guard — degrade
+            // to full like an unreadable MFT, never throw (Store's baseline
+            // path wraps ComputeGroups only, so this hole is planner-only).
+            int recordBytes;
+            try
+            {
+                recordBytes = vol.BytesPerRecord;
+            }
+            catch (InvalidDataException ex)
+            {
+                log.Info($"full image (MFT unreadable: {ex.Message})");
+                return null;
+            }
+            if (recordBytes != parent.MftRecordBytes)
             {
                 log.Info("full image (MFT record size changed, reformat?)");
                 return null;

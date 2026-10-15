@@ -31,7 +31,7 @@ logging:
 # GC retention: roots are the UNION of newest keep_last generations,
 # snapshots imaged within keep_within_days (0 = off, by CreatedUtc),
 # and explicitly pinned generations. Unknown pins warn and are ignored.
-# GC is manual only (--gc --confirm); nothing is ever deleted implicitly.
+# GC runs on demand (--gc --confirm) or on schedule (--service, see gc_daily_at below); nothing is ever deleted implicitly.
 retention:
   keep_last: 4
   keep_within_days: 0

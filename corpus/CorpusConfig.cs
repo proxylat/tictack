@@ -68,6 +68,10 @@ namespace Corpus
         // unencrypted. Runs per pack after sealing, never per chunk; a hook
         // failure fails the job loud. Corpus ships zero builtin crypto.
         public string Encrypt { get; set; }
+        // Service cadence (--service only; manual --gc ignores these):
+        // daily GC wall-clock time and landing-optimize interval.
+        public string GcDailyAt { get; set; }
+        public string OptimizeEvery { get; set; }
 
         public CorpusConfig()
         {
@@ -75,6 +79,8 @@ namespace Corpus
             StateDbPath = string.Empty;
             ChunkMib = 4;
             Encrypt = string.Empty;
+            GcDailyAt = "02:00";
+            OptimizeEvery = "00:15:00";
             Compression = new CorpusCompressionConfig();
             Logging = new CorpusLoggingConfig();
             Retention = new CorpusRetentionConfig();
@@ -132,6 +138,16 @@ namespace Corpus
                     valid = false;
                     break;
                 }
+            }
+            if (!TimeSpan.TryParse(cfg.GcDailyAt, out var dailyAt) || dailyAt < TimeSpan.Zero || dailyAt >= TimeSpan.FromDays(1))
+            {
+                log.Error("gc_daily_at must be HH:mm within a day (got: " + cfg.GcDailyAt + ")");
+                valid = false;
+            }
+            if (!TimeSpan.TryParse(cfg.OptimizeEvery, out var every) || every <= TimeSpan.Zero)
+            {
+                log.Error("optimize_every must be a positive interval (got: " + cfg.OptimizeEvery + ")");
+                valid = false;
             }
             return valid;
         }

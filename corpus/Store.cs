@@ -277,7 +277,9 @@ namespace Corpus
                 changeCursor: UsnChangeSource.TryCurrentCursor(source, _log),
                 layoutFingerprint: CurrentFingerprint(source, opts),
                 skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null,
-                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes);
+                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes,
+                bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
+                bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
             ManifestStore.Save(_manifestsDir, manifest, _key);
             if (manifest.SkippedExclusions != null)
                 _log.Warn($"excluded extents restored as zeros: {string.Join(", ", manifest.SkippedExclusions)}");
@@ -349,7 +351,9 @@ namespace Corpus
                 ChunkId.KeyId(_key), prevDigest, entries, parent.Generation, plan.NewCursor,
                 layoutFingerprint: CurrentFingerprint(source, opts),
                 skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null,
-                mftChunkDigests: plan.NewMftDigests, mftRecordBytes: plan.NewMftRecordBytes);
+                mftChunkDigests: plan.NewMftDigests, mftRecordBytes: plan.NewMftRecordBytes,
+                bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
+                bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
             ManifestStore.Save(_manifestsDir, manifest, _key);
             _log.Info($"incremental gen {generation} from parent {parent.Generation}: {reread}/{grid} chunks re-read, {newChunks} new");
             return manifest;
@@ -557,7 +561,9 @@ namespace Corpus
                 changeCursor: UsnChangeSource.TryCurrentCursor(source, _log),
                 layoutFingerprint: CurrentFingerprint(source, opts),
                 skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null,
-                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes);
+                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes,
+                bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
+                bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
             ManifestStore.Save(_manifestsDir, manifest, _key);
             if (manifest.SkippedExclusions != null)
                 _log.Warn($"excluded extents restored as zeros: {string.Join(", ", manifest.SkippedExclusions)}");
