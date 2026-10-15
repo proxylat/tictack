@@ -15,7 +15,12 @@ chunk_mib: 4
 
 compression:
   # zstd level 1..22. 3 = Veeam-High default, 1 = fast landing-zone tier.
+  # Level 3 locked per item-9 curve (CompressionCurveTests): higher levels
+  # gain ~0 bytes on realistic payloads, cost up to 90x encode.
   level: 3
+
+# Post-capture full re-read verify costs ~50% of capture time (8 MiB vol,
+# zstd 3, warm cache; measured by VerifyOverheadTests). Always on, no knob.
 
 logging:
   level: info
@@ -31,6 +36,14 @@ retention:
   keep_last: 4
   keep_within_days: 0
   pin: []
+
+# Exclusions (item 4): regenerable extents restored as zeros, names recorded
+# per-snapshot in the manifest skip record. Omit = defaults below
+# (pagefile/hiberfil/swapfile, $Recycle.Bin, System Volume Information,
+# $UsnJrnl:$J, Windows\Temp, Temp). Explicit list REPLACES defaults, never
+# merges. $LogFile is never excludable (stripped even if listed).
+#exclusions:
+#  skip: ['pagefile.sys', 'hiberfil.sys']
 
 # Restore (recovery stick): --restore --snapshot <gen> --target <disk#|\\.\PhysicalDriveN|file>
 # --confirm-type is required always (even --dry-run); a refused run names the want-TOKEN.

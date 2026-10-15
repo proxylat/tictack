@@ -14,7 +14,9 @@ namespace Corpus
         int ParentGeneration = 0,   // 0 = auto (latest) when Incremental, else full
         bool Incremental = false,
         bool ForceFull = false,
-        IChangeSource? ChangeSource = null);
+        IChangeSource? ChangeSource = null,
+        ILayoutFingerprintProvider? Layout = null,   // item 1-minimal guard seam (null = abstain)
+        IExclusionResolver? Exclusions = null);      // item 4 zero-ranges seam (null = none)
 
     public sealed record IncrementalPlan(HashSet<long> DirtyChunks, string NewCursor);
 
@@ -280,17 +282,12 @@ namespace Corpus
             return (BitConverter.ToInt32(output, 44), BitConverter.ToInt32(output, 48));
         }
 
-        // LCN range → chunk grid range via byte offsets (chunk i covers
-        // bytes [i*chunkBytes,...), not raw LCNs).
+        // LCN range → chunk grid range (CapturePolicy: byte offsets, sparse
+        // LCN -1 skipped — never a negative chunk index).
         private static void AddRunChunks(HashSet<long> dirty, List<(long StartLcn, long ClusterCount)> runs, long bpc, int chunkBytes)
         {
-            foreach (var (startLcn, count) in runs)
-            {
-                var first = startLcn * bpc / chunkBytes;
-                var last = ((startLcn + count) * bpc - 1) / chunkBytes;
-                for (var c = first; c <= last; c++)
-                    dirty.Add(c);
-            }
+            foreach (var c in CapturePolicy.DirtyChunksForRuns(runs, bpc, chunkBytes))
+                dirty.Add(c);
         }
 
         // Bounded 64KB reads from FirstUsn to the journal tip, keeping only
@@ -428,6 +425,9 @@ namespace Corpus
             foreach (var (off, len) in AttributeSpans(record))
             {
                 var type = BitConverter.ToUInt32(record, off);
+                // 0x80 with NO name filter: every $DATA stream counts — the
+                // unnamed default stream AND every named ADS (item 2: ADS
+                // captured by construction, not by assumption).
                 if (type != 0x80 && type != 0xA0)
                     continue;
                 if (len < 9)

@@ -41,6 +41,14 @@ namespace Corpus
         public int DiskNumber { get; set; }
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public int PartitionNumber { get; set; }
+        // Item 1-minimal: layout fingerprint (SHA-256 over $MFT runs). Null on
+        // old/file-source manifests → guard abstains, never false-positives.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? LayoutFingerprint { get; set; }
+        // Item 4: exclusion names whose extents were zeroed at capture. Null =
+        // none (omitted → old/dense JSON byte-identical).
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public List<string>? SkippedExclusions { get; set; }
         public List<ManifestEntry> Chunks { get; set; } = new();
         public string Hmac { get; set; } = "";
     }
@@ -53,7 +61,8 @@ namespace Corpus
     {
         public static SnapshotManifest Build(int generation, string name, long volumeLength, int chunkMib, int compressionLevel, string keyId, string prevDigest, List<ManifestEntry> chunks,
             int parentGeneration = 0, string? changeCursor = null, string? encKeyId = null,
-            string? partitionKey = null, int diskNumber = 0, int partitionNumber = 0)
+            string? partitionKey = null, int diskNumber = 0, int partitionNumber = 0,
+            string? layoutFingerprint = null, List<string>? skippedExclusions = null)
         {
             return new SnapshotManifest
             {
@@ -70,6 +79,8 @@ namespace Corpus
                 PartitionKey = partitionKey,
                 DiskNumber = diskNumber,
                 PartitionNumber = partitionNumber,
+                LayoutFingerprint = layoutFingerprint,
+                SkippedExclusions = skippedExclusions,
                 Chunks = chunks,
             };
         }

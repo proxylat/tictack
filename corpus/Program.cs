@@ -277,6 +277,7 @@ namespace Corpus
                         log.Info("store: " + cfg.StorePath);
                         log.Info("state root: " + CorpusConfig.StateRoot(cfg));
                         log.Info("chunk: " + cfg.ChunkMib + " MiB, zstd level " + cfg.Compression.Level);
+                        log.Info("exclusions: " + string.Join(", ", CapturePolicy.EffectiveSkip(cfg.Exclusions?.Skip)));
                         log.Info("Corpus config valid");
                         return 0;
                     case "image":

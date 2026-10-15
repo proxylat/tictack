@@ -109,14 +109,54 @@ namespace Corpus
             }
             if (parent != null)
             {
+                parent = CheckRelocation(parent, source, opts);
+                parent = parent != null ? CheckExclusionSet(parent, opts, source) : null;
+            }
+            if (parent != null)
+            {
                 var plan = (opts.ChangeSource ?? DefaultChangeSource()).Plan(parent, source, _chunkMib * 1024 * 1024, _log);
                 if (plan != null)
-                    return ImageIncremental(source, name, generation, prevDigest, parent, plan);
+                    return ImageIncremental(source, name, generation, prevDigest, parent, plan, opts);
             }
-            return ImageFull(source, name, generation, prevDigest);
+            return ImageFull(source, name, generation, prevDigest, opts);
         }
 
         private static IChangeSource DefaultChangeSource() => new UsnChangeSource();
+
+        // Item 1-minimal guard: fingerprint mismatch proves defrag/optimize
+        // relocated data without USN entries → reused digests would point at
+        // stale locations. Fall back to full re-read (loud), never wrong data.
+        private SnapshotManifest? CheckRelocation(SnapshotManifest parent, IBlockSource source, ImageOptions opts)
+        {
+            if (CapturePolicy.FingerprintMismatch(parent.LayoutFingerprint, CurrentFingerprint(source, opts)))
+            {
+                _log.Warn($"full image: layout fingerprint changed since gen {parent.Generation} (defrag/relocation?), re-reading all chunks");
+                return null;
+            }
+            return parent;
+        }
+
+        // Exclusion-set change → full: clean chunks still carry the old set's
+        // bytes, so reuse would contradict the child's skip record.
+        private SnapshotManifest? CheckExclusionSet(SnapshotManifest parent, ImageOptions opts, IBlockSource source)
+        {
+            var current = CurrentExclusionNames(opts, source);
+            if (CapturePolicy.ExclusionSetChanged(parent.SkippedExclusions, current.Count > 0 ? current : null))
+            {
+                _log.Info($"full image: exclusion set changed since gen {parent.Generation}, re-reading all chunks");
+                return null;
+            }
+            return parent;
+        }
+
+        private static IExclusionResolver? ResolveExclusions(IBlockSource source, ImageOptions opts) =>
+            opts.Exclusions ?? source as IExclusionResolver;
+
+        private static IReadOnlyList<string> CurrentExclusionNames(ImageOptions opts, IBlockSource source) =>
+            ResolveExclusions(source, opts)?.ExclusionNames ?? (IReadOnlyList<string>)Array.Empty<string>();
+
+        private static string? CurrentFingerprint(IBlockSource source, ImageOptions opts) =>
+            opts.Layout?.LayoutFingerprint() ?? (source as ILayoutFingerprintProvider)?.LayoutFingerprint();
 
         // Parent usability gate: resize / re-chunk / grid drift → log the
         // reason and return null (caller falls back to full re-read).
@@ -147,7 +187,7 @@ namespace Corpus
             return (int)((volumeLength + chunkBytes - 1) / chunkBytes);
         }
 
-        private SnapshotManifest ImageFull(IBlockSource source, string name, int generation, string prevDigest)
+        private SnapshotManifest ImageFull(IBlockSource source, string name, int generation, string prevDigest, ImageOptions opts)
         {
             var entries = new List<ManifestEntry>(GridCount(source.Length, _chunkMib));
             var pending = new List<ChunkRow>();
@@ -160,6 +200,9 @@ namespace Corpus
             var totalBytes = 0L;
             var holes = 0;
             var chunkBytes = _chunkMib * 1024 * 1024;
+            var excl = ResolveExclusions(source, opts);
+            var exclBpc = excl?.BytesPerCluster ?? 0;
+            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
             using (var pack = new PackWriter(_packsDir, v2: _encKey != null))
             using (var stream = source.OpenRead())
             {
@@ -179,6 +222,8 @@ namespace Corpus
                         holes++;
                         continue;
                     }
+                    if (exclRuns != null && exclRuns.Count > 0)
+                        CapturePolicy.ZeroExcludedRanges(chunk.Data, chunk.Offset, exclRuns, exclBpc);
                     var digest = ChunkId.ComputeId(chunk.Data, _key, _encKey);
                     var hex = ChunkId.ToHex(digest);
                     entries.Add(new ManifestEntry(hex, chunk.Data.Length));
@@ -212,8 +257,12 @@ namespace Corpus
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries,
-                changeCursor: UsnChangeSource.TryCurrentCursor(source, _log), encKeyId: _encKeyId);
+                changeCursor: UsnChangeSource.TryCurrentCursor(source, _log), encKeyId: _encKeyId,
+                layoutFingerprint: CurrentFingerprint(source, opts),
+                skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null);
             ManifestStore.Save(_manifestsDir, manifest, _key);
+            if (manifest.SkippedExclusions != null)
+                _log.Warn($"excluded extents restored as zeros: {string.Join(", ", manifest.SkippedExclusions)}");
             _log.Info($"imaged '{name}' gen {generation}: {entries.Count} chunks ({holes} holes), {newChunks} new, {totalBytes} bytes");
             return manifest;
         }
@@ -222,13 +271,16 @@ namespace Corpus
         // ZERO reads; only dirty chunks are seek-read, hashed, and packed.
         // The child manifest is self-contained (full chunk list) — export
         // and standalone verify never touch the parent.
-        private SnapshotManifest ImageIncremental(IBlockSource source, string name, int generation, string prevDigest, SnapshotManifest parent, IncrementalPlan plan)
+        private SnapshotManifest ImageIncremental(IBlockSource source, string name, int generation, string prevDigest, SnapshotManifest parent, IncrementalPlan plan, ImageOptions opts)
         {
             var chunkBytes = _chunkMib * 1024 * 1024;
             var grid = GridCount(source.Length, _chunkMib);
             var entries = new List<ManifestEntry>(parent.Chunks.Count);
             var pending = new List<ChunkRow>();
             var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
+            var excl = ResolveExclusions(source, opts);
+            var exclBpc = excl?.BytesPerCluster ?? 0;
+            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
             var reread = 0;
             var newChunks = 0;
             using (var pack = new PackWriter(_packsDir, v2: _encKey != null))
@@ -251,6 +303,8 @@ namespace Corpus
                     }
                     var data = ReadChunkAt(stream, i, chunkBytes, source.Length);
                     reread++;
+                    if (exclRuns != null && exclRuns.Count > 0)
+                        CapturePolicy.ZeroExcludedRanges(data, i * (long)chunkBytes, exclRuns, exclBpc);
                     var digest = ChunkId.ComputeId(data, _key, _encKey);
                     var hex = ChunkId.ToHex(digest);
                     entries.Add(new ManifestEntry(hex, data.Length));
@@ -282,7 +336,9 @@ namespace Corpus
 
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
-                ChunkId.KeyId(_key), prevDigest, entries, parent.Generation, plan.NewCursor, _encKeyId);
+                ChunkId.KeyId(_key), prevDigest, entries, parent.Generation, plan.NewCursor, _encKeyId,
+                layoutFingerprint: CurrentFingerprint(source, opts),
+                skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null);
             ManifestStore.Save(_manifestsDir, manifest, _key);
             _log.Info($"incremental gen {generation} from parent {parent.Generation}: {reread}/{grid} chunks re-read, {newChunks} new");
             return manifest;
@@ -379,6 +435,13 @@ namespace Corpus
                     {
                         parent = FindPartitionParent(key);
                     }
+                }
+                // Item 3: ReFS is incremental-ineligible (USN/MFT path is
+                // NTFS-only) → refuse loud, image full for that partition.
+                if (parent != null && FsTypePolicy.DecideFilesystem(part.Filesystem) == CaptureDecision.FullOnlyLoud)
+                {
+                    _log.Warn($"full image: partition {part.PartitionNumber} filesystem '{part.Filesystem}' is incremental-ineligible (ReFS), re-reading all chunks");
+                    parent = null;
                 }
                 var imageOpts = parent != null
                     ? new ImageOptions(ParentGeneration: parent.Generation, Incremental: true, ChangeSource: part.ChangeSource)

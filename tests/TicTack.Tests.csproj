@@ -75,6 +75,7 @@
     <Compile Include="../src/TrackedDeleter.cs" Link="src/TrackedDeleter.cs" />
     <Compile Include="../src/ProcessRunner.cs" Link="src/ProcessRunner.cs" />
     <Compile Include="../src/SqliteBootstrap.cs" Link="src/SqliteBootstrap.cs" />
+    <Compile Include="../src/OsCapture.cs" Link="src/OsCapture.cs" />
   </ItemGroup>
 
 </Project>

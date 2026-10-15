@@ -172,6 +172,30 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void StandaloneGap_TriggersCoveringScan_CatchingSilentDelete()
+    {
+        _pipeline.Dispose();
+        var monitor = new GapEventMonitor();
+        var log = new RecordingLogger();
+        var srcFile = Path.Combine(_srcDir, "gap.txt");
+        var dstFile = Path.Combine(_dstDir, "gap.txt");
+        File.WriteAllText(srcFile, "gap");
+        using var pipeline = new SyncPipeline(
+            new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
+            monitor, new SizeComparer(), _copy, _rename,
+            new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(),
+            _deletion, log, new StateDb(Path.Combine(_root, "gap-state.db")));
+        pipeline.Start();
+        WaitFor(() => log.Messages.Any(m => m.Contains("Sync complete")), "initial sync");
+        Assert.True(File.Exists(dstFile));
+        // Silent delete: no event, as if lost in an overflow window.
+        File.Delete(srcFile);
+        monitor.FireGap();
+        WaitFor(() => !File.Exists(dstFile), "gap covering delete");
+        Assert.Contains(log.Messages, m => m.StartsWith("WRN:Gap-triggered rescan starting: "));
+    }
+
+    [Fact]
     public void ScanGuard_SecondClaimFailsWhileHeld()
     {
         // Deterministic coalescing proof: an empty-dir scan can finish

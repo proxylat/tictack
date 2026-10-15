@@ -1273,7 +1273,21 @@ namespace TicTack
         // the current head. Anything else (recreation, trimmed cursor,
         // clock weirdness) starts at head like before.
         internal static bool CheckpointCoversGap(ulong storedId, long storedUsn, ulong journalId, long headUsn) =>
-            storedId == journalId && storedUsn >= 0 && storedUsn < headUsn;
+            CheckpointGapReason(storedId, storedUsn, journalId, headUsn) == null;
+
+        // Null = the checkpoint covers the offline window (replay from it).
+        // Else the human-readable reason it doesn't — logged at Info so a
+        // missed-change incident reads as two log lines, not a mystery.
+        internal static string? CheckpointGapReason(ulong storedId, long storedUsn, ulong journalId, long headUsn)
+        {
+            if (storedId != journalId)
+                return "journal id changed (stored=" + storedId + " current=" + journalId + ")";
+            if (storedUsn < 0)
+                return "negative stored cursor (" + storedUsn + ")";
+            if (storedUsn >= headUsn)
+                return "stored cursor at/past head (stored=" + storedUsn + " head=" + headUsn + ")";
+            return null;
+        }
 
         private string? CombineParent(UsnRecord rec, Func<ulong, string?> resolvePath)
         {
@@ -1590,11 +1604,28 @@ namespace TicTack
             try { cp = _checkpointStore.GetUsnCheckpoint(); }
             catch (Exception ex)
             {
-                _log?.Debug("USN checkpoint unreadable, starting at head: " + ex.Message);
+                _log?.Info("USN checkpoint unreadable, starting at head (journal=" + journalId + " head=" + headUsn + "): " + ex.Message);
                 return headUsn;
             }
-            if (cp == null || !CheckpointCoversGap(cp.Value.journalId, cp.Value.lastUsn, journalId, headUsn))
+            if (cp == null)
+            {
+                _log?.Info("USN no checkpoint stored, starting at head (journal=" + journalId + " head=" + headUsn + "); initial walk covers the window.");
                 return headUsn;
+            }
+            // Normal clean stop: the final write landed exactly on head, so
+            // there is no offline window. Its own line (not the "unusable"
+            // one below): nothing is wrong.
+            if (cp.Value.journalId == journalId && cp.Value.lastUsn == headUsn)
+            {
+                _log?.Info("USN cursor current (journal=" + journalId + " usn=" + headUsn + "), nothing to replay.");
+                return headUsn;
+            }
+            var gapReason = CheckpointGapReason(cp.Value.journalId, cp.Value.lastUsn, journalId, headUsn);
+            if (gapReason != null)
+            {
+                _log?.Info("USN checkpoint unusable (" + gapReason + "), starting at head (journal=" + journalId + " head=" + headUsn + "); initial walk covers the window.");
+                return headUsn;
+            }
             var lastUsn = cp.Value.lastUsn;
             var replayed = 0;
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
@@ -1614,13 +1645,13 @@ namespace TicTack
             }
             catch (UsnJournalReadException ex)
             {
-                _log?.Info("USN offline catch-up abandoned (Win32 " + ex.Win32Code + "), starting at head.");
+                _log?.Info("USN offline catch-up abandoned (Win32 " + ex.Win32Code + "), starting at head (journal=" + journalId + " head=" + headUsn + ").");
                 return headUsn;
             }
             if (lastUsn < headUsn)
-                _log?.Debug("USN offline catch-up hit its bounds after " + replayed + " record(s), resuming at head.");
+                _log?.Info("USN offline catch-up hit its bounds after " + replayed + " record(s) (journal=" + journalId + " stored=" + cp.Value.lastUsn + " head=" + headUsn + "), resuming at head; initial walk covers the rest.");
             else if (replayed > 0)
-                _log?.Debug("USN offline catch-up replayed " + replayed + " record(s).");
+                _log?.Info("USN offline catch-up replayed " + replayed + " record(s) (journal=" + journalId + " " + cp.Value.lastUsn + " -> " + headUsn + ").");
             return lastUsn;
         }
 

@@ -297,6 +297,21 @@ public class UsnMonitorTests : IDisposable
     }
 
     [Theory]
+    [InlineData(9UL, 100L, 9UL, 200L, null)]              // covered: replay, no reason
+    [InlineData(9UL, 200L, 9UL, 200L, "at/past head")]     // already at head
+    [InlineData(9UL, 300L, 9UL, 200L, "at/past head")]     // ahead of head: clock weirdness
+    [InlineData(8UL, 100L, 9UL, 200L, "journal id changed")] // recreated journal
+    [InlineData(9UL, -1L, 9UL, 200L, "negative")]          // corrupt row
+    public void CheckpointGapReason_Matrix(ulong storedId, long storedUsn, ulong journalId, long head, string? expectedFragment)
+    {
+        var reason = UsnJournalMonitor.CheckpointGapReason(storedId, storedUsn, journalId, head);
+        if (expectedFragment == null)
+            Assert.Null(reason);
+        else
+            Assert.Contains(expectedFragment, reason);
+    }
+
+    [Theory]
     [InlineData("NTFS", false)]
     [InlineData("ntfs", false)]
     [InlineData("ReFS", true)]

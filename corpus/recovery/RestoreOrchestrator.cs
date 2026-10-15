@@ -25,7 +25,11 @@ namespace Corpus
         string? ConfirmToken = null,
         bool AllowBootDisk = false,
         bool SkipVerify = false,
-        bool DryRun = false);
+        bool DryRun = false,
+        // Item 5: orchestrated layout-recreate + bootloader reinstall (opt-in;
+        // default false keeps the reviewed-manual printout path byte-identical).
+        bool RepairBoot = false,
+        IBootRepairRunner? BootRunner = null);
 
     // PE restore orchestration: preflight -> safety gate -> stream -> full
     // verify. Returns 0/1 matching the Verify exit posture. Never mints
@@ -239,7 +243,10 @@ namespace Corpus
                 var script = DiskpartScript.Generate(layout);
                 _log.Info("dry run: plan only, no bytes written");
                 _log.Info(script.TrimEnd());
-                PrintBootRepair(layout);
+                if (opts.RepairBoot)
+                    LogRepairPlan(layout);
+                else
+                    PrintBootRepair(layout);
                 File.WriteAllText(DiskpartPath(target), script);
                 return 0;
             }
@@ -319,8 +326,34 @@ namespace Corpus
             }
             sw.Stop();
             _log.Info($"restored disk layout {layout.Generation}: {extents.Count} partitions written and verified in {sw.Elapsed.TotalSeconds:F1}s");
+            if (opts.RepairBoot)
+                return RepairBootStep(layout, opts);
             PrintBootRepair(layout);
             return 0;
+        }
+
+        // Item 5: orchestrated tail — layout checks + recreate + bcdboot +
+        // boot-file verify. The injected fake serves tests/Linux; null means
+        // the Windows real runner (which throws off Windows — the real path
+        // is Windows-gated by construction).
+        private int RepairBootStep(DiskLayout layout, DiskRestoreOptions opts)
+        {
+            IBootRepairRunner runner = opts.BootRunner ?? new WindowsBootRepairRunner(_log);
+            return BootRepairOrchestrator.Repair(layout, runner, _log);
+        }
+
+        // Item 5 dry-run: checks run for real (a layout that would not repair
+        // fails the plan), the script apply stays unwritten.
+        private void LogRepairPlan(DiskLayout layout)
+        {
+            var blocked = BootRepairOrchestrator.CheckLayout(layout);
+            if (blocked != null)
+            {
+                _log.Error("dry run: " + blocked);
+                return;
+            }
+            _log.Info(BootRepairOrchestrator.Plan(layout).TrimEnd());
+            _log.Info("dry run: boot repair planned, nothing applied");
         }
 
         // Layout lookup by generation: the file name carries the source disk

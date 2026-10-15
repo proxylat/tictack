@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 
 namespace TicTack;
 
-public sealed class EventMonitor : IFileMonitor
+public class EventMonitor : IFileMonitor
 {
     public event EventHandler<FileChangedEventArgs>? Changed;
     public event EventHandler<MonitorErrorEventArgs>? Error;
@@ -17,6 +17,13 @@ public sealed class EventMonitor : IFileMonitor
     public void Start() => Started = true;
     public void Stop() => Started = false;
     public void Dispose() { }
+}
+
+public sealed class GapEventMonitor : EventMonitor, IGapSource
+{
+    public event EventHandler? GapDetected;
+
+    public void FireGap() => GapDetected?.Invoke(this, EventArgs.Empty);
 }
 
 public sealed class RecordingLogger : ILogger

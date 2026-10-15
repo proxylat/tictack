@@ -61,6 +61,7 @@ namespace TicTack
         private readonly FileCompleter? _completer;
         private Timer? _parityTimer;
         private EventHandler<MonitorErrorEventArgs>? _monitorErrorHandler;
+        private EventHandler? _monitorGapHandler;
         private volatile bool _parityRequested;
         private long _completedItems;
         private DateTime _lastProgressUtc;
@@ -235,6 +236,16 @@ namespace TicTack
             _monitor.Changed += OnChanged;
             _monitorErrorHandler = (s, e) => _log.Error("Monitor error", e.Exception);
             _monitor.Error += _monitorErrorHandler;
+            // Standalone gap cover: watcher overflows and USN re-baselines
+            // fire GapDetected; the covering scan picks up deletes the
+            // Modified-only monitor rescan cannot see. (Composite members
+            // are wired by the factory; CompositeMonitor itself is not a
+            // gap source, so this never double-subscribes.)
+            if (_monitor is IGapSource gap)
+            {
+                _monitorGapHandler = (s, e) => { try { _ = RequestRescanAsync(); } catch { } };
+                gap.GapDetected += _monitorGapHandler;
+            }
             _monitor.Start();
             if (startWorkers) StartWorkers();
             _log.Debug("Started: " + _config.Path + " -> " + _config.Destination);
@@ -416,7 +427,11 @@ namespace TicTack
         {
             try
             {
-                _log.Info("Gap-triggered rescan starting: " + _config.Path);
+                // Warn, not Info: a gap means the event stream lost coverage
+                // (overflow, re-baseline) — the operator should see it even
+                // though the covering scan below heals it. The logger
+                // prefixes every line with a timestamp.
+                _log.Warn("Gap-triggered rescan starting: " + _config.Path);
                 return await ScanAndSyncAsync("Gap rescan");
             }
             finally { ReleaseScan(); }
@@ -445,7 +460,7 @@ namespace TicTack
             if (_copyAction is CopyAction batchCopy) batchCopy.DirBatch = dirBatch;
             var scanStart = DateTime.UtcNow;
             // Debug only: the matching "Sync complete" line is the proof of
-            // work. Gap rescans already log their own Info above; logging
+            // work. Gap rescans already log their own Warn above; logging
             // every scan start at Info doubles that line and spams startup.
             _log.Debug(reason + " scan starting: " + _config.Path);
 
@@ -1167,6 +1182,11 @@ namespace TicTack
             {
                 _monitor.Error -= _monitorErrorHandler;
                 _monitorErrorHandler = null;
+            }
+            if (_monitorGapHandler != null && _monitor is IGapSource gap)
+            {
+                gap.GapDetected -= _monitorGapHandler;
+                _monitorGapHandler = null;
             }
             _monitor.Stop();
             _startRetryTimer?.Dispose();
