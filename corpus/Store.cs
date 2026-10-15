@@ -143,6 +143,23 @@ namespace Corpus
         private static IReadOnlyList<string> CurrentExclusionNames(ImageOptions opts, IBlockSource source) =>
             ResolveExclusions(source, opts)?.ExclusionNames ?? (IReadOnlyList<string>)Array.Empty<string>();
 
+        // CLI --exclude (repeatable) merges over the config policy:
+        // config-effective names ∪ CLI names, $LogFile stripped again,
+        // case-insensitive dedup. Explicit config never regains defaults
+        // through the union.
+        internal static IReadOnlyList<string> MergeExclusionNames(IReadOnlyList<string>? configured, IReadOnlyList<string> cli)
+        {
+            ArgumentNullException.ThrowIfNull(cli);
+            var merged = new List<string>(CapturePolicy.EffectiveSkip(configured));
+            var seen = new HashSet<string>(merged, StringComparer.OrdinalIgnoreCase);
+            foreach (var e in CapturePolicy.EffectiveSkip(cli))
+            {
+                if (seen.Add(e))
+                    merged.Add(e);
+            }
+            return merged;
+        }
+
         private static string? CurrentFingerprint(IBlockSource source, ImageOptions opts) =>
             opts.Layout?.LayoutFingerprint() ?? (source as ILayoutFingerprintProvider)?.LayoutFingerprint();
 

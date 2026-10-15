@@ -105,8 +105,13 @@ namespace Corpus
                 var loc = reagentcLocation.Trim().TrimEnd('\\', '/');
                 if (loc.StartsWith(@"\\?\GLOBALROOT", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Device path: not openable from user mode; the per-drive
-                    // scan below covers the mounted recovery partitions.
+                    // VM-proven (Win11 26200, elevated): GLOBALROOT recovery
+                    // paths open fine from user mode (File.Exists true,
+                    // OpenRead yields the WIM bytes). Skipping them strands
+                    // stock boxes whose recovery partition has no drive
+                    // letter — probe, never skip. A miss falls through to
+                    // known-path + scan + the ADK/refusal log.
+                    Add(Path.Combine(loc, "winre.wim"), "reagentc");
                 }
                 else if (loc.StartsWith(@"\\?\", StringComparison.Ordinal))
                 {

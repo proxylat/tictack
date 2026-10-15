@@ -57,12 +57,15 @@ public sealed class WinReLocateTests : IDisposable
     }
 
     [Fact]
-    public void CandidatePaths_GlobalRoot_SkipsDevicePath()
+    public void CandidatePaths_GlobalRoot_ProbedFirst()
     {
+        // VM-proven 2026-10-15 (Win11 26200, elevated): GLOBALROOT recovery
+        // paths are user-mode readable, so they lead as reagentc candidates.
         var cands = WinReLocate.CandidatePaths(@"\\?\GLOBALROOT\device\harddisk0\partition4\Recovery\WindowsRE",
             Path.Combine(_dir, "Windows"), [Path.Combine(_dir, "c")]);
-        Assert.DoesNotContain(cands, c => c.Source == "reagentc");
-        Assert.Equal(2, cands.Length); // known-path + one scan entry
+        Assert.Equal(3, cands.Length); // reagentc + known-path + one scan entry
+        Assert.Equal("reagentc", cands[0].Source);
+        Assert.EndsWith("winre.wim", cands[0].Path, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

@@ -41,6 +41,10 @@ namespace Corpus
             string? indexFlag = null;
             string? diskArg = null;
             string? layoutArg = null;
+            string? fromFlag = null;
+            string? toFlag = null;
+            var cliExcludes = new List<string>();
+            int chainGen = 0;
             string? confirmToken = null;
             var allowBootDisk = false;
             var skipVerify = false;
@@ -143,7 +147,34 @@ namespace Corpus
                         forceFull = true;
                         break;
                     case "--chain":
-                        chain = true;
+                        // Bare (--verify --chain) walks parent links; with a
+                        // generation (--copy --chain <gen>) it selects that
+                        // snapshot plus its ancestors.
+                        if (i + 1 < args.Length && int.TryParse(args[i + 1], out var cg) && cg > 0)
+                        {
+                            chain = true;
+                            chainGen = cg;
+                            i++;
+                        }
+                        else
+                        {
+                            chain = true;
+                        }
+                        break;
+                    case "--copy":
+                        verb = "copy";
+                        break;
+                    case "--sync":
+                        verb = "sync";
+                        break;
+                    case "--from":
+                        if (i + 1 < args.Length) fromFlag = args[++i];
+                        break;
+                    case "--to":
+                        if (i + 1 < args.Length) toFlag = args[++i];
+                        break;
+                    case "--exclude":
+                        if (i + 1 < args.Length) cliExcludes.Add(args[++i]);
                         break;
                     case "--build-media":
                         verb = "build-media";
@@ -296,7 +327,10 @@ namespace Corpus
                             using (var store = CreateStore(cfg, log))
                             using (var source = OpenSource(volume, log))
                             {
-                                var m = store.ImageFast(source, name);
+                                var excl = ResolveImageExclusions(cfg, volume, cliExcludes, log);
+                                var m = excl == null
+                                    ? store.ImageFast(source, name)
+                                    : store.ImageFast(source, name, new ImageOptions(Exclusions: excl));
                                 log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks (landing, optimize pending)");
                             }
                             return 0;
@@ -314,7 +348,7 @@ namespace Corpus
                         {
                             // MFT-digest default (USN hint inside for
                             // pre-digest parents and non-MFT sources).
-                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource()));
+                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, volume, cliExcludes, log)));
                             log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
                         }
                         return 0;
@@ -357,11 +391,14 @@ namespace Corpus
                     case "restore":
                         return RunRestore(cfg, baseDir, snapshotArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
                     case "image-disk":
-                        return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, log);
+                        return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log);
                     case "restore-disk":
                         return RunRestoreDisk(cfg, baseDir, layoutArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
                     case "gc":
                         return RunGc(cfg, dryRun, confirm, log);
+                    case "copy":
+                    case "sync":
+                        return RunTransfer(cfg, verb, fromFlag, toFlag, snapshotArg, chain, chainGen, log);
                     default:
                         return 1;
                 }
@@ -508,13 +545,15 @@ namespace Corpus
         // per non-skipped partition + sealed layout sidecar). Volume verbs
         // are untouched: --volume with --disk is rejected, never merged.
         private static int RunImageDisk(CorpusConfig cfg, string? diskArg, string? volume, string? name,
-            bool incremental, string? parentArg, bool forceFull, ILogger log)
+            bool incremental, string? parentArg, bool forceFull, List<string> cliExcludes, ILogger log)
         {
             if (string.IsNullOrEmpty(diskArg) || string.IsNullOrEmpty(name))
             {
                 log.Error("--image-disk requires --disk <N> --name <snapshot>");
                 return 1;
             }
+            if (cliExcludes.Count > 0)
+                log.Warn("--exclude applies to --image only, ignored for --image-disk");
             if (!string.IsNullOrEmpty(volume))
             {
                 log.Error("--volume cannot be combined with --image-disk --disk (use --image for volumes)");
@@ -585,6 +624,72 @@ namespace Corpus
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt);
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
+        }
+
+        // --copy/--sync: git-like delta transfer between two stores (missing
+        // packs only, manifests verbatim, no format change). --copy takes one
+        // snapshot (--snapshot <gen>, or --chain <gen> with ancestors);
+        // --sync takes every snapshot the dest lacks. Index paths follow the
+        // restore rule: store-local db when present, else the shared state db.
+        private static int RunTransfer(CorpusConfig cfg, string verb, string? fromFlag, string? toFlag,
+            string? snapshotArg, bool chain, int chainGen, ILogger log)
+        {
+            if (string.IsNullOrEmpty(fromFlag) || string.IsNullOrEmpty(toFlag))
+            {
+                log.Error("--" + verb + " requires --from <store> --to <store>");
+                return 1;
+            }
+            TransferOptions opts;
+            if (verb == "sync")
+            {
+                if (!string.IsNullOrEmpty(snapshotArg) || chain || chainGen > 0)
+                {
+                    log.Error("--sync copies every missing snapshot (use --copy with --snapshot/--chain for one)");
+                    return 1;
+                }
+                opts = new TransferOptions();
+            }
+            else
+            {
+                if (chainGen > 0 && !string.IsNullOrEmpty(snapshotArg)
+                    && (!int.TryParse(snapshotArg, out var sg) || sg != chainGen))
+                {
+                    log.Error("--snapshot and --chain name different generations (pass one)");
+                    return 1;
+                }
+                var gen = chainGen;
+                if (gen <= 0 && (!int.TryParse(snapshotArg, out gen) || gen <= 0))
+                {
+                    log.Error("--copy requires --snapshot <gen> or --chain <gen>");
+                    return 1;
+                }
+                opts = new TransferOptions(Snapshot: gen, IncludeChain: chain || chainGen > 0);
+            }
+            var defaultDb = Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            var r = StoreTransfer.Copy(fromFlag, StoreTransfer.ResolveIndexPath(fromFlag, defaultDb),
+                toFlag, StoreTransfer.ResolveIndexPath(toFlag, defaultDb), opts, log);
+            Console.WriteLine($"{verb}: {r.ManifestsCopied} manifests, {r.PacksCopied} packs ({r.PackBytesCopied} bytes), {r.LandingCopied} landing, {r.LayoutsCopied} layouts");
+            return 0;
+        }
+
+        // CLI --exclude (repeatable, --image only): merged over the config
+        // policy, resolved to extents by the item-4 resolver (never rebuilt
+        // here). Null = none (old behavior, byte-identical). Unresolvable
+        // here (non-Windows, no MFT) captures all, loud.
+        private static IExclusionResolver? ResolveImageExclusions(CorpusConfig cfg, string volume, List<string> cliExcludes, ILogger log)
+        {
+            if (cliExcludes.Count == 0)
+                return null;
+            var merged = Store.MergeExclusionNames(cfg.Exclusions?.Skip, cliExcludes);
+            if (merged.Count == 0)
+                return null;
+            var device = volume.Length == 2 && volume[1] == ':' && char.IsAsciiLetter(volume[0]) && OperatingSystem.IsWindows()
+                ? @"\\.\" + volume
+                : volume;
+            var resolver = MftExclusionResolver.TryCreate(device, merged, log);
+            if (resolver == null && !OperatingSystem.IsWindows())
+                log.Warn("exclusions unresolvable on this platform (no MFT), capturing all: " + string.Join(", ", merged));
+            return resolver;
         }
 
         // --gc: manual only, never automatic. Bare prints the plan and
@@ -833,6 +938,9 @@ namespace Corpus
             Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore every non-skipped extent at its recorded offset");
             Console.WriteLine("  --restore --snapshot <gen> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
             Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore a snapshot");
+            Console.WriteLine("  --copy --from <store> --to <store> (--snapshot <gen> | --chain <gen>) [--chain]  Copy one snapshot, missing packs only (--chain includes ancestors)");
+            Console.WriteLine("  --sync --from <store> --to <store>  Copy every snapshot the dest lacks, missing packs only (same id.key, or an empty dest)");
+            Console.WriteLine("  --exclude <path|pattern>  (repeatable, --image only) merged over config exclusions, recorded in the manifest ($LogFile never excludable)");
             Console.WriteLine("  --validate             Check config_corpus.yaml and exit");
             Console.WriteLine("  --config <path>        Config file (default: config_corpus.yaml beside the exe)");
             Console.WriteLine("  --version              Print version and exit");
