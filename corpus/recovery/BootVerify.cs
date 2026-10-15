@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using TicTack;
 
 namespace Corpus
@@ -12,7 +14,8 @@ namespace Corpus
     public sealed record BootVerifyOptions(
         string VhdxPath,
         string VmName = "corpus-bootverify",
-        int TimeoutSeconds = 300);
+        int TimeoutSeconds = 300,
+        int StartupMemoryMb = 2048);
 
     public interface IHyperVRunner
     {
@@ -29,12 +32,14 @@ namespace Corpus
     {
         private readonly ILogger _log;
         private readonly int _timeoutMs;
+        private readonly int _startupMemoryMb;
 
-        public WindowsHyperVRunner(ILogger log, int timeoutSeconds = 300)
+        public WindowsHyperVRunner(ILogger log, int timeoutSeconds = 300, int startupMemoryMb = 2048)
         {
             ArgumentNullException.ThrowIfNull(log);
             _log = log;
             _timeoutMs = Math.Max(1, timeoutSeconds) * 1000;
+            _startupMemoryMb = startupMemoryMb > 0 ? startupMemoryMb : 2048;
         }
 
         private static void RequireWindows()
@@ -50,24 +55,75 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(vmName);
             _log.Info($"boot-verify: starting {vmName} from {vhdxPath}");
             var r = ProcessRunner.RunAsync(
-                $"powershell -NoProfile -Command \"New-VM -Name '{vmName}' -VHDPath '{vhdxPath}' -Generation 2 -MemoryStartupBytes 2GB | Out-Null; Start-VM -Name '{vmName}'\"",
+                BuildBootCommand(vmName, vhdxPath, _startupMemoryMb),
                 Path.GetTempPath(), redirect: true, timeoutMs: _timeoutMs).GetAwaiter().GetResult();
             if (r.TimedOut || r.ExitCode != 0)
                 throw new InvalidDataException($"VM start failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
             return vmName;
         }
 
+        // Single-quoted into PowerShell (spaces safe); a raw ' would break
+        // out, so the verb rejects quotes in both values before this runs.
+        internal static string BuildBootCommand(string vmName, string vhdxPath, long startupMemoryMb) =>
+            $"powershell -NoProfile -Command \"New-VM -Name '{vmName}' -VHDPath '{vhdxPath}' -Generation 2 -MemoryStartupBytes {startupMemoryMb * 1024L * 1024L} | Out-Null; Start-VM -Name '{vmName}'\"";
+
         public string HealthCheck(string vmId)
         {
             RequireWindows();
             ArgumentNullException.ThrowIfNull(vmId);
+            return PollHealth(() => QueryHeartbeatOnce(vmId), _timeoutMs, ms => Thread.Sleep(ms), _log);
+        }
+
+        // Poll to verdict: a booting VM reports NoContact for minutes before
+        // the heartbeat IC answers. Any "Ok*" wins immediately; anything
+        // else (NoContact, query errors, timeouts) retries to the deadline.
+        internal static string PollHealth(Func<string> queryBeat, int timeoutMs, Action<int> sleepMs, ILogger log)
+        {
+            ArgumentNullException.ThrowIfNull(queryBeat);
+            ArgumentNullException.ThrowIfNull(sleepMs);
+            ArgumentNullException.ThrowIfNull(log);
+            var sw = Stopwatch.StartNew();
+            var last = "";
+            while (true)
+            {
+                try
+                {
+                    last = queryBeat();
+                }
+                catch (Exception ex)
+                {
+                    last = "query failed: " + ex.Message;
+                }
+                if (last.StartsWith("Ok", StringComparison.OrdinalIgnoreCase))
+                    return "heartbeat " + last;
+                if (sw.ElapsedMilliseconds >= timeoutMs)
+                    throw new InvalidDataException($"VM heartbeat is '{last}' — not healthy after {timeoutMs / 1000}s");
+                log.Info($"boot-verify: heartbeat '{last}', waiting for healthy...");
+                sleepMs(15000);
+            }
+        }
+
+        private string QueryHeartbeatOnce(string vmId)
+        {
             var r = ProcessRunner.RunAsync(
                 $"powershell -NoProfile -Command \"(Get-VM -Name '{vmId}').Heartbeat\"",
-                Path.GetTempPath(), redirect: true, timeoutMs: _timeoutMs).GetAwaiter().GetResult();
-            var beat = r.Stdout.Trim();
-            if (r.TimedOut || r.ExitCode != 0 || !beat.StartsWith("Ok", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException($"VM heartbeat is '{beat}' — not healthy (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
-            return "heartbeat " + beat;
+                Path.GetTempPath(), redirect: true, timeoutMs: Math.Min(60000, _timeoutMs)).GetAwaiter().GetResult();
+            if (r.TimedOut || r.ExitCode != 0)
+                throw new InvalidDataException($"heartbeat query failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
+            return FirstBeatLine(r.Stdout);
+        }
+
+        // First non-empty line: the query intermittently repeats the value
+        // ("NoContact\nNoContact" seen on-box) and trails blank lines.
+        internal static string FirstBeatLine(string stdout)
+        {
+            if (string.IsNullOrEmpty(stdout)) return string.Empty;
+            foreach (var raw in stdout.Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.Length > 0) return line;
+            }
+            return string.Empty;
         }
 
         // Best-effort by design: a stuck VM must not fail the verdict or

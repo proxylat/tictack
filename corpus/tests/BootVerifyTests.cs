@@ -108,4 +108,73 @@ public sealed class BootVerifyTests : IDisposable
         Assert.Throws<PlatformNotSupportedException>(() => runner.HealthCheck("vm"));
         Assert.Throws<PlatformNotSupportedException>(() => runner.Cleanup("vm"));
     }
+
+    [Fact]
+    public void PollHealth_RetriesToHealthy_NoRealSleep()
+    {
+        var log = new TestLogger();
+        var beats = new Queue<string>(new[] { "NoContact", "NoContact", "OkApplicationsHealthy" });
+        var sleeps = new List<int>();
+
+        var result = WindowsHyperVRunner.PollHealth(() => beats.Dequeue(), 300000, ms => sleeps.Add(ms), log);
+
+        Assert.Equal("heartbeat OkApplicationsHealthy", result);
+        Assert.Equal(new[] { 15000, 15000 }, sleeps);
+        Assert.Empty(beats);
+    }
+
+    [Fact]
+    public void PollHealth_QueryErrors_RetryNotFail()
+    {
+        var log = new TestLogger();
+        var calls = 0;
+        string Query()
+        {
+            calls++;
+            if (calls < 3) throw new InvalidDataException("fake Get-VM failure");
+            return "Ok";
+        }
+
+        var result = WindowsHyperVRunner.PollHealth(Query, 300000, _ => { }, log);
+
+        Assert.Equal("heartbeat Ok", result);
+        Assert.Equal(3, calls);
+    }
+
+    [Fact]
+    public void PollHealth_Deadline_ThrowsNamingLastBeat()
+    {
+        var log = new TestLogger();
+        var ex = Assert.Throws<InvalidDataException>(() =>
+            WindowsHyperVRunner.PollHealth(() => "NoContact", 0, _ => { }, log));
+        Assert.Contains("NoContact", ex.Message);
+    }
+
+    [Fact]
+    public void BuildBootCommand_SizesMemoryInBytes()
+    {
+        var cmd = WindowsHyperVRunner.BuildBootCommand("vm1", "D:\\snap.vhdx", 1024);
+        Assert.Contains("-MemoryStartupBytes 1073741824", cmd);
+        Assert.Contains("-VHDPath 'D:\\snap.vhdx'", cmd);
+        Assert.Contains("-Name 'vm1'", cmd);
+    }
+
+    [Fact]
+    public void BootVerifyOptions_Defaults()
+    {
+        var opts = new BootVerifyOptions("x.vhdx");
+        Assert.Equal("corpus-bootverify", opts.VmName);
+        Assert.Equal(300, opts.TimeoutSeconds);
+        Assert.Equal(2048, opts.StartupMemoryMb);
+    }
+
+    [Theory]
+    [InlineData("OkApplicationsHealthy\r\n", "OkApplicationsHealthy")]
+    [InlineData("NoContact\r\nNoContact\r\n", "NoContact")]
+    [InlineData("\r\n  Ok  \r\n", "Ok")]
+    [InlineData("", "")]
+    public void FirstBeatLine_TakesFirstNonEmptyLine(string stdout, string expected)
+    {
+        Assert.Equal(expected, WindowsHyperVRunner.FirstBeatLine(stdout));
+    }
 }

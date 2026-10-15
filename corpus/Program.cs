@@ -57,6 +57,10 @@ namespace Corpus
             string? nicDir = null;
             string? gpuDir = null;
             string? firmware = null;
+            string? vhdxFlag = null;
+            string? vmNameFlag = null;
+            string? bootTimeoutFlag = null;
+            string? bootMemoryFlag = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -118,6 +122,21 @@ namespace Corpus
                         break;
                     case "--check-repair":
                         verb = "check-repair";
+                        break;
+                    case "--boot-verify":
+                        verb = "boot-verify";
+                        break;
+                    case "--vhdx":
+                        if (i + 1 < args.Length) vhdxFlag = args[++i];
+                        break;
+                    case "--vm-name":
+                        if (i + 1 < args.Length) vmNameFlag = args[++i];
+                        break;
+                    case "--timeout-seconds":
+                        if (i + 1 < args.Length) bootTimeoutFlag = args[++i];
+                        break;
+                    case "--memory-mb":
+                        if (i + 1 < args.Length) bootMemoryFlag = args[++i];
                         break;
                     case "--repair-boot":
                         repairBoot = true;
@@ -319,6 +338,8 @@ namespace Corpus
                         return RunCheckBootMode(diskArg, firmware, log);
                     case "check-repair":
                         return RunCheckRepair(diskArg, log);
+                    case "boot-verify":
+                        return RunBootVerify(vhdxFlag, vmNameFlag, bootTimeoutFlag, bootMemoryFlag, log);
                     default:
                         break;
                 }
@@ -901,6 +922,45 @@ namespace Corpus
             return 0;
         }
 
+        // Item 7 proof verb: boot a VHDX in Hyper-V and poll the heartbeat
+        // IC to healthy (first boot takes minutes — the runner polls every
+        // 15s to the timeout). No vSwitch: the verify VM stays offline.
+        private static int RunBootVerify(string? vhdx, string? vmName, string? timeoutFlag, string? memoryFlag, ILogger log)
+        {
+            if (string.IsNullOrEmpty(vhdx))
+            {
+                log.Error("--boot-verify requires --vhdx <path> (export one first)");
+                return 1;
+            }
+            var timeout = 300;
+            if (!string.IsNullOrEmpty(timeoutFlag) && (!int.TryParse(timeoutFlag, out timeout) || timeout <= 0))
+            {
+                log.Error("--timeout-seconds must be a positive integer (got: " + timeoutFlag + ")");
+                return 1;
+            }
+            var memoryMb = 2048;
+            if (!string.IsNullOrEmpty(memoryFlag) && (!int.TryParse(memoryFlag, out memoryMb) || memoryMb <= 0))
+            {
+                log.Error("--memory-mb must be a positive integer (got: " + memoryFlag + ")");
+                return 1;
+            }
+            // Both values land single-quoted in a PowerShell command: a raw
+            // quote would break out, so refuse it here (trust boundary).
+            if ((vhdx != null && vhdx.Contains('\'')) || (vmName != null && vmName.Contains('\'')))
+            {
+                log.Error("--vhdx/--vm-name must not contain single quotes");
+                return 1;
+            }
+            if (!OperatingSystem.IsWindows())
+            {
+                Console.Error.WriteLine("--boot-verify needs Windows");
+                return 1;
+            }
+            return BootVerifyOrchestrator.Verify(
+                new BootVerifyOptions(vhdx, vmName ?? "corpus-bootverify", timeout, memoryMb),
+                new WindowsHyperVRunner(log, timeout, memoryMb), log);
+        }
+
         // Drive-letter-colon ("T:") images the live volume through VSS;
         // anything else is a file path for FileBlockSource.
         private static IBlockSource OpenSource(string volume, ILogger log) =>
@@ -1093,6 +1153,7 @@ namespace Corpus
             Console.WriteLine("      Offline storage-driver inject (DISM) + NIC/GPU first-boot staging into a restored tree");
             Console.WriteLine("  --check-boot-mode --disk <N> --firmware <UEFI|BIOS>  Refuse GPT-on-BIOS / MBR-on-UEFI with the conversion path");
             Console.WriteLine("  --check-repair --disk <N>  Live-layout repair checks + diskpart/bcdboot plan (read-only, exit 1 names the blocker)");
+            Console.WriteLine("  --boot-verify --vhdx <path> [--vm-name <n>] [--timeout-seconds <s>] [--memory-mb <mb>]  Boot a VHDX in Hyper-V, poll heartbeat to healthy (defaults 300s, 2048MB)");
             Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
             Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
             Console.WriteLine("      [--payload <dir>]  Skip re-publish (ADK box without the SDK: publish dir)");
