@@ -327,7 +327,7 @@ namespace Corpus
                             using (var store = CreateStore(cfg, log))
                             using (var source = OpenSource(volume, log))
                             {
-                                var excl = ResolveImageExclusions(cfg, volume, cliExcludes, log);
+                                var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
                                 var m = excl == null
                                     ? store.ImageFast(source, name)
                                     : store.ImageFast(source, name, new ImageOptions(Exclusions: excl));
@@ -348,7 +348,7 @@ namespace Corpus
                         {
                             // MFT-digest default (USN hint inside for
                             // pre-digest parents and non-MFT sources).
-                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, volume, cliExcludes, log)));
+                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, source, volume, cliExcludes, log)));
                             log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
                         }
                         return 0;
@@ -673,19 +673,21 @@ namespace Corpus
         }
 
         // CLI --exclude (repeatable, --image only): merged over the config
-        // policy, resolved to extents by the item-4 resolver (never rebuilt
-        // here). Null = none (old behavior, byte-identical). Unresolvable
-        // here (non-Windows, no MFT) captures all, loud.
-        private static IExclusionResolver? ResolveImageExclusions(CorpusConfig cfg, string volume, List<string> cliExcludes, ILogger log)
+        // policy (config null = built-in defaults), resolved to extents by
+        // the item-4 resolver. Null only when the merged set is empty
+        // (explicit opt-out) or unresolvable (non-Windows, no MFT).
+        // Snapshot-first: the frozen shadow the bytes come from — a live
+        // MFT could shift mid-capture and tear the manifest.
+        private static IExclusionResolver? ResolveImageExclusions(CorpusConfig cfg, IBlockSource source, string volume, List<string> cliExcludes, ILogger log)
         {
-            if (cliExcludes.Count == 0)
-                return null;
             var merged = Store.MergeExclusionNames(cfg.Exclusions?.Skip, cliExcludes);
             if (merged.Count == 0)
                 return null;
-            var device = volume.Length == 2 && volume[1] == ':' && char.IsAsciiLetter(volume[0]) && OperatingSystem.IsWindows()
-                ? @"\\.\" + volume
-                : volume;
+            var device = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
+            if (device == null)
+                device = volume.Length == 2 && volume[1] == ':' && char.IsAsciiLetter(volume[0]) && OperatingSystem.IsWindows()
+                    ? @"\\.\" + volume
+                    : volume;
             var resolver = MftExclusionResolver.TryCreate(device, merged, log);
             if (resolver == null && !OperatingSystem.IsWindows())
                 log.Warn("exclusions unresolvable on this platform (no MFT), capturing all: " + string.Join(", ", merged));
