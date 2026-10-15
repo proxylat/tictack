@@ -474,6 +474,35 @@ public sealed class GcTests : IDisposable
     }
 
     [Fact]
+    public void Cli_RestoreDisk_Partitions_Garbage_Refuses()
+    {
+        ImageGens(1);
+        var cfg = WriteCliConfig(console: true);
+        foreach (var bad in new[] { "a", "0", "-1", "1,,2", "" })
+        {
+            var (exit, stdout, stderr) = RunCorpus("--config", cfg,
+                "--restore-disk", "--layout", "1", "--target", Path.Combine(_dir, "rd.img"),
+                "--partitions", bad);
+            Assert.Equal(1, exit);
+            Assert.Contains("--partitions", stdout + stderr);
+        }
+    }
+
+    [Fact]
+    public void Cli_RestoreDisk_Partitions_Valid_ReachesStoreCheck()
+    {
+        // Valid numbers parse: the failure moves downstream to the missing
+        // store (proving the parse passed, without staging a full restore).
+        ImageGens(1);
+        var cfg = WriteCliConfig(console: true);
+        var (exit, stdout, stderr) = RunCorpus("--config", cfg,
+            "--restore-disk", "--layout", "1", "--target", Path.Combine(_dir, "rd.img"),
+            "--partitions", "1, 3", "--store", Path.Combine(_dir, "no-store"));
+        Assert.Equal(1, exit);
+        Assert.Contains("id.key", stdout + stderr);
+    }
+
+    [Fact]
     public void TmpUntouched()
     {
         ImageGens(2);

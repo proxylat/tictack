@@ -167,6 +167,143 @@ public sealed class BootRepairRecoveryTests : IDisposable
         Assert.Contains("boot repair: boot files verified", string.Join("\n", log.Messages));
     }
 
+    // Subset-restore fixtures: 4 partitions with distinct fills (ESP 0xE5,
+    // OS 0x03, DATA 0xD4) on an 8 MiB disk, so untouched ranges are
+    // distinguishable from restored bytes and from the 0xAA prefill.
+    private DiskLayout ImageSubsetLayout(string tag)
+    {
+        var espPath = Path.Combine(_dir, tag + "-esp.img");
+        var sysPath = Path.Combine(_dir, tag + "-sys.img");
+        var dataPath = Path.Combine(_dir, tag + "-data.img");
+        File.WriteAllBytes(espPath, Filled(1 * Mib, 0xE5));
+        File.WriteAllBytes(sysPath, Filled(2 * Mib, 0x03));
+        File.WriteAllBytes(dataPath, Filled(3 * Mib, 0xD4));
+        using var store = new Store(_storeRoot, _dbPath, 1, 3, new TestLogger());
+        using var esp = new FileBlockSource(espPath);
+        using var sys = new FileBlockSource(sysPath);
+        using var data = new FileBlockSource(dataPath);
+        return store.ImageDisk(0, "disk0", new DiskImageOptions(), new DiskCapturePlan("guid-subset-" + tag, 8L * Mib, 512,
+            new List<PartitionImageInput>
+            {
+                new(1, "EFI system partition", "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+                    Guid.NewGuid().ToString("D"), 2048, 4095, Mib, 1L * Mib, "fat32", false, null, esp, null),
+                new(2, "Microsoft reserved partition", "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+                    Guid.NewGuid().ToString("D"), 4096, 6143, 2L * Mib, 1L * Mib, "none", true, "msr-reserved", null, null),
+                new(3, "Basic data partition", "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
+                    Guid.NewGuid().ToString("D"), 6144, 10239, 3L * Mib, 2L * Mib, "ntfs", false, null, sys, null),
+                new(4, "Basic data partition", "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
+                    Guid.NewGuid().ToString("D"), 10240, 16383, 5L * Mib, 3L * Mib, "ntfs", false, null, data, null),
+            }));
+    }
+
+    private static byte[] Filled(int bytes, byte fill)
+    {
+        var buf = new byte[bytes];
+        Array.Fill(buf, fill);
+        return buf;
+    }
+
+    private static void AssertRange(byte[] all, long offset, long length, byte fill, string what)
+    {
+        for (long i = offset; i < offset + length; i++)
+            Assert.True(all[i] == fill, $"{what}: byte {i} is 0x{all[i]:X2}, want fill 0x{fill:X2}");
+    }
+
+    private int RunSubsetRestore(DiskLayout layout, string target, List<int>? parts, TestLogger log,
+        bool dryRun = false, bool repairBoot = false, IBootRepairRunner? runner = null)
+    {
+        using var store = new Store(_storeRoot, _dbPath, 1, 3, log);
+        var orch = new RestoreOrchestrator(store, log, path => new FileBlockTarget(path));
+        using var t = new FileBlockTarget(target);
+        return orch.RestoreDisk(new DiskRestoreOptions(
+            LayoutGen: layout.Generation, Target: target, StorePath: _storeRoot, IndexPath: _dbPath,
+            ConfirmToken: BootDiskGuard.TargetToken(t.DisplayName, t.Capacity),
+            AllowBootDisk: false, SkipVerify: false, DryRun: dryRun, RepairBoot: repairBoot,
+            BootRunner: runner, Partitions: parts));
+    }
+
+    [Fact]
+    public void RestoreDisk_Partitions_RestoresSubsetOnly()
+    {
+        var layout = ImageSubsetLayout("only");
+        var target = Path.Combine(_dir, "subset.img");
+        File.WriteAllBytes(target, Filled(8 * Mib, 0xAA));
+        var log = new TestLogger();
+
+        Assert.Equal(0, RunSubsetRestore(layout, target, new List<int> { 3 }, log));
+
+        var all = File.ReadAllBytes(target);
+        AssertRange(all, 3L * Mib, 2L * Mib, 0x03, "OS extent");
+        AssertRange(all, 1L * Mib, 1L * Mib, 0xAA, "ESP extent (unselected)");
+        AssertRange(all, 2L * Mib, 1L * Mib, 0xAA, "MSR extent (structural, no bytes)");
+        AssertRange(all, 5L * Mib, 3L * Mib, 0xAA, "DATA extent (unselected)");
+        var output = string.Join("\n", log.Messages);
+        Assert.Contains("partitions 3 selected", output);
+        Assert.Contains("auto-included", output);
+    }
+
+    [Fact]
+    public void RestoreDisk_Partitions_UnknownNumber_RefusesLoud()
+    {
+        var layout = ImageSubsetLayout("unknown");
+        var target = Path.Combine(_dir, "unknown.img");
+        File.WriteAllBytes(target, Filled(8 * Mib, 0xAA));
+        var log = new TestLogger();
+
+        Assert.Equal(1, RunSubsetRestore(layout, target, new List<int> { 3, 9 }, log));
+
+        var output = string.Join("\n", log.Messages);
+        Assert.Contains("no partition(s) 9", output);
+        Assert.Contains("has: 1,2,3,4", output);
+        Assert.Equal(0xAA, File.ReadAllBytes(target)[3 * Mib]); // nothing written
+    }
+
+    [Fact]
+    public void RestoreDisk_Partitions_SkippedOnly_RefusesLoud()
+    {
+        var layout = ImageSubsetLayout("skipped");
+        var target = Path.Combine(_dir, "skipped.img");
+        File.WriteAllBytes(target, Filled(8 * Mib, 0xAA));
+        var log = new TestLogger();
+
+        Assert.Equal(1, RunSubsetRestore(layout, target, new List<int> { 2 }, log));
+
+        Assert.Contains("selects no data", string.Join("\n", log.Messages));
+    }
+
+    [Fact]
+    public void RestoreDisk_Partitions_SmallerTarget_PassesFitPreflight()
+    {
+        // The PE case: a target smaller than the source disk passes when it
+        // covers the selected extents (OS ends at 5 MiB of an 8 MiB disk).
+        var layout = ImageSubsetLayout("small");
+        var target = Path.Combine(_dir, "small.img");
+        File.WriteAllBytes(target, Filled(5 * Mib, 0xAA));
+        var log = new TestLogger();
+
+        Assert.Equal(0, RunSubsetRestore(layout, target, new List<int> { 3 }, log));
+
+        var all = File.ReadAllBytes(target);
+        AssertRange(all, 3L * Mib, 2L * Mib, 0x03, "OS extent");
+    }
+
+    [Fact]
+    public void RestoreDisk_Partitions_DryRun_ScriptOmitsUnselected()
+    {
+        var layout = ImageSubsetLayout("dry");
+        var target = Path.Combine(_dir, "dry.img");
+        File.WriteAllBytes(target, Filled(8 * Mib, 0xAA));
+        var log = new TestLogger();
+
+        Assert.Equal(0, RunSubsetRestore(layout, target, new List<int> { 3, 4 }, log, dryRun: true));
+
+        var script = File.ReadAllText(target + ".diskpart.txt");
+        Assert.Contains("create partition msr", script); // auto-included structural
+        Assert.Equal(2, script.Split("create partition primary").Length - 1); // OS + DATA only
+        Assert.DoesNotContain("create partition efi", script);
+        Assert.Equal(0xAA, File.ReadAllBytes(target)[3 * Mib]); // dry: no bytes
+    }
+
     [Fact]
     public void Generate_NoFormat_SkipsFormatKeepsExactOffsets()
     {

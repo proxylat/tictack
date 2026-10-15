@@ -30,15 +30,21 @@ namespace Corpus
         // exact behavior they already had.
         internal const long MaxBytes = 1L * 1024 * 1024 * 1024;
 
-        internal static long RequiredHeadroomBytes(long totalBytes)
+        internal static long RequiredHeadroomBytes(long totalBytes, bool knownStatic = false)
         {
             if (totalBytes <= 0)
                 throw new ArgumentOutOfRangeException(nameof(totalBytes), "volume size must be positive (got: " + totalBytes + ")");
-            var floor = totalBytes < SmallVolumeBytes ? SmallMinBytes : LargeMinBytes;
+            // Known-static partitions (Windows Recovery: nothing writes there
+            // outside Update/reagentc runs) use the small tier minimum
+            // regardless of size: a 735MB Recovery volume with 120MB free
+            // snapshots fine on-box (VSS preallocation is best-effort, not a
+            // gate), and a genuinely-full diff still fails loud mid-capture
+            // via VSS — never silent corruption. The 10% term still applies.
+            var floor = (totalBytes < SmallVolumeBytes || knownStatic) ? SmallMinBytes : LargeMinBytes;
             return Math.Min(Math.Max(totalBytes / PercentDivisor, floor), MaxBytes);
         }
 
-        internal static bool MeetsFloor(long totalBytes, long freeBytes) =>
-            freeBytes >= RequiredHeadroomBytes(totalBytes);
+        internal static bool MeetsFloor(long totalBytes, long freeBytes, bool knownStatic = false) =>
+            freeBytes >= RequiredHeadroomBytes(totalBytes, knownStatic);
     }
 }

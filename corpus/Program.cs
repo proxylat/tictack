@@ -42,6 +42,7 @@ namespace Corpus
             string? indexFlag = null;
             string? diskArg = null;
             string? layoutArg = null;
+            string? partitionsArg = null;
             string? fromFlag = null;
             string? toFlag = null;
             var cliExcludes = new List<string>();
@@ -276,6 +277,9 @@ namespace Corpus
                     case "--layout":
                         if (i + 1 < args.Length) layoutArg = args[++i];
                         break;
+                    case "--partitions":
+                        if (i + 1 < args.Length) partitionsArg = args[++i];
+                        break;
                     case "--store":
                         if (i + 1 < args.Length) storeFlag = args[++i];
                         break;
@@ -458,7 +462,7 @@ namespace Corpus
                     case "image-disk":
                         return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log);
                     case "restore-disk":
-                        return RunRestoreDisk(cfg, baseDir, layoutArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, repairBoot, log);
+                        return RunRestoreDisk(cfg, baseDir, layoutArg, partitionsArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, repairBoot, log);
                     case "gc":
                         return RunGc(cfg, dryRun, confirm, log);
                     case "service":
@@ -644,6 +648,7 @@ namespace Corpus
                 Console.Error.WriteLine("--image-disk needs Windows");
                 return 1;
             }
+            DiskImager.CapturePlan = DiskCapture.BuildPlan;
             using (var store = CreateStore(cfg, log))
             {
                 var layout = store.ImageDisk(diskNumber, name,
@@ -657,7 +662,8 @@ namespace Corpus
         // per non-skipped extent at its recorded offset). Store/index/token
         // posture mirrors --restore; validation errors stay byte-identical
         // to the stub this replaced (Cli_RestoreDisk_RequiresLayout pins them).
-        private static int RunRestoreDisk(CorpusConfig cfg, string baseDir, string? layoutArg, string? target,
+        // --partitions <1,3,4> narrows to a subset (MSR auto-included).
+        private static int RunRestoreDisk(CorpusConfig cfg, string baseDir, string? layoutArg, string? partitionsArg, string? target,
             string? storeFlag, string? indexFlag, string? confirmToken, bool allowBootDisk, bool skipVerify, bool dryRun, bool repairBoot, ILogger log)
         {
             if (string.IsNullOrEmpty(layoutArg) || string.IsNullOrEmpty(target))
@@ -669,6 +675,21 @@ namespace Corpus
             {
                 log.Error("invalid --layout (want a positive layout generation number, got: " + layoutArg + ")");
                 return 1;
+            }
+            List<int>? partitions = null;
+            if (partitionsArg != null)
+            {
+                partitions = new List<int>();
+                foreach (var piece in partitionsArg.Split(','))
+                {
+                    if (!int.TryParse(piece.Trim(), out var n) || n <= 0)
+                    {
+                        log.Error("invalid --partitions (want comma-separated partition numbers, got: " + partitionsArg + ")");
+                        return 1;
+                    }
+                    if (!partitions.Contains(n))
+                        partitions.Add(n);
+                }
             }
             var storePath = !string.IsNullOrEmpty(storeFlag) ? storeFlag : cfg.StorePath;
             if (string.IsNullOrEmpty(storePath))
@@ -690,7 +711,7 @@ namespace Corpus
             indexPath = EnsureWritableIndex(indexPath, log);
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt);
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
-            return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun, RepairBoot: repairBoot));
+            return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun, RepairBoot: repairBoot, Partitions: partitions));
         }
 
         // --copy/--sync: git-like delta transfer between two stores (missing
@@ -957,7 +978,8 @@ namespace Corpus
                 return 1;
             }
             return BootVerifyOrchestrator.Verify(
-                new BootVerifyOptions(vhdx, vmName ?? "corpus-bootverify", timeout, memoryMb),
+                // Non-null: the IsNullOrEmpty guard above returns early.
+                new BootVerifyOptions(vhdx!, vmName ?? "corpus-bootverify", timeout, memoryMb),
                 new WindowsHyperVRunner(log, timeout, memoryMb), log);
         }
 
@@ -1162,7 +1184,8 @@ namespace Corpus
             Console.WriteLine("      --volume cannot be combined with --disk");
             Console.WriteLine("  --disk-layout --disk <N>  Print DiskLayout JSON to stdout, capture nothing (Windows, elevated)");
             Console.WriteLine("  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
-            Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore every non-skipped extent at its recorded offset");
+            Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run] [--partitions <1,3,4>]  Restore every non-skipped extent at its recorded offset");
+            Console.WriteLine("      --partitions restores a subset (MSR auto-included, structural); target may be smaller than the source disk");
             Console.WriteLine("  --restore --snapshot <gen> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
             Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore a snapshot");
             Console.WriteLine("  --copy --from <store> --to <store> (--snapshot <gen> | --chain <gen>) [--chain]  Copy one snapshot, missing packs only (--chain includes ancestors)");

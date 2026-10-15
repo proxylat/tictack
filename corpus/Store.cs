@@ -406,6 +406,8 @@ namespace Corpus
                 Style = "gpt",
             };
             var maxGen = 0;
+            try
+            {
             foreach (var part in plan.Partitions)
             {
                 var key = DiskImager.PartitionKey(diskNumber, part.PartitionNumber, part.UniqueGuid);
@@ -472,6 +474,17 @@ namespace Corpus
                 record.SnapshotGeneration = manifest.Generation;
                 if (manifest.Generation > maxGen)
                     maxGen = manifest.Generation;
+            }
+            }
+            finally
+            {
+                // Mirror the volume path's `using`: per-partition sources
+                // hold a shared VSS set + BitLocker scopes that only
+                // complete/resume on release. Dispose-all (not
+                // per-iteration) so a mid-disk failure still tears down
+                // partitions never imaged; Dispose is idempotent.
+                foreach (var part in plan.Partitions)
+                    part.Source?.Dispose();
             }
             layout.Generation = maxGen;
             LayoutStore.Save(_layoutsDir, layout, _key);

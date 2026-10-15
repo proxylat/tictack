@@ -29,7 +29,12 @@ namespace Corpus
         // Item 5: orchestrated layout-recreate + bootloader reinstall (opt-in;
         // default false keeps the reviewed-manual printout path byte-identical).
         bool RepairBoot = false,
-        IBootRepairRunner? BootRunner = null);
+        IBootRepairRunner? BootRunner = null,
+        // Subset restore: partition numbers to create+restore (null/empty =
+        // all). Skipped-structural partitions (MSR) auto-include in the
+        // layout recreate — they carry no bytes. Lets a 176GB disk's OS
+        // partitions restore to a 70GB target without touching data.
+        IReadOnlyList<int>? Partitions = null);
 
     // PE restore orchestration: preflight -> safety gate -> stream -> full
     // verify. Returns 0/1 matching the Verify exit posture. Never mints
@@ -200,8 +205,81 @@ namespace Corpus
                 _log.Error($"cannot load disk layout {opts.LayoutGen}", ex);
                 return 1;
             }
+            // Subset restore: everything downstream (extents, preflight,
+            // script, repair, stream, verify) runs against the filtered
+            // layout, so a null/empty selection behaves byte-identically to
+            // a full restore. Skipped-structural partitions (MSR) always
+            // survive filtering — the layout recreate needs them, and they
+            // stream no bytes either way.
+            var work = layout;
+            if (opts.Partitions != null && opts.Partitions.Count > 0)
+            {
+                var known = new List<int>();
+                foreach (var p in layout.Partitions)
+                    known.Add(p.PartitionNumber);
+                var unknown = new List<int>();
+                foreach (var n in opts.Partitions)
+                {
+                    if (!known.Contains(n) && !unknown.Contains(n))
+                        unknown.Add(n);
+                }
+                if (unknown.Count > 0)
+                {
+                    unknown.Sort();
+                    known.Sort();
+                    _log.Error($"refusing disk restore: layout {opts.LayoutGen} has no partition(s) {string.Join(",", unknown)} (has: {string.Join(",", known)})");
+                    return 1;
+                }
+                var want = new HashSet<int>(opts.Partitions);
+                var kept = new List<PartitionRecord>();
+                var auto = new List<int>();
+                foreach (var p in layout.Partitions)
+                {
+                    if (p.Skipped)
+                    {
+                        kept.Add(p);
+                        auto.Add(p.PartitionNumber);
+                    }
+                    else if (want.Contains(p.PartitionNumber))
+                    {
+                        kept.Add(p);
+                    }
+                }
+                var dataKept = false;
+                foreach (var p in kept)
+                {
+                    if (!p.Skipped)
+                        dataKept = true;
+                }
+                if (!dataKept)
+                {
+                    _log.Error($"refusing disk restore: --partitions {string.Join(",", opts.Partitions)} selects no data (all skipped-structural)");
+                    return 1;
+                }
+                var selEnd = 0L;
+                foreach (var p in kept)
+                    selEnd = Math.Max(selEnd, p.OffsetBytes + p.LengthBytes);
+                work = new DiskLayout
+                {
+                    SchemaVersion = layout.SchemaVersion,
+                    Generation = layout.Generation,
+                    DiskNumber = layout.DiskNumber,
+                    DiskGuid = layout.DiskGuid,
+                    DiskSizeBytes = selEnd,
+                    SectorSizeBytes = layout.SectorSizeBytes,
+                    Style = layout.Style,
+                    Partitions = kept,
+                    Hmac = layout.Hmac,
+                };
+                var sel = new List<int>(want);
+                sel.Sort();
+                var msg = $"restore disk layout {layout.Generation}: partitions {string.Join(",", sel)} selected";
+                if (auto.Count > 0)
+                    msg += $" (partition(s) {string.Join(",", auto)} auto-included, skipped-structural)";
+                _log.Info(msg);
+            }
             var extents = new List<PartitionRecord>();
-            foreach (var p in layout.Partitions)
+            foreach (var p in work.Partitions)
             {
                 if (!p.Skipped)
                     extents.Add(p);
@@ -237,16 +315,16 @@ namespace Corpus
                 _log.Error($"refusing disk restore: {target.DisplayName} is the boot disk ({boot}) — re-run with --allow-boot-disk and --confirm-type '{expected}'");
                 return 1;
             }
-            _log.Info($"restore disk layout {layout.Generation} ({extents.Count} partitions, {layout.DiskSizeBytes} bytes) -> {target.DisplayName} [{expected}]");
+            _log.Info($"restore disk layout {work.Generation} ({extents.Count} partitions, {work.DiskSizeBytes} bytes) -> {target.DisplayName} [{expected}]");
             if (opts.DryRun)
             {
-                var script = DiskpartScript.Generate(layout);
+                var script = DiskpartScript.Generate(work);
                 _log.Info("dry run: plan only, no bytes written");
                 _log.Info(script.TrimEnd());
                 if (opts.RepairBoot)
-                    LogRepairPlan(layout);
+                    LogRepairPlan(work);
                 else
-                    PrintBootRepair(layout);
+                    PrintBootRepair(work);
                 File.WriteAllText(DiskpartPath(target), script);
                 return 0;
             }
@@ -257,18 +335,18 @@ namespace Corpus
             if (opts.RepairBoot)
             {
                 repairRunner = opts.BootRunner ?? new WindowsBootRepairRunner(_log);
-                var applyRc = BootRepairOrchestrator.ApplyPhase(layout, repairRunner, _log);
+                var applyRc = BootRepairOrchestrator.ApplyPhase(work, repairRunner, _log);
                 if (applyRc != 0) return applyRc;
             }
             // 5. Grow file targets once (never truncate: gaps keep prefill);
             // raw targets already passed the fit preflight.
             if (target is FileBlockTarget grown)
-                GrowFile(grown.Path, layout.DiskSizeBytes);
+                GrowFile(grown.Path, work.DiskSizeBytes);
             // 6. Stream partition-by-partition in on-disk order through
             // extent windows, one cumulative ThrottledProgress over the disk
             // total (sync forwarding keeps progress monotonic).
             var sw = Stopwatch.StartNew();
-            var throttle = new ThrottledProgress(_log, layout.DiskSizeBytes, sw, progress);
+            var throttle = new ThrottledProgress(_log, work.DiskSizeBytes, sw, progress);
             var done = 0L;
             var manifests = new List<(PartitionRecord Part, SnapshotManifest Manifest)>();
             try
@@ -335,13 +413,13 @@ namespace Corpus
                 }
             }
             sw.Stop();
-            _log.Info($"restored disk layout {layout.Generation}: {extents.Count} partitions written and verified in {sw.Elapsed.TotalSeconds:F1}s");
+            _log.Info($"restored disk layout {work.Generation}: {extents.Count} partitions written and verified in {sw.Elapsed.TotalSeconds:F1}s");
             // 8. Bootloader only after verify passes (never boot a target
             // whose bytes didn't verify). The null runner means RepairBoot
             // was false — ApplyPhase above always sets it otherwise.
             if (opts.RepairBoot)
-                return BootRepairOrchestrator.BootloaderPhase(layout, repairRunner!, _log);
-            PrintBootRepair(layout);
+                return BootRepairOrchestrator.BootloaderPhase(work, repairRunner!, _log);
+            PrintBootRepair(work);
             return 0;
         }
 

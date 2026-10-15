@@ -26,6 +26,18 @@ public sealed class DiffFloorTests
     }
 
     [Fact]
+    public void Required_RecoverySizedStatic_UsesSmallTierMin()
+    {
+        // On-box: 735 MB Recovery with 120 MB free must clear the
+        // preflight as known-static (10% term = ~74 MB), while the same
+        // volume as ordinary data keeps the 320 MB size tier.
+        Assert.Equal(77070336L, DiffFloor.RequiredHeadroomBytes(735 * MiB, knownStatic: true));
+        Assert.Equal(335544320L, DiffFloor.RequiredHeadroomBytes(735 * MiB, knownStatic: false));
+        Assert.True(DiffFloor.MeetsFloor(735 * MiB, 120 * MiB, knownStatic: true));
+        Assert.False(DiffFloor.MeetsFloor(735 * MiB, 120 * MiB, knownStatic: false));
+    }
+
+    [Fact]
     public void Required_TinyVolume_PinsAt32MiBMin()
     {
         // 20 MiB total: 10% would be 2 MiB, but VSS cannot allocate a diff
