@@ -43,13 +43,8 @@ namespace Corpus
         }
     }
 
-    // Item 4: exclusion names (CapturePolicy.DefaultExclusions when Skip is
-    // null — explicit yaml replaces the whole list, never merges).
-    public class CorpusExclusionsConfig
-    {
-        public List<string>? Skip { get; set; }
-    }
-
+    // Item 4 exclusion names; null = CapturePolicy defaults. Explicit yaml
+    // replaces the whole list, never merges.
     public class CorpusConfig
     {
         // Chunk packs + manifests live here. Required.
@@ -61,8 +56,8 @@ namespace Corpus
         public CorpusLoggingConfig Logging { get; set; }
         // GC roots: union of keep-last-N, keep-within-days, pinned gens.
         public CorpusRetentionConfig Retention { get; set; }
-        // Item 4 exclusion names; null Skip = CapturePolicy defaults.
-        public CorpusExclusionsConfig Exclusions { get; set; }
+        // Item 4 exclusion names; null = CapturePolicy defaults.
+        public List<string>? Exclude { get; set; }
         // Per-pack encryption hook: shell command with {input}/{output}
         // substitution (same shape as TicTack jobs). Empty = stored
         // unencrypted. Runs per pack after sealing, never per chunk; a hook
@@ -84,7 +79,7 @@ namespace Corpus
             Compression = new CorpusCompressionConfig();
             Logging = new CorpusLoggingConfig();
             Retention = new CorpusRetentionConfig();
-            Exclusions = new CorpusExclusionsConfig();
+            Exclude = null;
         }
 
         public static CorpusConfig? Load(string path)

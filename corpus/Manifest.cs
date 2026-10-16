@@ -27,7 +27,7 @@ namespace Corpus
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public int ParentGeneration { get; set; }        // 0 = full image
         // Plaintext provenance (journal id + USN — not sensitive), readable
-        // without encryption keys so --list/planning never need key access.
+        // without encryption keys so --list-snapshots/planning never need key access.
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? ChangeCursor { get; set; }        // null = none/full
         // Whole-disk rung (spec §3): partition identity. Optional with

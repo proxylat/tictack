@@ -450,16 +450,48 @@ public sealed class GcTests : IDisposable
     }
 
     [Fact]
-    public void Cli_ImageDisk_RejectsVolumeCombo()
+    public void Cli_Image_RejectsVolumeDiskCombo()
     {
         ImageGens(1);
         var cfg = WriteCliConfig(console: true);
         var (exit, stdout, stderr) = RunCorpus("--config", cfg,
-            "--image-disk", "--disk", "0", "--volume", "C:", "--name", "snap");
+            "--image", "--disk", "0", "--volume", "C:", "--name", "snap");
         Assert.Equal(1, exit);
         var output = stdout + stderr;
         Assert.Contains("--volume", output);
         Assert.Contains("--disk", output);
+    }
+
+    [Fact]
+    public void Cli_ListSnapshots_ListsSeededGen()
+    {
+        ImageGens(1);
+        var cfg = WriteCliConfig(console: true);
+        var (exit, stdout, _) = RunCorpus("--config", cfg, "--list-snapshots");
+        Assert.Equal(0, exit);
+        Assert.Contains("1 ", stdout);
+    }
+
+    [Fact]
+    public void Cli_ListVolumes_ExitZero()
+    {
+        // Content is machine-specific (DriveInfo); the pin is that the
+        // config-free verb parses and runs (unknown verbs exit 1).
+        var (exit, _, _) = RunCorpus("--list-volumes");
+        Assert.Equal(0, exit);
+    }
+
+    [Fact]
+    public void Cli_UnknownConfigKey_FailsClean()
+    {
+        // Any unknown key fails as a plain config error (exit 1, names
+        // the key), never a crash.
+        var bad = Path.Combine(_dir, "bad.yaml");
+        File.WriteAllText(bad, "store_path: /data/store\nbogus_key_zzz: 1\n");
+        var (exit, stdout, stderr) = RunCorpus("--config", bad, "--validate");
+        Assert.Equal(1, exit);
+        Assert.Contains("Invalid config", stdout + stderr);
+        Assert.Contains("bogus_key_zzz", stdout + stderr);
     }
 
     [Fact]

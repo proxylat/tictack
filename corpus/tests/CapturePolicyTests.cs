@@ -330,18 +330,18 @@ public sealed class CapturePolicyTests : IDisposable
     public void Config_Exclusions_YamlOverride()
     {
         var custom = Path.Combine(_dir, "custom.yaml");
-        File.WriteAllText(custom, "store_path: /data/store\nexclusions:\n  skip: [custom.sys]\n");
+        File.WriteAllText(custom, "store_path: /data/store\nexclude: [custom.sys]\n");
         var cfg = CorpusConfig.Load(custom);
         Assert.NotNull(cfg);
-        Assert.Equal(["custom.sys"], cfg!.Exclusions.Skip);
-        Assert.Equal(["custom.sys"], CapturePolicy.EffectiveSkip(cfg.Exclusions.Skip));
+        Assert.Equal(["custom.sys"], cfg!.Exclude);
+        Assert.Equal(["custom.sys"], CapturePolicy.EffectiveSkip(cfg.Exclude));
         Assert.True(CorpusConfig.Validate(cfg, new TestLogger()));
 
         var minimal = Path.Combine(_dir, "minimal.yaml");
         File.WriteAllText(minimal, "store_path: /data/store\n");
         var cfg2 = CorpusConfig.Load(minimal);
         Assert.NotNull(cfg2);
-        Assert.Null(cfg2!.Exclusions.Skip);
-        Assert.Equal(CapturePolicy.DefaultExclusions, CapturePolicy.EffectiveSkip(cfg2.Exclusions.Skip));
+        Assert.Null(cfg2!.Exclude);
+        Assert.Equal(CapturePolicy.DefaultExclusions, CapturePolicy.EffectiveSkip(cfg2.Exclude));
     }
 }

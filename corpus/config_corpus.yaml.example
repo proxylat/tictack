@@ -37,13 +37,12 @@ retention:
   keep_within_days: 0
   pin: []
 
-# Exclusions (item 4): regenerable extents restored as zeros, names recorded
+# Exclude (item 4): regenerable extents restored as zeros, names recorded
 # per-snapshot in the manifest skip record. Omit = defaults below
 # (pagefile/hiberfil/swapfile, $Recycle.Bin, System Volume Information,
 # $UsnJrnl:$J, Windows\Temp, Temp). Explicit list REPLACES defaults, never
 # merges. $LogFile is never excludable (stripped even if listed).
-#exclusions:
-#  skip: ['pagefile.sys', 'hiberfil.sys']
+#exclude: ['pagefile.sys', 'hiberfil.sys']
 
 # Restore (recovery stick): --restore --snapshot <gen> --target <disk#|\\.\PhysicalDriveN|file>
 # --confirm-type is required always (even --dry-run); a refused run names the want-TOKEN.

@@ -11,8 +11,25 @@ namespace Corpus
     // the restore token needs.
     public sealed record DiskInfo(int Number, string DevicePath, long Size, bool IsBoot, string Model);
 
+    // Volume inventory for --list-volumes: ready drives via DriveInfo
+    // (cross-platform, no probing ioctls). Not-ready drives (empty DVD,
+    // sleeping card readers) are skipped — TotalSize throws on them.
+    public sealed record VolumeInfo(string Name, string FileSystem, long Size);
+
     public static class DiskInventory
     {
+        public static List<VolumeInfo> ListVolumes()
+        {
+            var vols = new List<VolumeInfo>();
+            foreach (var d in DriveInfo.GetDrives())
+            {
+                if (!d.IsReady)
+                    continue;
+                vols.Add(new VolumeInfo(d.Name, d.DriveFormat, d.TotalSize));
+            }
+            return vols;
+        }
+
         public static List<DiskInfo> ListDisks()
         {
             var disks = new List<DiskInfo>();

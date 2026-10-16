@@ -85,9 +85,6 @@ namespace Corpus
                     case "--image":
                         verb = "image";
                         break;
-                    case "--image-disk":
-                        verb = "image-disk";
-                        break;
                     case "--disk-layout":
                         verb = "disk-layout";
                         break;
@@ -103,8 +100,11 @@ namespace Corpus
                     case "--verify":
                         verb = "verify";
                         break;
-                    case "--list":
-                        verb = "list";
+                    case "--list-snapshots":
+                        verb = "list-snapshots";
+                        break;
+                    case "--list-volumes":
+                        verb = "list-volumes";
                         break;
                     case "--gc":
                         verb = "gc";
@@ -311,7 +311,18 @@ namespace Corpus
                 return 1;
             }
 
-            var cfg = CorpusConfig.Load(cfgPath);
+            CorpusConfig? cfg;
+            try
+            {
+                cfg = CorpusConfig.Load(cfgPath);
+            }
+            catch (YamlDotNet.Core.YamlException ex)
+            {
+                // User error, not a crash: plain message on stderr, no stack
+                // trace, no core dump (same shape as TicTack's config gate).
+                Console.Error.WriteLine("Invalid config " + cfgPath + ": " + ex.Message);
+                return 1;
+            }
             var log = CreateLogger(cfg, baseDir);
             try
             {
@@ -323,6 +334,8 @@ namespace Corpus
                         return VssList(baseDir);
                     case "list-disks":
                         return RunListDisks(log);
+                    case "list-volumes":
+                        return RunListVolumes(log);
                     case "disk-layout":
                         return RunDiskLayout(diskArg, log);
                     case "vss-snap":
@@ -375,13 +388,18 @@ namespace Corpus
                         log.Info("store: " + cfg.StorePath);
                         log.Info("state root: " + CorpusConfig.StateRoot(cfg));
                         log.Info("chunk: " + cfg.ChunkMib + " MiB, zstd level " + cfg.Compression.Level);
-                        log.Info("exclusions: " + string.Join(", ", CapturePolicy.EffectiveSkip(cfg.Exclusions?.Skip)));
+                        log.Info("exclusions: " + string.Join(", ", CapturePolicy.EffectiveSkip(cfg.Exclude)));
                         log.Info("Corpus config valid");
                         return 0;
                     case "image":
+                        // Whole-disk target rides the same verb: --volume and
+                        // --disk are mutually exclusive (RunImageDisk refuses
+                        // the combo, never merges).
+                        if (!string.IsNullOrEmpty(diskArg))
+                            return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log);
                         if (string.IsNullOrEmpty(volume) || string.IsNullOrEmpty(name))
                         {
-                            log.Error("--image requires --volume <path> --name <snapshot>");
+                            log.Error("--image requires --volume <path> --name <snapshot> (or --disk <N> --name <snapshot>)");
                             return 1;
                         }
                         if (!inline)
@@ -447,7 +465,7 @@ namespace Corpus
                         }
                         using (var store = CreateStore(cfg, log))
                             return store.Verify(verifyGen, chain) ? 0 : 1;
-                    case "list":
+                    case "list-snapshots":
                         using (var store = CreateStore(cfg, log))
                         {
                             foreach (var (gen, snap) in store.ListSnapshots())
@@ -459,8 +477,6 @@ namespace Corpus
                         return 0;
                     case "restore":
                         return RunRestore(cfg, baseDir, snapshotArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
-                    case "image-disk":
-                        return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log);
                     case "restore-disk":
                         return RunRestoreDisk(cfg, baseDir, layoutArg, partitionsArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, repairBoot, log);
                     case "gc":
@@ -508,6 +524,16 @@ namespace Corpus
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.ChunkMib, cfg.Compression.Level, log,
                 cfg.Encrypt);
+        }
+
+        private static int RunListVolumes(ILogger log)
+        {
+            var vols = DiskInventory.ListVolumes();
+            if (vols.Count == 0)
+                log.Info("no ready volumes enumerated");
+            foreach (var v in vols)
+                Console.WriteLine(v.Name + " " + v.FileSystem + " " + v.Size);
+            return 0;
         }
 
         private static int RunListDisks(ILogger log)
@@ -612,22 +638,22 @@ namespace Corpus
             return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
         }
 
-        // --image-disk: whole-disk capture via the store lane (one manifest
-        // per non-skipped partition + sealed layout sidecar). Volume verbs
+        // --image --disk: whole-disk capture via the store lane (one manifest
+        // per non-skipped partition + sealed layout sidecar). Volume captures
         // are untouched: --volume with --disk is rejected, never merged.
         private static int RunImageDisk(CorpusConfig cfg, string? diskArg, string? volume, string? name,
             bool incremental, string? parentArg, bool forceFull, List<string> cliExcludes, ILogger log)
         {
             if (string.IsNullOrEmpty(diskArg) || string.IsNullOrEmpty(name))
             {
-                log.Error("--image-disk requires --disk <N> --name <snapshot>");
+                log.Error("--image --disk requires --disk <N> --name <snapshot>");
                 return 1;
             }
             if (cliExcludes.Count > 0)
-                log.Warn("--exclude applies to --image only, ignored for --image-disk");
+                log.Warn("--exclude applies to volume captures only, ignored for --disk");
             if (!string.IsNullOrEmpty(volume))
             {
-                log.Error("--volume cannot be combined with --image-disk --disk (use --image for volumes)");
+                log.Error("--volume cannot be combined with --disk (capture a volume or a disk, not both)");
                 return 1;
             }
             if (incremental && parentArg != null)
@@ -645,7 +671,7 @@ namespace Corpus
                 return 1;
             if (!OperatingSystem.IsWindows())
             {
-                Console.Error.WriteLine("--image-disk needs Windows");
+                Console.Error.WriteLine("--image --disk needs Windows");
                 return 1;
             }
             DiskImager.CapturePlan = DiskCapture.BuildPlan;
@@ -768,7 +794,7 @@ namespace Corpus
         // MFT could shift mid-capture and tear the manifest.
         private static IExclusionResolver? ResolveImageExclusions(CorpusConfig cfg, IBlockSource source, string volume, List<string> cliExcludes, ILogger log)
         {
-            var merged = Store.MergeExclusionNames(cfg.Exclusions?.Skip, cliExcludes);
+            var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
             if (merged.Count == 0)
                 return null;
             var device = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
@@ -1155,6 +1181,7 @@ namespace Corpus
             Console.WriteLine();
             Console.WriteLine("  --image --volume <path|X:> --name <snap>   Fast landing capture (default, always full; run --gc/optimize to fold)");
             Console.WriteLine("      --inline [--incremental | --parent <gen>] [--full]   Classic packed capture instead of landing");
+            Console.WriteLine("  --image --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)");
             Console.WriteLine("  --export --snapshot <gen> --out <path>  Export a snapshot to a file");
             Console.WriteLine("  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX");
             Console.WriteLine("  --vss-list                   Relay 'vssadmin list writers' (Windows)");
@@ -1164,7 +1191,7 @@ namespace Corpus
             Console.WriteLine("  --bitmap-stats --volume <X:> Used-cluster stats over a snapshot (Windows, elevated)");
             Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
             Console.WriteLine("  --verify --snapshot <gen> [--chain]              Verify a snapshot (exit 1 on failure; --chain also walks parent links to genesis, a gap fails loud even if the target alone verifies)");
-            Console.WriteLine("  --list                                 List snapshots (\"gen name\" lines)");
+            Console.WriteLine("  --list-snapshots                     List snapshots (\"gen name\" lines)");
             Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual; --service runs this on schedule)");
             Console.WriteLine("      retention: keep_last/keep_within_days/pin from config; exports outside the store are untouched");
             Console.WriteLine("      retention pool is shared between volume and disk snapshots (use two stores for isolation)");
@@ -1180,9 +1207,9 @@ namespace Corpus
             Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
             Console.WriteLine("      [--payload <dir>]  Skip re-publish (ADK box without the SDK: publish dir)");
             Console.WriteLine("  --list-disks                           List physical disks (Windows; empty on Linux)");
-            Console.WriteLine("  --image-disk --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)");
-            Console.WriteLine("      --volume cannot be combined with --disk");
+            Console.WriteLine("  --list-volumes                         List ready volumes (\"name filesystem bytes\" lines)");
             Console.WriteLine("  --disk-layout --disk <N>  Print DiskLayout JSON to stdout, capture nothing (Windows, elevated)");
+            Console.WriteLine("  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
             Console.WriteLine("  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
             Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run] [--partitions <1,3,4>]  Restore every non-skipped extent at its recorded offset");
             Console.WriteLine("      --partitions restores a subset (MSR auto-included, structural); target may be smaller than the source disk");
@@ -1190,7 +1217,7 @@ namespace Corpus
             Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore a snapshot");
             Console.WriteLine("  --copy --from <store> --to <store> (--snapshot <gen> | --chain <gen>) [--chain]  Copy one snapshot, missing packs only (--chain includes ancestors)");
             Console.WriteLine("  --sync --from <store> --to <store>  Copy every snapshot the dest lacks, missing packs only (same id.key, or an empty dest)");
-            Console.WriteLine("  --exclude <path|pattern>  (repeatable, --image only) merged over config exclusions, recorded in the manifest ($LogFile never excludable)");
+            Console.WriteLine("  --exclude <path|pattern>  (repeatable, volume captures only) merged over config exclude, recorded in the manifest ($LogFile never excludable)");
             Console.WriteLine("  --validate             Check config_corpus.yaml and exit");
             Console.WriteLine("  --config <path>        Config file (default: config_corpus.yaml beside the exe)");
             Console.WriteLine("  --version              Print version and exit");
