@@ -26,3 +26,8 @@ service/linux/runtimes/
 service/linux/createdump
 AGENTS.md
 docs/
+vm-harness/
+future-arch.md
+system-image.md
+VM-TESTS.md
+logs/
