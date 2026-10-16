@@ -242,6 +242,56 @@ namespace Corpus
             }
         }
 
+        // Every single-extent volume on one disk (GUID paths, no trailing
+        // backslash): the restore locker quiesces these before streaming so
+        // mid-stream filesystem recognition can't mount and deny raw
+        // writes. Empty off Windows (callers need no guard).
+        internal static List<string> VolumesOnDisk(int diskNumber)
+        {
+            var found = new List<string>();
+            if (!OperatingSystem.IsWindows())
+                return found;
+            var name = new char[512];
+            var find = FindFirstVolume(name, (uint)name.Length);
+            if (find == new IntPtr(-1))
+                return found;
+            try
+            {
+                do
+                {
+                    var volume = new string(name).TrimEnd('\0').TrimEnd('\\');
+                    if (VolumeOnDisk(volume, diskNumber))
+                        found.Add(volume);
+                    Array.Clear(name, 0, name.Length);
+                }
+                while (FindNextVolume(find, name, (uint)name.Length));
+                return found;
+            }
+            finally
+            {
+                FindVolumeClose(find);
+            }
+        }
+
+        private static bool VolumeOnDisk(string volume, int diskNumber)
+        {
+            try
+            {
+                using var handle = NativeDisk.OpenHandle(volume, read: true);
+                var outBuf = new byte[4096];
+                if (!DeviceIoControl(handle.DangerousGetHandle(), IoctlVolumeGetVolumeDiskExtents,
+                        IntPtr.Zero, 0, outBuf, (uint)outBuf.Length, out _, IntPtr.Zero))
+                    return false;
+                if (BitConverter.ToInt32(outBuf, 0) != 1)
+                    return false;
+                return BitConverter.ToInt32(outBuf, 8) == diskNumber;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+        }
+
         private static bool TryMatchExtent(string volume, int diskNumber, long offsetBytes, long lengthBytes)
         {
             try

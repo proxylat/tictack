@@ -70,6 +70,22 @@ namespace Corpus
             return new FileBlockTarget(spec);
         }
 
+        // Disk number behind a target spec (same grammar as OpenTarget):
+        // "2" or "\\.\PhysicalDrive2" -> 2, anything else (file) -> null.
+        // Repair needs the number for `select disk`; file targets refuse.
+        internal static int? TryParseTargetDisk(string spec)
+        {
+            if (string.IsNullOrEmpty(spec))
+                return null;
+            if (int.TryParse(spec, out var number) && number >= 0)
+                return number;
+            const string marker = @"\\.\PhysicalDrive";
+            if (spec.StartsWith(marker, StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(spec.Substring(marker.Length), out var drive) && drive >= 0)
+                return drive;
+            return null;
+        }
+
         public int Restore(RestoreOptions opts, IProgress<long>? progress = null)
         {
             ArgumentNullException.ThrowIfNull(opts);
@@ -132,7 +148,7 @@ namespace Corpus
             try
             {
                 using (var stream = target.OpenWrite())
-                    _store.ExportToStream(opts.Generation, stream, new ThrottledProgress(_log, manifest.VolumeLength, sw, progress), fillGaps: true);
+                    _store.ExportToStream(opts.Generation, stream, new ThrottledProgress(_log, manifest.VolumeLength, sw, progress));
                 if (target is FileBlockTarget file)
                     FixFileLength(file.Path, manifest.VolumeLength);
             }
@@ -151,36 +167,40 @@ namespace Corpus
             }
             else
             {
-                List<long> bad;
+                List<long> dataBad;
+                List<long> gapBad;
                 try
                 {
-                    bad = VerifyTarget(target, manifest, opts.StorePath);
+                    (dataBad, gapBad) = VerifyTarget(target, manifest, opts.StorePath);
                 }
                 catch (Exception ex)
                 {
                     _log.Error("restore verify failed to re-read the target", ex);
                     return 1;
                 }
-                if (bad.Count > 0)
+                if (dataBad.Count > 0)
                 {
-                    for (var i = 0; i < Math.Min(5, bad.Count); i++)
-                        _log.Error($"restore verify mismatch at offset {bad[i]}");
-                    _log.Error($"restore verify failed: {bad.Count} corrupt ranges (re-run restore; do not boot this target)");
+                    for (var i = 0; i < Math.Min(5, dataBad.Count); i++)
+                        _log.Error($"restore verify mismatch at offset {dataBad[i]}");
+                    _log.Error($"restore verify failed: {dataBad.Count} corrupt ranges (re-run restore; do not boot this target)");
                     return 1;
                 }
+                if (gapBad.Count > 0)
+                    _log.Warn($"restore verify: {gapBad.Count} free-space range(s) hold stale bytes (reused target — cosmetic, boot-safe; first at offset {gapBad[0]})");
             }
             sw.Stop();
             _log.Info($"restored snapshot {manifest.Generation}: {manifest.VolumeLength} bytes written and verified in {sw.Elapsed.TotalSeconds:F1}s");
             return 0;
         }
 
-        // Whole-disk restore (disk-spec §6): the existing 5 phases per
-        // extent at its recorded offset. Skipped (MSR) extents are never
+        // Whole-disk restore (disk-spec §6): phased restore per extent at
+        // its recorded offset. Skipped (MSR) extents are never
         // written and never verified (their contents are undefined by
         // design — writing zeros would fake a fidelity capture never had).
-        // v1 does NOT partition: the target table must already exist (see
-        // DiskpartScript for the reviewed manual prep); boot repair stays a
-        // printed bcdboot line, no FAT32 parsing.
+        // --repair-boot recreates the table orchestrated (ApplyPhase) and
+        // reinstalls the bootloader post-verify (BootloaderPhase); without
+        // it the target table must already exist and boot repair stays a
+        // printed bcdboot line.
         public int RestoreDisk(DiskRestoreOptions opts, IProgress<long>? progress = null)
         {
             ArgumentNullException.ThrowIfNull(opts);
@@ -195,6 +215,19 @@ namespace Corpus
                 _log.Error("refusing disk restore: no store path (check --store)");
                 return 1;
             }
+            // Repair needs a real disk for `select disk`: a file target has
+            // no partition table to recreate. Fail fast, before the layout
+            // even loads (nothing to plan against a file).
+            var targetDisk = TryParseTargetDisk(opts.Target);
+            if (opts.RepairBoot && targetDisk == null)
+            {
+                _log.Error($"refusing disk restore: --repair-boot needs a disk target (got file '{opts.Target}' — files have no partition table to recreate)");
+                return 1;
+            }
+            // -1 only when repair is off (never passed anywhere then); if
+            // the gate above ever regresses, ApplyPhase's own guard throws
+            // loud before diskpart runs — never a silent wrong-disk clean.
+            var repairDisk = targetDisk ?? -1;
             DiskLayout layout;
             try
             {
@@ -318,11 +351,14 @@ namespace Corpus
             _log.Info($"restore disk layout {work.Generation} ({extents.Count} partitions, {work.DiskSizeBytes} bytes) -> {target.DisplayName} [{expected}]");
             if (opts.DryRun)
             {
-                var script = DiskpartScript.Generate(work);
+                // Disk targets print the real `select disk`; file targets
+                // keep the source number for the reviewed-manual path (the
+                // header tells the operator to verify with --list-disks).
+                var script = DiskpartScript.Generate(work, targetDisk ?? work.DiskNumber);
                 _log.Info("dry run: plan only, no bytes written");
                 _log.Info(script.TrimEnd());
                 if (opts.RepairBoot)
-                    LogRepairPlan(work);
+                    LogRepairPlan(work, targetDisk ?? work.DiskNumber);
                 else
                     PrintBootRepair(work);
                 File.WriteAllText(DiskpartPath(target), script);
@@ -335,18 +371,30 @@ namespace Corpus
             if (opts.RepairBoot)
             {
                 repairRunner = opts.BootRunner ?? new WindowsBootRepairRunner(_log);
-                var applyRc = BootRepairOrchestrator.ApplyPhase(work, repairRunner, _log);
+                var applyRc = BootRepairOrchestrator.ApplyPhase(work, repairRunner, _log, repairDisk);
                 if (applyRc != 0) return applyRc;
             }
-            // 5. Grow file targets once (never truncate: gaps keep prefill);
-            // raw targets already passed the fit preflight.
+            // 5. Quiesce (disk targets only; files get an empty set): lock
+            // every target volume so mid-stream FS recognition can't mount
+            // and deny raw writes. Held across streaming AND verify;
+            // released explicitly before the bootloader (letters/bcdboot
+            // need fresh opens — a lock would deny them too). Then grow
+            // file targets once (never truncate: gaps keep prefill); raw
+            // targets already passed the fit preflight.
+            using var locks = VolumeLockSet.Acquire(targetDisk, _log);
             if (target is FileBlockTarget grown)
                 GrowFile(grown.Path, work.DiskSizeBytes);
             // 6. Stream partition-by-partition in on-disk order through
             // extent windows, one cumulative ThrottledProgress over the disk
             // total (sync forwarding keeps progress monotonic).
             var sw = Stopwatch.StartNew();
-            var throttle = new ThrottledProgress(_log, work.DiskSizeBytes, sw, progress);
+            // Progress total is the streamed extents (MSR gaps and the disk
+            // tail are never touched — DiskSizeBytes would cap the bar at
+            // ~70% on subset restores).
+            var progressTotal = 0L;
+            foreach (var p in extents)
+                progressTotal += p.LengthBytes;
+            var throttle = new ThrottledProgress(_log, progressTotal, sw, progress);
             var done = 0L;
             var manifests = new List<(PartitionRecord Part, SnapshotManifest Manifest)>();
             try
@@ -365,7 +413,7 @@ namespace Corpus
                     }
                     using var window = new OffsetBlockTarget(target, part.OffsetBytes);
                     using (var stream = window.OpenWrite())
-                        _store.ExportToStream(part.SnapshotGeneration, stream, new OffsetForwarder(throttle, done), fillGaps: true);
+                        _store.ExportToStream(part.SnapshotGeneration, stream, new OffsetForwarder(throttle, done));
                     manifests.Add((part, manifest));
                     done += manifest.VolumeLength;
                 }
@@ -390,13 +438,16 @@ namespace Corpus
             }
             else
             {
-                var bad = new List<long>();
+                var dataBad = new List<long>();
+                var gapBad = new List<long>();
                 try
                 {
                     foreach (var (part, manifest) in manifests)
                     {
                         using var window = new OffsetBlockTarget(target, part.OffsetBytes);
-                        bad.AddRange(VerifyTarget(window, manifest, opts.StorePath));
+                        var (d, g) = VerifyTarget(window, manifest, opts.StorePath);
+                        dataBad.AddRange(d);
+                        gapBad.AddRange(g);
                     }
                 }
                 catch (Exception ex)
@@ -404,28 +455,33 @@ namespace Corpus
                     _log.Error("disk restore verify failed to re-read the target", ex);
                     return 1;
                 }
-                if (bad.Count > 0)
+                if (dataBad.Count > 0)
                 {
-                    for (var i = 0; i < Math.Min(5, bad.Count); i++)
-                        _log.Error($"disk restore verify mismatch at offset {bad[i]}");
-                    _log.Error($"disk restore verify failed: {bad.Count} corrupt ranges (re-run restore; do not boot this target)");
+                    for (var i = 0; i < Math.Min(5, dataBad.Count); i++)
+                        _log.Error($"disk restore verify mismatch at offset {dataBad[i]}");
+                    _log.Error($"disk restore verify failed: {dataBad.Count} corrupt ranges (re-run restore; do not boot this target)");
                     return 1;
                 }
+                if (gapBad.Count > 0)
+                    _log.Warn($"disk restore verify: {gapBad.Count} free-space range(s) hold stale bytes (reused target — cosmetic, boot-safe; first at offset {gapBad[0]})");
             }
             sw.Stop();
             _log.Info($"restored disk layout {work.Generation}: {extents.Count} partitions written and verified in {sw.Elapsed.TotalSeconds:F1}s");
             // 8. Bootloader only after verify passes (never boot a target
-            // whose bytes didn't verify). The null runner means RepairBoot
-            // was false — ApplyPhase above always sets it otherwise.
+            // whose bytes didn't verify). Release the volume locks first:
+            // letter assignment and bcdboot open the volumes, which a held
+            // lock denies. (The `using` also releases at method end; Dispose
+            // is idempotent.)
+            locks.Dispose();
             if (opts.RepairBoot)
-                return BootRepairOrchestrator.BootloaderPhase(work, repairRunner!, _log);
+                return BootRepairOrchestrator.BootloaderPhase(work, repairRunner!, _log, repairDisk);
             PrintBootRepair(work);
             return 0;
         }
 
         // Item 5 dry-run: checks run for real (a layout that would not repair
         // fails the plan), the script apply stays unwritten.
-        private void LogRepairPlan(DiskLayout layout)
+        private void LogRepairPlan(DiskLayout layout, int targetDisk)
         {
             var blocked = BootRepairOrchestrator.CheckLayout(layout);
             if (blocked != null)
@@ -433,7 +489,7 @@ namespace Corpus
                 _log.Error("dry run: " + blocked);
                 return;
             }
-            _log.Info(BootRepairOrchestrator.Plan(layout).TrimEnd());
+            _log.Info(BootRepairOrchestrator.Plan(layout, targetDisk).TrimEnd());
             _log.Info("dry run: boot repair planned, nothing applied");
         }
 
@@ -532,15 +588,20 @@ namespace Corpus
         }
 
         // Verify-after-write: FULL re-read, per manifest entry in order —
-        // target bytes hashed with ChunkId vs the manifest digest (holes:
-        // expect zeros). The store id.key supplies identity; the injected
-        // Store is not involved, so this works for any target.
-        private static List<long> VerifyTarget(IBlockTarget target, SnapshotManifest manifest, string? storeRoot)
+        // data bytes hashed with ChunkId vs the digest, holes expected
+        // zero. Split result: data mismatches are corruption (fail loud,
+        // do not boot); gap mismatches are stale free-space bytes on a
+        // reused target (warn-and-pass — the FS never reads free space
+        // expecting values, so boot-safe by construction). The store
+        // id.key supplies identity; the injected Store is not involved,
+        // so this works for any target.
+        private static (List<long> Data, List<long> Gaps) VerifyTarget(IBlockTarget target, SnapshotManifest manifest, string? storeRoot)
         {
             if (string.IsNullOrEmpty(storeRoot) || !File.Exists(Path.Combine(storeRoot, "id.key")))
                 throw new InvalidDataException("post-restore verify needs the store id.key");
             var idKey = File.ReadAllBytes(Path.Combine(storeRoot, "id.key"));
-            var bad = new List<long>();
+            var dataBad = new List<long>();
+            var gapBad = new List<long>();
             // Per-extent offset: positions stay extent-relative, the window
             // base is added at seek/report time (the offset-0 path is the
             // BaseOffset==0 case — single-gen restores pass plain targets
@@ -554,15 +615,15 @@ namespace Corpus
                 if (entry.IsHole)
                 {
                     if (!ReadZeros(read, position, entry.Size, buf, baseOffset))
-                        bad.Add(baseOffset + position);
+                        gapBad.Add(baseOffset + position);
                 }
                 else if (!VerifyRange(read, position, entry, idKey, buf, baseOffset))
                 {
-                    bad.Add(baseOffset + position);
+                    dataBad.Add(baseOffset + position);
                 }
                 position += entry.Size;
             }
-            return bad;
+            return (dataBad, gapBad);
         }
 
         private static bool VerifyRange(Stream read, long position, ManifestEntry entry, byte[] idKey, byte[] buf, long baseOffset = 0)

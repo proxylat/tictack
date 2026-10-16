@@ -938,7 +938,7 @@ namespace Corpus
                 log.Error(blocked);
                 return 1;
             }
-            Console.WriteLine(BootRepairOrchestrator.Plan(layout).TrimEnd());
+            Console.WriteLine(BootRepairOrchestrator.Plan(layout, diskNumber).TrimEnd());
             log.Info("repair checks passed (plan above, nothing applied)");
             return 0;
         }

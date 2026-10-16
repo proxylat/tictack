@@ -708,36 +708,29 @@ namespace Corpus
 
         // Streamed export for restore: the same decoded bytes as Export,
         // chunk by chunk, with cumulative logical-byte progress (holes
-        // included, so the final report equals VolumeLength). fillGaps
-        // writes zeros explicitly instead of seeking past holes/zero
-        // chunks — required on target REUSE (raw disks, second restores),
-        // where stale bytes would survive the seek and fail verify.
-        // Export/ExportVhdx keep sparse seeks (dynamic VHDX relies on them
-        // for non-allocation); only restore passes true.
-        public void ExportToStream(int generation, Stream output, IProgress<long>? progress = null, bool fillGaps = false)
+        // included, so the final report equals VolumeLength). Holes and
+        // zero chunks are SEEKED, never written: free space is don't-care
+        // (the FS never reads it expecting values), and writing 17GB of
+        // zeros would balloon thin targets (dynamic VHDX allocates on
+        // zero writes) for zero fidelity gain. Verify compensates:
+        // data ranges hash-fail loud, stale gap bytes warn-and-pass
+        // (reused targets keep old free-space bytes — cosmetic,
+        // boot-safe). Fresh targets read zeros and pass strictly.
+        public void ExportToStream(int generation, Stream output, IProgress<long>? progress = null)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentNullException.ThrowIfNull(output);
-            WriteSnapshotToStream(LoadGeneration(generation), output, progress, fillGaps);
+            WriteSnapshotToStream(LoadGeneration(generation), output, progress);
         }
 
-        private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output, IProgress<long>? progress = null, bool fillGaps = false)
+        private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output, IProgress<long>? progress = null)
         {
             var reported = 0L;
-            byte[]? zeros = null;
             foreach (var entry in manifest.Chunks)
             {
                 if (entry.IsHole)
                 {
-                    if (fillGaps)
-                    {
-                        zeros ??= new byte[1024 * 1024];
-                        WriteZeros(output, entry.Size, zeros);
-                    }
-                    else
-                    {
-                        output.Seek(entry.Size, SeekOrigin.Current);
-                    }
+                    output.Seek(entry.Size, SeekOrigin.Current);
                     reported += entry.Size; progress?.Report(reported); continue;
                 }
                 var digest = Convert.FromHexString(entry.DigestHex);
@@ -758,17 +751,12 @@ namespace Corpus
                 {
                     throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
                 }
+                // Zero chunks decode (proving pack readability) but seek:
+                // same don't-care rule as holes — verify hashes them as
+                // data, so a dirty target fails strict here, not silent.
                 if (IsAllZero(plain))
                 {
-                    if (fillGaps)
-                    {
-                        zeros ??= new byte[1024 * 1024];
-                        WriteZeros(output, plain.Length, zeros);
-                    }
-                    else
-                    {
-                        output.Seek(plain.Length, SeekOrigin.Current);
-                    }
+                    output.Seek(plain.Length, SeekOrigin.Current);
                 }
                 else
                 {
@@ -776,16 +764,6 @@ namespace Corpus
                 }
                 reported += plain.Length;
                 progress?.Report(reported);
-            }
-        }
-
-        private static void WriteZeros(Stream output, long count, byte[] scratch)
-        {
-            while (count > 0)
-            {
-                var n = (int)Math.Min(scratch.Length, count);
-                output.Write(scratch, 0, n);
-                count -= n;
             }
         }
 

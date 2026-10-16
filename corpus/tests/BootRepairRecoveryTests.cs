@@ -112,7 +112,7 @@ public sealed class BootRepairRecoveryTests : IDisposable
     [Fact]
     public void Plan_ContainsDiskpartAndBcdboot()
     {
-        var plan = BootRepairOrchestrator.Plan(GoodLayout());
+        var plan = BootRepairOrchestrator.Plan(GoodLayout(), 0);
         Assert.Contains("create partition efi", plan);
         Assert.Contains("bcdboot", plan);
     }
@@ -155,10 +155,12 @@ public sealed class BootRepairRecoveryTests : IDisposable
         var fake = new FakeBootRepairRunner();
         using (var store = new Store(_storeRoot, _dbPath, 1, 3, log))
         {
-            var orch = new RestoreOrchestrator(store, log, path => new FileBlockTarget(path));
+            // Disk spec with a file-backed factory: the repair gate sees a
+            // disk target, bytes land in the file.
+            var orch = new RestoreOrchestrator(store, log, _ => new FileBlockTarget(target));
             using var t = new FileBlockTarget(target);
             var rc = orch.RestoreDisk(new DiskRestoreOptions(
-                LayoutGen: layout.Generation, Target: target, StorePath: _storeRoot, IndexPath: _dbPath,
+                LayoutGen: layout.Generation, Target: "2", StorePath: _storeRoot, IndexPath: _dbPath,
                 ConfirmToken: BootDiskGuard.TargetToken(t.DisplayName, t.Capacity),
                 AllowBootDisk: false, SkipVerify: true, DryRun: false, RepairBoot: true, BootRunner: fake));
             Assert.Equal(0, rc);
@@ -307,7 +309,7 @@ public sealed class BootRepairRecoveryTests : IDisposable
     [Fact]
     public void Generate_NoFormat_SkipsFormatKeepsExactOffsets()
     {
-        var script = DiskpartScript.Generate(GoodLayout(), formatPartitions: false);
+        var script = DiskpartScript.Generate(GoodLayout(), 0, formatPartitions: false);
         Assert.Contains("create partition efi size=260 offset=1024", script);
         Assert.Contains("create partition msr size=16 offset=267264", script);
         Assert.Contains("create partition primary size=6 offset=283648", script);
@@ -317,7 +319,7 @@ public sealed class BootRepairRecoveryTests : IDisposable
     [Fact]
     public void Generate_Default_FormatsPrimaries()
     {
-        var script = DiskpartScript.Generate(GoodLayout());
+        var script = DiskpartScript.Generate(GoodLayout(), 0);
         Assert.Contains("format fs=fat32 quick", script);
         Assert.Contains("format fs=ntfs quick", script);
     }
@@ -327,12 +329,138 @@ public sealed class BootRepairRecoveryTests : IDisposable
     {
         var oddLen = GoodLayout();
         oddLen.Partitions[2].LengthBytes = 6L * Mib + 512;
-        var ex = Assert.Throws<InvalidDataException>(() => DiskpartScript.Generate(oddLen));
+        var ex = Assert.Throws<InvalidDataException>(() => DiskpartScript.Generate(oddLen, 0));
         Assert.Contains("MiB-exact", ex.Message);
         var oddOff = GoodLayout();
         oddOff.Partitions[2].OffsetBytes = 277L * Mib + 512;
-        var ex2 = Assert.Throws<InvalidDataException>(() => DiskpartScript.Generate(oddOff));
+        var ex2 = Assert.Throws<InvalidDataException>(() => DiskpartScript.Generate(oddOff, 0));
         Assert.Contains("KiB-exact", ex2.Message);
+    }
+
+    [Fact]
+    public void Generate_RemovesAutoMsrBeforeCreates()
+    {
+        // convert gpt auto-creates a front MSR that collides with an
+        // offset-exact ESP: the script must delete partition 1 after
+        // convert and before the first create (proven on-box 2026-10-15).
+        var script = DiskpartScript.Generate(GoodLayout(), 2);
+        var convert = script.IndexOf("convert gpt", StringComparison.Ordinal);
+        var del = script.IndexOf("delete partition override", StringComparison.Ordinal);
+        var firstCreate = script.IndexOf("create partition", StringComparison.Ordinal);
+        Assert.True(convert >= 0 && del > convert && firstCreate > del,
+            "order must be convert -> delete auto-MSR -> creates:\n" + script);
+    }
+
+    [Fact]
+    public void Generate_NeverAssignsLetters()
+    {
+        // A mounted volume locks its disk against raw-sector writes: the
+        // first streamed byte dies with UnauthorizedAccessException
+        // (proven on-box 2026-10-15). Letters come post-verify from
+        // LocateVolumes — both script variants stay letterless.
+        foreach (var formatted in new[] { true, false })
+        {
+            var script = DiskpartScript.Generate(GoodLayout(), 2, formatPartitions: formatted);
+            foreach (var line in script.Split('\n'))
+                Assert.False(line.TrimStart().StartsWith("assign", StringComparison.OrdinalIgnoreCase),
+                    $"variant formatted={formatted} assigns a letter: {line}");
+        }
+    }
+
+    [Fact]
+    public void Generate_UsesTargetDiskNumber_NeverSource()
+    {
+        // The load-bearing line: layout came from disk 0, target is disk 2 —
+        // a `select disk 0` here would clean the live OS. (Caught by dry-run
+        // before the first orchestrated cross-disk restore.)
+        var script = DiskpartScript.Generate(GoodLayout(), 2);
+        Assert.Contains("select disk 2", script);
+        Assert.DoesNotContain("select disk 0", script);
+    }
+
+    [Fact]
+    public void Generate_NegativeTarget_Refuses()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => DiskpartScript.Generate(GoodLayout(), -1));
+    }
+
+    [Fact]
+    public void ApplyPhase_TargetDisk_ReachesScript()
+    {
+        var log = new TestLogger();
+        var fake = new FakeBootRepairRunner();
+
+        Assert.Equal(0, BootRepairOrchestrator.ApplyPhase(GoodLayout(), fake, log, 2));
+
+        Assert.Contains("select disk 2", fake.LastScript);
+        Assert.Contains("partition layout recreated on disk 2", string.Join("\n", log.Messages));
+    }
+
+    [Fact]
+    public void Repair_SameDisk_UsesLayoutNumber()
+    {
+        var log = new TestLogger();
+        var fake = new FakeBootRepairRunner();
+
+        Assert.Equal(0, BootRepairOrchestrator.Repair(GoodLayout(), fake, log));
+
+        Assert.Contains("select disk 0", fake.LastScript);
+        Assert.Equal(0, fake.LastLocateDisk);
+    }
+
+    [Fact]
+    public void BootloaderPhase_ForwardsTargetDisk()
+    {
+        var log = new TestLogger();
+        var fake = new FakeBootRepairRunner();
+
+        Assert.Equal(0, BootRepairOrchestrator.BootloaderPhase(GoodLayout(), fake, log, 5));
+
+        Assert.Equal(5, fake.LastLocateDisk);
+        Assert.Contains("target disk 5", string.Join("\n", log.Messages));
+    }
+
+    [Theory]
+    [InlineData("2", 2)]
+    [InlineData("0", 0)]
+    [InlineData("\\\\.\\PhysicalDrive2", 2)]
+    [InlineData("\\\\.\\physicaldrive0", 0)]
+    public void TryParseTargetDisk_DiskSpecs_Parse(string spec, int expected)
+    {
+        Assert.Equal(expected, RestoreOrchestrator.TryParseTargetDisk(spec));
+    }
+
+    [Theory]
+    [InlineData("C:\\x.img")]
+    [InlineData("disk2")]
+    [InlineData("")]
+    [InlineData("-1")]
+    [InlineData("PhysicalDrive")]
+    [InlineData("\\\\.\\PhysicalDrive2x")]
+    public void TryParseTargetDisk_FilesAndGarbage_Null(string spec)
+    {
+        Assert.Null(RestoreOrchestrator.TryParseTargetDisk(spec));
+    }
+
+    [Fact]
+    public void RestoreDisk_RepairBoot_FileTarget_RefusesBeforeLoad()
+    {
+        // Layout gen 999 cannot exist: the refusal proves the gate runs
+        // before the layout even loads (fail fast, nothing planned).
+        ImageSubsetLayout("fileboot"); // store + id.key only; gen 999 never loads
+        var target = Path.Combine(_dir, "fileboot.img");
+        File.WriteAllBytes(target, Filled(8 * Mib, 0xAA));
+        var log = new TestLogger();
+        using var store = new Store(_storeRoot, _dbPath, 1, 3, log);
+        var orch = new RestoreOrchestrator(store, log, path => new FileBlockTarget(path));
+
+        var rc = orch.RestoreDisk(new DiskRestoreOptions(
+            LayoutGen: 999, Target: target, StorePath: _storeRoot, IndexPath: _dbPath,
+            ConfirmToken: "whatever", RepairBoot: true));
+
+        Assert.Equal(1, rc);
+        Assert.Contains("needs a disk target", string.Join("\n", log.Messages));
+        Assert.Equal(0xAA, File.ReadAllBytes(target)[0]); // nothing written
     }
 
     // Shared event list pins the load-bearing order: diskpart clean
@@ -343,7 +471,7 @@ public sealed class BootRepairRecoveryTests : IDisposable
         private readonly List<string> _events;
         public OrderRunner(List<string> events) => _events = events;
         public void ApplyLayout(string diskpartScript) => _events.Add("apply");
-        public (string WindowsDir, string EspDir) LocateVolumes() => ("D:\\Windows", "S:");
+        public (string WindowsDir, string EspDir) LocateVolumes(DiskLayout layout, int targetDisk) => ("D:\\Windows", "S:");
         public void InstallBootloader(string windowsDir, string espDir) { }
         public string FirmwareType() => "UEFI";
         public void CheckBootFiles(string espDir) { }
@@ -391,10 +519,10 @@ public sealed class BootRepairRecoveryTests : IDisposable
         var events = new List<string>();
         using (var store = new Store(_storeRoot, _dbPath, 1, 3, log))
         {
-            var orch = new RestoreOrchestrator(store, log, path => new OrderTarget(path, events));
+            var orch = new RestoreOrchestrator(store, log, _ => new OrderTarget(target, events));
             using var t = new FileBlockTarget(target);
             var rc = orch.RestoreDisk(new DiskRestoreOptions(
-                LayoutGen: layout.Generation, Target: target, StorePath: _storeRoot, IndexPath: _dbPath,
+                LayoutGen: layout.Generation, Target: "2", StorePath: _storeRoot, IndexPath: _dbPath,
                 ConfirmToken: BootDiskGuard.TargetToken(t.DisplayName, t.Capacity),
                 AllowBootDisk: false, SkipVerify: true, DryRun: false, RepairBoot: true, BootRunner: new OrderRunner(events)));
             Assert.Equal(0, rc);
@@ -413,9 +541,46 @@ public sealed class BootRepairRecoveryTests : IDisposable
             return; // On-box run is a VM step, not CI.
         var runner = new WindowsBootRepairRunner(new TestLogger());
         Assert.Throws<PlatformNotSupportedException>(() => runner.ApplyLayout("select disk 0"));
-        Assert.Throws<PlatformNotSupportedException>(() => runner.LocateVolumes());
+        Assert.Throws<PlatformNotSupportedException>(() => runner.LocateVolumes(GoodLayout(), 0));
         Assert.Throws<PlatformNotSupportedException>(() => runner.InstallBootloader("D:\\Windows", "S:"));
         Assert.Throws<PlatformNotSupportedException>(() => runner.FirmwareType());
         Assert.Throws<PlatformNotSupportedException>(() => runner.CheckBootFiles("S:"));
+    }
+
+    [Fact]
+    public void FirmwareType_BindsEntryPoint()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        // Same guard as NativeDisk_GetLengthBytes_BindsEntryPoint: a wrong
+        // DllImport (e.g. ExactSpelling on an A/W export) throws
+        // EntryPointNotFoundException instead of answering. Burns the
+        // 2026-10-15 lesson: GetFirmwareEnvironmentVariable died on-box.
+        var type = new WindowsBootRepairRunner(new TestLogger()).FirmwareType();
+        Assert.True(type == "UEFI" || type == "Legacy", "firmware type: " + type);
+    }
+
+    [Fact]
+    public void FindFreeLetter_Empty_ReturnsZ() =>
+        Assert.Equal('Z', WindowsBootRepairRunner.FindFreeLetter(new HashSet<char>()));
+
+    [Fact]
+    public void FindFreeLetter_TopTaken_WalksDown() =>
+        Assert.Equal('Y', WindowsBootRepairRunner.FindFreeLetter(new HashSet<char> { 'Z' }));
+
+    [Fact]
+    public void FindFreeLetter_AllButC_ReturnsC()
+    {
+        var taken = new HashSet<char>();
+        for (var c = 'D'; c <= 'Z'; c++) taken.Add(c);
+        Assert.Equal('C', WindowsBootRepairRunner.FindFreeLetter(taken));
+    }
+
+    [Fact]
+    public void FindFreeLetter_Full_ReturnsNull()
+    {
+        // Full C..Z also proves A/B are never offered (loop never dips).
+        var taken = new HashSet<char>();
+        for (var c = 'C'; c <= 'Z'; c++) taken.Add(c);
+        Assert.Null(WindowsBootRepairRunner.FindFreeLetter(taken));
     }
 }

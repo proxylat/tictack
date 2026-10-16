@@ -44,6 +44,7 @@
     <Compile Include="../recovery/DriveRotation.cs" Link="corpus/recovery/DriveRotation.cs" />
     <Compile Include="../recovery/OffsetTarget.cs" Link="corpus/recovery/OffsetTarget.cs" />
     <Compile Include="../recovery/DiskpartScript.cs" Link="corpus/recovery/DiskpartScript.cs" />
+    <Compile Include="../recovery/VolumeLock.cs" Link="corpus/recovery/VolumeLock.cs" />
     <Compile Include="../PackWriter.cs" Link="corpus/PackWriter.cs" />
     <Compile Include="../PackHook.cs" Link="corpus/PackHook.cs" />
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />

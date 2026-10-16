@@ -628,6 +628,75 @@ public sealed class DiskLayoutTests : IDisposable
     }
 
     [Fact]
+    public void RestoreDisk_SparseHole_PrefillSurvives_WarnsAndPasses()
+    {
+        // Free space is don't-care: holes seek (never written — thin
+        // targets stay thin), and stale gap bytes on a reused target warn
+        // instead of failing. Data chunks stay byte-strict.
+        var vol = Path.Combine(_dir, "sparse-vol.img");
+        WriteFile(vol, RandomChunk(42), RandomChunk(43), RandomChunk(44), RandomChunk(45), RandomChunk(46));
+        DiskLayout layout;
+        using (var store = NewStore())
+        using (var sparse = new FakeSparseSource(vol, new (long Start, long Count)[] { (256, 256), (768, 512) }))
+        {
+            layout = store.ImageDisk(0, "disk0", new DiskImageOptions(), new DiskCapturePlan("disk-guid-sparse", 8L * Mib, 512,
+                new List<PartitionImageInput> { Part(1, NewGuid(), vol, "ntfs", sparse, null) }));
+        }
+        var part = layout.Partitions[0];
+        var target = Path.Combine(_dir, "sparse-disk.img");
+        PreFill(target, 8L * Mib);
+        var log = new TestLogger();
+        using (var store = NewStore(log))
+        {
+            Assert.Equal(0, RunDiskRestore(store, log, new DiskRestoreOptions(
+                LayoutGen: layout.Generation, Target: target, StorePath: _storeRoot, IndexPath: _dbPath,
+                ConfirmToken: DiskTokenFor(target), AllowBootDisk: false, SkipVerify: false, DryRun: false)));
+        }
+        var got = File.ReadAllBytes(target);
+        var want = File.ReadAllBytes(vol);
+        // Runs cover chunks 1,3,4 — chunks 0+2 are holes: prefill survives.
+        AssertRangeFill(got, part.OffsetBytes + 0L * Mib, part.OffsetBytes + 1L * Mib, 0xAA);
+        AssertRangeFill(got, part.OffsetBytes + 2L * Mib, part.OffsetBytes + 3L * Mib, 0xAA);
+        Assert.Equal(want.AsSpan(Mib, Mib).ToArray(), got.AsSpan((int)part.OffsetBytes + Mib, Mib).ToArray());
+        Assert.Contains("stale bytes", string.Join("\n", log.Messages));
+    }
+
+    [Fact]
+    public void RestoreDisk_ZeroChunk_PrefillSurvives_FailsStrict()
+    {
+        // Contrast: zero chunks are DATA (hash-verified), not holes. Seeked
+        // like holes on write, but a dirty target fails strict — the
+        // don't-care rule covers free space only, never stored bytes.
+        var vol = Path.Combine(_dir, "zero-vol.img");
+        WriteFile(vol, new byte[Mib], new byte[Mib]);
+        DiskLayout layout;
+        using (var store = NewStore())
+        using (var source = new FileBlockSource(vol))
+        {
+            layout = store.ImageDisk(0, "disk0", new DiskImageOptions(), new DiskCapturePlan("disk-guid-zero", 8L * Mib, 512,
+                new List<PartitionImageInput> { Part(1, NewGuid(), vol, "ntfs", source, null) }));
+        }
+        // Premise pin: dense zeros are DATA, not holes.
+        var m = LoadGen(layout.Partitions[0].SnapshotGeneration);
+        Assert.Equal(2, m.Chunks.Count);
+        Assert.All(m.Chunks, c => Assert.False(c.IsHole));
+        var part = layout.Partitions[0];
+        var target = Path.Combine(_dir, "zero-disk.img");
+        PreFill(target, 8L * Mib);
+        var log = new TestLogger();
+        using (var store = NewStore(log))
+        {
+            Assert.Equal(1, RunDiskRestore(store, log, new DiskRestoreOptions(
+                LayoutGen: layout.Generation, Target: target, StorePath: _storeRoot, IndexPath: _dbPath,
+                ConfirmToken: DiskTokenFor(target), AllowBootDisk: false, SkipVerify: false, DryRun: false)));
+        }
+        var output = string.Join("\n", log.Messages);
+        Assert.Contains("corrupt ranges", output);
+        Assert.Contains("do not boot", output);
+        AssertRangeFill(File.ReadAllBytes(target), part.OffsetBytes, part.OffsetBytes + part.LengthBytes, 0xAA);
+    }
+
+    [Fact]
     public void RestoreDisk_ShortTarget_RefusesBeforeWrite()
     {
         var aPath = Path.Combine(_dir, "sa.img");

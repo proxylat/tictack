@@ -1,19 +1,20 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using TicTack;
 
 namespace Corpus
 {
     // Item 5: bare-metal tail — orchestrated layout recreate + bootloader
     // reinstall with checks (the manual bcdboot printout stays only as the
-    // default dry-run/review path). Windows-only syscalls (diskpart, bcdboot,
-    // mountvol, firmware query) sit behind IBootRepairRunner; Linux tests run
+    // default dry-run/review path). Windows-only syscalls (diskpart, mountvol,
+    // bcdboot, firmware query) sit behind IBootRepairRunner; Linux tests run
     // the fake, the real runner fails loud off Windows.
     public interface IBootRepairRunner
     {
         void ApplyLayout(string diskpartScript);
-        (string WindowsDir, string EspDir) LocateVolumes();
+        (string WindowsDir, string EspDir) LocateVolumes(DiskLayout layout, int targetDisk);
         void InstallBootloader(string windowsDir, string espDir);
         string FirmwareType();
         void CheckBootFiles(string espDir);
@@ -40,11 +41,16 @@ namespace Corpus
         {
             RequireWindows();
             ArgumentNullException.ThrowIfNull(diskpartScript);
+            _log.Info("applying partition layout via diskpart");
+            RunDiskpartScript(diskpartScript);
+        }
+
+        private static void RunDiskpartScript(string diskpartScript)
+        {
             var script = Path.GetTempFileName();
             try
             {
                 File.WriteAllText(script, diskpartScript);
-                _log.Info("applying partition layout via diskpart");
                 var r = ProcessRunner.RunAsync($"diskpart /s \"{script}\"", Path.GetTempPath(), redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
                 if (r.TimedOut || r.ExitCode != 0)
                     throw new InvalidDataException($"diskpart failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
@@ -55,28 +61,97 @@ namespace Corpus
             }
         }
 
-        public (string WindowsDir, string EspDir) LocateVolumes()
+        // Target-scoped volume location: the ESP and Windows come from the
+        // TARGET disk (extent match), never the running system. mountvol /S
+        // and the C..Z scan would find the live OS — wrong whenever target
+        // != boot disk (VHDX restores, PE with the OS disk present).
+        public (string WindowsDir, string EspDir) LocateVolumes(DiskLayout layout, int targetDisk)
         {
             RequireWindows();
-            // The supported ESP mount (no manual letter assignment): mountvol
-            // /S mounts the system partition; the OS volume is found by scan.
-            var m = ProcessRunner.RunAsync("mountvol S: /S", Path.GetTempPath(), redirect: true, timeoutMs: 60000).GetAwaiter().GetResult();
-            if (m.TimedOut || m.ExitCode != 0)
-                throw new InvalidDataException($"mountvol S: /S failed (exit {m.ExitCode}{(m.TimedOut ? ", timed out" : "")}): {Tail(m.Stderr + m.Stdout)}");
-            string? win = null;
-            for (var d = 'C'; d <= 'Z'; d++)
+            ArgumentNullException.ThrowIfNull(layout);
+            if (targetDisk < 0)
+                throw new ArgumentOutOfRangeException(nameof(targetDisk), "target disk must be non-negative (got: " + targetDisk + ")");
+            PartitionRecord? esp = null;
+            var osCandidates = new List<PartitionRecord>();
+            foreach (var p in layout.Partitions)
             {
-                if (Directory.Exists(d + ":\\Windows\\System32"))
-                {
-                    win = d + ":\\Windows";
-                    break;
-                }
+                if (p.Skipped)
+                    continue;
+                if (esp == null && string.Equals(p.Filesystem, "fat32", StringComparison.OrdinalIgnoreCase))
+                    esp = p;
+                if (string.Equals(p.Filesystem, "ntfs", StringComparison.OrdinalIgnoreCase))
+                    osCandidates.Add(p);
             }
-            if (win == null)
-                throw new InvalidDataException("no Windows install found (scanned C..Z for \\Windows\\System32)");
-            if (!Directory.Exists("S:\\EFI"))
-                throw new InvalidDataException("ESP mounted at S: but has no \\EFI (wrong partition or empty ESP)");
-            return (win, "S:");
+            if (esp == null)
+                throw new InvalidDataException($"no FAT32 ESP in the layout for target disk {targetDisk}");
+            var espLetter = ResolveLetter(targetDisk, esp, assign: true);
+            if (espLetter == null)
+                throw new InvalidDataException($"target disk {targetDisk} partition {esp.PartitionNumber} (ESP) has no drive letter and auto-assign failed");
+            if (!Directory.Exists(espLetter + "\\EFI"))
+                throw new InvalidDataException($"target ESP at {espLetter} has no \\EFI (restore did not stream it?)");
+            // Two passes: resolve-only first (no side effects when the OS
+            // already has a letter), assign-and-retry only for the still
+            // letterless. Windows dir verified per candidate — the first
+            // NTFS partition is the OS on Windows layouts, Recovery follows.
+            foreach (var os in osCandidates)
+            {
+                var letter = ResolveLetter(targetDisk, os, assign: false);
+                if (letter != null && Directory.Exists(letter + "\\Windows\\System32"))
+                    return (letter + "\\Windows", espLetter);
+            }
+            foreach (var os in osCandidates)
+            {
+                var letter = ResolveLetter(targetDisk, os, assign: true);
+                if (letter != null && Directory.Exists(letter + "\\Windows\\System32"))
+                    return (letter + "\\Windows", espLetter);
+            }
+            throw new InvalidDataException($"no Windows install on target disk {targetDisk} (checked {osCandidates.Count} NTFS partition(s))");
+        }
+
+        private string? ResolveLetter(int targetDisk, PartitionRecord rec, bool assign)
+        {
+            var found = DiskCapture.TryFindVolume(targetDisk, rec.OffsetBytes, rec.LengthBytes);
+            // bcdboot wants letters: GUID paths and mount points don't do.
+            if (found != null && found.Length == 2 && found[1] == ':' && char.IsAsciiLetter(found[0]))
+                return found;
+            if (!assign)
+                return null;
+            // diskpart `assign` lies to ESPs: it reports success but no
+            // letter appears (proven live 2026-10-15 — the no-default-letter
+            // attribute eats it). mountvol on the volume GUID sticks for
+            // every type, so all letters go through this one path.
+            if (found == null)
+                throw new InvalidDataException($"target disk {targetDisk} partition {rec.PartitionNumber} has no volume to mount (extent {rec.OffsetBytes}+{rec.LengthBytes} unresolved)");
+            if (!found.StartsWith(@"\\?\", StringComparison.Ordinal))
+                throw new InvalidDataException($"target disk {targetDisk} partition {rec.PartitionNumber} is mounted at {found} with no GUID path (give the volume a letter first)");
+            var taken = new HashSet<char>();
+            foreach (var d in DriveInfo.GetDrives())
+                if (d.Name.Length > 0)
+                    taken.Add(char.ToUpperInvariant(d.Name[0]));
+            var letter = FindFreeLetter(taken);
+            if (letter == null)
+                throw new InvalidDataException($"no free drive letter for target disk {targetDisk} partition {rec.PartitionNumber}");
+            _log.Info($"assigning {letter}: to target disk {targetDisk} partition {rec.PartitionNumber} via mountvol");
+            // mountvol wants the trailing backslash TryFindVolume trims.
+            var r = ProcessRunner.RunAsync($"mountvol {letter}: {found}\\", Path.GetTempPath(), redirect: true, timeoutMs: 60000).GetAwaiter().GetResult();
+            if (r.TimedOut || r.ExitCode != 0)
+                throw new InvalidDataException($"mountvol {letter}: failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
+            found = DiskCapture.TryFindVolume(targetDisk, rec.OffsetBytes, rec.LengthBytes);
+            if (found != null && found.Length == 2 && found[1] == ':' && char.IsAsciiLetter(found[0]))
+                return found;
+            throw new InvalidDataException($"mountvol {letter}: reported success but target disk {targetDisk} partition {rec.PartitionNumber} still has no letter");
+        }
+
+        // Free-letter scan, Z down to C (A/B are floppy legacy): descending
+        // so operator-attached sticks (lowest-free-first) rarely collide.
+        // Pure for tests; the caller feeds uppercase GetDrives initials.
+        internal static char? FindFreeLetter(ISet<char> taken)
+        {
+            ArgumentNullException.ThrowIfNull(taken);
+            for (var c = 'Z'; c >= 'C'; c--)
+                if (!taken.Contains(c))
+                    return c;
+            return null;
         }
 
         public void InstallBootloader(string windowsDir, string espDir)
@@ -93,12 +168,18 @@ namespace Corpus
         public string FirmwareType()
         {
             RequireWindows();
-            var r = ProcessRunner.RunAsync("powershell -NoProfile -Command \"(Get-ComputerInfo -Property BiosFirmwareType).BiosFirmwareType\"",
-                Path.GetTempPath(), redirect: true, timeoutMs: 60000).GetAwaiter().GetResult();
-            if (r.TimedOut || r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.Stdout))
-                throw new InvalidDataException($"firmware-type query failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
-            return r.Stdout.Trim();
+            // No PowerShell/WMI (both absent in installer-PE): probe a bogus
+            // UEFI variable. UEFI answers "no such variable" (203); Legacy
+            // BIOS answers "invalid function" (1) — the API doesn't exist
+            // there. Any other failure (access denied without the privilege,
+            // real variable collision) still lands on the UEFI branch, which
+            // is the only side that can reach this call at all.
+            _ = GetFirmwareEnvironmentVariable("", "{00000000-0000-0000-0000-000000000000}", new byte[1], 1);
+            return Marshal.GetLastWin32Error() == 1 ? "Legacy" : "UEFI";
         }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetFirmwareEnvironmentVariable(string lpName, string lpGuid, byte[] pBuffer, uint nSize);
 
         public void CheckBootFiles(string espDir)
         {
@@ -125,13 +206,18 @@ namespace Corpus
         public void ApplyLayout(string diskpartScript)
         {
             Calls.Add("ApplyLayout:" + diskpartScript.Length);
+            LastScript = diskpartScript;
             if (ThrowOnApply)
                 throw new InvalidDataException("fake diskpart failure");
         }
 
-        public (string WindowsDir, string EspDir) LocateVolumes()
+        public string LastScript { get; private set; } = "";
+        public int LastLocateDisk { get; private set; } = -1;
+
+        public (string WindowsDir, string EspDir) LocateVolumes(DiskLayout layout, int targetDisk)
         {
             Calls.Add("LocateVolumes");
+            LastLocateDisk = targetDisk;
             return (WindowsDir, EspDir);
         }
 
@@ -160,19 +246,26 @@ namespace Corpus
             // after. RestoreDisk calls the phases separately so bytes
             // stream between them — the table MUST be recreated before
             // streaming (diskpart clean wipes the old table; streaming
-            // first would be destroyed).
-            var rc = ApplyPhase(layout, runner, log);
-            return rc != 0 ? rc : BootloaderPhase(layout, runner, log);
+            // first would be destroyed). Same-disk contract: Repair
+            // targets the disk the layout came from (bare-metal
+            // same-slot replacement); cross-disk restores go through
+            // RestoreDisk, which passes the real target.
+            var rc = ApplyPhase(layout, runner, log, layout.DiskNumber);
+            return rc != 0 ? rc : BootloaderPhase(layout, runner, log, layout.DiskNumber);
         }
 
         // Pre-stream: checks + firmware gate + partition-table recreate.
         // The script is the no-format variant (payload ranges stream next;
         // formatting here would wipe what restore is about to write).
-        public static int ApplyPhase(DiskLayout layout, IBootRepairRunner runner, ILogger log)
+        // targetDisk is explicit: the script's `select disk` MUST name the
+        // restore target, never the layout's source disk.
+        public static int ApplyPhase(DiskLayout layout, IBootRepairRunner runner, ILogger log, int targetDisk)
         {
             ArgumentNullException.ThrowIfNull(layout);
             ArgumentNullException.ThrowIfNull(runner);
             ArgumentNullException.ThrowIfNull(log);
+            if (targetDisk < 0)
+                throw new ArgumentOutOfRangeException(nameof(targetDisk), "target disk must be non-negative (got: " + targetDisk + ")");
             var blocked = CheckLayout(layout);
             if (blocked != null)
             {
@@ -187,8 +280,8 @@ namespace Corpus
                     log.Error($"refusing boot repair: firmware is {firmware}, layout is GPT (Legacy+GPT is unbootable; the MBR2GPT path is a staged follow-up)");
                     return 1;
                 }
-                runner.ApplyLayout(DiskpartScript.Generate(layout, formatPartitions: false));
-                log.Info("boot repair: partition layout recreated");
+                runner.ApplyLayout(DiskpartScript.Generate(layout, targetDisk, formatPartitions: false));
+                log.Info($"boot repair: partition layout recreated on disk {targetDisk}");
                 return 0;
             }
             catch (Exception ex)
@@ -200,15 +293,19 @@ namespace Corpus
 
         // Post-verify: bootloader reinstall + boot-file check. Runs only
         // after the restored bytes verified (never boot a corrupt target).
-        public static int BootloaderPhase(DiskLayout layout, IBootRepairRunner runner, ILogger log)
+        // Volumes resolve from the TARGET disk (extent match), never the
+        // running system.
+        public static int BootloaderPhase(DiskLayout layout, IBootRepairRunner runner, ILogger log, int targetDisk)
         {
             ArgumentNullException.ThrowIfNull(layout);
             ArgumentNullException.ThrowIfNull(runner);
             ArgumentNullException.ThrowIfNull(log);
+            if (targetDisk < 0)
+                throw new ArgumentOutOfRangeException(nameof(targetDisk), "target disk must be non-negative (got: " + targetDisk + ")");
             try
             {
-                var (win, esp) = runner.LocateVolumes();
-                log.Info($"boot repair: OS at {win}, ESP at {esp}");
+                var (win, esp) = runner.LocateVolumes(layout, targetDisk);
+                log.Info($"boot repair: OS at {win}, ESP at {esp} (target disk {targetDisk})");
                 runner.InstallBootloader(win, esp);
                 log.Info("boot repair: bootloader reinstalled");
                 runner.CheckBootFiles(esp);
@@ -224,11 +321,11 @@ namespace Corpus
 
         // Dry-run plan: the same script restore-disk writes, plus the bcdboot
         // line with letters resolved at repair time (never by hand).
-        public static string Plan(DiskLayout layout)
+        public static string Plan(DiskLayout layout, int targetDisk)
         {
             ArgumentNullException.ThrowIfNull(layout);
-            return DiskpartScript.Generate(layout)
-                + "rem boot repair plan: mountvol S: /S, then bcdboot <OS>\\Windows /s S: /f UEFI (letters auto-resolved)\n";
+            return DiskpartScript.Generate(layout, targetDisk)
+                + "rem boot repair plan: resolve the target ESP + OS letters by extent match, then bcdboot <OS>\\Windows /s <ESP> /f UEFI (letters auto-resolved)\n";
         }
 
         // Pure layout gate, shared by Repair and the dry-run path.
