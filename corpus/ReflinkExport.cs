@@ -120,7 +120,7 @@ namespace Corpus
                     };
                     if (!DeviceIoControl(dst.SafeFileHandle, FsctlDuplicateExtentsToFile, ref data, Marshal.SizeOf<DuplicateExtentsData>(), IntPtr.Zero, 0, out _, IntPtr.Zero))
                     {
-                        reason = $"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed at offset {off} (win32 {Marshal.GetLastWin32Error()})";
+                        reason = $"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed at offset {off} (win32 {Marshal.GetLastWin32Error()}, vol {srcVol} fs {fs} cluster {cluster} len {length} struct {Marshal.SizeOf<DuplicateExtentsData>()})";
                         return false;
                     }
                     off += piece;
@@ -230,36 +230,45 @@ namespace Corpus
                 log.Warn($"block clone unavailable ({cloneReason}); plain copy fallback for '{cloneFromPath}'");
                 File.Copy(cloneFromPath, outPath, true);
             }
-            var dirty = DiffDirtyChunks(baseManifest, target);
-            string? verifyError;
-            using (var disk = new Disk(outPath, FileAccess.ReadWrite))
+            try
             {
-                using (var filter = new DirtyRangeWriteFilter(disk.Content, target, dirty))
+                var dirty = DiffDirtyChunks(baseManifest, target);
+                string? verifyError;
+                using (var disk = new Disk(outPath, FileAccess.ReadWrite))
                 {
-                    store.ExportToStream(generation, filter);
-                    log.Info($"reflink export: {filter.WrittenBytes} dirty bytes written, {filter.SkippedBytes} clean bytes left COW-shared ({dirty.Count} dirty chunks)");
+                    using (var filter = new DirtyRangeWriteFilter(disk.Content, target, dirty))
+                    {
+                        store.ExportToStream(generation, filter);
+                        log.Info($"reflink export: {filter.WrittenBytes} dirty bytes written, {filter.SkippedBytes} clean bytes left COW-shared ({dirty.Count} dirty chunks)");
+                    }
+                    using (var verifier = new ContentVerifyStream(disk.Content))
+                    {
+                        store.ExportToStream(generation, verifier);
+                        if (verifier.GapBytes > 0)
+                            log.Info($"{verifier.GapBytes} gap bytes left as cloned (don't-care free space)");
+                        verifyError = verifier.FailureMessage(outPath, generation);
+                    }
                 }
-                using (var verifier = new ContentVerifyStream(disk.Content))
-                {
-                    store.ExportToStream(generation, verifier);
-                    if (verifier.GapBytes > 0)
-                        log.Info($"{verifier.GapBytes} gap bytes left as cloned (don't-care free space)");
-                    verifyError = verifier.FailureMessage(outPath, generation);
-                }
+                if (verifyError != null)
+                    throw new InvalidDataException(verifyError);
             }
-            if (verifyError != null)
+            catch (Exception ex)
             {
-                // Never leave a corrupt VHDX masquerading as gen N (dest is
-                // ours — ExportVhdx overwrites it too).
+                // Never leave a corrupt/partial VHDX masquerading as gen N
+                // (dest is ours — plain ExportVhdx overwrites it too).
                 try
                 {
-                    File.Delete(outPath);
+                    if (File.Exists(outPath))
+                    {
+                        File.Delete(outPath);
+                        log.Warn($"deleted partial reflink export '{outPath}' after failure: {ex.Message}");
+                    }
                 }
-                catch (Exception ex)
+                catch (Exception cleanEx)
                 {
-                    log.Warn($"could not delete failed reflink export '{outPath}': {ex.Message}");
+                    log.Warn($"could not delete failed reflink export '{outPath}': {cleanEx.Message}");
                 }
-                throw new InvalidDataException(verifyError);
+                throw;
             }
             log.Info($"exported snapshot {generation} ({target.Chunks.Count} chunks) to VHDX {outPath} via clone-from gen {baseManifest.Generation}");
         }

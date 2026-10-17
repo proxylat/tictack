@@ -150,7 +150,7 @@ namespace Corpus
                     return c;
                 }
             }
-            log.Error($"winre.wim not found (probed {cands.Length} candidates: reagentc + known-path + partition-scan) — build with the ADK path or enable Windows RE (reagentc /enable)");
+            log.Error($"winre.wim not found (probed {cands.Length} candidates: reagentc + known-path + partition-scan) — build with the ADK path (ADK + WinPE add-on: https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install) or enable Windows RE (reagentc /enable)");
             return null;
         }
     }

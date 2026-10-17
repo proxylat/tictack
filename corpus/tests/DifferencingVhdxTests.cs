@@ -201,6 +201,158 @@ public sealed class DifferencingVhdxTests : IDisposable
         Assert.Contains("fixed", ex.Message);
     }
 
+    [Fact]
+    public void DirtyPlan_OnlyTrueDirty()
+    {
+        var volA = SeedVolume("a.img", seed: 7);
+        var parent = MakeParent(volA, "base.vhdx");
+        var volB = Path.Combine(_dir, "b.img");
+        File.Copy(volA, volB);
+        FlipChunk(volB, 1);
+        ZeroChunk(volB, 3);
+
+        using (var src = new FileBlockSource(volB))
+            Assert.Equal(new HashSet<long> { 1, 3 }, DifferencingVhdx.ComputeDirtyVsParent(src, parent, Mib, _log));
+        // Identical live: empty plan, not hundreds of false dirty.
+        using (var src = new FileBlockSource(volA))
+            Assert.Empty(DifferencingVhdx.ComputeDirtyVsParent(src, parent, Mib, _log));
+    }
+
+    [Fact]
+    public void DirtyPlan_MissingParent_Curated()
+    {
+        var missing = Path.Combine(_dir, "no-such-base.vhdx");
+        using var src = new FileBlockSource(SeedVolume("a.img", seed: 7));
+        // The dirty plan gates BEFORE opening: curated, never raw
+        // FileNotFoundException + DiscUtils stack (Wave-2 B5 §7(b)).
+        var ex = Assert.Throws<DifferencingParentMissingException>(() =>
+            DifferencingVhdx.ComputeDirtyVsParent(src, missing, Mib, _log));
+        Assert.Contains("no-such-base.vhdx", ex.Message);
+    }
+
+    [Fact]
+    public void DirtyPlan_ForeignFile_Loud()
+    {
+        var junk = Path.Combine(_dir, "junk.vhdx");
+        File.WriteAllText(junk, "not a vhdx");
+        using var src = new FileBlockSource(SeedVolume("a.img", seed: 7));
+        Assert.Throws<DifferencingVhdxException>(() =>
+            DifferencingVhdx.ComputeDirtyVsParent(src, junk, Mib, _log));
+    }
+
+    [Fact]
+    public void DirtyPlan_FirstPassGarbage_DroppedOnConfirm()
+    {
+        // 8 chunks: 0-1 data, 2-7 holes. Live truth adds data in hole 6
+        // (true dirty); the first pass additionally sees garbage in 3-5.
+        var truth = new byte[8 * Mib];
+        new Random(7).NextBytes(truth.AsSpan(0, 2 * Mib));
+        new Random(11).NextBytes(truth.AsSpan(6 * Mib, Mib));
+        var volA = Path.Combine(_dir, "a.img");
+        var baseBytes = new byte[8 * Mib];
+        Array.Copy(truth, 0, baseBytes, 0, 2 * Mib);
+        File.WriteAllBytes(volA, baseBytes);
+        var parent = MakeParent(volA, "base.vhdx");
+        var pass1 = (byte[])truth.Clone();
+        for (var c = 3; c <= 5; c++)
+            Array.Fill(pass1, (byte)0xAB, c * Mib, Mib);
+        using var src = new ScriptedSource(pass1, truth);
+        Assert.Equal(new HashSet<long> { 6 }, DifferencingVhdx.ComputeDirtyVsParent(src, parent, Mib, _log));
+    }
+
+    [Fact]
+    public void DirtyPlan_UnstableLive_Refuses()
+    {
+        // Same candidate, different bytes per open: truth unknown, so the
+        // plan refuses instead of risking a poisoned child.
+        var volA = SeedVolume("a.img", seed: 7);
+        var parent = MakeParent(volA, "base.vhdx");
+        var a = File.ReadAllBytes(volA);
+        var b = (byte[])a.Clone();
+        Array.Fill(b, (byte)0x11, Mib, Mib);
+        var c = (byte[])a.Clone();
+        Array.Fill(c, (byte)0x22, Mib, Mib);
+        using var src = new ScriptedSource(b, c);
+        var ex = Assert.Throws<DifferencingVhdxException>(() =>
+            DifferencingVhdx.ComputeDirtyVsParent(src, parent, Mib, _log));
+        Assert.Contains("unstable", ex.Message);
+    }
+
+    [Fact]
+    public void Verify_Mismatch_NamesParentByte()
+    {
+        var volA = SeedVolume("a.img", seed: 7);
+        var parent = MakeParent(volA, "base.vhdx");
+        var volB = Path.Combine(_dir, "b.img");
+        File.Copy(volA, volB);
+        FillChunk(volB, 1, 0x11);
+        var child = Path.Combine(_dir, "c.vhdx");
+        using (var src = new FileBlockSource(volB))
+            DifferencingVhdx.CreateDiff(src, "T:", child, parent, new HashSet<long> { 1 }, Mib, _log);
+        // Live moved on: the pair still holds 0x11, the source now 0x22.
+        FillChunk(volB, 1, 0x22);
+        using (var src = new FileBlockSource(volB))
+        {
+            var ex = Assert.Throws<DifferencingVhdxException>(() =>
+                DifferencingVhdx.VerifyDiff(child, src, _log));
+            Assert.Contains("parent 0x", ex.Message);
+            Assert.Contains("IS present", ex.Message);
+        }
+    }
+
+    [Fact]
+    public void Create_Failure_RemovesPartialChild()
+    {
+        var volA = SeedVolume("a.img", seed: 7);
+        var parent = MakeParent(volA, "base.vhdx");
+        var b1 = File.ReadAllBytes(volA);
+        var b2 = (byte[])b1.Clone();
+        Array.Fill(b1, (byte)0x11, Mib, Mib);
+        Array.Fill(b2, (byte)0x22, Mib, Mib);
+        // Write pass stores 0x11, verify re-reads 0x22: refusal, and no
+        // half-written child (or sidecar) may linger — it still mounts.
+        var child = Path.Combine(_dir, "c.vhdx");
+        using var src = new ScriptedSource(b1, b2);
+        Assert.Throws<DifferencingVhdxException>(() =>
+            DifferencingVhdx.CreateDiff(src, "T:", child, parent, new HashSet<long> { 1 }, Mib, _log));
+        Assert.False(File.Exists(child));
+        Assert.False(File.Exists(DifferencingVhdx.SidecarPath(child)));
+    }
+
+    // IBlockSource with scripted bytes per open (first open = pass 1,
+    // later opens = confirm/write/verify passes).
+    private sealed class ScriptedSource : IBlockSource
+    {
+        private readonly byte[][] _opens;
+        private int _n;
+
+        public ScriptedSource(params byte[][] opens)
+        {
+            _opens = opens;
+        }
+
+        public long Length => _opens[0].Length;
+
+        public Stream OpenRead()
+        {
+            var i = Math.Min(_n++, _opens.Length - 1);
+            return new MemoryStream(_opens[i], writable: false);
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private static void FillChunk(string volPath, int chunk, byte fill)
+    {
+        using var f = new FileStream(volPath, FileMode.Open, FileAccess.Write, FileShare.Read);
+        f.Seek(chunk * Mib, SeekOrigin.Begin);
+        var buf = new byte[Mib];
+        Array.Fill(buf, fill);
+        f.Write(buf, 0, buf.Length);
+    }
+
     private string SeedVolume(string name, int seed)
     {
         var path = Path.Combine(_dir, name);

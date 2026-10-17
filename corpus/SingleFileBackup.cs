@@ -117,9 +117,8 @@ namespace Corpus
     }
 
     // §12.11 ESD/solid lock: refuse-to-append is the locked default. The
-    // on-box DISM probe of what append-to-solid actually does is OWED
-    // (needs Windows + real DISM; cannot run on Linux) — until that probe
-    // lands, refuse stays; never assume rebuild-or-fail behavior as fact.
+    // on-box DISM probe LANDED 2026-10-17 (DISM appends/splits ESD fine) —
+    // the refusal stays as Corpus policy, not a DISM limit.
     public sealed class SingleFileAppendRefusedException : SingleFileBackupException
     {
         public string ImagePath { get; }
@@ -636,14 +635,18 @@ namespace Corpus
             }
             if (resolver != null && resolver.ExclusionNames.Count > 0)
                 log.Warn($"excluded extents restored as zeros: {string.Join(", ", resolver.ExclusionNames)}");
-            VerifyVhdx(target, source, written, skipped, log);
+            VerifyVhdx(target, source, written, skipped, log, exclRuns, exclBpc);
             log.Info($"backed up volume {volume} ({source.Length} bytes, {written.Count} extents, {skipped.Count} sparse) to {target}");
             return target;
         }
 
         // VHDX verify: re-read every written extent and compare to source;
         // skipped ranges must read back zero AND hold no allocation.
-        public static void VerifyVhdx(string vhdxPath, IBlockSource source, IReadOnlyList<(long Start, long Length)> written, IReadOnlyList<(long Start, long Length)> skipped, ILogger log)
+        // Excluded sub-ranges inside written extents (partial-chunk pagefile
+        // etc.) read back zero by design — asserted as zero, never compared
+        // to the live source (proven on-box 2026-10-17: comparing them
+        // false-fails against live pagefile bytes).
+        public static void VerifyVhdx(string vhdxPath, IBlockSource source, IReadOnlyList<(long Start, long Length)> written, IReadOnlyList<(long Start, long Length)> skipped, ILogger log, IReadOnlyList<(long StartLcn, long ClusterCount)>? exclRuns = null, long exclBpc = 0)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(vhdxPath);
             ArgumentNullException.ThrowIfNull(source);
@@ -657,10 +660,11 @@ namespace Corpus
             using var src = source.OpenRead();
             var bufA = new byte[VerifyBufferBytes];
             var bufB = new byte[VerifyBufferBytes];
+            var excl = ExcludedByteRanges(exclRuns, exclBpc);
             var compared = 0L;
             foreach (var (start, length) in written)
             {
-                CompareRange(src, content, start, length, bufA, bufB, vhdxPath);
+                CompareRange(src, content, start, length, bufA, bufB, vhdxPath, excl);
                 compared += length;
             }
             foreach (var (start, length) in skipped)
@@ -670,6 +674,39 @@ namespace Corpus
                     throw new SingleFileVerifyException(vhdxPath, $"skipped range [{start},{start + length}) is allocated on disk (not sparse)");
             }
             log.Info($"verified {vhdxPath}: {compared} bytes re-read OK, {skipped.Count} skipped ranges sparse");
+        }
+
+        // Snapshot-dir liveness: VSS shadow device paths
+        // (\\?\GLOBALROOT\...) are not Win32-visible, so
+        // Directory.Exists is always false on them even while the
+        // snapshot we hold is live (proven on-box 2026-10-17). A
+        // GLOBALROOT path that fails to open as a file is still a live
+        // device object — DISM does the real work; anything else keeps
+        // the old loud refusal. A dead snapshot surfaces as
+        // File/DirectoryNotFound (device object gone).
+        private static bool SnapshotDirLive(string path)
+        {
+            if (Directory.Exists(path))
+                return true;
+            if (!path.StartsWith(@"\\?\GLOBALROOT", StringComparison.OrdinalIgnoreCase))
+                return false;
+            try
+            {
+                using var probe = new FileStream(path.TrimEnd('\\'), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                return true;
+            }
+            catch (FileNotFoundException)
+            {
+                return false;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return false;
+            }
+            catch
+            {
+                return true;
+            }
         }
 
         // WIM single-file backup: capture from our VSS snapshot path via
@@ -682,7 +719,7 @@ namespace Corpus
             ArgumentException.ThrowIfNullOrWhiteSpace(volume);
             ArgumentNullException.ThrowIfNull(dism);
             ArgumentNullException.ThrowIfNull(log);
-            if (!Directory.Exists(snapshotPath))
+            if (!SnapshotDirLive(snapshotPath))
                 throw new SingleFileSourceNotFoundException(snapshotPath);
             var target = SingleFileTarget.Resolve(targetArg, "--to-wim", volume, "wim", now);
             var ini = WriteTempIni(CapturePolicy.EffectiveSkip(exclusions));
@@ -710,7 +747,7 @@ namespace Corpus
             ArgumentException.ThrowIfNullOrWhiteSpace(volume);
             ArgumentNullException.ThrowIfNull(dism);
             ArgumentNullException.ThrowIfNull(log);
-            if (!Directory.Exists(snapshotPath))
+            if (!SnapshotDirLive(snapshotPath))
                 throw new SingleFileSourceNotFoundException(snapshotPath);
             var target = SingleFileTarget.Resolve(targetArg, "--to-esd", volume, "esd", now);
             var tempWim = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "corpus-" + Guid.NewGuid().ToString("N") + ".wim");
@@ -806,8 +843,8 @@ namespace Corpus
         }
 
         // Solid heuristic on /Get-WimInfo stdout ("solid" anywhere,
-        // case-insensitive). Locked default, not a probed fact: the on-box
-        // DISM append-to-solid probe is OWED (needs Windows + real DISM).
+        // case-insensitive). Corpus policy (§12.11): the on-box probe
+        // LANDED 2026-10-17 (DISM handles solid images itself).
         public static bool IsSolidImageInfo(string getWimInfoStdout)
         {
             ArgumentNullException.ThrowIfNull(getWimInfoStdout);
@@ -821,7 +858,7 @@ namespace Corpus
         // compression, /Compress is capture-only) and 12.11 index naming.
         // Returns the base path (now holding one more index). Verify is
         // count+1 then apply + SHA-sample of the new index. Base must exist;
-        // ESD/solid refuses loud (locked default, probe owed — see
+        // ESD/solid refuses loud (Corpus policy, locked §12.11 — see
         // SingleFileAppendRefusedException).
         public static string AppendWim(string snapshotPath, string baseWim, int gen, IReadOnlyList<string>? exclusions, IDismRunner dism, ILogger log, DateTime? now = null)
         {
@@ -830,12 +867,12 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(dism);
             ArgumentNullException.ThrowIfNull(log);
             if (gen < 0) throw new ArgumentOutOfRangeException(nameof(gen));
-            if (!Directory.Exists(snapshotPath))
+            if (!SnapshotDirLive(snapshotPath))
                 throw new SingleFileSourceNotFoundException(snapshotPath);
             if (!File.Exists(baseWim))
                 throw new SingleFileBaseNotFoundException(baseWim);
             if (baseWim.EndsWith(".esd", StringComparison.OrdinalIgnoreCase))
-                throw new SingleFileAppendRefusedException(baseWim, "ESD is solid-compressed; --append is plain-WIM only (on-box DISM append-to-solid probe still owed — refuse stays until it lands)");
+                throw new SingleFileAppendRefusedException(baseWim, "ESD is solid-compressed; --append is plain-WIM only by Corpus policy (on-box probe 2026-10-17: DISM itself appends and splits ESD fine — the refusal is our locked §12.11 default, not a DISM limit)");
             var before = RunGetIndexCount(dism, baseWim);
             var name = BuildAppendImageName(gen, now ?? DateTime.Now);
             var ini = WriteTempIni(CapturePolicy.EffectiveSkip(exclusions));
@@ -913,7 +950,7 @@ namespace Corpus
             if (r.ExitCode != 0)
                 throw new SingleFileDismException(imagePath, $"/Get-WimInfo /WimFile:{ProcessRunner.QuoteArg(imagePath)}", r);
             if (IsSolidImageInfo(r.Stdout))
-                throw new SingleFileAppendRefusedException(imagePath, "solid-compressed image; --append is plain-WIM only (on-box DISM append-to-solid probe still owed — refuse stays until it lands)");
+                throw new SingleFileAppendRefusedException(imagePath, "solid-compressed image; --append is plain-WIM only by Corpus policy (on-box probe 2026-10-17: DISM itself handles solid images — the refusal is our locked §12.11 default, not a DISM limit)");
             return CountImageIndexes(r.Stdout);
         }
 
@@ -1002,12 +1039,41 @@ namespace Corpus
                 throw new SingleFileVerifyException(partial, "sidecar decode hash mismatch — original kept");
         }
 
-        private static void CompareRange(Stream src, Stream content, long start, long length, byte[] bufA, byte[] bufB, string vhdxPath)
+        // LCN exclusion runs to sorted merged byte ranges (same skip
+        // semantics as CapturePolicy.ZeroExcludedRanges); null when empty.
+        private static List<(long Start, long Length)>? ExcludedByteRanges(IReadOnlyList<(long StartLcn, long ClusterCount)>? runs, long bytesPerCluster)
+        {
+            if (runs == null || runs.Count == 0 || bytesPerCluster <= 0)
+                return null;
+            var ranges = new List<(long Start, long Length)>();
+            foreach (var (lcn, count) in runs)
+            {
+                if (lcn < 0 || count <= 0)
+                    continue;
+                ranges.Add((lcn * bytesPerCluster, count * bytesPerCluster));
+            }
+            if (ranges.Count == 0)
+                return null;
+            ranges.Sort((a, b) => a.Start.CompareTo(b.Start));
+            var merged = new List<(long Start, long Length)> { ranges[0] };
+            foreach (var r in ranges.Skip(1))
+            {
+                var last = merged[^1];
+                if (r.Start <= last.Start + last.Length)
+                    merged[^1] = (last.Start, Math.Max(last.Length, r.Start + r.Length - last.Start));
+                else
+                    merged.Add(r);
+            }
+            return merged;
+        }
+
+        private static void CompareRange(Stream src, Stream content, long start, long length, byte[] bufA, byte[] bufB, string vhdxPath, IReadOnlyList<(long Start, long Length)>? excl = null)
         {
             src.Seek(start, SeekOrigin.Begin);
             content.Seek(start, SeekOrigin.Begin);
             var remaining = length;
             var pos = start;
+            var e = 0;
             while (remaining > 0)
             {
                 var want = (int)Math.Min(bufA.Length, remaining);
@@ -1015,13 +1081,19 @@ namespace Corpus
                 var nb = ReadExactly(content, bufB, want);
                 if (na != want || nb != want)
                     throw new SingleFileVerifyException(vhdxPath, $"short read at offset {pos} (source {na}, image {nb}, want {want})");
-                for (var i = 0; i < want; i++)
+                for (var i = 0; i < want; i++, pos++)
                 {
-                    if (bufA[i] != bufB[i])
-                        throw new SingleFileVerifyException(vhdxPath, $"byte mismatch at offset {pos + i} (source 0x{bufA[i]:X2}, image 0x{bufB[i]:X2})");
+                    while (e < (excl?.Count ?? 0) && pos >= excl![e].Start + excl[e].Length)
+                        e++;
+                    if (excl != null && e < excl.Count && pos >= excl[e].Start)
+                    {
+                        if (bufB[i] != 0)
+                            throw new SingleFileVerifyException(vhdxPath, $"excluded byte at offset {pos} reads 0x{bufB[i]:X2} (want 0x00)");
+                    }
+                    else if (bufA[i] != bufB[i])
+                        throw new SingleFileVerifyException(vhdxPath, $"byte mismatch at offset {pos} (source 0x{bufA[i]:X2}, image 0x{bufB[i]:X2})");
                 }
                 remaining -= want;
-                pos += want;
             }
         }
 

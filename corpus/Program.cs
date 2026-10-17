@@ -6,7 +6,6 @@ using System.Security.Cryptography;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
-using DiscUtils.Vhdx;
 using TicTack;
 
 namespace Corpus
@@ -1164,7 +1163,8 @@ namespace Corpus
                 return 1;
             }
             // §12.14 SWM split: chop a --to-wim into FAT32-sized parts.
-            // WIM-only (solid ESD can't split — same posture as --append).
+            // WIM-only by Corpus policy (DISM itself splits ESD fine,
+            // proven 2026-10-17 — same posture as --append).
             int splitMb = 0;
             if (splitSwm != null)
             {
@@ -1175,7 +1175,7 @@ namespace Corpus
                 }
                 if (toWim == null)
                 {
-                    log.Error("--split-swm needs --to-wim <base.wim> (solid ESD cannot split)");
+                    log.Error("--split-swm needs --to-wim <base.wim> (Corpus policy: no ESD split; DISM itself splits ESD fine)");
                     return 1;
                 }
                 if (!int.TryParse(splitSwm, out splitMb) || splitMb <= 0)
@@ -1256,7 +1256,7 @@ namespace Corpus
                             return 1;
                         }
                         var chunkBytes = cfg.ChunkMib * 1024 * 1024;
-                        var dirty = ComputeDirtyVsParent(source, parentArg, chunkBytes, log);
+                        var dirty = DifferencingVhdx.ComputeDirtyVsParent(source, parentArg, chunkBytes, log);
                         var child = DifferencingVhdx.CreateDiff(source, volume, toVhdx, parentArg, dirty, chunkBytes, log);
                         if (zstd)
                             SingleFileBackup.CompressSidecar(child, log, cfg.Compression.Level);
@@ -1313,46 +1313,6 @@ namespace Corpus
                 : new WimlibRunner();
             var swm = Path.ChangeExtension(wimPath, "swm");
             WimBackend.SplitSwm(wimPath, swm, sizeMb, runner, log);
-        }
-
-        // §12.6 dirty computation: chunk-wise compare of the live source
-        // against the full parent VHDX on the store chunk grid. Byte
-        // compare only — equality is all the child needs. Short parent
-        // reads (parent smaller than the source) count as dirty; a parent
-        // larger than the source is a size mismatch the create refuses.
-        private static HashSet<long> ComputeDirtyVsParent(IBlockSource source, string parentPath, int chunkBytes, ILogger log)
-        {
-            var dirty = new HashSet<long>();
-            using var disk = new Disk(parentPath, FileAccess.Read);
-            using var parent = disk.Content;
-            using var live = source.OpenRead();
-            var a = new byte[chunkBytes];
-            var b = new byte[chunkBytes];
-            var index = 0L;
-            for (long offset = 0; offset < source.Length; offset += chunkBytes, index++)
-            {
-                var length = (int)Math.Min(chunkBytes, source.Length - offset);
-                if (ReadExactly(live, a, length) != length)
-                    throw new DifferencingVhdxException($"short source read at chunk {index} (offset {offset}) — cannot diff {parentPath}");
-                parent.Seek(offset, SeekOrigin.Begin);
-                var got = ReadExactly(parent, b, length);
-                if (got != length || !a.AsSpan(0, length).SequenceEqual(b.AsSpan(0, length)))
-                    dirty.Add(index);
-            }
-            log.Info($"diff plan vs {parentPath}: {dirty.Count} dirty of {index} chunks");
-            return dirty;
-        }
-
-        private static int ReadExactly(Stream stream, byte[] buffer, int length)
-        {
-            var total = 0;
-            while (total < length)
-            {
-                var n = stream.Read(buffer, total, length - total);
-                if (n == 0) break;
-                total += n;
-            }
-            return total;
         }
 
         // --gc: manual only, never automatic. Bare prints the plan and
@@ -1965,7 +1925,7 @@ namespace Corpus
             Console.WriteLine("  --mount --wim <image> --index <N> --mount-dir <empty dir>  Read/write servicing mount (our marker; never over non-empty dir)");
             Console.WriteLine("  --unmount --mount-dir <dir> --commit | --discard  Commit or throw away servicing (exactly one; foreign mounts refused)");
             Console.WriteLine("  --apply --wim <image> [--index N] --target <D:>  Apply image to partition + bcdboot, no WinPE boot needed (refuses the live-OS volume; /CheckIntegrity covers the WIM, not the disk write)");
-            Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> --split-swm <sizeMb>  Split the WIM into FAT32-sized .swm parts (DISM on Windows, wimlib on Linux; ESD cannot split)");
+            Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> --split-swm <sizeMb>  Split the WIM into FAT32-sized .swm parts (DISM on Windows, wimlib on Linux; Corpus policy: no ESD split)");
             Console.WriteLine("  --optimize-wim --wim <file> [--recompress]  Dedupe (+ optional recompress) a WIM in place via wimlib optimize (no DISM equivalent; Windows refuses naming wimlib)");
             Console.WriteLine("  --image --volume <path|X:> --to-vhdx <file|dir> [--optimize-vhd]  Compact the VHDX post-verify via Optimize-VHD Mode Full (Windows Hyper-V module; refuses differencing children)");
             Console.WriteLine("  --record-compact --snapshot <gen> [--windows-dir <offline>]  Record Compact OS state beside the snapshot manifest (record-only; Windows queries live)");

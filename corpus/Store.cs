@@ -810,10 +810,12 @@ namespace Corpus
             if (skipParent != null)
             {
                 // §12.8 landing short-circuit: the MFT-digest plan costs an
-                // MFT read only. Empty → skip before ANY bulk streaming —
-                // without this the flag saves nothing on the default path.
+                // MFT read only. Empty user-dirty → skip before ANY bulk
+                // streaming — without this the flag saves nothing on the
+                // default path. Sys-only dirt (FRN<16 churn) still skips:
+                // see PlanMatchesExceptSys.
                 var skipPlan = (opts.ChangeSource ?? DefaultChangeSource()).Plan(skipParent, source, chunkBytes, _log);
-                if (skipPlan != null && skipPlan.DirtyChunks.Count == 0)
+                if (skipPlan != null && PlanMatchesExceptSys(skipPlan, source, chunkBytes))
                     SkipUnchanged(skipParent.Generation);
             }
             Directory.CreateDirectory(_landingDir);
@@ -882,14 +884,15 @@ namespace Corpus
                 if (planned <= 0 || done < planned)
                     reporter.Report(planned);
             }
-            if (skipParent != null && (newChunks == 0 || entries.SequenceEqual(skipParent.Chunks)))
+            if (skipParent != null && (newChunks == 0 || EntriesEqualExceptSys(entries, skipParent, source, chunkBytes)))
             {
                 // Withhold: no manifest, and the just-landed duplicates go
                 // back. Manifest-compare covers pre-optimize reruns (landing
                 // bytes aren't indexed until optimize folds them); every
                 // distinct hex is then index-resident (a first-seen hex
                 // always counts as new), so no manifest loses its landing
-                // read-through.
+                // read-through. The compare ignores sys-only churn (FRN<16
+                // extents): see EntriesEqualExceptSys.
                 foreach (var path in landedThisRun)
                     File.Delete(path);
                 SkipUnchanged(skipParent.Generation);
@@ -923,6 +926,190 @@ namespace Corpus
             File.WriteAllBytes(tmp, data);
             File.Move(tmp, path, true);
             return true;
+        }
+
+        // Every non-hole digest referenced by any committed manifest.
+        // Null when the manifests cannot be enumerated or a manifest
+        // fails its HMAC load: the caller keeps all landed chunks rather
+        // than risk stranding a snapshot it cannot see.
+        private HashSet<string>? ReferencedLandingHexes()
+        {
+            List<(int Generation, string Name)> list;
+            try
+            {
+                list = ManifestStore.List(_manifestsDir);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+            var refs = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var (gen, name) in list)
+            {
+                SnapshotManifest manifest;
+                try
+                {
+                    manifest = ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{name}.json"), _key);
+                }
+                catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
+                {
+                    return null;
+                }
+                foreach (var entry in manifest.Chunks)
+                {
+                    if (!entry.IsHole && !string.IsNullOrEmpty(entry.DigestHex))
+                        refs.Add(entry.DigestHex);
+                }
+            }
+            return refs;
+        }
+
+        // §12.8 pre-stream gate: dirty confined to FRN<16 sys extents
+        // (MFT/$MFTMirr/$LogFile churn, mapped through the CURRENT volume
+        // geometry) still skips. Non-MFT sources and unreadable sys runs
+        // stay strict. Capture plans are untouched — only the skip
+        // DECISION ignores sys dirt.
+        private static bool PlanMatchesExceptSys(IncrementalPlan plan, IBlockSource source, int chunkBytes)
+        {
+            ArgumentNullException.ThrowIfNull(plan);
+            ArgumentNullException.ThrowIfNull(source);
+            if (plan.DirtyChunks.Count == 0)
+                return true;
+            if (source is not IMftVolume vol)
+                return false;
+            var sys = MftSysExtents.Runs(vol);
+            if (sys == null)
+                return false;
+            var sysChunks = CapturePolicy.DirtyChunksForRuns(sys, vol.BytesPerCluster, chunkBytes);
+            foreach (var c in plan.DirtyChunks)
+            {
+                if (!sysChunks.Contains(c))
+                    return false;
+            }
+            return true;
+        }
+
+        // §12.8 post-stream backstop: manifests equal except within FRN<16
+        // sys runs. Overlap-safe: for every differing data chunk the
+        // NON-sys bytes must match the parent's exactly (masked with the
+        // current sys geometry), so a user write landing in a sys-sharing
+        // chunk still trips the gate. Any unreadable side (parent bytes
+        // missing from index AND landing, torn landing read) refuses the
+        // skip — conservative, never blind. Hole flips always count: an
+        // allocation change is a real change.
+        private bool EntriesEqualExceptSys(List<ManifestEntry> entries, SnapshotManifest parent, IBlockSource source, int chunkBytes)
+        {
+            ArgumentNullException.ThrowIfNull(entries);
+            ArgumentNullException.ThrowIfNull(parent);
+            ArgumentNullException.ThrowIfNull(source);
+            if (entries.Count != parent.Chunks.Count)
+                return false;
+            List<(long StartLcn, long ClusterCount)>? sys = null;
+            long bpc = 0;
+            var sysResolved = false;
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var cur = entries[i];
+                var prev = parent.Chunks[i];
+                if (cur.IsHole || prev.IsHole)
+                {
+                    if (cur.IsHole != prev.IsHole || cur.Size != prev.Size)
+                        return false;
+                    continue;
+                }
+                if (cur.Size != prev.Size || string.Equals(cur.DigestHex, prev.DigestHex, StringComparison.Ordinal))
+                    continue;
+                if (!sysResolved)
+                {
+                    sysResolved = true;
+                    if (source is IMftVolume vol)
+                    {
+                        sys = MftSysExtents.Runs(vol);
+                        bpc = vol.BytesPerCluster;
+                    }
+                }
+                if (sys == null || sys.Count == 0)
+                    return false;
+                if (!ChunkDiffIsSysOnly(i, cur, prev, sys, bpc, chunkBytes))
+                    return false;
+            }
+            return true;
+        }
+
+        // Mask current-sys byte ranges on both sides (digest-keyed files
+        // carry the exact imaged bytes), compare the rest exactly.
+        private bool ChunkDiffIsSysOnly(int index, ManifestEntry cur, ManifestEntry prev,
+            List<(long StartLcn, long ClusterCount)> sys, long bpc, int chunkBytes)
+        {
+            var start = index * (long)chunkBytes;
+            var end = start + cur.Size;
+            var overlaps = false;
+            foreach (var (lcn, count) in sys)
+            {
+                if (lcn < 0 || count <= 0)
+                    continue;
+                if (lcn * bpc < end && (lcn + count) * bpc > start)
+                {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (!overlaps)
+                return false;
+            var parentBytes = TryReadChunkBytes(prev.DigestHex, prev.Size);
+            var currentBytes = TryReadLanding(cur.DigestHex);
+            if (parentBytes == null || currentBytes == null
+                || parentBytes.Length != prev.Size || currentBytes.Length != cur.Size
+                || parentBytes.Length != currentBytes.Length)
+                return false;
+            foreach (var (lcn, count) in sys)
+            {
+                if (lcn < 0 || count <= 0)
+                    continue;
+                var s = Math.Max(lcn * bpc, start);
+                var e = Math.Min((lcn + count) * bpc, end);
+                if (s < e)
+                {
+                    Array.Clear(parentBytes, (int)(s - start), (int)(e - s));
+                    Array.Clear(currentBytes, (int)(s - start), (int)(e - s));
+                }
+            }
+            return parentBytes.SequenceEqual(currentBytes);
+        }
+
+        // Parent-side chunk bytes for the sys-masked compare: packs first
+        // (post-optimize), landing read-through otherwise. Null when the
+        // chunk lives nowhere (Bug-A-shaped hole) or fails to decode —
+        // the caller then refuses the skip. Mirrors Verify's read paths.
+        private byte[]? TryReadChunkBytes(string hex, long size)
+        {
+            byte[] digest;
+            try
+            {
+                digest = Convert.FromHexString(hex);
+            }
+            catch (FormatException)
+            {
+                return null;
+            }
+            if (_index.TryGet(digest, out var row))
+            {
+                try
+                {
+                    var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                    var plain = Compression.Decode(blob.Payload, blob.Codec);
+                    return plain.Length == size ? plain : null;
+                }
+                // Broad catch like Verify: zstd throws plain Exception on
+                // corrupt frames, IO/pack faults throw their own — any of
+                // them means "cannot prove", i.e. null (no skip).
+                catch (Exception)
+                {
+                    return null;
+                }
+            }
+            var landed = TryReadLanding(hex);
+            return landed != null && landed.Length == size ? landed : null;
         }
 
         // §12.13 capture resume. The fingerprint binds the landed chunks
@@ -1042,8 +1229,19 @@ namespace Corpus
                 : LandingMismatchCause(previous, current);
             if (cause != null)
             {
+                // Committed-but-unsealed generations still read their
+                // chunks from landing until optimize folds them
+                // (Verify/Export read-through). Only drop chunks no
+                // manifest references — deleting referenced ones strands
+                // committed snapshots (verify `missing from index`).
+                // Null = manifests unreadable → fail-safe: keep all.
+                var referenced = ReferencedLandingHexes();
                 foreach (var path in landed)
+                {
+                    if (referenced == null || referenced.Contains(Path.GetFileNameWithoutExtension(path)))
+                        continue;
                     File.Delete(path);
+                }
                 _log.Info($"landing resume discarded ({cause}), starting fresh");
                 WriteLandingFingerprint(current);
                 return verified;
@@ -1159,10 +1357,36 @@ namespace Corpus
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             var manifest = GetManifest(generation);
-            using var output = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read);
-            ExportToStream(generation, output);
-            output.SetLength(manifest.VolumeLength);
+            try
+            {
+                using var output = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                ExportToStream(generation, output);
+                output.SetLength(manifest.VolumeLength);
+            }
+            catch (Exception ex)
+            {
+                DeletePartialExport(outPath, ex);
+                throw;
+            }
             _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to {outPath}");
+        }
+
+        // Best-effort partial-output cleanup: a failed export must never
+        // leave a corrupt file masquerading as a valid artifact.
+        private void DeletePartialExport(string outPath, Exception ex)
+        {
+            try
+            {
+                if (File.Exists(outPath))
+                {
+                    File.Delete(outPath);
+                    _log.Warn($"deleted partial export '{outPath}' after failure: {ex.Message}");
+                }
+            }
+            catch (Exception cleanEx)
+            {
+                _log.Warn($"could not delete partial export '{outPath}': {cleanEx.Message}");
+            }
         }
 
         // VHDX edge render: same decoded bytes as Export, written into a
@@ -1172,7 +1396,15 @@ namespace Corpus
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             var manifest = GetManifest(generation);
-            VhdxExporter.Export(outPath, manifest.VolumeLength, content => ExportToStream(generation, content));
+            try
+            {
+                VhdxExporter.Export(outPath, manifest.VolumeLength, content => ExportToStream(generation, content));
+            }
+            catch (Exception ex)
+            {
+                DeletePartialExport(outPath, ex);
+                throw;
+            }
             _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to VHDX {outPath}");
         }
 

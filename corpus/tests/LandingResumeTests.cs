@@ -200,6 +200,36 @@ public sealed class LandingResumeTests : IDisposable
     }
 
     [Fact]
+    public void CommittedLanding_SurvivesExclusionChangeDiscard()
+    {
+        // BUG-A: default fast captures seal nothing (packs come at
+        // optimize), so gens 1+ live in landing/ until then. An
+        // exclusion change correctly discards the STALE resume — but
+        // chunks committed manifests reference must survive, else
+        // verify 1 fails `missing from index` with no GC ever run.
+        using (var store = NewStore())
+        using (var source = new FileBlockSource(_volPath))
+            store.ImageFast(source, "gen1");
+        var original = File.ReadAllBytes(_volPath);
+        WriteChunks(_volPath, RandomChunk(201), RandomChunk(202), RandomChunk(203), RandomChunk(204));
+
+        var log = new TestLogger();
+        using (var store = NewStore(log))
+        using (var source = new FileBlockSource(_volPath))
+            store.ImageFast(source, "gen2",
+                new ImageOptions(Exclusions: new FakeExclusions("hiberfil.sys")));
+        AssertHasLine(log, "landing resume discarded (exclusion set changed");
+        using (var store = NewStore())
+        {
+            Assert.Equal(2, store.ListSnapshots().Count);
+            Assert.True(store.Verify(1));
+            Assert.True(store.Verify(2));
+            Assert.Equal(original, ExportBytes(store, 1, Path.Combine(_dir, "kept1.img")));
+            Assert.Equal(File.ReadAllBytes(_volPath), ExportBytes(store, 2, Path.Combine(_dir, "kept2.img")));
+        }
+    }
+
+    [Fact]
     public void StaleFingerprint_Resize_Discards()
     {
         using (var store = NewStore())

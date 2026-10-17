@@ -349,4 +349,114 @@ public sealed class SkipUnchangedTests : IDisposable
             BuildPlan(sys2, data2, sysGuid, dataGuid, EmptyPlan()), skipIfUnchanged: true);
         Assert.Equal(4, layout.Generation);
     }
+
+    // §9 skip gate on live NTFS: FRN<16 sys extents ($MFT/$MFTMirr/
+    // $LogFile zones) churn on every mount, so a gate counting them as
+    // user changes never fires. Grid: chunkMib 1, bpc 4096 → chunk i =
+    // LCNs [i*256,(i+1)*256). Sys runs parked at LCN 0-7 (chunk 0);
+    // the user file at LCN 512-767 (chunk 2).
+    private static Dictionary<long, byte[]> SysUserRecords()
+    {
+        var records = new Dictionary<long, byte[]>();
+        for (var r = 0L; r < 16; r++)
+            records[r] = MftRecordBuilder.Live(1024, 7,
+                MftRecordBuilder.DataAttr(true, MftRecordBuilder.EncodeRuns((8, 0))));
+        records[16] = MftRecordBuilder.Live(1024, 7,
+            MftRecordBuilder.DataAttr(true, MftRecordBuilder.EncodeRuns((256, 512))));
+        return records;
+    }
+
+    private static FakeMftVolume MftVol(IBlockSource inner, Dictionary<long, byte[]> records) =>
+        new(records: records, mftRuns: new (long, long)[] { (0, 100) }, inner: inner);
+
+    private static void MutateBytes(string path, long offset, int count)
+    {
+        var buf = new byte[count];
+        new Random(9182).NextBytes(buf);
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read);
+        f.Seek(offset, SeekOrigin.Begin);
+        f.Write(buf, 0, buf.Length);
+    }
+
+    [Fact]
+    public void Landing_SysZoneChurn_Skips()
+    {
+        // MFT-zone-only churn (sys record + sys-zone volume bytes, the
+        // on-box remount signature) yields skip: the pre-stream plan is
+        // sys-polluted so streaming happens, but the post-stream
+        // manifest compare proves every diff is sys-confined.
+        var vol = SeedVolume("mftvol.img", RandomChunk(71), RandomChunk(72), RandomChunk(73), RandomChunk(74));
+        using var store = NewStore();
+        using (var v1 = MftVol(new FileBlockSource(vol), SysUserRecords()))
+            store.ImageFast(v1, "gen1");
+
+        var churned = SysUserRecords();
+        churned[0][1023] ^= 0xFF; // record padding: flips the group digest, parses identically
+        MutateBytes(vol, 1000, 100); // inside LCN 0-7 (chunk 0), outside every user extent
+        using (var v2 = MftVol(new FileBlockSource(vol), churned))
+        {
+            var ex = Assert.Throws<StoredSkippedException>(() =>
+                store.ImageFast(v2, "gen2", skipIfUnchanged: true));
+            Assert.Equal(1, ex.Generation);
+        }
+        Assert.Equal(1, ManifestCount());
+        Assert.True(store.Verify(1));
+    }
+
+    [Fact]
+    public void Landing_UserExtentChange_WritesGen()
+    {
+        // A single user-extent write must still trip the gate: the
+        // differing chunk is outside every sys run, so no skip.
+        var vol = SeedVolume("mftvol2.img", RandomChunk(81), RandomChunk(82), RandomChunk(83), RandomChunk(84));
+        using var store = NewStore();
+        using (var v1 = MftVol(new FileBlockSource(vol), SysUserRecords()))
+            store.ImageFast(v1, "gen1");
+
+        var changed = SysUserRecords();
+        changed[16][1023] ^= 0xFF;
+        MutateBytes(vol, 2L * Mib + 1000, 100); // chunk 2: the user file's clusters
+        using (var v2 = MftVol(new FileBlockSource(vol), changed))
+        {
+            var m = store.ImageFast(v2, "gen2", skipIfUnchanged: true);
+            Assert.Equal(2, m.Generation);
+        }
+        Assert.Equal(2, ManifestCount());
+        Assert.True(store.Verify(2));
+        var outPath = Path.Combine(_dir, "mft-rt.img");
+        store.Export(2, outPath);
+        Assert.Equal(File.ReadAllBytes(vol), File.ReadAllBytes(outPath));
+    }
+
+    [Fact]
+    public void Landing_SysOnlyDirty_SkipsBeforeBulkStream()
+    {
+        // Pre-stream fast path: a plan dirty ONLY in sys chunks skips
+        // with zero bulk reads (the seconds-path); user dirt forces
+        // the streaming path even when the bytes turn out identical.
+        var vol = SeedVolume("mftvol3.img", RandomChunk(91), RandomChunk(92), RandomChunk(93), RandomChunk(94));
+        using var store = NewStore();
+        using (var v1 = MftVol(new FileBlockSource(vol), SysUserRecords()))
+            store.ImageFast(v1, "gen1");
+
+        using var inner = new FileBlockSource(vol);
+        using var counting = new CountingBlockSource(inner, Mib);
+        using var v2 = MftVol(counting, SysUserRecords());
+        var sysOnly = new FakeChangeSource((_, _, _) => new IncrementalPlan(new HashSet<long> { 0 }, "fake:1"));
+        var ex = Assert.Throws<StoredSkippedException>(() =>
+            store.ImageFast(v2, "gen2", new ImageOptions(ChangeSource: sysOnly), skipIfUnchanged: true));
+        Assert.Equal(1, ex.Generation);
+        Assert.Empty(counting.ReadChunks);
+        Assert.Equal(1, ManifestCount());
+
+        using var inner2 = new FileBlockSource(vol);
+        using var counting2 = new CountingBlockSource(inner2, Mib);
+        using var v3 = MftVol(counting2, SysUserRecords());
+        var userDirty = new FakeChangeSource((_, _, _) => new IncrementalPlan(new HashSet<long> { 2 }, "fake:2"));
+        var ex2 = Assert.Throws<StoredSkippedException>(() =>
+            store.ImageFast(v3, "gen2b", new ImageOptions(ChangeSource: userDirty), skipIfUnchanged: true));
+        Assert.Equal(1, ex2.Generation);
+        Assert.NotEmpty(counting2.ReadChunks);
+        Assert.Equal(1, ManifestCount());
+    }
 }

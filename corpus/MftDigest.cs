@@ -73,6 +73,39 @@ namespace Corpus
 
     // Digest planner over the IMftVolume seam (fake-testable on Linux).
     // Null = incremental impossible → caller falls back to full re-read.
+    // System-metadata extents for the §12.8 skip comparison: FRN 0..15
+    // ($MFT/$MFTMirr/$LogFile/$Bitmap/...) churn on every mount, so a
+    // skip gate that counts them as user changes never fires on live
+    // NTFS. Capture plans must NOT use this (incrementals re-read sys
+    // extents — a stale $MFT corrupts restores); only skip DECISIONS may
+    // ignore diffs confined here. Null = unreadable/unknown → the caller
+    // stays strict (never skip blind).
+    internal static class MftSysExtents
+    {
+        internal static List<(long StartLcn, long ClusterCount)>? Runs(IMftVolume vol)
+        {
+            ArgumentNullException.ThrowIfNull(vol);
+            var runs = new List<(long StartLcn, long ClusterCount)>();
+            try
+            {
+                for (var sys = 0UL; sys < 16 && (long)sys < vol.RecordCount; sys++)
+                {
+                    var bytes = vol.GetRecordBytes(sys);
+                    var extents = MftExtentReader.ParseRecordExtents(bytes, sys,
+                        vol.BytesPerCluster, vol.BytesPerRecord, vol.MftRuns, skipSequenceCheck: true);
+                    if (extents == null)
+                        continue;
+                    runs.AddRange(extents);
+                }
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+            return runs;
+        }
+    }
+
     internal static class MftDigestPlanner
     {
         internal static (HashSet<long> Dirty, List<string> Groups)? PlanDirty(

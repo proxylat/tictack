@@ -113,6 +113,110 @@ namespace Corpus
             return childPath + SidecarSuffix;
         }
 
+        // Creation-time parent gate (existence → full/type → capacity),
+        // shared by the dirty plan and the create: curated exceptions fire
+        // BEFORE any open, never a raw FileNotFoundException + stack.
+        // Returns the parent capacity both callers record/compare.
+        private static long GateParent(IBlockSource source, string parentPath)
+        {
+            if (!File.Exists(parentPath))
+                throw new DifferencingParentMissingException(parentPath);
+            try
+            {
+                AssertFullParent(parentPath);
+            }
+            catch (Exception ex) when (ex is not DifferencingVhdxException
+                && (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidDataException))
+            {
+                throw new DifferencingVhdxException($"parent {parentPath} is not a readable VHDX ({ex.GetType().Name}: {ex.Message})", ex);
+            }
+            var wantCapacity = VhdxExporter.AlignedCapacity(source.Length);
+            var parentCapacity = ReadCapacity(parentPath);
+            if (parentCapacity != wantCapacity)
+                throw new DifferencingParentChangedException(parentPath,
+                    $"size mismatch: parent capacity {parentCapacity} != source length {source.Length} (aligned {wantCapacity}) — the parent must be the full VHDX of this volume");
+            return parentCapacity;
+        }
+
+        // §12.6 dirty computation: chunk-wise compare of the live source
+        // against the full parent VHDX on the store chunk grid. Byte
+        // compare only — equality is all the child needs. Short parent
+        // reads (parent smaller than the source) count as dirty; a parent
+        // larger than the source is a size mismatch the gate refuses.
+        //
+        // The plan is CONFIRMED by a second, independently-opened live
+        // pass over dirty candidates only. A single sequential pass
+        // over-reported ~60x on-box (stable non-truth bytes from the
+        // shadow read stack over unallocated regions) while the
+        // seek/verify pattern stayed clean, so one pass is not trusted:
+        // a candidate the confirm pass reads parent-equal is dropped as
+        // first-pass garbage; a candidate whose bytes disagree across the
+        // two passes fails LOUD (truth unknown — writing either copy
+        // risks a poisoned child that verify could approve on matching
+        // garbage). Only live bytes hashed here (32 B/chunk, bounded);
+        // the parent is a stable file the base verify already pins.
+        public static HashSet<long> ComputeDirtyVsParent(IBlockSource source, string parentPath, int chunkBytes, ILogger log)
+        {
+            ArgumentNullException.ThrowIfNull(source);
+            ArgumentException.ThrowIfNullOrWhiteSpace(parentPath);
+            if (chunkBytes <= 0) throw new ArgumentOutOfRangeException(nameof(chunkBytes));
+            ArgumentNullException.ThrowIfNull(log);
+            GateParent(source, parentPath);
+            var candidates = new List<(long Index, byte[] Hash)>();
+            long total = 0;
+            using (var disk = new Disk(parentPath, FileAccess.Read))
+            using (var parent = disk.Content)
+            using (var live = source.OpenRead())
+            {
+                var a = new byte[chunkBytes];
+                var b = new byte[chunkBytes];
+                for (long offset = 0; offset < source.Length; offset += chunkBytes, total++)
+                {
+                    var length = (int)Math.Min(chunkBytes, source.Length - offset);
+                    if (ReadExactly(live, a, length) != length)
+                        throw new DifferencingVhdxException($"short source read at chunk {total} (offset {offset}) — cannot diff {parentPath}");
+                    parent.Seek(offset, SeekOrigin.Begin);
+                    var got = ReadExactly(parent, b, length);
+                    if (got != length || !a.AsSpan(0, length).SequenceEqual(b.AsSpan(0, length)))
+                        candidates.Add((total, SHA256.HashData(a.AsSpan(0, length))));
+                }
+                // Confirm through a fresh, seeked live pass (fresh fills,
+                // not the first pass's segment state) plus a parent re-read.
+                var dirty = new HashSet<long>();
+                var dropped = 0;
+                var unstable = 0;
+                if (candidates.Count > 0)
+                {
+                    using var live2 = source.OpenRead();
+                    var c = new byte[chunkBytes];
+                    var d = new byte[chunkBytes];
+                    foreach (var (index, hash) in candidates)
+                    {
+                        var offset = index * (long)chunkBytes;
+                        var length = (int)Math.Min(chunkBytes, source.Length - offset);
+                        live2.Seek(offset, SeekOrigin.Begin);
+                        if (ReadExactly(live2, c, length) != length)
+                            throw new DifferencingVhdxException($"short source re-read at chunk {index} (offset {offset}) — cannot diff {parentPath}");
+                        parent.Seek(offset, SeekOrigin.Begin);
+                        // Short parent re-read mirrors pass 1 (dirty, never
+                        // clean); a clean live2-vs-parent2 drops first-pass
+                        // garbage from either side; anything else needs
+                        // pass-1 agreement or it is untrustworthy.
+                        if (ReadExactly(parent, d, length) == length && c.AsSpan(0, length).SequenceEqual(d.AsSpan(0, length)))
+                            dropped++;
+                        else if (SHA256.HashData(c.AsSpan(0, length)).AsSpan().SequenceEqual(hash))
+                            dirty.Add(index);
+                        else
+                            unstable++;
+                    }
+                }
+                if (unstable > 0)
+                    throw new DifferencingVhdxException($"cannot diff {parentPath}: live source reads disagree across two passes ({unstable} of {candidates.Count} candidates unstable) — refusing to build a child from untrustworthy bytes (re-run; if it persists, probe shadow-read stability with --vss-dump and the host disk SMART)");
+                log.Info($"diff plan vs {parentPath}: {dirty.Count} dirty of {total} chunks" + (dropped > 0 ? $" ({dropped} first-pass candidates dropped on confirm)" : ""));
+                return dirty;
+            }
+        }
+
         // Create a depth-1 differencing VHDX: parent checks (exists, full
         // dynamic, capacity matches this source) → record identity → create
         // the child → write every dirty chunk from the incremental plan →
@@ -136,14 +240,7 @@ namespace Corpus
                 : fullTarget.Equals(fullParent, StringComparison.Ordinal);
             if (samePath)
                 throw new DifferencingVhdxException($"parent {parentPath} is the target itself ({target}) — a differencing VHDX cannot parent itself");
-            if (!File.Exists(fullParent))
-                throw new DifferencingParentMissingException(parentPath);
-            AssertFullParent(fullParent);
-            var wantCapacity = VhdxExporter.AlignedCapacity(source.Length);
-            var parentCapacity = ReadCapacity(fullParent);
-            if (parentCapacity != wantCapacity)
-                throw new DifferencingParentChangedException(parentPath,
-                    $"size mismatch: parent capacity {parentCapacity} != source length {source.Length} (aligned {wantCapacity}) — the parent must be the full VHDX of this volume");
+            var parentCapacity = GateParent(source, parentPath);
             var chunkCount = (source.Length + chunkBytes - 1) / chunkBytes;
             foreach (var index in dirtyChunks)
             {
@@ -184,8 +281,20 @@ namespace Corpus
                 disk.Content.Flush();
             }
 
-            WriteSidecar(target, record);
-            VerifyDiff(target, source, log);
+            try
+            {
+                WriteSidecar(target, record);
+                VerifyDiff(target, source, log);
+            }
+            catch (Exception)
+            {
+                // A refused child must not linger: a verify-rejected child
+                // still mounts, so remove our just-written child + sidecar
+                // (both are ours — collision refuses pre-existing targets).
+                TryDelete(target);
+                TryDelete(SidecarPath(target));
+                throw;
+            }
             log.Info($"created differencing VHDX {target} on parent {fullParent} ({record.DirtyChunks.Count} dirty chunks)");
             return target;
         }
@@ -246,10 +355,87 @@ namespace Corpus
             {
                 var offset = index * (long)record.ChunkBytes;
                 var length = Math.Min((long)record.ChunkBytes, source.Length - offset);
-                CompareRange(src, disk.Content, offset, length, bufA, bufB, childPath);
+                try
+                {
+                    CompareRange(src, disk.Content, offset, length, bufA, bufB, childPath);
+                }
+                catch (PairMismatchException mismatch)
+                {
+                    throw DescribeMismatch(childPath, record.ParentPath, mismatch);
+                }
                 compared += length;
             }
             log.Info($"verified {childPath}: parent {record.ParentPath} identity OK, {compared} bytes re-read OK through the pair");
+        }
+
+        // Byte-level mismatch inside the pair: internal carrier (never
+        // escapes VerifyDiff, which rethrows the curated message below).
+        private sealed class PairMismatchException : DifferencingVhdxException
+        {
+            public long Offset { get; }
+            public byte SourceByte { get; }
+            public byte PairByte { get; }
+
+            public PairMismatchException(string childPath, long offset, byte sourceByte, byte pairByte)
+                : base($"verify refuses {childPath}: byte mismatch at offset {offset} (source 0x{sourceByte:X2}, pair 0x{pairByte:X2})")
+            {
+                Offset = offset;
+                SourceByte = sourceByte;
+                PairByte = pairByte;
+            }
+        }
+
+        // Attribution for a pair mismatch: the parent byte at the failing
+        // offset discriminates a missing child block (pair == parent: the
+        // child carries nothing here — plan garbage or a lost block) from
+        // live-read instability (pair holds non-parent bytes yet differs
+        // from the re-read source: the live source answered differently at
+        // plan/write/verify time — not a lost write).
+        private static DifferencingVhdxException DescribeMismatch(string childPath, string parentPath, PairMismatchException mismatch)
+        {
+            var parentByte = TryReadParentByte(parentPath, mismatch.Offset);
+            var parentPart = parentByte.HasValue ? $", parent 0x{parentByte.Value:X2}" : " (parent re-read unavailable)";
+            if (parentByte.HasValue && parentByte.Value == mismatch.PairByte)
+                return new DifferencingVhdxException($"{mismatch.Message}{parentPart}: pair matches the parent here, so the child carries nothing for this range (plan marked it dirty but no child block landed) — suspect first-pass plan garbage or a lost child block");
+            return new DifferencingVhdxException($"{mismatch.Message}{parentPart}: the child block IS present (differs from the parent) but differs from the re-read source — the live source returned different bytes at plan/write/verify time (unstable reads), not a lost write");
+        }
+
+        // One sector read of the parent's virtual bytes at an offset (VHDX
+        // content reads require sector-aligned counts). Best-effort: null
+        // when the parent cannot be re-read (the mismatch stays loud).
+        private static byte? TryReadParentByte(string parentPath, long offset)
+        {
+            try
+            {
+                using var disk = new Disk(parentPath, FileAccess.Read);
+                var sector = (offset / disk.BlockSize) * disk.BlockSize;
+                var buf = new byte[disk.BlockSize];
+                disk.Content.Seek(sector, SeekOrigin.Begin);
+                if (ReadExactly(disk.Content, buf, buf.Length) != buf.Length)
+                    return null;
+                return buf[offset - sector];
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidDataException)
+            {
+                return null;
+            }
+        }
+
+        // Best-effort removal of our own just-written artifacts after a
+        // refused create (house TryDelete idiom: specific catches, silent).
+        private static void TryDelete(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
 
         // Full = dynamic with no parent. Differencing (HasParent) names its
@@ -317,7 +503,7 @@ namespace Corpus
                 for (var i = 0; i < want; i++)
                 {
                     if (bufA[i] != bufB[i])
-                        throw new DifferencingVhdxException($"verify refuses {childPath}: byte mismatch at offset {pos + i} (source 0x{bufA[i]:X2}, pair 0x{bufB[i]:X2})");
+                        throw new PairMismatchException(childPath, pos + i, bufA[i], bufB[i]);
                 }
                 remaining -= want;
                 pos += want;

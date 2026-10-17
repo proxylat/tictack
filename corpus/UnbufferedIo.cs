@@ -155,11 +155,14 @@ namespace Corpus
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        // Names are Corpus-local (ReadFileRaw/SeekFileRaw); the real
+        // kernel32 exports are pinned via EntryPoint (proven on-box
+        // 2026-10-17: bare names throw EntryPointNotFoundException).
+        [DllImport("kernel32.dll", EntryPoint = "ReadFile", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool ReadFileRaw(IntPtr hFile, IntPtr lpBuffer, int nNumberOfBytesToRead, out int lpNumberOfBytesRead, IntPtr lpOverlapped);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", EntryPoint = "SetFilePointerEx", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool SeekFileRaw(IntPtr hFile, long liDistanceToMove, out long lpNewFilePointer, uint dwMoveMethod);
 
