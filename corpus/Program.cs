@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
+using DiscUtils.Vhdx;
 using TicTack;
 
 namespace Corpus
@@ -62,6 +63,18 @@ namespace Corpus
             string? vmNameFlag = null;
             string? bootTimeoutFlag = null;
             string? bootMemoryFlag = null;
+            string? toVhdx = null;
+            string? toWim = null;
+            string? toEsd = null;
+            var zstd = false;
+            string? vhdxWriter = null;
+            string? budgetBytes = null;
+            string? extractPaths = null;
+            string? cloneFrom = null;
+            string? retryLockFlag = null;
+            var append = false;
+            var bufferedIo = false;
+            var skipIfUnchanged = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -295,6 +308,50 @@ namespace Corpus
                     case "--skip-verify":
                         skipVerify = true;
                         break;
+                    case "--to-vhdx":
+                        if (i + 1 < args.Length) toVhdx = args[++i];
+                        break;
+                    case "--to-wim":
+                        if (i + 1 < args.Length) toWim = args[++i];
+                        break;
+                    case "--to-esd":
+                        if (i + 1 < args.Length) toEsd = args[++i];
+                        break;
+                    case "--zstd":
+                        zstd = true;
+                        break;
+                    case "--vhdx-writer":
+                        // TEMPORARY (§12.1 phase 1): A/B spike selector, dies
+                        // with the loser the day the verdict lands.
+                        if (i + 1 < args.Length) vhdxWriter = args[++i];
+                        break;
+                    case "--optimize-to-fit":
+                        verb = "optimize-to-fit";
+                        break;
+                    case "--bytes":
+                        if (i + 1 < args.Length) budgetBytes = args[++i];
+                        break;
+                    case "--extract":
+                        verb = "extract";
+                        break;
+                    case "--paths":
+                        if (i + 1 < args.Length) extractPaths = args[++i];
+                        break;
+                    case "--clone-from":
+                        if (i + 1 < args.Length) cloneFrom = args[++i];
+                        break;
+                    case "--retry-lock":
+                        if (i + 1 < args.Length) retryLockFlag = args[++i];
+                        break;
+                    case "--append":
+                        append = true;
+                        break;
+                    case "--buffered-io":
+                        bufferedIo = true;
+                        break;
+                    case "--skip-if-unchanged":
+                        skipIfUnchanged = true;
+                        break;
                     case "--dry-run":
                         dryRun = true;
                         break;
@@ -392,11 +449,25 @@ namespace Corpus
                         log.Info("Corpus config valid");
                         return 0;
                     case "image":
+                        // §12.1 single-file backup rides --image but stores
+                        // no snapshot: --volume only, never --name/--disk.
+                        if (toVhdx != null || toWim != null || toEsd != null)
+                            return RunSingleFile(cfg, volume, name, diskArg, toVhdx, toWim, toEsd, zstd, vhdxWriter, append, incremental, parentArg, forceFull, inline, cliExcludes, log, !bufferedIo, skipIfUnchanged);
+                        // §12.9 writer lock: store captures serialize on the
+                        // store root (storeless single-file above takes no
+                        // lock). Contention/timeout throw loud via the outer
+                        // handler naming the holder. Braced block: using-var is
+                        // illegal directly in a switch section (CS8647).
+                        {
+                            // First capture initializes the store: the lock
+                            // file lives inside it, so the dir must exist.
+                            Directory.CreateDirectory(cfg.StorePath);
+                            using var imageStoreLock = StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log);
                         // Whole-disk target rides the same verb: --volume and
                         // --disk are mutually exclusive (RunImageDisk refuses
                         // the combo, never merges).
                         if (!string.IsNullOrEmpty(diskArg))
-                            return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log);
+                            return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log, !bufferedIo, skipIfUnchanged);
                         if (string.IsNullOrEmpty(volume) || string.IsNullOrEmpty(name))
                         {
                             log.Error("--image requires --volume <path> --name <snapshot> (or --disk <N> --name <snapshot>)");
@@ -412,12 +483,12 @@ namespace Corpus
                                 return 1;
                             }
                             using (var store = CreateStore(cfg, log))
-                            using (var source = OpenSource(volume, log))
+                            using (var source = OpenSource(volume, log, !bufferedIo))
                             {
                                 var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
                                 var m = excl == null
-                                    ? store.ImageFast(source, name)
-                                    : store.ImageFast(source, name, new ImageOptions(Exclusions: excl));
+                                    ? store.ImageFast(source, name, skipIfUnchanged: skipIfUnchanged)
+                                    : store.ImageFast(source, name, new ImageOptions(Exclusions: excl), skipIfUnchanged);
                                 log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks (landing, optimize pending)");
                             }
                             return 0;
@@ -431,14 +502,15 @@ namespace Corpus
                         if (parentArg != null && !TryParent(parentArg, log, out parentGen))
                             return 1;
                         using (var store = CreateStore(cfg, log))
-                        using (var source = OpenSource(volume, log))
+                        using (var source = OpenSource(volume, log, !bufferedIo))
                         {
                             // MFT-digest default (USN hint inside for
                             // pre-digest parents and non-MFT sources).
-                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, source, volume, cliExcludes, log)));
+                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, source, volume, cliExcludes, log)), skipIfUnchanged);
                             log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
                         }
                         return 0;
+                        }
                     case "export":
                         if (!TrySnapshot(snapshotArg, log, out var exportGen) || string.IsNullOrEmpty(outPath))
                         {
@@ -453,6 +525,21 @@ namespace Corpus
                         {
                             log.Error("--export-vhdx requires --snapshot <gen> --out <path>");
                             return 1;
+                        }
+                        // §12.5 reflink fast path: clone the previous export,
+                        // overwrite dirty-vs-gen-N-1 ranges only. Base is
+                        // always gen N-1 (manifest-compared); the file only
+                        // needs matching VHDX capacity.
+                        if (cloneFrom != null)
+                        {
+                            if (cloneFrom.StartsWith("--", StringComparison.Ordinal))
+                            {
+                                log.Error("bare --clone-from refuses (missing <base.vhdx>, got flag: " + cloneFrom + ")");
+                                return 1;
+                            }
+                            using (var store = CreateStore(cfg, log))
+                                ReflinkExport.ExportVhdxFromClone(store, vhdxGen, outPath, cloneFrom, log);
+                            return 0;
                         }
                         using (var store = CreateStore(cfg, log))
                             store.ExportVhdx(vhdxGen, outPath);
@@ -480,15 +567,55 @@ namespace Corpus
                     case "restore-disk":
                         return RunRestoreDisk(cfg, baseDir, layoutArg, partitionsArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, repairBoot, log);
                     case "gc":
-                        return RunGc(cfg, dryRun, confirm, log);
+                        using (StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log))
+                            return RunGc(cfg, dryRun, confirm, log);
                     case "service":
                         return RunService(cfg, log);
                     case "copy":
                     case "sync":
                         return RunTransfer(cfg, verb, fromFlag, toFlag, snapshotArg, chain, chainGen, log);
+                    case "optimize-to-fit":
+                        long? budget = null;
+                        if (budgetBytes != null)
+                        {
+                            if (!long.TryParse(budgetBytes, out var b) || b <= 0)
+                            {
+                                log.Error("invalid --bytes (want a positive byte count, got: " + budgetBytes + ")");
+                                return 1;
+                            }
+                            budget = b;
+                        }
+                        var optimizer = new StoreOptimizer(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, cfg.Compression.Level, cfg.Encrypt);
+                        using (StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log))
+                            optimizer.Optimize(budget);
+                        return 0;
+                    case "extract":
+                        if (!TrySnapshot(snapshotArg, log, out var extractGen) || string.IsNullOrEmpty(extractPaths) || string.IsNullOrEmpty(outPath))
+                        {
+                            log.Error("--extract requires --snapshot <gen> --paths <a,b> --out <dir>");
+                            return 1;
+                        }
+                        // No Trim: NTFS names can hold spaces.
+                        var index = EnsureWritableIndex(Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), log);
+                        var summary = SelectiveExtract.Extract(cfg.StorePath, index, extractGen, extractPaths.Split(','), outPath, log);
+                        log.Info($"extracted {summary.Files} files + {summary.Directories} dirs ({summary.Bytes} bytes, {summary.Skipped} skipped) from snapshot {extractGen}");
+                        return 0;
                     default:
                         return 1;
                 }
+            }
+            catch (StoredSkippedException)
+            {
+                // §12.8: Store already logged the exact skip line at INFO;
+                // exit 0 without logging again (else it appears twice).
+                return 0;
+            }
+            catch (StoreLockException ex)
+            {
+                // Operator error (bad duration, contended store), not a
+                // crash: plain message, no stack (house error shape).
+                log.Error(ex.Message);
+                return 1;
             }
             catch (Exception ex)
             {
@@ -642,7 +769,7 @@ namespace Corpus
         // per non-skipped partition + sealed layout sidecar). Volume captures
         // are untouched: --volume with --disk is rejected, never merged.
         private static int RunImageDisk(CorpusConfig cfg, string? diskArg, string? volume, string? name,
-            bool incremental, string? parentArg, bool forceFull, List<string> cliExcludes, ILogger log)
+            bool incremental, string? parentArg, bool forceFull, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false)
         {
             if (string.IsNullOrEmpty(diskArg) || string.IsNullOrEmpty(name))
             {
@@ -674,11 +801,11 @@ namespace Corpus
                 Console.Error.WriteLine("--image --disk needs Windows");
                 return 1;
             }
-            DiskImager.CapturePlan = DiskCapture.BuildPlan;
+            DiskImager.CapturePlan = (d, l) => DiskCapture.BuildPlan(d, l, useUnbuffered);
             using (var store = CreateStore(cfg, log))
             {
                 var layout = store.ImageDisk(diskNumber, name,
-                    new DiskImageOptions(Incremental: incremental, ForceFull: forceFull, ParentLayoutGen: parentGen));
+                    new DiskImageOptions(Incremental: incremental, ForceFull: forceFull, ParentLayoutGen: parentGen), skipIfUnchanged);
                 log.Info($"disk image {layout.Generation:D6}-disk{diskNumber}: {layout.Partitions.Count} partitions");
             }
             return 0;
@@ -806,6 +933,221 @@ namespace Corpus
             if (resolver == null && !OperatingSystem.IsWindows())
                 log.Warn("exclusions unresolvable on this platform (no MFT), capturing all: " + string.Join(", ", merged));
             return resolver;
+        }
+
+        // §12.1 single-file backup: capture straight to one file, no chunk
+        // store, no snapshot. Exactly one of --to-vhdx/--to-wim/--to-esd;
+        // store concepts (--name/--inline/--incremental/--parent/--full)
+        // and --disk are refused, never merged.
+        private static int RunSingleFile(CorpusConfig cfg, string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd, bool zstd, string? vhdxWriter, bool append, bool incremental, string? parentArg, bool forceFull, bool inline, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false)
+        {
+            var kinds = 0;
+            if (toVhdx != null) kinds++;
+            if (toWim != null) kinds++;
+            if (toEsd != null) kinds++;
+            if (kinds != 1)
+            {
+                log.Error("--to-vhdx/--to-wim/--to-esd are mutually exclusive (exactly one)");
+                return 1;
+            }
+            // Bare flag swallowed the next flag as its value — refuse, never
+            // write a file literally named "--zstd".
+            foreach (var t in new[] { toVhdx, toWim, toEsd })
+            {
+                if (t != null && t.StartsWith("--", StringComparison.Ordinal))
+                {
+                    log.Error("bare --to-vhdx/--to-wim/--to-esd refuses (missing <file|dir>, got flag: " + t + ")");
+                    return 1;
+                }
+            }
+            if (string.IsNullOrEmpty(volume))
+            {
+                log.Error("--image --to-vhdx/--to-wim/--to-esd requires --volume <path|X:>");
+                return 1;
+            }
+            if (!string.IsNullOrEmpty(diskArg))
+            {
+                log.Error("--to-vhdx/--to-wim/--to-esd cannot combine with --disk");
+                return 1;
+            }
+            if (!string.IsNullOrEmpty(name))
+            {
+                log.Error("--to-vhdx/--to-wim/--to-esd store no snapshot, --name is refused (drop it)");
+                return 1;
+            }
+            if (incremental || forceFull || inline)
+            {
+                log.Error("--to-vhdx/--to-wim/--to-esd take no --inline/--incremental/--full (store concepts)");
+                return 1;
+            }
+            // Storeless outputs write no gen: nothing to compare, so the
+            // flag is refused rather than silently ignored.
+            if (skipIfUnchanged)
+            {
+                log.Error("--skip-if-unchanged needs a store capture (--image/--disk without --to-*)");
+                return 1;
+            }
+            if (parentArg != null && toVhdx == null)
+            {
+                log.Error("--parent <base.vhdx> needs --to-vhdx (differencing child of a full VHDX)");
+                return 1;
+            }
+            if (zstd && toVhdx == null)
+            {
+                log.Error("--zstd needs --to-vhdx (WIM/ESD are already compressed)");
+                return 1;
+            }
+            if (vhdxWriter != null && toVhdx == null)
+            {
+                log.Error("--vhdx-writer needs --to-vhdx");
+                return 1;
+            }
+            // §12.11 WIM-append: this volume's state as a new image index
+            // in the existing base WIM. Gen = current index count + 1
+            // (one redundant Get-WimInfo; captures dwarf it).
+            if (append)
+            {
+                if (toWim == null)
+                {
+                    log.Error("--append needs --to-wim <base.wim> (new image index in an existing WIM)");
+                    return 1;
+                }
+                using (var source = OpenSource(volume, log))
+                {
+                    var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
+                    if (snap == null)
+                    {
+                        log.Error("--to-wim --append need --volume <drive:> (a live volume, not a file: " + volume + ")");
+                        return 1;
+                    }
+                    var snapDir = snap.EndsWith('\\') ? snap : snap + "\\";
+                    var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
+                    var dism = new DismRunner();
+                    var info = dism.Run("/Get-WimInfo /WimFile:" + ProcessRunner.QuoteArg(toWim));
+                    if (info.ExitCode != 0)
+                    {
+                        log.Error($"--append: cannot read indexes of {toWim} (exit {info.ExitCode}: {info.Stderr})");
+                        return 1;
+                    }
+                    SingleFileBackup.AppendWim(snapDir, toWim, SingleFileBackup.CountImageIndexes(info.Stdout) + 1, merged, dism, log);
+                }
+                return 0;
+            }
+            if (toVhdx != null)
+            {
+                VhdxWriterKind kind;
+                try
+                {
+                    kind = ExtentSinkFactory.ParseKind(vhdxWriter);
+                }
+                catch (SingleFileBackupException ex)
+                {
+                    log.Error(ex.Message);
+                    return 1;
+                }
+                // §12.6 differencing child: the parent VHDX is the baseline
+                // (storeless single-file has no manifest to plan against), so
+                // dirty = chunks where the live source differs from the
+                // parent on the store chunk grid. Exclusions bake into the
+                // full parent at creation — re-specifying them here is
+                // refused, never silently reinterpreted.
+                if (parentArg != null)
+                {
+                    if (parentArg.StartsWith("--", StringComparison.Ordinal))
+                    {
+                        log.Error("bare --parent refuses (missing <base.vhdx>, got flag: " + parentArg + ")");
+                        return 1;
+                    }
+                    if (kind != VhdxWriterKind.DiscUtils)
+                    {
+                        log.Error("--parent <base.vhdx> needs the DiscUtils writer (differencing create is a DiscUtils path)");
+                        return 1;
+                    }
+                    using (var source = OpenSource(volume, log, useUnbuffered))
+                    {
+                        var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
+                        if (excl != null)
+                        {
+                            log.Error("--parent cannot combine with exclusions (baked into the full parent at creation; got: " + string.Join(", ", Store.MergeExclusionNames(cfg.Exclude, cliExcludes)) + ")");
+                            return 1;
+                        }
+                        var chunkBytes = cfg.ChunkMib * 1024 * 1024;
+                        var dirty = ComputeDirtyVsParent(source, parentArg, chunkBytes, log);
+                        var child = DifferencingVhdx.CreateDiff(source, volume, toVhdx, parentArg, dirty, chunkBytes, log);
+                        if (zstd)
+                            SingleFileBackup.CompressSidecar(child, log, cfg.Compression.Level);
+                    }
+                    return 0;
+                }
+                using (var source = OpenSource(volume, log, useUnbuffered))
+                {
+                    var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
+                    var path = SingleFileBackup.BackupVhdx(source, volume, toVhdx, kind, excl, log);
+                    if (zstd)
+                        SingleFileBackup.CompressSidecar(path, log, cfg.Compression.Level);
+                }
+                return 0;
+            }
+            // WIM/ESD capture from the VSS snapshot dir — a live volume, not
+            // a file. Trailing backslash: the shadow device object is only a
+            // valid directory path in root form.
+            using (var source = OpenSource(volume, log))
+            {
+                var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
+                if (snap == null)
+                {
+                    log.Error("--to-wim/--to-esd need --volume <drive:> (a live volume, not a file: " + volume + ")");
+                    return 1;
+                }
+                var snapDir = snap.EndsWith('\\') ? snap : snap + "\\";
+                var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
+                var dism = new DismRunner();
+                if (toWim != null)
+                    SingleFileBackup.BackupWim(snapDir, volume, toWim, merged, dism, log);
+                else
+                    SingleFileBackup.BackupEsd(snapDir, volume, toEsd, merged, dism, log);
+            }
+            return 0;
+        }
+
+        // §12.6 dirty computation: chunk-wise compare of the live source
+        // against the full parent VHDX on the store chunk grid. Byte
+        // compare only — equality is all the child needs. Short parent
+        // reads (parent smaller than the source) count as dirty; a parent
+        // larger than the source is a size mismatch the create refuses.
+        private static HashSet<long> ComputeDirtyVsParent(IBlockSource source, string parentPath, int chunkBytes, ILogger log)
+        {
+            var dirty = new HashSet<long>();
+            using var disk = new Disk(parentPath, FileAccess.Read);
+            using var parent = disk.Content;
+            using var live = source.OpenRead();
+            var a = new byte[chunkBytes];
+            var b = new byte[chunkBytes];
+            var index = 0L;
+            for (long offset = 0; offset < source.Length; offset += chunkBytes, index++)
+            {
+                var length = (int)Math.Min(chunkBytes, source.Length - offset);
+                if (ReadExactly(live, a, length) != length)
+                    throw new DifferencingVhdxException($"short source read at chunk {index} (offset {offset}) — cannot diff {parentPath}");
+                parent.Seek(offset, SeekOrigin.Begin);
+                var got = ReadExactly(parent, b, length);
+                if (got != length || !a.AsSpan(0, length).SequenceEqual(b.AsSpan(0, length)))
+                    dirty.Add(index);
+            }
+            log.Info($"diff plan vs {parentPath}: {dirty.Count} dirty of {index} chunks");
+            return dirty;
+        }
+
+        private static int ReadExactly(Stream stream, byte[] buffer, int length)
+        {
+            var total = 0;
+            while (total < length)
+            {
+                var n = stream.Read(buffer, total, length - total);
+                if (n == 0) break;
+                total += n;
+            }
+            return total;
         }
 
         // --gc: manual only, never automatic. Bare prints the plan and
@@ -1011,10 +1353,10 @@ namespace Corpus
 
         // Drive-letter-colon ("T:") images the live volume through VSS;
         // anything else is a file path for FileBlockSource.
-        private static IBlockSource OpenSource(string volume, ILogger log) =>
+        private static IBlockSource OpenSource(string volume, ILogger log, bool useUnbuffered = true) =>
             volume.Length == 2 && volume[1] == ':' && char.IsAsciiLetter(volume[0])
-                ? new VssBlockSource(volume, log)
-                : new FileBlockSource(volume);
+                ? new VssBlockSource(volume, log, useUnbuffered)
+                : new FileBlockSource(volume, useUnbuffered);
 
         private static string? ProbeVolume(string? volume, ILogger log)
         {
@@ -1184,6 +1526,16 @@ namespace Corpus
             Console.WriteLine("  --image --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)");
             Console.WriteLine("  --export --snapshot <gen> --out <path>  Export a snapshot to a file");
             Console.WriteLine("  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX");
+            Console.WriteLine("      --clone-from <base.vhdx>  Reflink export: clone base (gen N-1 contents) + overwrite dirty ranges only (same-volume COW, else plain-copy WRN)");
+            Console.WriteLine("  --image --volume <path|X:> --to-vhdx <file|dir> [--zstd] [--vhdx-writer <discutils|virtdisk>]  Single-file VHDX backup, no store (writer flag is temporary: A/B spike, loser deleted same day)");
+            Console.WriteLine("      --skip-if-unchanged  Exit 0 with no new gen when the source matches the latest snapshot (volume+disk; --force-full wins; storeless --to-* refuses)");
+            Console.WriteLine("      --buffered-io  Opt out of unbuffered (O_DIRECT/NO_BUFFERING) extent reads for weird drivers (bulk capture only)");
+            Console.WriteLine("      --parent <base.vhdx>  Differencing child holding dirty-vs-parent chunks only (depth 1, parent immutable while the child lives; no --exclude)");
+            Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> | --to-esd <file|dir>  Single-file WIM/ESD via inbox DISM from the VSS snapshot (Windows, elevated)");
+            Console.WriteLine("      --to-wim <base.wim> --append  New image index in an existing WIM (gen = count+1; ESD/solid refused)");
+            Console.WriteLine("  --retry-lock <90|10m|2h>  Wait up to the duration for a contended store lock (writers: image/gc/optimize-to-fit; default fails loud naming the holder)");
+            Console.WriteLine("  --optimize-to-fit [--bytes N]  Compact the chunk store in place (+ prune oldest gens to N bytes via GC)");
+            Console.WriteLine("  --extract --snapshot <gen> --paths <a,b> --out <dir>  Pull files/folders out of a snapshot (no ADS/ACL/EFS — WRN names path+reason each)");
             Console.WriteLine("  --vss-list                   Relay 'vssadmin list writers' (Windows)");
             Console.WriteLine("  --vss-snap --volume <X:>     Create+delete a VSS snapshot probe (Windows, elevated)");
             Console.WriteLine("  --vss-read --volume <X:>     Read a 64 KiB extent via snapshot probe (Windows, elevated)");

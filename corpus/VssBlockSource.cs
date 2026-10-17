@@ -16,20 +16,22 @@ namespace Corpus
         private readonly BitLockerCaptureScope? _bitlocker;
         private readonly string _device;
         private readonly Lazy<IMftVolume> _mft;
+        private readonly bool _useUnbuffered;
         private bool _fullyRead;
         private bool _disposed;
 
-        public VssBlockSource(string drive, ILogger log)
-            : this(drive, log, ManageBdeBitLocker.Instance)
+        public VssBlockSource(string drive, ILogger log, bool useUnbuffered = true)
+            : this(drive, log, ManageBdeBitLocker.Instance, useUnbuffered)
         {
         }
 
         // Item 12b: the scope arms BEFORE the snapshot freezes the volume
         // (suspend-then-capture) and resumes AFTER teardown; the catch
         // re-enables even when snapshot creation itself throws.
-        internal VssBlockSource(string drive, ILogger log, IBitLockerController bitlocker)
+        internal VssBlockSource(string drive, ILogger log, IBitLockerController bitlocker, bool useUnbuffered = true)
         {
             _bitlocker = BitLockerCaptureScope.Arm(drive, bitlocker, log);
+            _useUnbuffered = useUnbuffered;
             try
             {
                 _snap = VssSnapshot.Create(drive, log);
@@ -47,7 +49,7 @@ namespace Corpus
 
         // Test seam: no shadow (Linux-safe); the factory mirrors the
         // production MftVolumeReader(device) open with a scripted fake.
-        internal VssBlockSource(string device, long length, long bytesPerCluster, Func<string, IMftVolume> mftFactory)
+        internal VssBlockSource(string device, long length, long bytesPerCluster, Func<string, IMftVolume> mftFactory, bool useUnbuffered = true)
         {
             ArgumentException.ThrowIfNullOrEmpty(device);
             ArgumentNullException.ThrowIfNull(mftFactory);
@@ -56,6 +58,7 @@ namespace Corpus
             _device = device;
             Length = length;
             BytesPerCluster = bytesPerCluster;
+            _useUnbuffered = useUnbuffered;
             _mft = new Lazy<IMftVolume>(() => mftFactory(device));
         }
 
@@ -119,8 +122,10 @@ namespace Corpus
         public Stream OpenRead()
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var fs = new FileStream(_device, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            return new VssReadStream(fs, Length, () => _fullyRead = true);
+            // §12.12: the extent stream goes unbuffered (default ON);
+            // MFT/bitmap reads stay buffered. Alignment lives in the helper.
+            var raw = ExtentStreams.OpenExtentRead(_device, _useUnbuffered);
+            return new VssReadStream(raw, Length, () => _fullyRead = true);
         }
 
         public void Dispose()

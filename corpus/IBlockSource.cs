@@ -23,11 +23,19 @@ namespace Corpus
     public sealed class FileBlockSource : IBlockSource
     {
         private readonly string _path;
+        private readonly bool _useUnbuffered;
         private bool _disposed;
 
         public FileBlockSource(string path)
+            : this(path, true)
+        {
+        }
+
+        // §12.12 seam: --buffered-io passes false (default ON).
+        public FileBlockSource(string path, bool useUnbuffered)
         {
             _path = path;
+            _useUnbuffered = useUnbuffered;
         }
 
         public long Length => new FileInfo(_path).Length;
@@ -35,7 +43,7 @@ namespace Corpus
         public Stream OpenRead()
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            return new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return ExtentStreams.OpenExtentRead(_path, _useUnbuffered);
         }
 
         public void Dispose()

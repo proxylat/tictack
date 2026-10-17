@@ -59,6 +59,8 @@
     <Compile Include="../DiskImager.cs" Link="corpus/DiskImager.cs" />
     <Compile Include="../DiskCapture.cs" Link="corpus/DiskCapture.cs" />
     <Compile Include="../Store.cs" Link="corpus/Store.cs" />
+    <Compile Include="../StoreLock.cs" Link="corpus/StoreLock.cs" />
+    <Compile Include="../StoreOptimize.cs" Link="corpus/StoreOptimize.cs" />
     <Compile Include="../StoreTransfer.cs" Link="corpus/StoreTransfer.cs" />
     <Compile Include="../Vhdx.cs" Link="corpus/Vhdx.cs" />
     <Compile Include="../Vss.cs" Link="corpus/Vss.cs" />
@@ -66,8 +68,13 @@
     <Compile Include="../DiffFloor.cs" Link="corpus/DiffFloor.cs" />
     <Compile Include="../VolumeBitmap.cs" Link="corpus/VolumeBitmap.cs" />
     <Compile Include="../VssBlockSource.cs" Link="corpus/VssBlockSource.cs" />
+    <Compile Include="../UnbufferedIo.cs" Link="corpus/UnbufferedIo.cs" />
     <Compile Include="../PartitionTable.cs" Link="corpus/PartitionTable.cs" />
     <Compile Include="../EspLiveSource.cs" Link="corpus/EspLiveSource.cs" />
+    <Compile Include="../Extract.cs" Link="corpus/Extract.cs" />
+    <Compile Include="../SingleFileBackup.cs" Link="corpus/SingleFileBackup.cs" />
+    <Compile Include="../DifferencingVhdx.cs" Link="corpus/DifferencingVhdx.cs" />
+    <Compile Include="../ReflinkExport.cs" Link="corpus/ReflinkExport.cs" />
     <Compile Include="../../src/Interfaces.cs" Link="shared/Interfaces.cs" />
     <Compile Include="../../src/ProcessRunner.cs" Link="shared/ProcessRunner.cs" />
     <Compile Include="../../src/PathUtil.cs" Link="shared/PathUtil.cs" />

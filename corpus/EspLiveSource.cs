@@ -16,9 +16,10 @@ namespace Corpus
         private const uint IoctlVolumeGetVolumeDiskExtents = 0x00560000;
 
         private readonly string _devicePath;
+        private readonly bool _useUnbuffered;
         private bool _disposed;
 
-        public EspLiveSource(int diskNumber, long offsetBytes, long lengthBytes)
+        public EspLiveSource(int diskNumber, long offsetBytes, long lengthBytes, bool useUnbuffered = true)
         {
             if (!OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("ESP live read needs Windows block-device paths.");
@@ -28,6 +29,7 @@ namespace Corpus
                 throw new ArgumentOutOfRangeException(nameof(lengthBytes));
             _devicePath = Resolve(diskNumber, offsetBytes, lengthBytes)
                 ?? throw new InvalidDataException($"no live volume matches disk {diskNumber} offset {offsetBytes} length {lengthBytes} (single-extent volumes only; spanned/striped never match)");
+            _useUnbuffered = useUnbuffered;
             OffsetBytes = offsetBytes;
             Length = lengthBytes;
         }
@@ -41,7 +43,7 @@ namespace Corpus
         public Stream OpenRead()
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            return new FileStream(_devicePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return ExtentStreams.OpenExtentRead(_devicePath, _useUnbuffered);
         }
 
         public void Dispose()

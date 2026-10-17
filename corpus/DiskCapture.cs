@@ -28,6 +28,10 @@ namespace Corpus
         private const string RecoveryTypeGuid = "de94bba4-06d1-4d40-a16a-bfd50179d6ac";
 
         public static DiskCapturePlan BuildPlan(int diskNumber, ILogger log)
+            => BuildPlan(diskNumber, log, useUnbuffered: true);
+
+        // §12.12 seam: --buffered-io passes false (default ON).
+        public static DiskCapturePlan BuildPlan(int diskNumber, ILogger log, bool useUnbuffered)
         {
             ArgumentNullException.ThrowIfNull(log);
             if (!OperatingSystem.IsWindows())
@@ -39,8 +43,8 @@ namespace Corpus
                 TryFindVolume,
                 ManageBdeBitLocker.Instance,
                 (volumes, statics, l) => VssSnapshotSet.Create(volumes, l, statics),
-                (lifetime, volume, device, _, scope) => new DiskSnapshotSource(lifetime, volume, device, scope),
-                (lifetime, record, scope) => new LiveCaptureSource(lifetime, new EspLiveSource(diskNumber, record.OffsetBytes, record.LengthBytes), scope),
+                (lifetime, volume, device, _, scope) => new DiskSnapshotSource(lifetime, volume, device, scope, useUnbuffered),
+                (lifetime, record, scope) => new LiveCaptureSource(lifetime, new EspLiveSource(diskNumber, record.OffsetBytes, record.LengthBytes, useUnbuffered), scope),
                 log);
         }
 
@@ -693,9 +697,10 @@ namespace Corpus
         private readonly string _device;
         private readonly BitLockerCaptureScope _bitlocker;
         private readonly Lazy<IMftVolume> _mft;
+        private readonly bool _useUnbuffered;
         private bool _disposed;
 
-        internal DiskSnapshotSource(DiskCaptureLifetime lifetime, string volume, string device, BitLockerCaptureScope bitlocker)
+        internal DiskSnapshotSource(DiskCaptureLifetime lifetime, string volume, string device, BitLockerCaptureScope bitlocker, bool useUnbuffered = true)
         {
             ArgumentNullException.ThrowIfNull(lifetime);
             ArgumentException.ThrowIfNullOrEmpty(volume);
@@ -705,6 +710,7 @@ namespace Corpus
             _volume = volume;
             _device = device.TrimEnd('\\');
             _bitlocker = bitlocker;
+            _useUnbuffered = useUnbuffered;
             Length = VssBlockSource.DeviceLength(volume, _device);
             BytesPerCluster = VolumeBitmap.BytesPerCluster(volume.TrimEnd('\\') + "\\");
             _mft = new Lazy<IMftVolume>(() => new MftVolumeReader(_device));
@@ -751,8 +757,8 @@ namespace Corpus
         public Stream OpenRead()
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var fs = new FileStream(_device, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            return new VssReadStream(fs, Length, () => _lifetime.ReportFullRead(_volume));
+            var raw = ExtentStreams.OpenExtentRead(_device, _useUnbuffered);
+            return new VssReadStream(raw, Length, () => _lifetime.ReportFullRead(_volume));
         }
 
         public void Dispose()
