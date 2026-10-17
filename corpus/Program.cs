@@ -75,6 +75,11 @@ namespace Corpus
             var append = false;
             var bufferedIo = false;
             var skipIfUnchanged = false;
+            string? splitSwm = null;
+            var trimResetBase = false;
+            var trimFeatures = new List<string>();
+            var trimPackages = new List<string>();
+            var trimNoHibernate = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -352,6 +357,24 @@ namespace Corpus
                     case "--skip-if-unchanged":
                         skipIfUnchanged = true;
                         break;
+                    case "--split-swm":
+                        if (i + 1 < args.Length) splitSwm = args[++i];
+                        break;
+                    case "--record-compact":
+                        verb = "record-compact";
+                        break;
+                    case "--trim-resetbase":
+                        trimResetBase = true;
+                        break;
+                    case "--trim-disable-feature":
+                        if (i + 1 < args.Length) trimFeatures.Add(args[++i]);
+                        break;
+                    case "--trim-remove-package":
+                        if (i + 1 < args.Length) trimPackages.Add(args[++i]);
+                        break;
+                    case "--trim-no-hibernate":
+                        trimNoHibernate = true;
+                        break;
                     case "--dry-run":
                         dryRun = true;
                         break;
@@ -407,7 +430,7 @@ namespace Corpus
                     case "locate-winre":
                         return RunLocateWinre(log);
                     case "prepare-universal":
-                        return RunPrepareUniversal(windowsDir, drivers, nicDir, gpuDir, dryRun, log);
+                        return RunPrepareUniversal(windowsDir, drivers, nicDir, gpuDir, dryRun, trimResetBase, trimFeatures, trimPackages, trimNoHibernate, log);
                     case "check-boot-mode":
                         return RunCheckBootMode(diskArg, firmware, log);
                     case "check-repair":
@@ -452,7 +475,7 @@ namespace Corpus
                         // §12.1 single-file backup rides --image but stores
                         // no snapshot: --volume only, never --name/--disk.
                         if (toVhdx != null || toWim != null || toEsd != null)
-                            return RunSingleFile(cfg, volume, name, diskArg, toVhdx, toWim, toEsd, zstd, vhdxWriter, append, incremental, parentArg, forceFull, inline, cliExcludes, log, !bufferedIo, skipIfUnchanged);
+                            return RunSingleFile(cfg, volume, name, diskArg, toVhdx, toWim, toEsd, zstd, vhdxWriter, append, incremental, parentArg, forceFull, inline, cliExcludes, log, !bufferedIo, skipIfUnchanged, splitSwm);
                         // §12.9 writer lock: store captures serialize on the
                         // store root (storeless single-file above takes no
                         // lock). Contention/timeout throw loud via the outer
@@ -599,6 +622,24 @@ namespace Corpus
                         var index = EnsureWritableIndex(Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), log);
                         var summary = SelectiveExtract.Extract(cfg.StorePath, index, extractGen, extractPaths.Split(','), outPath, log);
                         log.Info($"extracted {summary.Files} files + {summary.Directories} dirs ({summary.Bytes} bytes, {summary.Skipped} skipped) from snapshot {extractGen}");
+                        return 0;
+                    case "record-compact":
+                        // §12.14 Compact OS: record-only. Queries the live (or
+                        // offline --windows-dir) OS state and files it beside
+                        // the snapshot manifest. Restore writes blocks, never
+                        // DISM-applies, so there is no apply step to attach.
+                        if (!TrySnapshot(snapshotArg, log, out var compactGen))
+                        {
+                            log.Error("--record-compact requires --snapshot <gen> [--windows-dir <offline>]");
+                            return 1;
+                        }
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            log.Error("--record-compact needs Windows (compact.exe query)");
+                            return 1;
+                        }
+                        var state = CompactQuery.Query(new CompactQuery.ProcessCompactRunner(), windowsDir);
+                        CompactStateRecord.Write(cfg.StorePath, compactGen, state, log);
                         return 0;
                     default:
                         return 1;
@@ -939,7 +980,7 @@ namespace Corpus
         // store, no snapshot. Exactly one of --to-vhdx/--to-wim/--to-esd;
         // store concepts (--name/--inline/--incremental/--parent/--full)
         // and --disk are refused, never merged.
-        private static int RunSingleFile(CorpusConfig cfg, string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd, bool zstd, string? vhdxWriter, bool append, bool incremental, string? parentArg, bool forceFull, bool inline, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false)
+        private static int RunSingleFile(CorpusConfig cfg, string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd, bool zstd, string? vhdxWriter, bool append, bool incremental, string? parentArg, bool forceFull, bool inline, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false, string? splitSwm = null)
         {
             var kinds = 0;
             if (toVhdx != null) kinds++;
@@ -1002,6 +1043,27 @@ namespace Corpus
                 log.Error("--vhdx-writer needs --to-vhdx");
                 return 1;
             }
+            // §12.14 SWM split: chop a --to-wim into FAT32-sized parts.
+            // WIM-only (solid ESD can't split — same posture as --append).
+            int splitMb = 0;
+            if (splitSwm != null)
+            {
+                if (splitSwm.StartsWith("--", StringComparison.Ordinal))
+                {
+                    log.Error("bare --split-swm refuses (missing <sizeMb>, got flag: " + splitSwm + ")");
+                    return 1;
+                }
+                if (toWim == null)
+                {
+                    log.Error("--split-swm needs --to-wim <base.wim> (solid ESD cannot split)");
+                    return 1;
+                }
+                if (!int.TryParse(splitSwm, out splitMb) || splitMb <= 0)
+                {
+                    log.Error("invalid --split-swm (want a positive part size in MB, got: " + splitSwm + ")");
+                    return 1;
+                }
+            }
             // §12.11 WIM-append: this volume's state as a new image index
             // in the existing base WIM. Gen = current index count + 1
             // (one redundant Get-WimInfo; captures dwarf it).
@@ -1030,6 +1092,8 @@ namespace Corpus
                         return 1;
                     }
                     SingleFileBackup.AppendWim(snapDir, toWim, SingleFileBackup.CountImageIndexes(info.Stdout) + 1, merged, dism, log);
+                    if (splitMb > 0)
+                        SplitWimFile(toWim, splitMb, log);
                 }
                 return 0;
             }
@@ -1103,11 +1167,27 @@ namespace Corpus
                 var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
                 var dism = new DismRunner();
                 if (toWim != null)
-                    SingleFileBackup.BackupWim(snapDir, volume, toWim, merged, dism, log);
+                {
+                    var wimPath = SingleFileBackup.BackupWim(snapDir, volume, toWim, merged, dism, log);
+                    if (splitMb > 0)
+                        SplitWimFile(wimPath, splitMb, log);
+                }
                 else
                     SingleFileBackup.BackupEsd(snapDir, volume, toEsd, merged, dism, log);
             }
             return 0;
+        }
+
+        // SWM target: beside the WIM, same stem (<name>.swm, siblings
+        // <name>2.swm...). Backend follows the OS: inbox DISM on Windows,
+        // wimlib where it exists (Linux), loud when neither is present.
+        private static void SplitWimFile(string wimPath, int sizeMb, ILogger log)
+        {
+            IWimRunner runner = OperatingSystem.IsWindows()
+                ? new DismWimRunner(new DismRunner())
+                : new WimlibRunner();
+            var swm = Path.ChangeExtension(wimPath, "swm");
+            WimBackend.SplitSwm(wimPath, swm, sizeMb, runner, log);
         }
 
         // §12.6 dirty computation: chunk-wise compare of the live source
@@ -1248,7 +1328,7 @@ namespace Corpus
         // first-boot staging into a restored (offline) Windows tree. --driver
         // is required (storage inject is the core); NIC/GPU dirs warn-and-skip
         // when absent. Never runs against the live OS dir — offline only.
-        private static int RunPrepareUniversal(string? windowsDir, List<string> drivers, string? nicDir, string? gpuDir, bool dryRun, ILogger log)
+        private static int RunPrepareUniversal(string? windowsDir, List<string> drivers, string? nicDir, string? gpuDir, bool dryRun, bool trimResetBase, List<string> trimFeatures, List<string> trimPackages, bool trimNoHibernate, ILogger log)
         {
             if (string.IsNullOrEmpty(windowsDir) || !Directory.Exists(windowsDir))
             {
@@ -1257,7 +1337,21 @@ namespace Corpus
             }
             var rc = UniversalRestore.InjectStorageDrivers(new UniversalRestoreOptions(drivers.ToArray(), windowsDir, dryRun), new WindowsDismDriverInjector(log), log);
             if (rc != 0) return rc;
-            return UniversalRestore.StageFirstBootDrivers(new FirstBootOptions(nicDir, gpuDir, windowsDir, dryRun), new FileFirstBootStager(), log);
+            rc = UniversalRestore.StageFirstBootDrivers(new FirstBootOptions(nicDir, gpuDir, windowsDir, dryRun), new FileFirstBootStager(), log);
+            if (rc != 0) return rc;
+            // §12.14 footprint trim (REMOVAL — each op deletes something;
+            // ResetBase is irreversible, stated again in flag help). Runs
+            // after servicing so the base reset covers the injected drivers.
+            // powercfg never runs live (that would hit the tech box): the
+            // off switch is staged into SetupComplete.cmd for first boot.
+            if (trimResetBase || trimFeatures.Count > 0 || trimPackages.Count > 0)
+            {
+                rc = OfflineTrim.Trim(new OfflineTrimOptions(windowsDir, trimResetBase, trimFeatures.ToArray(), trimPackages.ToArray(), false, dryRun), new WindowsTrimRunner(), log);
+                if (rc != 0) return rc;
+            }
+            if (trimNoHibernate)
+                return OfflineTrim.StageNoHibernate(windowsDir, dryRun, log);
+            return 0;
         }
 
         // Item 6 boot-mode half: GPT wants UEFI, MBR wants BIOS. Firmware is
@@ -1552,6 +1646,10 @@ namespace Corpus
             Console.WriteLine("  --restore-disk ... --repair-boot       Recreate layout + reinstall bootloader after restore (default: print manual steps)");
             Console.WriteLine("  --prepare-universal --windows-dir <offline> --driver <dir>... [--nic-dir <d>] [--gpu-dir <d>] [--dry-run]");
             Console.WriteLine("      Offline storage-driver inject (DISM) + NIC/GPU first-boot staging into a restored tree");
+            Console.WriteLine("      [--trim-resetbase] [--trim-disable-feature <name>]... [--trim-remove-package <id>]... [--trim-no-hibernate]");
+            Console.WriteLine("      Footprint trim = REMOVAL (ResetBase is irreversible; feature/package lists are caller-named, never builtin; hibernate stages to SetupComplete.cmd for first boot)");
+            Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> --split-swm <sizeMb>  Split the WIM into FAT32-sized .swm parts (DISM on Windows, wimlib on Linux; ESD cannot split)");
+            Console.WriteLine("  --record-compact --snapshot <gen> [--windows-dir <offline>]  Record Compact OS state beside the snapshot manifest (record-only; Windows queries live)");
             Console.WriteLine("  --check-boot-mode --disk <N> --firmware <UEFI|BIOS>  Refuse GPT-on-BIOS / MBR-on-UEFI with the conversion path");
             Console.WriteLine("  --check-repair --disk <N>  Live-layout repair checks + diskpart/bcdboot plan (read-only, exit 1 names the blocker)");
             Console.WriteLine("  --boot-verify --vhdx <path> [--vm-name <n>] [--timeout-seconds <s>] [--memory-mb <mb>]  Boot a VHDX in Hyper-V, poll heartbeat to healthy (defaults 300s, 2048MB)");

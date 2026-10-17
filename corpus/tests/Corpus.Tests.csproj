@@ -39,6 +39,7 @@
     <Compile Include="../recovery/RestoreOrchestrator.cs" Link="corpus/recovery/RestoreOrchestrator.cs" />
     <Compile Include="../recovery/BootRepair.cs" Link="corpus/recovery/BootRepair.cs" />
     <Compile Include="../recovery/UniversalRestore.cs" Link="corpus/recovery/UniversalRestore.cs" />
+    <Compile Include="../recovery/OfflineTrim.cs" Link="corpus/recovery/OfflineTrim.cs" />
     <Compile Include="../recovery/WinReLocate.cs" Link="corpus/recovery/WinReLocate.cs" />
     <Compile Include="../recovery/BootVerify.cs" Link="corpus/recovery/BootVerify.cs" />
     <Compile Include="../recovery/DriveRotation.cs" Link="corpus/recovery/DriveRotation.cs" />
@@ -73,8 +74,10 @@
     <Compile Include="../EspLiveSource.cs" Link="corpus/EspLiveSource.cs" />
     <Compile Include="../Extract.cs" Link="corpus/Extract.cs" />
     <Compile Include="../SingleFileBackup.cs" Link="corpus/SingleFileBackup.cs" />
+    <Compile Include="../WimBackend.cs" Link="corpus/WimBackend.cs" />
     <Compile Include="../DifferencingVhdx.cs" Link="corpus/DifferencingVhdx.cs" />
     <Compile Include="../ReflinkExport.cs" Link="corpus/ReflinkExport.cs" />
+    <Compile Include="../CompactState.cs" Link="corpus/CompactState.cs" />
     <Compile Include="../../src/Interfaces.cs" Link="shared/Interfaces.cs" />
     <Compile Include="../../src/ProcessRunner.cs" Link="shared/ProcessRunner.cs" />
     <Compile Include="../../src/PathUtil.cs" Link="shared/PathUtil.cs" />
