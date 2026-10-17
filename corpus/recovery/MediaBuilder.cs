@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -399,6 +400,7 @@ namespace Corpus
         private static void WriteUsb(string mediaDir, string usbDrive, bool initialize, ILogger log)
         {
             var letter = NormalizeUsbDrive(usbDrive);
+            bool fat32 = false;
             if (initialize)
             {
                 ConfirmErase(letter);
@@ -438,9 +440,52 @@ namespace Corpus
                 var bytes = DirSize(mediaDir);
                 if (bytes > drive.AvailableFreeSpace)
                     throw new InvalidDataException($"USB target {letter}:\\ needs {bytes} bytes, has {drive.AvailableFreeSpace}");
+                fat32 = string.Equals(drive.DriveFormat, "FAT32", StringComparison.OrdinalIgnoreCase);
             }
+            // --initialize always formats FAT32 (see the diskpart script
+            // above), so the pre-flight runs on both branches.
+            if (initialize)
+                fat32 = true;
+            if (fat32)
+                Fat32Preflight(mediaDir, letter, log);
             CopyDir(mediaDir, letter + ":\\");
             log.Info($"wrote recovery media to {letter}:\\ (no format: plain copy)");
+        }
+
+        // FAT32 caps single files at 4 GiB - 1 (2^32-1 bytes): any staged
+        // file over it will fail the copy. Note only, never auto-split —
+        // destructive media actions stay operator-driven. The note names the
+        // file, its size, and the exact --split-swm re-capture flag.
+        internal const long Fat32MaxFileBytes = 4294967295L;
+
+        internal static List<(string Path, long Size)> OverFat32Limit(string mediaDir)
+        {
+            var over = new List<(string Path, long Size)>();
+            if (!Directory.Exists(mediaDir))
+                return over;
+            foreach (var file in Directory.EnumerateFiles(mediaDir, "*", SearchOption.AllDirectories))
+            {
+                long size;
+                try
+                {
+                    size = new FileInfo(file).Length;
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    continue;
+                }
+                if (size > Fat32MaxFileBytes)
+                    over.Add((file, size));
+            }
+            return over;
+        }
+
+        private static void Fat32Preflight(string mediaDir, string letter, ILogger log)
+        {
+            foreach (var (path, size) in OverFat32Limit(mediaDir))
+            {
+                log.Warn($"{path} is {size} bytes — over the FAT32 4 GiB file limit; {letter}:\\ is FAT32 so this copy will fail. Re-capture with --split-swm 4095 on the --to-wim capture that produced {Path.GetFileName(path)}, then rebuild the media.");
+            }
         }
 
         internal static string NormalizeUsbDrive(string usb)

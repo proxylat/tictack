@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.ExceptionServices;
 using System.Text;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using TicTack;
 
 namespace Corpus
@@ -141,6 +144,10 @@ namespace Corpus
         // deepest-first (child writes would otherwise clobber parent times).
         private sealed class ExtractJob
         {
+            // shortcut: 32 MiB readahead segments are arbitrary (one segment
+            // fills half the 64 MiB decode cache, leaving headroom for MFT
+            // re-reads); shrink it if small boxes show memory pressure.
+            private const long PrefetchSegmentBytes = 32L * 1024 * 1024;
             private readonly SnapshotVolumeReader _vol;
             private readonly MftStream _mft;
             private readonly NtfsGeometry _geo;
@@ -417,8 +424,27 @@ namespace Corpus
                     throw new ExtractCorruptException(_generation, $"file '{src}' runs shorter than its size");
                 var buf = new byte[(int)Math.Min(parsed.DataSize, 1024 * 1024)];
                 var pos = 0L;
+                var nextPrefetch = 0L;
                 while (pos < parsed.DataSize)
                 {
+                    if (pos >= nextPrefetch)
+                    {
+                        // Bounded readahead: the next segment's chunks are
+                        // fetched (serial pack reads) and decoded in parallel
+                        // before the loop below consumes them. Writes stay
+                        // serial, so output bytes are identical at any thread
+                        // count. Best-effort: a failed prefetch surfaces
+                        // identically on the authoritative read below.
+                        try
+                        {
+                            stream.PrefetchFileRange(pos, Math.Min(PrefetchSegmentBytes, parsed.DataSize - pos));
+                        }
+                        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException or SqliteException)
+                        {
+                            // The read loop below re-fetches and throws identically.
+                        }
+                        nextPrefetch = pos + PrefetchSegmentBytes;
+                    }
                     var take = (int)Math.Min(buf.Length, parsed.DataSize - pos);
                     stream.Read(pos, buf, 0, take, zeroUnmapped: false);
                     // Valid-data-length tail: NTFS reads [initSize, realSize) as zeros.
@@ -475,22 +501,35 @@ namespace Corpus
 
     // Random-access volume bytes over snapshot chunks. Same fetch order and
     // failure texts as Store's export path (index → pack → decode, landing
-    // read-through, holes seek as zeros); the FIFO cache (8 chunks) keeps
-    // sequential MFT scans to one decode per chunk at any volume size.
+    // read-through, holes seek as zeros). The decode cache is
+    // content-addressed (digest-keyed: deduped chunks sharing one digest
+    // decode once) under a hard MB cap, so cached RAM never grows with
+    // volume size; sequential MFT scans still decode each chunk once, and
+    // re-reads (MFT pass 2, overlapping --paths) hit until evicted.
     internal sealed class SnapshotVolumeReader : IDisposable
     {
-        private const int MaxCachedChunks = 8;
+        // shortcut: 64 MiB cap is arbitrary headroom for one prefetch segment
+        // (32 MiB) plus MFT re-reads on small backup boxes; raise it if
+        // profiles show cache thrash on large extracts, never uncap it.
+        private const long MaxCacheBytes = 64L * 1024 * 1024;
+        // Bounded parallel-decode width, same clamp as Store.EncodeWindow.
+        private static readonly int DecodeDop = Math.Clamp(Environment.ProcessorCount, 2, 16);
+        internal static int? DecodeDopOverride; // tests only: forces worker count
         private readonly SnapshotManifest _manifest;
         private readonly int _generation;
         private readonly string _packsDir;
         private readonly string _landingDir;
         private readonly int _chunkBytes;
         private readonly ChunkIndex _index;
-        private readonly Dictionary<long, byte[]> _cache = new();
-        private readonly Queue<long> _order = new();
+        private readonly Dictionary<string, byte[]> _cache = new(StringComparer.Ordinal);
+        private readonly Queue<string> _order = new();
+        private long _cacheBytes;
         private bool _disposed;
 
         public long Length => _manifest.VolumeLength;
+
+        internal int CachedChunkCount => _cache.Count;
+        internal long CachedBytes => _cacheBytes;
 
         internal SnapshotVolumeReader(string storeRoot, string dbPath, SnapshotManifest manifest)
         {
@@ -548,19 +587,129 @@ namespace Corpus
 
         private byte[] GetChunk(long index)
         {
-            if (_cache.TryGetValue(index, out var chunk))
-                return chunk;
-            chunk = FetchChunk(index);
-            if (_cache.Count >= MaxCachedChunks && _order.TryDequeue(out var oldest))
-                _cache.Remove(oldest);
-            _cache[index] = chunk;
-            _order.Enqueue(index);
+            var entry = _manifest.Chunks[(int)index];
+            if (!entry.IsHole && _cache.TryGetValue(entry.DigestHex, out var hit))
+                return hit;
+            var chunk = FetchChunk(index);
+            if (!entry.IsHole)
+                AddToCache(entry.DigestHex, chunk);
             return chunk;
+        }
+
+        private void AddToCache(string digestHex, byte[] plain)
+        {
+            if (_cache.ContainsKey(digestHex))
+                return;
+            while (_cacheBytes + plain.Length > MaxCacheBytes && _order.Count > 0)
+            {
+                var oldest = _order.Dequeue();
+                if (_cache.Remove(oldest, out var evicted))
+                    _cacheBytes -= evicted.Length;
+            }
+            _cache[digestHex] = plain;
+            _order.Enqueue(digestHex);
+            _cacheBytes += plain.Length;
+        }
+
+        // Best-effort readahead for a volume span: missing chunks are
+        // fetched serially in volume order (pack reads stay sequential for
+        // readahead) and decoded in parallel; every failure mode is the
+        // caller's Read path re-throwing identically, so prefetch never
+        // changes observable behavior — it only warms the cache.
+        internal void PrefetchRange(long volumeOffset, long byteCount)
+        {
+            if (_disposed || byteCount <= 0 || volumeOffset < 0 || volumeOffset >= _manifest.VolumeLength)
+                return;
+            var end = Math.Min(volumeOffset + byteCount, _manifest.VolumeLength);
+            List<long>? missing = null;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var pos = volumeOffset;
+            while (pos < end)
+            {
+                var chunkIdx = pos / _chunkBytes;
+                if (chunkIdx >= _manifest.Chunks.Count)
+                    return;
+                var entry = _manifest.Chunks[(int)chunkIdx];
+                var chunkOff = pos % _chunkBytes;
+                if (chunkOff >= entry.Size)
+                    return;
+                var take = Math.Min(entry.Size - chunkOff, end - pos);
+                if (take <= 0)
+                    return;
+                if (!entry.IsHole && !_cache.ContainsKey(entry.DigestHex) && seen.Add(entry.DigestHex))
+                    (missing ??= new()).Add(chunkIdx);
+                pos += take;
+            }
+            if (missing == null || missing.Count == 0)
+                return;
+            var blobs = new (string Digest, byte[] Payload, byte Codec, long Size)[missing.Count];
+            for (var i = 0; i < missing.Count; i++)
+            {
+                var entry = _manifest.Chunks[(int)missing[i]];
+                var (payload, codec) = FetchPayload(missing[i], entry);
+                blobs[i] = (entry.DigestHex, payload, codec, entry.Size);
+            }
+            var plains = new byte[blobs.Length][];
+            if (blobs.Length == 1 || AllRaw(blobs))
+            {
+                // Nothing to parallelize (same skip as Compression.EncodeBatch).
+                for (var i = 0; i < blobs.Length; i++)
+                    plains[i] = CheckSize(blobs[i], missing[i]);
+            }
+            else
+            {
+                try
+                {
+                    Parallel.For(0, blobs.Length, new ParallelOptions { MaxDegreeOfParallelism = DecodeDopOverride ?? DecodeDop },
+                        i => { plains[i] = Compression.Decode(blobs[i].Payload, blobs[i].Codec); });
+                }
+                catch (AggregateException ex) when (ex.InnerExceptions.Count > 0)
+                {
+                    ExceptionDispatchInfo.Capture(ex.InnerExceptions[0]).Throw();
+                }
+                for (var i = 0; i < blobs.Length; i++)
+                {
+                    if (plains[i] == null || plains[i].Length != blobs[i].Size)
+                        throw new InvalidDataException($"snapshot {_generation} chunk {missing[i]}: content mismatch");
+                }
+            }
+            for (var i = 0; i < blobs.Length; i++)
+                AddToCache(blobs[i].Digest, plains[i]);
+        }
+
+        private static bool AllRaw((string Digest, byte[] Payload, byte Codec, long Size)[] blobs)
+        {
+            foreach (var b in blobs)
+            {
+                if (b.Codec != Compression.CodecRaw)
+                    return false;
+            }
+            return true;
+        }
+
+        private byte[] CheckSize((string Digest, byte[] Payload, byte Codec, long Size) b, long index)
+        {
+            var plain = Compression.Decode(b.Payload, b.Codec);
+            if (plain.Length != b.Size)
+                throw new InvalidDataException($"snapshot {_generation} chunk {index}: content mismatch");
+            return plain;
         }
 
         private byte[] FetchChunk(long index)
         {
             var entry = _manifest.Chunks[(int)index];
+            var (payload, codec) = FetchPayload(index, entry);
+            var plain = Compression.Decode(payload, codec);
+            if (plain.Length != entry.Size)
+                throw new InvalidDataException($"snapshot {_generation} chunk {index}: content mismatch");
+            return plain;
+        }
+
+        // Index → pack → payload (landing read-through); decode and size
+        // checks stay with the caller so serial and prefetch paths share
+        // the exact failure texts.
+        private (byte[] Payload, byte Codec) FetchPayload(long index, ManifestEntry entry)
+        {
             byte[] digest;
             try
             {
@@ -575,10 +724,7 @@ namespace Corpus
             if (_index.TryGet(digest, out var row))
             {
                 var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
-                var plain = Compression.Decode(blob.Payload, blob.Codec);
-                if (plain.Length != entry.Size)
-                    throw new InvalidDataException($"snapshot {_generation} chunk {index}: content mismatch");
-                return plain;
+                return (blob.Payload, blob.Codec);
             }
             var landingPath = Path.Combine(_landingDir, entry.DigestHex + ".chunk");
             if (File.Exists(landingPath))
@@ -586,7 +732,7 @@ namespace Corpus
                 var landed = File.ReadAllBytes(landingPath);
                 if (landed.Length != entry.Size)
                     throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {_generation} landing size mismatch ({landed.Length} != {entry.Size})");
-                return landed;
+                return (landed, Compression.CodecRaw);
             }
             throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {_generation} missing from index");
         }
@@ -734,6 +880,72 @@ namespace Corpus
                 bpos += want;
                 remaining -= want;
             }
+        }
+
+        // Best-effort readahead for a file span: walks VCNs exactly like
+        // Read (same TryMap, sparse runs skipped) and prefetches each
+        // contiguous mapped volume extent. Never throws outward — the
+        // caller swallows so the authoritative Read keeps its exact errors.
+        internal void PrefetchFileRange(long fileOffset, long count)
+        {
+            if (count <= 0 || fileOffset < 0)
+                return;
+            var remaining = count;
+            var pos = fileOffset;
+            long extStart = -1;
+            long extLen = 0;
+            while (remaining > 0)
+            {
+                var vcn = pos / _bpc;
+                var vcnOff = (int)(pos % _bpc);
+                if (!TryMap(vcn, out var lcn, out var runEnd) || lcn < 0)
+                {
+                    if (extStart >= 0)
+                    {
+                        _vol.PrefetchRange(extStart, extLen);
+                        extStart = -1;
+                        extLen = 0;
+                    }
+                    var skip = Math.Min(remaining, (long)_bpc - vcnOff);
+                    pos += skip;
+                    remaining -= skip;
+                    continue;
+                }
+                var want = Math.Min(remaining, (runEnd - vcn) * _bpc + (_bpc - vcnOff));
+                var volOff = lcn * _bpc + vcnOff;
+                if (volOff < 0 || want <= 0)
+                {
+                    if (extStart >= 0)
+                    {
+                        _vol.PrefetchRange(extStart, extLen);
+                        extStart = -1;
+                        extLen = 0;
+                    }
+                    var step = Math.Min(remaining, (long)_bpc - vcnOff);
+                    pos += step;
+                    remaining -= step;
+                    continue;
+                }
+                if (extStart < 0)
+                {
+                    extStart = volOff;
+                    extLen = want;
+                }
+                else if (volOff == extStart + extLen)
+                {
+                    extLen += want;
+                }
+                else
+                {
+                    _vol.PrefetchRange(extStart, extLen);
+                    extStart = volOff;
+                    extLen = want;
+                }
+                pos += want;
+                remaining -= want;
+            }
+            if (extStart >= 0)
+                _vol.PrefetchRange(extStart, extLen);
         }
 
         private bool TryMap(long vcn, out long lcn, out long runEnd)

@@ -88,6 +88,7 @@ public sealed class WimBackendTests : IDisposable
         var wim = Path.Combine(_dir, "base.wim");
         File.WriteAllText(wim, "fake-wim");
         var swm = Path.Combine(_dir, "base.swm");
+        File.WriteAllText(swm, "fake-part");
         var infos = 0;
         var runner = new FakeWimRunner
         {
@@ -100,13 +101,13 @@ public sealed class WimBackendTests : IDisposable
         var returned = WimBackend.SplitSwm(wim, swm, 3800, runner, log);
         Assert.Equal(swm, returned);
         Assert.Equal(3, runner.Calls.Count);
-        Assert.Contains("/Get-WimInfo", runner.Calls[0], StringComparison.Ordinal); // pre-split solid probe
+        Assert.Contains("/Get-WimInfo", runner.Calls[0], StringComparison.Ordinal); // source probe: solid gate + image count
         var split = runner.Calls[1];
         Assert.StartsWith("/Split-Image", split, StringComparison.Ordinal);
         Assert.Contains("/ImageFile:", split, StringComparison.Ordinal);
         Assert.Contains("/SWMFile:", split, StringComparison.Ordinal);
         Assert.Contains("/FileSize:3800", split, StringComparison.Ordinal);
-        Assert.Contains("/Get-WimInfo", runner.Calls[2], StringComparison.Ordinal); // first-part proof
+        Assert.Contains("/Get-WimInfo", runner.Calls[2], StringComparison.Ordinal); // per-part equality proof
         Assert.Contains(swm, runner.Calls[2], StringComparison.Ordinal);
         Assert.Contains(log.Messages, m => m.Contains("split", StringComparison.Ordinal));
     }
@@ -117,6 +118,7 @@ public sealed class WimBackendTests : IDisposable
         var wim = Path.Combine(_dir, "base.wim");
         File.WriteAllText(wim, "fake-wim");
         var swm = Path.Combine(_dir, "base.swm");
+        File.WriteAllText(swm, "fake-part");
         var runner = new FakeWimRunner
         {
             Backend = WimBackendKind.Wimlib,
@@ -126,14 +128,16 @@ public sealed class WimBackendTests : IDisposable
         };
         var returned = WimBackend.SplitSwm(wim, swm, 100, runner, new TestLogger());
         Assert.Equal(swm, returned);
-        Assert.Equal(2, runner.Calls.Count); // no solid probe on the wimlib path
-        var split = runner.Calls[0];
+        Assert.Equal(3, runner.Calls.Count); // source info + split + per-part info (no solid probe on wimlib)
+        Assert.StartsWith("info ", runner.Calls[0], StringComparison.Ordinal); // source count first
+        Assert.Contains(wim, runner.Calls[0], StringComparison.Ordinal);
+        var split = runner.Calls[1];
         Assert.StartsWith("split ", split, StringComparison.Ordinal);
         Assert.Contains("\"" + wim + "\"", split, StringComparison.Ordinal);
         Assert.Contains("\"" + swm + "\"", split, StringComparison.Ordinal);
         Assert.EndsWith(" 100", split, StringComparison.Ordinal);
-        Assert.StartsWith("info ", runner.Calls[1], StringComparison.Ordinal);
-        Assert.Contains(swm, runner.Calls[1], StringComparison.Ordinal);
+        Assert.StartsWith("info ", runner.Calls[2], StringComparison.Ordinal);
+        Assert.Contains(swm, runner.Calls[2], StringComparison.Ordinal);
     }
 
     [Theory]
@@ -257,6 +261,78 @@ public sealed class WimBackendTests : IDisposable
         var ex = Assert.Throws<SingleFileVerifyException>(() =>
             WimBackend.SplitSwm(wim, swm, 100, runner, new TestLogger()));
         Assert.Contains(swm, ex.Message);
+    }
+
+    [Fact]
+    public void SplitSwm_PartCountMismatch_FailsAndCleansParts()
+    {
+        // Source lists 2 images, the emitted part lists 1: incomplete set —
+        // fail loud and leave no parts behind.
+        var wim = Path.Combine(_dir, "base.wim");
+        File.WriteAllText(wim, "fake-wim");
+        var swm = Path.Combine(_dir, "base.swm");
+        var swm2 = Path.Combine(_dir, "base2.swm");
+        File.WriteAllText(swm, "fake-part");
+        File.WriteAllText(swm2, "fake-part");
+        var calls = 0;
+        var runner = new FakeWimRunner
+        {
+            Backend = WimBackendKind.Wimlib,
+            Handler = args =>
+            {
+                if (!args.StartsWith("info ", StringComparison.Ordinal))
+                    return new DismResult(0, "", "");
+                calls++;
+                return new DismResult(0, WimlibInfo(calls == 1 ? 2 : 1), "");
+            },
+        };
+        var ex = Assert.Throws<SingleFileVerifyException>(() =>
+            WimBackend.SplitSwm(wim, swm, 100, runner, new TestLogger()));
+        Assert.Contains("incomplete", ex.Message);
+        Assert.False(File.Exists(swm), "failed split must not leave the first part");
+        Assert.False(File.Exists(swm2), "failed split must not leave part 2");
+    }
+
+    [Fact]
+    public void SplitSwm_SplitFails_DeletesFreshPartsKeepsStale()
+    {
+        // Fresh part (this run) is deleted; a stale same-stem file from an
+        // older run is somebody else's — left alone and named in the log.
+        var wim = Path.Combine(_dir, "base.wim");
+        File.WriteAllText(wim, "fake-wim");
+        var swm = Path.Combine(_dir, "base.swm");
+        var stale = Path.Combine(_dir, "base2.swm");
+        File.WriteAllText(swm, "fake-part");
+        File.WriteAllText(stale, "older-run");
+        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow - TimeSpan.FromHours(2));
+        var runner = new FakeWimRunner
+        {
+            Backend = WimBackendKind.Wimlib,
+            Handler = args => args.StartsWith("split ", StringComparison.Ordinal)
+                ? new DismResult(1, "", "boom")
+                : new DismResult(0, WimlibInfo(1), ""),
+        };
+        var log = new TestLogger();
+        Assert.Throws<WimBackendException>(() =>
+            WimBackend.SplitSwm(wim, swm, 100, runner, log));
+        Assert.False(File.Exists(swm), "failed split must delete its fresh part");
+        Assert.True(File.Exists(stale), "stale same-stem files are left alone");
+        Assert.Contains(log.Messages, m => m.Contains(stale, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void EnumerateSwmParts_StemConvention()
+    {
+        var first = Path.Combine(_dir, "inst.swm");
+        var second = Path.Combine(_dir, "inst2.swm");
+        var third = Path.Combine(_dir, "inst3.swm");
+        File.WriteAllText(first, "1");
+        File.WriteAllText(second, "2");
+        File.WriteAllText(third, "3");
+        File.WriteAllText(Path.Combine(_dir, "other.swm"), "unrelated");
+        var parts = WimBackend.EnumerateSwmParts(first).ToList();
+        Assert.Equal(new[] { first, second, third }, parts);
+        Assert.Empty(WimBackend.EnumerateSwmParts(Path.Combine(_dir, "missing.swm")));
     }
 
     [Fact]

@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using TicTack;
 
@@ -102,9 +104,14 @@ namespace Corpus
         // SWM split for FAT32 USB targets: any WIM >4GB fails on FAT32, so
         // --to-wim results get --split-swm <sizeMb>. Returns the first part
         // path (= swmTarget); parts 2..n follow the DISM/wimlib stem
-        // convention (X.swm, X2.swm, ...). Part enumeration is the caller's
-        // glob — this method proves the SET is readable by info-querying the
-        // first part (index count >= 1) instead.
+        // convention (X.swm, X2.swm, ...). The SET is proven by info-querying
+        // every emitted part: each must list exactly the source image count
+        // (split replicates metadata per part — probed 2026-10-17 against
+        // wimlib 1.14.5 where every part reports Image Count 1 for a 1-image
+        // source; a literal sum would multiply, so per-part equality is the
+        // check. DISM replication assumed same — on-box probe owed). Any
+        // failure after the split runs deleted the emitted parts: no partial
+        // sets are ever left behind.
         public static string SplitSwm(string wimPath, string swmTarget, int fileSizeMb, IWimRunner runner, ILogger log)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(wimPath);
@@ -118,22 +125,82 @@ namespace Corpus
             if (wimPath.EndsWith(".esd", StringComparison.OrdinalIgnoreCase))
                 throw new WimSplitRefusedException(wimPath, "ESD is solid-compressed and cannot be split — same rule as --append (plain-WIM only)");
             var wimlib = runner.Backend == WimBackendKind.Wimlib;
-            if (!wimlib)
-                RefuseIfSolid(wimPath, runner);
+            var start = DateTime.UtcNow;
+            int sourceCount = wimlib ? WimInfo(wimPath, runner) : ProbeSourceCount(wimPath, runner);
             var size = fileSizeMb.ToString(CultureInfo.InvariantCulture);
             var splitArgs = wimlib
                 ? $"split {ProcessRunner.QuoteArg(wimPath)} {ProcessRunner.QuoteArg(swmTarget)} {size}"
                 : $"/Split-Image /ImageFile:{ProcessRunner.QuoteArg(wimPath)} /SWMFile:{ProcessRunner.QuoteArg(swmTarget)} /FileSize:{size}";
             var r = runner.Run(splitArgs);
             if (r.ExitCode != 0)
+            {
+                DeleteEmittedParts(swmTarget, start, log);
                 throw wimlib
                     ? new WimBackendException(wimPath, splitArgs, r)
                     : new SingleFileDismException(wimPath, splitArgs, r);
-            var indexes = WimInfo(swmTarget, runner);
-            if (indexes < 1)
-                throw new SingleFileVerifyException(swmTarget, "split produced no readable images — the SWM set is not usable");
-            log.Info($"split {wimPath} into {swmTarget} (+parts) at {fileSizeMb} MB: first part lists {indexes} image(s)");
+            }
+            var parts = EnumerateSwmParts(swmTarget).ToList();
+            try
+            {
+                if (parts.Count == 0)
+                    throw new SingleFileVerifyException(swmTarget, $"split of {wimPath} emitted no parts at {swmTarget} — the SWM set is not usable");
+                foreach (var part in parts)
+                {
+                    var count = WimInfo(part, runner);
+                    if (count != sourceCount)
+                        throw new SingleFileVerifyException(part, $"part lists {count} image(s), source has {sourceCount} — the SWM set is incomplete");
+                }
+            }
+            catch (Exception)
+            {
+                DeleteEmittedParts(swmTarget, start, log);
+                throw;
+            }
+            log.Info($"split {wimPath} into {parts.Count} part(s) at {fileSizeMb} MB (first: {swmTarget}), each lists {sourceCount} image(s)");
             return swmTarget;
+        }
+
+        // Stem enumeration (X.swm, X2.swm, ...): the first part as given,
+        // then N=2.. while the file exists. A missing first part yields
+        // nothing — a set without its head is already broken.
+        internal static IEnumerable<string> EnumerateSwmParts(string firstPart)
+        {
+            if (!File.Exists(firstPart))
+                yield break;
+            yield return firstPart;
+            var dir = Path.GetDirectoryName(firstPart);
+            var stem = Path.GetFileNameWithoutExtension(firstPart);
+            var ext = Path.GetExtension(firstPart);
+            for (var n = 2; ; n++)
+            {
+                var next = (string.IsNullOrEmpty(dir) ? "" : dir + Path.DirectorySeparatorChar) + stem + n + ext;
+                if (!File.Exists(next))
+                    yield break;
+                yield return next;
+            }
+        }
+
+        // Partial-set cleanup: delete only parts this run plausibly wrote
+        // (mtime at/after split start, 60 s grace for coarse timestamps).
+        // Older same-stem files are somebody else's — left alone and named.
+        internal static void DeleteEmittedParts(string swmTarget, DateTime startUtc, ILogger log)
+        {
+            foreach (var part in EnumerateSwmParts(swmTarget))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(part) < startUtc - TimeSpan.FromSeconds(60))
+                    {
+                        log.Warn($"leaving pre-existing {part} (older than this split run) — delete it yourself if stale");
+                        continue;
+                    }
+                    File.Delete(part);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    log.Warn($"could not delete failed-split part {part}: {ex.Message}");
+                }
+            }
         }
 
         // Index count of an image (WIM, SWM part, or ESD): DISM via
@@ -197,10 +264,10 @@ namespace Corpus
             return count;
         }
 
-        // Pre-split solid gate (DISM only): same locked default as --append —
-        // the on-box DISM split-of-solid probe is OWED (needs Windows + real
-        // DISM; on-box-unprobed, fake-covered only).
-        private static void RefuseIfSolid(string wimPath, IWimRunner runner)
+        // Pre-split source probe (DISM only): solid gate (locked default,
+        // on-box DISM split-of-solid probe OWED) + source image count for
+        // the per-part equality check. Returns the count.
+        private static int ProbeSourceCount(string wimPath, IWimRunner runner)
         {
             var args = $"/Get-WimInfo /WimFile:{ProcessRunner.QuoteArg(wimPath)}";
             var r = runner.Run(args);
@@ -208,6 +275,7 @@ namespace Corpus
                 throw new SingleFileDismException(wimPath, args, r);
             if (SingleFileBackup.IsSolidImageInfo(r.Stdout))
                 throw new WimSplitRefusedException(wimPath, "solid-compressed image; --split-swm is plain-WIM only (on-box DISM split-of-solid probe still owed — refuse stays until it lands)");
+            return SingleFileBackup.CountImageIndexes(r.Stdout);
         }
     }
 }

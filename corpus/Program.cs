@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using DiscUtils.Vhdx;
@@ -76,10 +77,26 @@ namespace Corpus
             var bufferedIo = false;
             var skipIfUnchanged = false;
             string? splitSwm = null;
+            var optimizeVhd = false;
+            var recompress = false;
             var trimResetBase = false;
             var trimFeatures = new List<string>();
             var trimPackages = new List<string>();
             var trimNoHibernate = false;
+            string? wimPath = null;
+            string? mountDir = null;
+            var commit = false;
+            var discard = false;
+            string? compressFlag = null;
+            string? swmPath = null;
+            string? unattendFile = null;
+            var langPacks = new List<string>();
+            string? regHive = null;
+            string? regKey = null;
+            string? regName = null;
+            string? regType = null;
+            string? regData = null;
+            var removeKbs = new List<string>();
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -360,6 +377,15 @@ namespace Corpus
                     case "--split-swm":
                         if (i + 1 < args.Length) splitSwm = args[++i];
                         break;
+                    case "--optimize-vhd":
+                        optimizeVhd = true;
+                        break;
+                    case "--optimize-wim":
+                        verb = "optimize-wim";
+                        break;
+                    case "--recompress":
+                        recompress = true;
+                        break;
                     case "--record-compact":
                         verb = "record-compact";
                         break;
@@ -374,6 +400,66 @@ namespace Corpus
                         break;
                     case "--trim-no-hibernate":
                         trimNoHibernate = true;
+                        break;
+                    case "--convert":
+                        verb = "convert";
+                        break;
+                    case "--merge-swm":
+                        verb = "merge-swm";
+                        break;
+                    case "--wim-info":
+                        verb = "wim-info";
+                        break;
+                    case "--mount":
+                        verb = "mount";
+                        break;
+                    case "--unmount":
+                        verb = "unmount";
+                        break;
+                    case "--apply":
+                        verb = "apply";
+                        break;
+                    case "--wim":
+                        if (i + 1 < args.Length) wimPath = args[++i];
+                        break;
+                    case "--mount-dir":
+                        if (i + 1 < args.Length) mountDir = args[++i];
+                        break;
+                    case "--commit":
+                        commit = true;
+                        break;
+                    case "--discard":
+                        discard = true;
+                        break;
+                    case "--compress":
+                        if (i + 1 < args.Length) compressFlag = args[++i];
+                        break;
+                    case "--swm":
+                        if (i + 1 < args.Length) swmPath = args[++i];
+                        break;
+                    case "--unattend":
+                        if (i + 1 < args.Length) unattendFile = args[++i];
+                        break;
+                    case "--lang-pack":
+                        if (i + 1 < args.Length) langPacks.Add(args[++i]);
+                        break;
+                    case "--reg-hive":
+                        if (i + 1 < args.Length) regHive = args[++i];
+                        break;
+                    case "--reg-key":
+                        if (i + 1 < args.Length) regKey = args[++i];
+                        break;
+                    case "--reg-name":
+                        if (i + 1 < args.Length) regName = args[++i];
+                        break;
+                    case "--reg-type":
+                        if (i + 1 < args.Length) regType = args[++i];
+                        break;
+                    case "--reg-data":
+                        if (i + 1 < args.Length) regData = args[++i];
+                        break;
+                    case "--remove-kb":
+                        if (i + 1 < args.Length) removeKbs.Add(args[++i]);
                         break;
                     case "--dry-run":
                         dryRun = true;
@@ -430,7 +516,21 @@ namespace Corpus
                     case "locate-winre":
                         return RunLocateWinre(log);
                     case "prepare-universal":
-                        return RunPrepareUniversal(windowsDir, drivers, nicDir, gpuDir, dryRun, trimResetBase, trimFeatures, trimPackages, trimNoHibernate, log);
+                        return RunPrepareUniversal(windowsDir, drivers, nicDir, gpuDir, dryRun, trimResetBase, trimFeatures, trimPackages, trimNoHibernate, unattendFile, langPacks, regHive, regKey, regName, regType, regData, removeKbs, log);
+                    case "convert":
+                        return RunConvert(wimPath, toFlag, indexFlag, compressFlag, log);
+                    case "merge-swm":
+                        return RunMergeSwm(swmPath, toFlag, log);
+                    case "wim-info":
+                        return RunWimInfo(wimPath, log);
+                    case "mount":
+                        return RunMount(wimPath, indexFlag, mountDir, log);
+                    case "unmount":
+                        return RunUnmount(mountDir, commit, discard, log);
+                    case "apply":
+                        return RunApply(wimPath, indexFlag, target, log);
+                    case "optimize-wim":
+                        return RunOptimizeWim(wimPath, recompress, log);
                     case "check-boot-mode":
                         return RunCheckBootMode(diskArg, firmware, log);
                     case "check-repair":
@@ -475,7 +575,7 @@ namespace Corpus
                         // §12.1 single-file backup rides --image but stores
                         // no snapshot: --volume only, never --name/--disk.
                         if (toVhdx != null || toWim != null || toEsd != null)
-                            return RunSingleFile(cfg, volume, name, diskArg, toVhdx, toWim, toEsd, zstd, vhdxWriter, append, incremental, parentArg, forceFull, inline, cliExcludes, log, !bufferedIo, skipIfUnchanged, splitSwm);
+                            return RunSingleFile(cfg, volume, name, diskArg, toVhdx, toWim, toEsd, zstd, vhdxWriter, append, incremental, parentArg, forceFull, inline, cliExcludes, log, !bufferedIo, skipIfUnchanged, splitSwm, optimizeVhd);
                         // §12.9 writer lock: store captures serialize on the
                         // store root (storeless single-file above takes no
                         // lock). Contention/timeout throw loud via the outer
@@ -980,7 +1080,7 @@ namespace Corpus
         // store, no snapshot. Exactly one of --to-vhdx/--to-wim/--to-esd;
         // store concepts (--name/--inline/--incremental/--parent/--full)
         // and --disk are refused, never merged.
-        private static int RunSingleFile(CorpusConfig cfg, string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd, bool zstd, string? vhdxWriter, bool append, bool incremental, string? parentArg, bool forceFull, bool inline, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false, string? splitSwm = null)
+        private static int RunSingleFile(CorpusConfig cfg, string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd, bool zstd, string? vhdxWriter, bool append, bool incremental, string? parentArg, bool forceFull, bool inline, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false, string? splitSwm = null, bool optimizeVhd = false)
         {
             var kinds = 0;
             if (toVhdx != null) kinds++;
@@ -1041,6 +1141,26 @@ namespace Corpus
             if (vhdxWriter != null && toVhdx == null)
             {
                 log.Error("--vhdx-writer needs --to-vhdx");
+                return 1;
+            }
+            // §12.29 Optimize-VHD compacts a full VHDX only — the
+            // differencing child's blocks fall through to the parent, so
+            // compacting it is refused (unprobed interaction), never silent.
+            if (optimizeVhd && toVhdx == null)
+            {
+                log.Error("--optimize-vhd needs --to-vhdx (full VHDX post-step)");
+                return 1;
+            }
+            if (optimizeVhd && parentArg != null)
+            {
+                log.Error("--optimize-vhd refuses a --parent differencing child (compact the full parent instead)");
+                return 1;
+            }
+            // Fail fast off-Windows: Compact would run the whole backup
+            // first, then throw. Same message shape as the runner's.
+            if (optimizeVhd && !OperatingSystem.IsWindows())
+            {
+                log.Error("--optimize-vhd needs Windows (Hyper-V Optimize-VHD)");
                 return 1;
             }
             // §12.14 SWM split: chop a --to-wim into FAT32-sized parts.
@@ -1147,6 +1267,11 @@ namespace Corpus
                 {
                     var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
                     var path = SingleFileBackup.BackupVhdx(source, volume, toVhdx, kind, excl, log);
+                    // Order: verify (inside BackupVhdx) → compact → zstd.
+                    // The sidecar hashes and deletes the original, so
+                    // compacting after it compacts nothing.
+                    if (optimizeVhd)
+                        OptimizeVhd.Compact(path, new PowershellOptimizeRunner(), log);
                     if (zstd)
                         SingleFileBackup.CompressSidecar(path, log, cfg.Compression.Level);
                 }
@@ -1328,17 +1453,188 @@ namespace Corpus
         // first-boot staging into a restored (offline) Windows tree. --driver
         // is required (storage inject is the core); NIC/GPU dirs warn-and-skip
         // when absent. Never runs against the live OS dir — offline only.
-        private static int RunPrepareUniversal(string? windowsDir, List<string> drivers, string? nicDir, string? gpuDir, bool dryRun, bool trimResetBase, List<string> trimFeatures, List<string> trimPackages, bool trimNoHibernate, ILogger log)
+        // WIM file ops run through the backend seam: inbox DISM on
+        // Windows, wimlib shell-out on Linux (same string protocol).
+        private static IWimRunner CreateWimRunner() =>
+            OperatingSystem.IsWindows()
+                ? new DismWimRunner(new DismRunner())
+                : new WimlibRunner();
+
+        private static bool IsBare(string? value) =>
+            !string.IsNullOrEmpty(value) && value.StartsWith("--", StringComparison.Ordinal);
+
+        // §12.19 convert + single-index export: both directions are the
+        // same op (source-agnostic export). --index optional on
+        // single-image sources (defaults 1), required on multi-image.
+        private static int RunConvert(string? wimPath, string? dest, string? indexFlag, string? compressFlag, ILogger log)
+        {
+            if (string.IsNullOrEmpty(wimPath) || IsBare(wimPath) || string.IsNullOrEmpty(dest) || IsBare(dest))
+            {
+                log.Error("--convert requires --wim <source> --to <dest> (bare flag refuses)");
+                return 1;
+            }
+            int? index = null;
+            if (!string.IsNullOrEmpty(indexFlag))
+            {
+                if (!int.TryParse(indexFlag, out var n) || n < 1)
+                {
+                    log.Error("invalid --index (want a positive image number, got: " + indexFlag + ")");
+                    return 1;
+                }
+                index = n;
+            }
+            var compress = WimCompression.Max;
+            if (!string.IsNullOrEmpty(compressFlag))
+            {
+                if (compressFlag.Equals("max", StringComparison.OrdinalIgnoreCase)) compress = WimCompression.Max;
+                else if (compressFlag.Equals("recovery", StringComparison.OrdinalIgnoreCase)) compress = WimCompression.Recovery;
+                else
+                {
+                    log.Error("invalid --compress (want max|recovery, got: " + compressFlag + ")");
+                    return 1;
+                }
+            }
+            else if (dest.EndsWith(".esd", StringComparison.OrdinalIgnoreCase))
+            {
+                compress = WimCompression.Recovery;
+                log.Info("--convert to .esd implies --compress recovery (ESD is always solid)");
+            }
+            WimImageOps.Convert(wimPath, dest, index, compress, CreateWimRunner(), log);
+            return 0;
+        }
+
+        // §12.28 wimlib optimize: dedupe (+ optional recompress) in place.
+        // No DISM equivalent exists — the Windows runner refuses naming
+        // wimlib as the path. Sizes + reclaimed bytes logged by the op.
+        private static int RunOptimizeWim(string? wimPath, bool recompress, ILogger log)
+        {
+            if (string.IsNullOrEmpty(wimPath) || IsBare(wimPath))
+            {
+                log.Error("--optimize-wim requires --wim <file> [--recompress] (bare flag refuses)");
+                return 1;
+            }
+            WimOptimize.Optimize(wimPath, recompress, CreateWimRunner(), log);
+            return 0;
+        }
+
+        // §12.20 SWM merge: reunite a split set (join needs ALL parts).
+        private static int RunMergeSwm(string? swmPath, string? dest, ILogger log)
+        {
+            if (string.IsNullOrEmpty(swmPath) || IsBare(swmPath) || string.IsNullOrEmpty(dest) || IsBare(dest))
+            {
+                log.Error("--merge-swm requires --swm <first.swm> --to <dest.wim> (bare flag refuses)");
+                return 1;
+            }
+            WimImageOps.MergeSwm(swmPath, dest, CreateWimRunner(), log);
+            return 0;
+        }
+
+        // §12.21 image dossier: indexes, sizes, languages (+ recorded
+        // compact state when a sidecar path is derivable — not here: pass
+        // null, the report owns the file read when given).
+        private static int RunWimInfo(string? wimPath, ILogger log)
+        {
+            if (string.IsNullOrEmpty(wimPath) || IsBare(wimPath))
+            {
+                log.Error("--wim-info requires --wim <image> (bare flag refuses)");
+                return 1;
+            }
+            Console.WriteLine(WimInfoReport.Get(wimPath, CreateWimRunner(), log).ToString());
+            return 0;
+        }
+
+        // §12.22 mount: read/write servicing mount + our marker (never
+        // mount over a non-empty dir; marker reclaims only our mounts).
+        private static int RunMount(string? wimPath, string? indexFlag, string? mountDir, ILogger log)
+        {
+            if (string.IsNullOrEmpty(wimPath) || IsBare(wimPath) || string.IsNullOrEmpty(mountDir) || IsBare(mountDir))
+            {
+                log.Error("--mount requires --wim <image> --index <N> --mount-dir <empty dir> (bare flag refuses)");
+                return 1;
+            }
+            if (string.IsNullOrEmpty(indexFlag) || !int.TryParse(indexFlag, out var index) || index < 1)
+            {
+                log.Error("--mount requires --index <N> (positive image number, got: " + indexFlag + ")");
+                return 1;
+            }
+            WimMount.Mount(wimPath, index, mountDir, CreateWimRunner(), log);
+            return 0;
+        }
+
+        // §12.22 unmount: exactly one of --commit/--discard (no silent
+        // default — committing or throwing away servicing must be explicit).
+        private static int RunUnmount(string? mountDir, bool commit, bool discard, ILogger log)
+        {
+            if (string.IsNullOrEmpty(mountDir) || IsBare(mountDir))
+            {
+                log.Error("--unmount requires --mount-dir <dir> (bare flag refuses)");
+                return 1;
+            }
+            if (commit == discard)
+            {
+                log.Error("--unmount requires exactly one of --commit | --discard");
+                return 1;
+            }
+            WimMount.Unmount(mountDir, commit, CreateWimRunner(), log);
+            return 0;
+        }
+
+        // Install-without-USB flow: apply a WIM/ESD straight to a partition
+        // + bcdboot, from the live OS or WinPE — no boot.wim needed. Index
+        // rule mirrors --convert (single→default, multi→require). Refuses
+        // the live-OS volume; /CheckIntegrity covers the WIM, not the write.
+        private static int RunApply(string? wimPath, string? indexFlag, string? targetDir, ILogger log)
+        {
+            if (string.IsNullOrEmpty(wimPath) || IsBare(wimPath) || string.IsNullOrEmpty(targetDir) || IsBare(targetDir))
+            {
+                log.Error("--apply requires --wim <image> --target <dir> (bare flag refuses)");
+                return 1;
+            }
+            int? index = null;
+            if (!string.IsNullOrEmpty(indexFlag))
+            {
+                if (!int.TryParse(indexFlag, out var n) || n < 1)
+                {
+                    log.Error("invalid --index (want a positive image number, got: " + indexFlag + ")");
+                    return 1;
+                }
+                index = n;
+            }
+            WimApply.Apply(wimPath, index, targetDir, CreateWimRunner(), log);
+            return 0;
+        }
+
+        private static int RunPrepareUniversal(string? windowsDir, List<string> drivers, string? nicDir, string? gpuDir, bool dryRun, bool trimResetBase, List<string> trimFeatures, List<string> trimPackages, bool trimNoHibernate, string? unattendFile, List<string> langPacks, string? regHive, string? regKey, string? regName, string? regType, string? regData, List<string> removeKbs, ILogger log)
         {
             if (string.IsNullOrEmpty(windowsDir) || !Directory.Exists(windowsDir))
             {
                 log.Error("--prepare-universal requires --windows-dir <offline Windows dir> (got: " + windowsDir + ")");
                 return 1;
             }
+            // Registry edit needs all five parts or none (partial = refuse,
+            // never guess the missing piece).
+            var regParts = new[] { regHive, regKey, regName, regType, regData };
+            if (regParts.Any(p => p != null) && regParts.Any(string.IsNullOrEmpty))
+            {
+                log.Error("--reg-hive/--reg-key/--reg-name/--reg-type/--reg-data are all required together (partial edit refuses)");
+                return 1;
+            }
             var rc = UniversalRestore.InjectStorageDrivers(new UniversalRestoreOptions(drivers.ToArray(), windowsDir, dryRun), new WindowsDismDriverInjector(log), log);
             if (rc != 0) return rc;
             rc = UniversalRestore.StageFirstBootDrivers(new FirstBootOptions(nicDir, gpuDir, windowsDir, dryRun), new FileFirstBootStager(), log);
             if (rc != 0) return rc;
+            // Payload adds first (drivers above, then language packs), then
+            // the answer file that may reference them.
+            if (langPacks.Count > 0)
+            {
+                rc = OfflineServicing.AddLangPack(windowsDir, langPacks, new WindowsTrimRunner(), log, dryRun);
+                if (rc != 0) return rc;
+            }
+            if (!string.IsNullOrEmpty(unattendFile))
+            {
+                rc = OfflineServicing.ApplyUnattend(windowsDir, unattendFile, new WindowsTrimRunner(), log, dryRun);
+                if (rc != 0) return rc;
+            }
             // §12.14 footprint trim (REMOVAL — each op deletes something;
             // ResetBase is irreversible, stated again in flag help). Runs
             // after servicing so the base reset covers the injected drivers.
@@ -1347,6 +1643,19 @@ namespace Corpus
             if (trimResetBase || trimFeatures.Count > 0 || trimPackages.Count > 0)
             {
                 rc = OfflineTrim.Trim(new OfflineTrimOptions(windowsDir, trimResetBase, trimFeatures.ToArray(), trimPackages.ToArray(), false, dryRun), new WindowsTrimRunner(), log);
+                if (rc != 0) return rc;
+            }
+            // KB removal after servicing (never the live OS — the guard
+            // inside refuses %SystemRoot%).
+            if (removeKbs.Count > 0)
+            {
+                rc = OfflineKb.RemoveKb(windowsDir, removeKbs, new WindowsTrimRunner(), log, dryRun);
+                if (rc != 0) return rc;
+            }
+            // Registry tweaks last (config over content).
+            if (regHive != null)
+            {
+                rc = OfflineRegistry.SetValue(regHive, regKey!, regName!, regType!, regData!, new WindowsRegistryRunner(), log, dryRun);
                 if (rc != 0) return rc;
             }
             if (trimNoHibernate)
@@ -1648,7 +1957,17 @@ namespace Corpus
             Console.WriteLine("      Offline storage-driver inject (DISM) + NIC/GPU first-boot staging into a restored tree");
             Console.WriteLine("      [--trim-resetbase] [--trim-disable-feature <name>]... [--trim-remove-package <id>]... [--trim-no-hibernate]");
             Console.WriteLine("      Footprint trim = REMOVAL (ResetBase is irreversible; feature/package lists are caller-named, never builtin; hibernate stages to SetupComplete.cmd for first boot)");
+            Console.WriteLine("      [--unattend <file>] [--lang-pack <cab>]... [--remove-kb <KBnnn>]... [--reg-hive <f> --reg-key <k> --reg-name <n> --reg-type <t> --reg-data <d>]");
+            Console.WriteLine("      Servicing order: drivers, first-boot staging, lang packs, unattend, trim, KB removal, registry; KB guard refuses the live OS");
+            Console.WriteLine("  --convert --wim <src> --to <dest> [--index N] [--compress max|recovery]  Convert WIM<->ESD or re-export single-index (.esd implies recovery; multi-image source requires --index)");
+            Console.WriteLine("  --merge-swm --swm <first.swm> --to <dest.wim>  Reunite a split set (join needs ALL parts)");
+            Console.WriteLine("  --wim-info --wim <image>  Human-readable dossier: indexes, sizes, languages");
+            Console.WriteLine("  --mount --wim <image> --index <N> --mount-dir <empty dir>  Read/write servicing mount (our marker; never over non-empty dir)");
+            Console.WriteLine("  --unmount --mount-dir <dir> --commit | --discard  Commit or throw away servicing (exactly one; foreign mounts refused)");
+            Console.WriteLine("  --apply --wim <image> [--index N] --target <D:>  Apply image to partition + bcdboot, no WinPE boot needed (refuses the live-OS volume; /CheckIntegrity covers the WIM, not the disk write)");
             Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> --split-swm <sizeMb>  Split the WIM into FAT32-sized .swm parts (DISM on Windows, wimlib on Linux; ESD cannot split)");
+            Console.WriteLine("  --optimize-wim --wim <file> [--recompress]  Dedupe (+ optional recompress) a WIM in place via wimlib optimize (no DISM equivalent; Windows refuses naming wimlib)");
+            Console.WriteLine("  --image --volume <path|X:> --to-vhdx <file|dir> [--optimize-vhd]  Compact the VHDX post-verify via Optimize-VHD Mode Full (Windows Hyper-V module; refuses differencing children)");
             Console.WriteLine("  --record-compact --snapshot <gen> [--windows-dir <offline>]  Record Compact OS state beside the snapshot manifest (record-only; Windows queries live)");
             Console.WriteLine("  --check-boot-mode --disk <N> --firmware <UEFI|BIOS>  Refuse GPT-on-BIOS / MBR-on-UEFI with the conversion path");
             Console.WriteLine("  --check-repair --disk <N>  Live-layout repair checks + diskpart/bcdboot plan (read-only, exit 1 names the blocker)");
