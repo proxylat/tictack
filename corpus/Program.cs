@@ -707,7 +707,7 @@ namespace Corpus
                             }
                             budget = b;
                         }
-                        var optimizer = new StoreOptimizer(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, cfg.Compression.Level, cfg.Encrypt);
+                        var optimizer = new StoreOptimizer(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, cfg.Compression.Level, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
                         using (StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log))
                             optimizer.Optimize(budget);
                         return 0;
@@ -719,7 +719,7 @@ namespace Corpus
                         }
                         // No Trim: NTFS names can hold spaces.
                         var index = EnsureWritableIndex(Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), log);
-                        var summary = SelectiveExtract.Extract(cfg.StorePath, index, extractGen, extractPaths.Split(','), outPath, log);
+                        var summary = SelectiveExtract.Extract(cfg.StorePath, index, extractGen, extractPaths.Split(','), outPath, log, new ZstdDeltaCodec(cfg.Compression.Level));
                         log.Info($"extracted {summary.Files} files + {summary.Directories} dirs ({summary.Bytes} bytes, {summary.Skipped} skipped) from snapshot {extractGen}");
                         return 0;
                     case "record-compact":
@@ -790,7 +790,7 @@ namespace Corpus
                 cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.ChunkMib, cfg.Compression.Level, log,
-                cfg.Encrypt);
+                cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
         }
 
         private static int RunListVolumes(ILogger log)
@@ -900,7 +900,7 @@ namespace Corpus
                 : File.Exists(mediaDb) ? mediaDb
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
             indexPath = EnsureWritableIndex(indexPath, log);
-            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt);
+            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
         }
@@ -1002,7 +1002,7 @@ namespace Corpus
                 : File.Exists(mediaDb) ? mediaDb
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
             indexPath = EnsureWritableIndex(indexPath, log);
-            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt);
+            using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
             return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun, RepairBoot: repairBoot, Partitions: partitions));
         }

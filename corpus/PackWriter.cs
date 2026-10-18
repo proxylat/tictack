@@ -179,6 +179,21 @@ namespace Corpus
             return blob.Payload;
         }
 
+        // Header-only peek: the codec byte without a full payload read.
+        // Capture uses it to reuse an indexed chunk's kind (whole vs delta)
+        // without paying a decode on the hot path.
+        public static byte PeekCodec(string packPath, long offset)
+        {
+            if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+            using (var stream = new FileStream(packPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                stream.Seek(offset, SeekOrigin.Begin);
+                Span<byte> header = stackalloc byte[9];
+                Fill(stream, header);
+                return header[8];
+            }
+        }
+
         private static void Fill(Stream stream, Span<byte> buf)
         {
             var filled = 0;

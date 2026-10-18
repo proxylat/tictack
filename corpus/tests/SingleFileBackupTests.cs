@@ -470,7 +470,7 @@ public sealed class SingleFileBackupTests : IDisposable
         Assert.False(File.Exists(target));
         // In-process decode: every frame must reproduce the original bytes.
         using var input = new FileStream(zst, FileMode.Open, FileAccess.Read);
-        using var z = new ZstdSharp.ZstdStream(input, ZstdSharp.ZstdStreamMode.Decompress, leaveOpen: false);
+        using var z = new ZstdSharp.DecompressionStream(input, 128 * 1024, checkEndOfStream: true, leaveOpen: false);
         using var plain = new MemoryStream();
         z.CopyTo(plain);
         Assert.Equal(before, plain.ToArray());

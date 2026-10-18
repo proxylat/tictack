@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -11,6 +12,7 @@ using DiscUtils.Streams;
 using DiscUtils.Vhdx;
 using TicTack;
 using ZstdSharp;
+using ZstdSharp.Unsafe;
 
 namespace Corpus
 {
@@ -957,8 +959,8 @@ namespace Corpus
         // --zstd cold-archive sidecar (--to-vhdx only; GuardZstd refuses the
         // rest): streaming multi-frame compress AFTER the VHDX verify
         // greened, then the original is deleted and `.zst` appended.
-        // ZstdSharp 0.7.2 has no parameterised streaming (ZstdStream takes
-        // only a level), so each bounded frame is compressed with a
+        // Framed design (kept from the 0.7.2 era, when ZstdStream took
+        // only a level): each bounded frame is compressed with a
         // windowLog-27 + LDM context and concatenated — stock `zstd -d`
         // reads multi-frame streams transparently. NbWorkers is NOT set:
         // the port throws "Unsupported parameter" for workers > 0
@@ -978,11 +980,11 @@ namespace Corpus
             var partial = zst + ".partial";
             var frames = new List<(long ZLen, long PLen)>();
             byte[] hash;
-            using (var ctx = new ZstdCompressionContext())
+            using (var ctx = new Compressor(level))
             {
-                ctx.SetParameter(ZstdCompressionParameter.WindowLog, ZstdWindowLog);
-                ctx.SetParameter(ZstdCompressionParameter.EnableLongDistanceMatching, 1);
-                ctx.SetParameter(ZstdCompressionParameter.ChecksumFlag, 0);
+                ctx.SetParameter(ZSTD_cParameter.ZSTD_c_windowLog, ZstdWindowLog);
+                ctx.SetParameter(ZSTD_cParameter.ZSTD_c_enableLongDistanceMatching, 1);
+                ctx.SetParameter(ZSTD_cParameter.ZSTD_c_checksumFlag, 0);
                 using var input = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 using var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.Read);
                 using var sha = SHA256.Create();
@@ -996,9 +998,21 @@ namespace Corpus
                     if (filled == 0)
                         break;
                     sha.TransformBlock(buf, 0, filled, null, 0);
-                    var frame = ctx.Compress(buf, 0, filled, level);
-                    output.Write(frame, 0, frame.Length);
-                    frames.Add((frame.Length, filled));
+                    // Bound-sized rent (64MiB frames must not park a second
+                    // bound-sized array per frame): exact bytes copied out.
+                    var bound = Compressor.GetCompressBound(filled);
+                    var tmp = ArrayPool<byte>.Shared.Rent(bound);
+                    try
+                    {
+                        if (!ctx.TryWrap(buf, 0, filled, tmp, 0, tmp.Length, out var w))
+                            throw new SingleFileBackupException($"zstd refused a {filled}-byte frame of {imagePath} (bound {bound}) — original kept");
+                        output.Write(tmp, 0, w);
+                        frames.Add((w, filled));
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(tmp);
+                    }
                 }
                 sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
                 hash = sha.Hash!;
@@ -1027,7 +1041,7 @@ namespace Corpus
                 if (filled != zbuf.Length)
                     throw new SingleFileVerifyException(partial, "sidecar truncated mid-frame — original kept");
                 using var ms = new MemoryStream(zbuf, writable: false);
-                using var z = new ZstdStream(ms, ZstdStreamMode.Decompress, leaveOpen: false);
+                using var z = new DecompressionStream(ms, 128 * 1024, checkEndOfStream: true, leaveOpen: false);
                 using var plain = new MemoryStream((int)Math.Min(plen, int.MaxValue));
                 z.CopyTo(plain);
                 if (plain.Length != plen)

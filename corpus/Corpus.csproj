@@ -24,7 +24,7 @@
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.9" />
     <!-- Compile-time only (same as TicTack): Roslyn rules, never ships. -->
     <PackageReference Include="Meziantou.Analyzer" Version="3.0.259" PrivateAssets="all" />
-    <PackageReference Include="ZstdSharp" Version="0.7.2" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
   </ItemGroup>
   <ItemGroup>
     <None Include="recovery\assets\*" CopyToOutputDirectory="PreserveNewest" />

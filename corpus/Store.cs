@@ -40,6 +40,10 @@ namespace Corpus
         private readonly byte[] _key;
         private readonly string? _encryptHook;
         private readonly ChunkIndex _index;
+        // §12.7 seam: null = no delta codec wired (old behavior; delta reads
+        // refuse loud). The winning codec plugs in here post-spike.
+        private readonly IDeltaCodec? _deltaCodec;
+        private readonly DeltaChunkReader? _deltaReader;
         private bool _disposed;
 
         // §12.4 bounded parallel-encode window: collect (digest, data)
@@ -161,11 +165,13 @@ namespace Corpus
             return volumeLength - holes;
         }
 
-        public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log, string? encryptHook = null)
+        public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log, string? encryptHook = null, IDeltaCodec? deltaCodec = null)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
             ArgumentNullException.ThrowIfNull(log);
+            if (deltaCodec != null && (deltaCodec.CodecId == Compression.CodecRaw || deltaCodec.CodecId == Compression.CodecZstd))
+                throw new ArgumentException("delta codec id must not collide with 0 (raw) or 1 (zstd)", nameof(deltaCodec));
             _packsDir = Path.Combine(storeRoot, "packs");
             _manifestsDir = Path.Combine(storeRoot, "manifests");
             _layoutsDir = Path.Combine(storeRoot, "layouts");
@@ -177,7 +183,9 @@ namespace Corpus
             _log = log;
             _key = ChunkId.EnsureKey(storeRoot);
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
+            _deltaCodec = deltaCodec;
             _index = new ChunkIndex(dbPath);
+            _deltaReader = deltaCodec != null ? new DeltaChunkReader(_index, _packsDir, _landingDir, _key, deltaCodec) : null;
         }
 
         public SnapshotManifest Image(IBlockSource source, string name) =>
@@ -490,7 +498,9 @@ namespace Corpus
             var grid = GridCount(source.Length, _chunkMib);
             var entries = new List<ManifestEntry>(parent.Chunks.Count);
             var pending = new List<ChunkRow>();
-            var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
+            // Prototype per digest packed this run: reuses the stored kind
+            // (whole or delta) for intra-image dupes without a pack re-read.
+            var packedThisImage = new Dictionary<string, ManifestEntry>(StringComparer.Ordinal);
             var excl = ResolveExclusions(source, opts);
             var exclBpc = excl?.BytesPerCluster ?? 0;
             var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
@@ -535,21 +545,43 @@ namespace Corpus
                         CapturePolicy.ZeroExcludedRanges(data, i * (long)chunkBytes, exclRuns, exclBpc);
                     var digest = ChunkId.ComputeId(data, _key);
                     var hex = ChunkId.ToHex(digest);
-                    entries.Add(new ManifestEntry(hex, data.Length));
+                    ManifestEntry entry;
+                    if (packedThisImage.TryGetValue(hex, out var proto))
+                    {
+                        entry = proto;
+                    }
+                    else if (_index.TryGet(digest, out var row))
+                    {
+                        entry = ReuseIndexedEntry(digest, row, hex, data.Length, i, generation);
+                    }
+                    else if (TryPackDelta(parent, i, data, hex, digest, pack, pending, packedThisImage))
+                    {
+                        entry = packedThisImage[hex];
+                        newChunks++;
+                        if (pending.Count >= 500)
+                        {
+                            _index.UpsertBatch(pending);
+                            pending.Clear();
+                            packedThisImage.Clear();
+                        }
+                    }
+                    else
+                    {
+                        entry = new ManifestEntry(hex, data.Length);
+                        packedThisImage[hex] = entry;
+                        window.Add(digest, data);
+                        newChunks++;
+                        if (pending.Count >= 500)
+                        {
+                            window.Drain();
+                            _index.UpsertBatch(pending);
+                            pending.Clear();
+                            packedThisImage.Clear();
+                        }
+                    }
+                    entries.Add(entry);
                     done += data.Length;
                     reporter.Report(done);
-                    if (packedThisImage.Contains(hex) || _index.TryGet(digest, out _))
-                        continue;
-                    packedThisImage.Add(hex);
-                    window.Add(digest, data);
-                    newChunks++;
-                    if (pending.Count >= 500)
-                    {
-                        window.Drain();
-                        _index.UpsertBatch(pending);
-                        pending.Clear();
-                        packedThisImage.Clear();
-                    }
                 }
                 window.Drain();
                 _index.UpsertBatch(pending);
@@ -575,6 +607,79 @@ namespace Corpus
             ManifestStore.Save(_manifestsDir, manifest, _key);
             _log.Info($"incremental gen {generation} from parent {parent.Generation}: {reread}/{grid} chunks re-read, {newChunks} new");
             return manifest;
+        }
+
+        // §12.7 capture: try patch-from the parent-gen same-index chunk.
+        // Smaller-wins per chunk (delta payload incl. 32B base digest must
+        // beat whole-compressed, mirroring the raw-if-larger rule), depth-1
+        // enforced by SELECTION (parent must be entry-marked whole — a delta
+        // is never a base, so chains are unproducible). False = caller stores
+        // whole; every fallback here is data-safe (bytes come from source),
+        // so unresolvable bases fall back instead of failing the image —
+        // the read path has no fallback and fails loud instead.
+        private bool TryPackDelta(SnapshotManifest parent, long index, byte[] data, string hex, byte[] digest,
+            PackWriter pack, List<ChunkRow> pending, Dictionary<string, ManifestEntry> packedThisImage)
+        {
+            if (_deltaCodec == null)
+                return false;
+            if (index < 0 || index >= parent.Chunks.Count)
+                return false;
+            var prev = parent.Chunks[(int)index];
+            if (prev.IsHole || prev.BaseDigestHex != null)
+                return false;
+            var baseBytes = TryReadChunkBytes(new ManifestEntry(prev.DigestHex, prev.Size));
+            if (baseBytes == null)
+                return false;
+            if (!_deltaCodec.TryCreatePatch(baseBytes, data, out var patch))
+                return false;
+            var whole = Compression.Encode(data, _zstdLevel);
+            if ((long)patch.Length + DeltaFormat.BaseBytes >= whole.Payload.Length)
+                return false;
+            byte[] baseDigest;
+            try
+            {
+                baseDigest = Convert.FromHexString(prev.DigestHex);
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
+            var payload = new byte[DeltaFormat.BaseBytes + patch.Length];
+            Buffer.BlockCopy(baseDigest, 0, payload, 0, DeltaFormat.BaseBytes);
+            Buffer.BlockCopy(patch, 0, payload, DeltaFormat.BaseBytes, patch.Length);
+            var (packName, offset) = pack.Add(digest, payload, data.Length, _deltaCodec.CodecId);
+            pending.Add(new ChunkRow(digest, data.Length, payload.Length, packName, offset));
+            packedThisImage[hex] = new ManifestEntry(hex, data.Length, BaseDigestHex: prev.DigestHex, DeltaCodec: _deltaCodec.CodecId);
+            return true;
+        }
+
+        // A dirty chunk whose bytes already live in the store reuses the
+        // stored kind: entry marking must match the blob or readers decode
+        // wrong. Header peek only (no decode on the capture path). A foreign
+        // codec byte fails loud — never a silent whole.
+        private ManifestEntry ReuseIndexedEntry(byte[] digest, ChunkRow row, string hex, int length, long chunkIndex, int generation)
+        {
+            byte codec;
+            try
+            {
+                codec = PackReader.PeekCodec(Path.Combine(_packsDir, row.Pack), row.PackOffset);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+            {
+                throw new InvalidDataException($"snapshot {generation} chunk {chunkIndex}: indexed chunk {hex} unreadable ({ex.Message})", ex);
+            }
+            if (codec == Compression.CodecRaw || codec == Compression.CodecZstd)
+                return new ManifestEntry(hex, length);
+            if (_deltaCodec != null && codec == _deltaCodec.CodecId)
+            {
+                var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                if (blob.Payload.Length < DeltaFormat.BaseBytes)
+                    throw new InvalidDataException($"snapshot {generation} chunk {chunkIndex}: delta entry truncated");
+                return new ManifestEntry(hex, length,
+                    BaseDigestHex: ChunkId.ToHex(blob.Payload[..DeltaFormat.BaseBytes]),
+                    DeltaCodec: codec);
+            }
+            throw new InvalidDataException($"snapshot {generation} chunk {chunkIndex}: indexed chunk {hex} has unknown codec {codec} (old reader cannot read it)");
         }
 
         private static byte[] ReadChunkAt(Stream stream, long index, int chunkBytes, long volumeLength)
@@ -1282,7 +1387,7 @@ namespace Corpus
                 _log.Info($"skip-compare: chunk {index} overlap=N reads=n/a masked-equal=n/a");
                 return false;
             }
-            var parentBytes = TryReadChunkBytes(prev.DigestHex, prev.Size);
+            var parentBytes = TryReadChunkBytes(prev);
             var currentBytes = TryReadLanding(cur.DigestHex);
             var reads = parentBytes == null || parentBytes.Length != prev.Size ? "parent-miss"
                 : currentBytes == null || currentBytes.Length != cur.Size || currentBytes.Length != parentBytes.Length ? "cur-miss"
@@ -1313,12 +1418,15 @@ namespace Corpus
         // (post-optimize), landing read-through otherwise. Null when the
         // chunk lives nowhere (Bug-A-shaped hole) or fails to decode —
         // the caller then refuses the skip. Mirrors Verify's read paths.
-        private byte[]? TryReadChunkBytes(string hex, long size)
+        // Delta entries resolve through the shared reader (any failure =
+        // null = cannot prove).
+        private byte[]? TryReadChunkBytes(ManifestEntry entry)
         {
+            ArgumentNullException.ThrowIfNull(entry);
             byte[] digest;
             try
             {
-                digest = Convert.FromHexString(hex);
+                digest = Convert.FromHexString(entry.DigestHex);
             }
             catch (FormatException)
             {
@@ -1329,8 +1437,18 @@ namespace Corpus
                 try
                 {
                     var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
-                    var plain = Compression.Decode(blob.Payload, blob.Codec);
-                    return plain.Length == size ? plain : null;
+                    byte[] plain;
+                    if (entry.BaseDigestHex != null)
+                    {
+                        if (_deltaReader == null || _deltaCodec == null || blob.Codec != _deltaCodec.CodecId)
+                            return null;
+                        plain = _deltaReader.Resolve(entry, blob.Payload, 0, -1);
+                    }
+                    else
+                    {
+                        plain = Compression.Decode(blob.Payload, blob.Codec);
+                    }
+                    return plain.Length == entry.Size ? plain : null;
                 }
                 // Broad catch like Verify: zstd throws plain Exception on
                 // corrupt frames, IO/pack faults throw their own — any of
@@ -1340,8 +1458,28 @@ namespace Corpus
                     return null;
                 }
             }
-            var landed = TryReadLanding(hex);
-            return landed != null && landed.Length == size ? landed : null;
+            var landed = TryReadLanding(entry.DigestHex);
+            return landed != null && landed.Length == entry.Size ? landed : null;
+        }
+
+        // Delta read funnel for export/verify: index → kind check → shared
+        // resolve, landing read-through when the reconstructed bytes were
+        // never packed. Throws InvalidDataException naming the chunk on
+        // every failure — including the old-reader case (no codec wired).
+        private byte[] ReadDeltaEntry(int generation, long chunkIndex, ManifestEntry entry, byte[] digest)
+        {
+            if (_deltaCodec == null || _deltaReader == null)
+                throw new InvalidDataException($"snapshot {generation} chunk {chunkIndex}: delta entry needs codec {entry.DeltaCodec} (old reader cannot read deltas)");
+            if (_index.TryGet(digest, out var row))
+            {
+                var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                if (blob.Codec != _deltaCodec.CodecId)
+                    throw new InvalidDataException($"snapshot {generation} chunk {chunkIndex}: delta entry stored as codec {blob.Codec}, expected {_deltaCodec.CodecId}");
+                return _deltaReader.Resolve(entry, blob.Payload, generation, chunkIndex);
+            }
+            if (TryReadLanding(entry.DigestHex) is byte[] landed && landed.Length == entry.Size)
+                return landed;
+            throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {generation} missing from index");
         }
 
         // §12.13 capture resume. The fingerprint binds the landed chunks
@@ -1663,8 +1801,9 @@ namespace Corpus
         private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output, IProgress<long>? progress = null)
         {
             var reported = 0L;
-            foreach (var entry in manifest.Chunks)
+            for (var ci = 0; ci < manifest.Chunks.Count; ci++)
             {
+                var entry = manifest.Chunks[ci];
                 if (entry.IsHole)
                 {
                     output.Seek(entry.Size, SeekOrigin.Current);
@@ -1672,7 +1811,11 @@ namespace Corpus
                 }
                 var digest = Convert.FromHexString(entry.DigestHex);
                 byte[] plain;
-                if (_index.TryGet(digest, out var row))
+                if (entry.BaseDigestHex != null)
+                {
+                    plain = ReadDeltaEntry(manifest.Generation, ci, entry, digest);
+                }
+                else if (_index.TryGet(digest, out var row))
                 {
                     var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
                     plain = Compression.Decode(blob.Payload, blob.Codec);
@@ -1727,6 +1870,28 @@ namespace Corpus
                         continue;
                     }
                     var digest = Convert.FromHexString(entry.DigestHex);
+                    if (entry.BaseDigestHex != null)
+                    {
+                        // Full re-read rule: verify reconstructs EVERY delta,
+                        // nobody samples. Resolver failures already name the
+                        // chunk (InvalidDataException); log verbatim.
+                        try
+                        {
+                            var deltaPlain = ReadDeltaEntry(generation, i, entry, digest);
+                            if (deltaPlain.Length != entry.Size
+                                || !CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(deltaPlain, _key), digest))
+                            {
+                                failed = true;
+                                if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: content mismatch");
+                            }
+                        }
+                        catch (InvalidDataException ex)
+                        {
+                            failed = true;
+                            if (logged++ < 5) _log.Error(ex.Message);
+                        }
+                        continue;
+                    }
                     if (!_index.TryGet(digest, out var row))
                     {
                         // Pre-optimize landing read-through: plaintext chunk,

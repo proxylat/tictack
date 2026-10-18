@@ -9,7 +9,13 @@ using System.Text.Json.Serialization;
 namespace Corpus
 {
     public sealed record ManifestEntry(string DigestHex, long Size,
-        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsHole = false)
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsHole = false,
+        // §12.7 sub-chunk delta: base digest (always a WHOLE chunk) + the codec
+        // id that wrote the patch. Null/0 = whole chunk. Omitted when default
+        // so old manifests load unchanged and old JSON stays byte-identical;
+        // DigestHex/Size always describe the RECONSTRUCTED bytes.
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] string? BaseDigestHex = null,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] byte DeltaCodec = 0)
     {
         public static ManifestEntry Hole(long size) => new("", size, true);
     }

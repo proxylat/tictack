@@ -70,7 +70,7 @@ namespace Corpus
         // An empty/whitespace --paths ENTRY means the volume root; an empty
         // LIST refuses. Overwrites existing files, merges into existing dirs
         // (tar-like; re-extract is idempotent).
-        public static ExtractSummary Extract(string storeRoot, string dbPath, int generation, IReadOnlyList<string> paths, string outDir, ILogger log)
+        public static ExtractSummary Extract(string storeRoot, string dbPath, int generation, IReadOnlyList<string> paths, string outDir, ILogger log, IDeltaCodec? deltaCodec = null)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
@@ -89,7 +89,7 @@ namespace Corpus
             if (!File.Exists(dbPath))
                 throw new ExtractRefusedException($"extract: chunk index '{dbPath}' not found", dbPath);
             var manifest = LoadGeneration(storeRoot, File.ReadAllBytes(keyPath), generation);
-            using var vol = new SnapshotVolumeReader(storeRoot, dbPath, manifest);
+            using var vol = new SnapshotVolumeReader(storeRoot, dbPath, manifest, deltaCodec);
             var geo = NtfsBoot.Parse(vol, generation);
             var mft = new MftStream(vol, geo, generation);
             var job = new ExtractJob(vol, mft, geo, generation, outDir, log);
@@ -521,6 +521,10 @@ namespace Corpus
         private readonly string _landingDir;
         private readonly int _chunkBytes;
         private readonly ChunkIndex _index;
+        // §12.7 seam: null = no delta codec wired (old behavior; delta reads
+        // refuse loud). The winning codec plugs in here post-spike.
+        private readonly IDeltaCodec? _deltaCodec;
+        private readonly DeltaChunkReader? _deltaReader;
         private readonly Dictionary<string, byte[]> _cache = new(StringComparer.Ordinal);
         private readonly Queue<string> _order = new();
         private long _cacheBytes;
@@ -531,7 +535,7 @@ namespace Corpus
         internal int CachedChunkCount => _cache.Count;
         internal long CachedBytes => _cacheBytes;
 
-        internal SnapshotVolumeReader(string storeRoot, string dbPath, SnapshotManifest manifest)
+        internal SnapshotVolumeReader(string storeRoot, string dbPath, SnapshotManifest manifest, IDeltaCodec? deltaCodec = null)
         {
             _manifest = manifest;
             _generation = manifest.Generation;
@@ -539,6 +543,10 @@ namespace Corpus
             _landingDir = Path.Combine(storeRoot, "landing");
             _chunkBytes = manifest.ChunkMib * 1024 * 1024;
             _index = new ChunkIndex(dbPath);
+            _deltaCodec = deltaCodec;
+            // ChunkId key is store-local; the id key binds digests, so the
+            // resolver needs it for the reconstruction hash-check.
+            _deltaReader = deltaCodec != null ? new DeltaChunkReader(_index, _packsDir, _landingDir, ChunkId.EnsureKey(storeRoot), deltaCodec) : null;
         }
 
         public void Read(long offset, byte[] buffer, int bufOffset, int count)
@@ -724,6 +732,13 @@ namespace Corpus
             if (_index.TryGet(digest, out var row))
             {
                 var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                if (entry.BaseDigestHex != null)
+                {
+                    // Deltas resolve serially here (index IO is not
+                    // thread-safe); the prefetch parallel loop below then
+                    // only ever sees raw/whole codecs.
+                    return (ResolveDelta(index, entry, blob.Payload, blob.Codec), Compression.CodecRaw);
+                }
                 return (blob.Payload, blob.Codec);
             }
             var landingPath = Path.Combine(_landingDir, entry.DigestHex + ".chunk");
@@ -735,6 +750,18 @@ namespace Corpus
                 return (landed, Compression.CodecRaw);
             }
             throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {_generation} missing from index");
+        }
+
+        // Delta fetch funnel: kind check here, reconstruct + hash-check in
+        // the shared reader. Every failure names the chunk, old-reader case
+        // included (no codec wired = loud refusal, never a silent whole).
+        private byte[] ResolveDelta(long index, ManifestEntry entry, byte[] payload, byte codec)
+        {
+            if (_deltaCodec == null || _deltaReader == null)
+                throw new InvalidDataException($"snapshot {_generation} chunk {index}: delta entry needs codec {entry.DeltaCodec} (old reader cannot read deltas)");
+            if (codec != _deltaCodec.CodecId)
+                throw new InvalidDataException($"snapshot {_generation} chunk {index}: delta entry stored as codec {codec}, expected {_deltaCodec.CodecId}");
+            return _deltaReader.Resolve(entry, payload, _generation, index);
         }
 
         public void Dispose()

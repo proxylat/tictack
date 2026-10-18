@@ -116,7 +116,11 @@ namespace Corpus
 
             // Live = union of non-hole digests over ROOT manifests only.
             // Digest strings need no key threading (identity binds the key).
+            // §12.7: a delta counts as a reference to its base digest —
+            // pruning a parent keeps bases while any retained delta
+            // references them (extends whole-chain expiry to chunk pairs).
             var liveHex = new HashSet<string>(StringComparer.Ordinal);
+            var deltaRefs = 0;
             foreach (var gen in gens)
             {
                 if (!roots.Contains(gen))
@@ -125,8 +129,15 @@ namespace Corpus
                 {
                     if (!entry.IsHole && entry.DigestHex != "")
                         liveHex.Add(entry.DigestHex);
+                    if (!entry.IsHole && !string.IsNullOrEmpty(entry.BaseDigestHex))
+                    {
+                        liveHex.Add(entry.BaseDigestHex);
+                        deltaRefs++;
+                    }
                 }
             }
+            if (deltaRefs > 0)
+                notes.Add($"{deltaRefs} delta entries pin their base chunks (depth-1, pruned parents stay readable)");
             var live = new List<byte[]>(liveHex.Count);
             foreach (var hex in liveHex)
                 live.Add(Convert.FromHexString(hex));
@@ -221,6 +232,9 @@ namespace Corpus
                 {
                     if (!entry.IsHole && entry.DigestHex != "")
                         live.Add(entry.DigestHex);
+                    // §12.7 pin, same as Plan: deltas reference their bases.
+                    if (!entry.IsHole && !string.IsNullOrEmpty(entry.BaseDigestHex))
+                        live.Add(entry.BaseDigestHex);
                 }
             }
             return live;

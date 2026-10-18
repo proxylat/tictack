@@ -1,9 +1,11 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using ZstdSharp;
+using ZstdSharp.Unsafe;
 
 namespace Corpus
 {
@@ -19,19 +21,34 @@ namespace Corpus
         // Native contexts are NOT thread-safe — one per worker thread,
         // reused across chunks (no disposal point for a static pool; the
         // finalizer frees, and pool threads are sticky so reuse is high).
-        private static readonly ThreadLocal<ZstdCompressionContext> _encoders = new(() =>
+        // Level is set per call (the store level varies by config/tests).
+        private static readonly ThreadLocal<Compressor> _encoders = new(() =>
         {
-            var ctx = new ZstdCompressionContext();
-            ctx.SetParameter(ZstdCompressionParameter.ChecksumFlag, 0);
+            var ctx = new Compressor(3);
+            ctx.SetParameter(ZSTD_cParameter.ZSTD_c_checksumFlag, 0);
             return ctx;
         });
 
         public static (byte[] Payload, byte Codec) Encode(byte[] plain, int level)
         {
-            var compressed = _encoders.Value!.Compress(plain, 0, plain.Length, level);
-            if (compressed.Length >= plain.Length)
-                return (plain, CodecRaw);
-            return (compressed, CodecZstd);
+            var enc = _encoders.Value!;
+            enc.Level = level;
+            var bound = Compressor.GetCompressBound(plain.Length);
+            var buf = ArrayPool<byte>.Shared.Rent(bound);
+            try
+            {
+                // Bound-sized: TryWrap cannot fail; a false is treated as
+                // incompressible (raw passthrough, same as before).
+                if (!enc.TryWrap(plain, buf, 0, out var written) || written >= plain.Length)
+                    return (plain, CodecRaw);
+                var outBuf = new byte[written];
+                Buffer.BlockCopy(buf, 0, outBuf, 0, written);
+                return (outBuf, CodecZstd);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
         }
 
         // Order-preserving parallel encode over a bounded window: results[i]
@@ -60,7 +77,7 @@ namespace Corpus
                 // Decode isn't given — stream it so the payload stays a pure
                 // zstd frame any tool can read.
                 using var input = new MemoryStream(payload, writable: false);
-                using var zstd = new ZstdStream(input, ZstdStreamMode.Decompress, leaveOpen: false);
+                using var zstd = new DecompressionStream(input, 128 * 1024, checkEndOfStream: true, leaveOpen: false);
                 using var output = new MemoryStream(payload.Length);
                 zstd.CopyTo(output);
                 return output.ToArray();

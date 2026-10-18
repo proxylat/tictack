@@ -57,8 +57,9 @@ namespace Corpus
         private readonly int _chunkMib;
         private readonly int _zstdLevel;
         private readonly string? _encryptHook;
+        private readonly IDeltaCodec? _deltaCodec;
 
-        public StoreOptimizer(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, string? encryptHook = null)
+        public StoreOptimizer(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, string? encryptHook = null, IDeltaCodec? deltaCodec = null)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
@@ -75,6 +76,7 @@ namespace Corpus
             _chunkMib = chunkMib;
             _zstdLevel = zstdLevel;
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
+            _deltaCodec = deltaCodec;
         }
 
         // Test seam: free bytes on the store volume (null = DriveInfo).
@@ -278,7 +280,7 @@ namespace Corpus
         private void VerifyAll()
         {
             var failed = new List<int>();
-            using (var store = new Store(_storeRoot, _dbPath, _chunkMib, _zstdLevel, _log, _encryptHook))
+            using (var store = new Store(_storeRoot, _dbPath, _chunkMib, _zstdLevel, _log, _encryptHook, _deltaCodec))
             {
                 foreach (var (gen, _) in ManifestStore.List(_manifestsDir))
                 {
