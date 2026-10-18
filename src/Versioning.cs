@@ -240,15 +240,21 @@ namespace TicTack
                 Directory.CreateDirectory(verDir);
                 try
                 {
+                    // Hash WHILE copying: the streamed bytes are exactly what
+                    // the temp holds, so validation re-reads only destPath
+                    // (mid-copy change detection) instead of both files.
+                    string streamHash;
                     using (var input = File.OpenRead(PathUtil.EnsureExtended(destPath)))
                     using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
-                        input.CopyTo(output);
+                        streamHash = FileHasher.CopyAndHash(input, output);
                         output.Flush(true);
                     }
-                    // Same post-write validation as the copy and archive paths:
-                    // never trust a version file that was not verified.
-                    if (!FileHasher.SameContent(destPath, temp))
+                    // Single post-copy hash, dest side only: a source mutated
+                    // mid-copy no longer matches the streamed bytes. The temp
+                    // needs no re-read — it is byte-identical to that stream
+                    // by construction (flushed above, renamed below).
+                    if (!string.Equals(streamHash, FileHasher.ComputeHex(destPath, null), StringComparison.Ordinal))
                         throw new IOException("Version validation failed: " + destPath);
                     File.Move(temp, verFile);
                     // Barrier for the version commit (same Pillai surface as

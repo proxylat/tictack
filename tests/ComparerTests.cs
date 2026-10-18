@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+
 namespace TicTack;
 
 public class ComparerTests : IDisposable
@@ -132,5 +134,46 @@ public class ComparerTests : IDisposable
     public void Factory_ThrowsOnUnknownLevel()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => ComparerFactory.Create((VerificationLevel)999));
+    }
+
+    // Fix 2 guard: the pooled incremental hash must equal a fresh
+    // one-shot SHA-256 digest at every size class (empty, sub-chunk,
+    // exact chunk, chunk +/- 1, multi-chunk), via both open paths.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(81919)]
+    [InlineData(81920)]
+    [InlineData(81921)]
+    [InlineData(200000)]
+    public void FileHasher_PooledHash_MatchesFreshSha256(int size)
+    {
+        var bytes = new byte[size];
+        new Random(42).NextBytes(bytes);
+        File.WriteAllBytes(Src("h.bin"), bytes);
+        var expected = Convert.ToHexStringLower(SHA256.HashData(bytes));
+
+        Assert.Equal(expected, FileHasher.ComputeHex(Src("h.bin"), null));
+        Assert.Equal(expected, FileHasher.ComputeHex(Src("h.bin"), _accessor));
+        using (var stream = File.OpenRead(Src("h.bin")))
+            Assert.Equal(expected, FileHasher.ComputeHex(stream));
+    }
+
+    // Fix 1 guard: hash-during-copy returns the content digest and
+    // transfers bytes exactly.
+    [Fact]
+    public void FileHasher_CopyAndHash_CopiesBytesAndMatchesDigest()
+    {
+        var bytes = new byte[200000];
+        new Random(7).NextBytes(bytes);
+        File.WriteAllBytes(Src("c.bin"), bytes);
+
+        string hash;
+        using (var input = File.OpenRead(Src("c.bin")))
+        using (var output = File.Create(Dst("c.bin")))
+            hash = FileHasher.CopyAndHash(input, output);
+
+        Assert.Equal(bytes, File.ReadAllBytes(Dst("c.bin")));
+        Assert.Equal(Convert.ToHexStringLower(SHA256.HashData(bytes)), hash);
     }
 }

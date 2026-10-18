@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
@@ -53,6 +54,15 @@ namespace TicTack
         private long _streakCount;
         private DateTime _streakAt;
         private const int StreakFlushSeconds = 60;
+        // Held-open handle: one append stream per file instead of
+        // open-append-close per line. Flush piggybacks on Write (no thread).
+        private FileStream? _stream;
+        private StreamWriter? _writer;
+        private long _baseLength; // on-disk length when the handle was opened
+        private long _unflushedBytes; // buffered since open; logical len = base + this
+        private DateTime _lastFlush = DateTime.UtcNow;
+        private const int FlushIntervalSeconds = 4;
+        private const long FlushThresholdBytes = 128 * 1024;
 
         public FileLogger(string path, LogLevel minLevel = LogLevel.Info, long maxSizeMb = 10, int maxFiles = 5)
         {
@@ -123,12 +133,61 @@ namespace TicTack
         {
             try
             {
-                if (File.Exists(_logPath) && new FileInfo(_logPath).Length > _maxSizeBytes)
+                EnsureOpenLocked();
+                // Rotation trigger identical to before (on-disk length > max),
+                // tracked in memory so no stat/flush syscall per line. Only
+                // this class rotates, so base + buffered is the true length.
+                if (_baseLength + _unflushedBytes > _maxSizeBytes)
+                {
+                    FlushStreamLocked();
+                    CloseStreamLocked();
                     Rotate();
-                File.AppendAllText(_logPath,
-                    "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg + Environment.NewLine);
+                    EnsureOpenLocked();
+                }
+                var line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg + Environment.NewLine;
+                _writer!.Write(line);
+                _unflushedBytes += Encoding.UTF8.GetByteCount(line);
+                if (_unflushedBytes >= FlushThresholdBytes
+                    || (DateTime.UtcNow - _lastFlush).TotalSeconds >= FlushIntervalSeconds)
+                    FlushStreamLocked();
             }
             catch { }
+        }
+
+        // Caller holds the lock. Opens the append handle lazily so a
+        // never-written logger creates no file, and reopens after
+        // rotation/Dispose. FileShare.ReadWrite|Delete keeps tail/readers working.
+        private void EnsureOpenLocked()
+        {
+            if (_writer != null) return;
+            long len = 0;
+            try { if (File.Exists(_logPath)) len = new FileInfo(_logPath).Length; } catch { }
+            _stream = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+            _writer = new StreamWriter(_stream, Encoding.UTF8);
+            _baseLength = len;
+            _unflushedBytes = 0;
+            _lastFlush = DateTime.UtcNow;
+        }
+
+        // Caller holds the lock.
+        private void FlushStreamLocked()
+        {
+            try
+            {
+                _writer?.Flush();
+                _unflushedBytes = 0;
+                _lastFlush = DateTime.UtcNow;
+            }
+            catch { }
+        }
+
+        // Caller holds the lock. Close (without flush) so rotation/dispose
+        // can move the file; next Emit reopens lazily.
+        private void CloseStreamLocked()
+        {
+            try { _writer?.Dispose(); } catch { }
+            _writer = null;
+            _stream = null;
         }
 
         private void Rotate()
@@ -150,7 +209,13 @@ namespace TicTack
 
         public void Dispose()
         {
-            lock (_lock) FlushStreakLocked();
+            lock (_lock)
+            {
+                FlushStreakLocked();
+                FlushStreamLocked();
+                CloseStreamLocked();
+            }
+            // No disposed flag: a Write after Dispose reopens lazily.
         }
     }
 

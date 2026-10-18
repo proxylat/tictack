@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -730,6 +731,24 @@ namespace TicTack
             foreach (var rel in sample)
             {
                 if (ct.IsCancellationRequested) return;
+                // Cheap gate first: differing sizes already prove a mismatch,
+                // so neither side is hashed. Equal sizes still hash both —
+                // bitrot preserves stat metadata, so size/mtime agreement
+                // cannot stand in for content comparison.
+                FileInfo srcInfo, dstInfo;
+                try
+                {
+                    srcInfo = new FileInfo(PathUtil.EnsureExtended(Path.Combine(_config.Path, rel)));
+                    dstInfo = new FileInfo(PathUtil.EnsureExtended(Path.Combine(_config.Destination, rel)));
+                }
+                catch { skipped++; continue; }
+                if (!srcInfo.Exists || !dstInfo.Exists) { skipped++; continue; }
+                if (srcInfo.Length != dstInfo.Length)
+                {
+                    failed++;
+                    _log.Error("Routine check FAILED (destination differs from source): " + rel);
+                    continue;
+                }
                 string hs, hd;
                 try { hs = FileHasher.ComputeHex(PathUtil.EnsureExtended(Path.Combine(_config.Path, rel)), null); }
                 catch { skipped++; continue; }
@@ -777,22 +796,30 @@ namespace TicTack
                 using var fa = new FileStream(PathUtil.EnsureExtended(a), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufSize, FileOptions.SequentialScan);
                 using var fb = new FileStream(PathUtil.EnsureExtended(b), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufSize, FileOptions.SequentialScan);
                 if (fa.Length != fb.Length) return false;
-                var ba = new byte[bufSize];
-                var bb = new byte[bufSize];
-                int ra;
-                while ((ra = fa.Read(ba, 0, ba.Length)) > 0)
+                var ba = ArrayPool<byte>.Shared.Rent(bufSize);
+                var bb = ArrayPool<byte>.Shared.Rent(bufSize);
+                try
                 {
-                    var rb = 0;
-                    while (rb < ra)
+                    int ra;
+                    while ((ra = fa.Read(ba, 0, bufSize)) > 0)
                     {
-                        var n = fb.Read(bb, rb, ra - rb);
-                        if (n == 0) return false;
-                        rb += n;
+                        var rb = 0;
+                        while (rb < ra)
+                        {
+                            var n = fb.Read(bb, rb, ra - rb);
+                            if (n == 0) return false;
+                            rb += n;
+                        }
+                        for (var i = 0; i < ra; i++)
+                            if (ba[i] != bb[i]) return false;
                     }
-                    for (var i = 0; i < ra; i++)
-                        if (ba[i] != bb[i]) return false;
+                    return true;
                 }
-                return true;
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(bb);
+                    ArrayPool<byte>.Shared.Return(ba);
+                }
             }
             catch { return false; }
         }

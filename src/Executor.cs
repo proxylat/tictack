@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -240,13 +241,17 @@ namespace TicTack
                         // the copy and a hash validator. Same buffer size as
                         // CopyToAsync's default so throughput is unchanged.
                         using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                        var buffer = new byte[81920];
-                        int read;
-                        while ((read = await srcStream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
+                        var buffer = ArrayPool<byte>.Shared.Rent(FileHasher.BufferSize);
+                        try
                         {
-                            hasher.AppendData(buffer, 0, read);
-                            await dstStream.WriteAsync(buffer, 0, read, ct);
+                            int read;
+                            while ((read = await srcStream.ReadAsync(buffer, 0, FileHasher.BufferSize, ct)) > 0)
+                            {
+                                hasher.AppendData(buffer, 0, read);
+                                await dstStream.WriteAsync(buffer, 0, read, ct);
+                            }
                         }
+                        finally { ArrayPool<byte>.Shared.Return(buffer); }
                         sourceHash = Convert.ToHexStringLower(hasher.GetHashAndReset());
                     }
                     else

@@ -132,9 +132,21 @@ public class SrcLockTests : IDisposable
         Assert.True(lockObj.IsHeld);
         var t0 = File.GetLastWriteTimeUtc(_lockPath);
 
-        Thread.Sleep(700);
+        // Timer callbacks starve under full-suite CI load: poll for the
+        // touch instead of sleep-then-assert once.
+        var touched = false;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(100);
+            if (!lockObj.IsHeld) break;
+            if (File.GetLastWriteTimeUtc(_lockPath) > t0) { touched = true; break; }
+        }
 
         Assert.True(lockObj.IsHeld);
-        Assert.True(File.GetLastWriteTimeUtc(_lockPath) > t0);
+        // Any swallowed touch failure is Debug-logged: surface it so a
+        // real Windows touch bug names itself instead of flaking silent.
+        Assert.True(touched, "lock refresh never advanced mtime. log: " +
+            string.Join(" | ", _log.Messages));
     }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 using System.Security.Cryptography;
 
@@ -8,14 +9,51 @@ namespace TicTack
     // accessor seam, same lowercase hex format.
     internal static class FileHasher
     {
+        // One chunk size for every hash/copy loop (the old CopyToAsync
+        // default, so throughput is unchanged). Rented, never newed (Fix 2).
+        internal const int BufferSize = 81920;
+
         internal static string ComputeHex(string path, IFileAccessor? accessor)
         {
             path = PathUtil.EnsureExtended(path);
-            using (var sha256 = SHA256.Create())
             using (var stream = accessor != null ? accessor.OpenRead(path) : File.OpenRead(path))
+                return ComputeHex(stream);
+        }
+
+        // Pooled incremental hash over an open stream: one pass, no
+        // per-call buffer, same digest as SHA256.HashData (pinned by test).
+        internal static string ComputeHex(Stream stream)
+        {
+            using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+            try
             {
-                return Convert.ToHexStringLower(sha256.ComputeHash(stream));
+                int read;
+                while ((read = stream.Read(buffer, 0, BufferSize)) > 0)
+                    sha256.AppendData(buffer, 0, read);
             }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
+            return Convert.ToHexStringLower(sha256.GetHashAndReset());
+        }
+
+        // Sync copy that hashes the transferred bytes in the same pass, so
+        // callers validate with one re-read instead of two (Fix 1). Returns
+        // the lowercase hex SHA-256 of the bytes written.
+        internal static string CopyAndHash(Stream source, Stream destination)
+        {
+            using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+            try
+            {
+                int read;
+                while ((read = source.Read(buffer, 0, BufferSize)) > 0)
+                {
+                    sha256.AppendData(buffer, 0, read);
+                    destination.Write(buffer, 0, read);
+                }
+            }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
+            return Convert.ToHexStringLower(sha256.GetHashAndReset());
         }
 
         // Length pre-check + full-content compare, for the archive/recovery

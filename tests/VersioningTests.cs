@@ -114,4 +114,41 @@ public class VersioningTests : IDisposable
         var versioning = VersioningFactory.Create(new VersioningConfig { Path = _verDir, MaxVersions = 5 }, _dstDir);
         Assert.IsType<TimestampVersioning>(versioning);
     }
+
+    // Fix 1 guard: a dest mutated mid-archive must fail validation (the
+    // copy-stream hash no longer matches the post-copy dest re-read), and
+    // the failed archive must commit nothing and leave no temp behind.
+    [Fact]
+    public async Task TimestampVersioning_DetectsMidCopyModification()
+    {
+        const int size = 24 * 1024 * 1024;
+        var dest = Dst("race.bin");
+        File.WriteAllBytes(dest, new byte[size]);
+
+        var versioning = new TimestampVersioning(_verDir, _dstDir, 10);
+        using var stop = new ManualResetEventSlim(false);
+        // Continuous whole-file rewrites, each state distinct: any copy
+        // window overlapping a write streams bytes the final re-read cannot
+        // match. Interrupted writes are expected on Windows (share
+        // violation against the open copy stream) and retried.
+        var writer = Task.Run(() =>
+        {
+            var buf = new byte[size];
+            var i = 1;
+            while (!stop.IsSet)
+            {
+                Array.Fill(buf, (byte)i);
+                try { File.WriteAllBytes(dest, buf); } catch { }
+                if (++i > 250) i = 1;
+            }
+        });
+        ActionResult result;
+        try { result = await versioning.ArchivePreviousVersionAsync(dest, CancellationToken.None); }
+        finally { stop.Set(); await writer; }
+
+        Assert.False(result.Success);
+        Assert.Contains("Version validation failed", result.ErrorMessage ?? "");
+        var verSub = Path.Combine(_verDir, "Desktop");
+        Assert.Empty(Directory.Exists(verSub) ? Directory.GetFiles(verSub) : Array.Empty<string>());
+    }
 }

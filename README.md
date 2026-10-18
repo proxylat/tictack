@@ -253,7 +253,7 @@ Fields live at three levels: top-level source keys (`path`/`paths`, `destination
 | `file_access` | `direct` | File read path: `direct` = open source files directly / `vss` = read locked files via on-demand VSS snapshots (Windows-only, needs elevation; falls back to `direct` with a warning otherwise) — snapshot created per volume only on lock failure, cached 10 min, no writer coordination (file-level reads, not app-consistent quiesce) |
 | `max_file_size_mb` | `no-limit` | Skip files larger than this (MB). `no-limit` = all files, `none` = skip everything |
 | `exclude` | `[]` | Glob patterns to skip (`*.iso`, `*.tmp`, `temp/*`) — case-insensitive on Windows only |
-| `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` (`full` compares date+size+hash but validates hash-only) |
+| `verification` | `date_and_size` | Pre-copy compare + post-copy check: `size` / `date_and_size` / `hash` / `full` (`full` compares date+size+hash but validates hash-only). **WARNING:** `hash`/`full` re-read every file — much slower; use only when you need bit-proof |
 | `durability` | `full` | `full` fsyncs each temporary file before rename; `fdatasync` (Linux) flushes file data and size but a freshly written mtime may roll back on power loss — safe, the next comparison re-copies; on Windows it falls back to `full`. `rename-only` skips per-file disk flush and fsyncs the destination directory instead, trading a power-loss window for speed |
 | `initial_sync_workers` | `2` | Bounded parallel workers for initial sync only; copying remains complete before parity/deletion cleanup |
 | `retry.max_attempts` | `5` | Per file: max copy retries on failure |

@@ -115,7 +115,8 @@ namespace TicTack
                 }
                 var dstHash = FileHasher.ComputeHex(dstFull, null);
                 if (string.Equals(srcHash, dstHash, StringComparison.Ordinal)) return 0;
-                _log.Warn("Scrub mismatch, re-queueing from source: " + rel);
+                // Routine (file changed mid-copy): file log only, never the desktop.
+                _log.Info("Scrub mismatch, re-queueing from source: " + rel);
                 await _deleteAsync(null, destPath, rel, "Scrub mismatch", ct);
                 return 1;
             }

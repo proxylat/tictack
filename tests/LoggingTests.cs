@@ -32,9 +32,11 @@ public class LoggingTests
         var path = Path.GetTempFileName();
         try
         {
-            var logger = new FileLogger(path, LogLevel.Debug);
-            logger.Info("test message");
-            logger.Debug("debug message");
+            using (var logger = new FileLogger(path, LogLevel.Debug))
+            {
+                logger.Info("test message");
+                logger.Debug("debug message");
+            }
 
             var content = File.ReadAllText(path);
             Assert.Contains("[INF]", content);
@@ -50,11 +52,13 @@ public class LoggingTests
         var path = Path.GetTempFileName();
         try
         {
-            var logger = new FileLogger(path, LogLevel.Warn);
-            logger.Debug("should not appear");
-            logger.Info("should not appear");
-            logger.Warn("warning message");
-            logger.Error("error message");
+            using (var logger = new FileLogger(path, LogLevel.Warn))
+            {
+                logger.Debug("should not appear");
+                logger.Info("should not appear");
+                logger.Warn("warning message");
+                logger.Error("error message");
+            }
 
             var content = File.ReadAllText(path);
             Assert.Contains("[WRN]", content);
@@ -72,8 +76,8 @@ public class LoggingTests
         var path = Path.Combine(dir, "sub", "test.log");
         try
         {
-            var logger = new FileLogger(path, LogLevel.Info);
-            logger.Info("dir created");
+            using (var logger = new FileLogger(path, LogLevel.Info))
+                logger.Info("dir created");
             Assert.True(Directory.Exists(dir));
             Assert.True(File.Exists(path));
         }
@@ -86,9 +90,11 @@ public class LoggingTests
         var path = Path.GetTempFileName();
         try
         {
-            var logger = new FileLogger(path, LogLevel.Info, maxSizeMb: 0);
-            logger.Info("line 1"); // appends to the empty temp file, no rotation
-            logger.Info("line 2"); // existing length > 0: rotates, then appends
+            using (var logger = new FileLogger(path, LogLevel.Info, maxSizeMb: 0))
+            {
+                logger.Info("line 1"); // appends to the empty temp file, no rotation
+                logger.Info("line 2"); // existing length > 0: rotates, then appends
+            }
             Assert.True(File.Exists(path + ".1"));
             Assert.Contains("line 1", File.ReadAllText(path + ".1"));
             Assert.Contains("line 2", File.ReadAllText(path));
@@ -169,8 +175,8 @@ public class LoggingTests
         try
         {
             File.WriteAllText(path, "preexisting content\n");
-            var logger = new FileLogger(path, LogLevel.Info);
-            logger.Info("appended");
+            using (var logger = new FileLogger(path, LogLevel.Info))
+                logger.Info("appended");
 
             var content = File.ReadAllText(path);
             Assert.Contains("preexisting content", content);
@@ -199,11 +205,13 @@ public class LoggingTests
         var path = Path.GetTempFileName();
         try
         {
-            using var logger = new FileLogger(path, LogLevel.Debug);
-            logger.Warn("same storm");
-            logger.Warn("same storm");
-            logger.Warn("same storm");
-            logger.Info("after");
+            using (var logger = new FileLogger(path, LogLevel.Debug))
+            {
+                logger.Warn("same storm");
+                logger.Warn("same storm");
+                logger.Warn("same storm");
+                logger.Info("after");
+            }
 
             var content = File.ReadAllText(path);
             // First occurrence + one closing count line; the two middle
@@ -269,5 +277,60 @@ public class LoggingTests
             Assert.DoesNotContain("yesterday", File.ReadAllText(path));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void FileLogger_HeldHandle_NoLossOrDupAcrossRotations()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var logger = new FileLogger(path, LogLevel.Info, maxSizeMb: 0, maxFiles: 10))
+                for (int i = 0; i < 5; i++)
+                    logger.Info("held-line-" + i);
+
+            var all = File.ReadAllText(path);
+            for (int i = 1; i <= 10; i++)
+                try { if (File.Exists(path + "." + i)) all += File.ReadAllText(path + "." + i); } catch { }
+            for (int i = 0; i < 5; i++)
+                Assert.Equal(1, Regex.Matches(all, "held-line-" + i).Count);
+        }
+        finally
+        {
+            for (int i = 0; i <= 10; i++)
+                try { File.Delete(i == 0 ? path : path + "." + i); } catch { }
+        }
+    }
+
+    [Fact]
+    public void FileLogger_Dispose_FlushesBufferedContent()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            var logger = new FileLogger(path, LogLevel.Debug);
+            logger.Info("buffered tiny line"); // far under any flush threshold
+            logger.Dispose();
+            Assert.Contains("buffered tiny line", File.ReadAllText(path));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void FileLogger_DisposeThenWrite_Reopens()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            var logger = new FileLogger(path, LogLevel.Debug);
+            logger.Info("before dispose");
+            logger.Dispose();
+            logger.Info("after dispose");
+            logger.Dispose();
+            var content = File.ReadAllText(path);
+            Assert.Contains("before dispose", content);
+            Assert.Contains("after dispose", content);
+        }
+        finally { File.Delete(path); }
     }
 }
