@@ -54,6 +54,36 @@ namespace Corpus
         public List<string>? MftChunkDigests { get; set; }
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public int MftRecordBytes { get; set; }
+        // Item 13b (§9 skip): per-record MFT digests (SkipRecordDigest hex per
+        // record number: LSN/USA-insensitive, unlike the raw group digests).
+        // Lets the pre-stream skip decision diff at record granularity instead
+        // of group expansion — group 0 flips on any VSS touch, which otherwise
+        // unions every live file's extents and kills the gate on live NTFS.
+        // Live records carry their hex; dead/empty slots carry a sentinel
+        // ("dead"/"empty": never 64-hex) and are excluded from comparison —
+        // they hold no restorable data and their shadow-view bytes are
+        // unstable. Null on old manifests → the record gate abstains to the
+        // byte backstop.
+        // Pre-skip-digest gens compare unequal (raw vs masked) and refuse once
+        // to the backstop — fail to skip, never wrong-skip — then self-heal.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public List<string>? MftRecordDigests { get; set; }
+        // Record-digest liveness version (MftDigest.SkipRecordVersion): 0 =
+        // pre-liveness gens (empty/dead slots hashed — unstable under VSS
+        // shadow views) or no digests; 1 = live-only slots but LSN/USA-only
+        // masking (B6K USA-tail + root-SI churn still vetoed every skip);
+        // 2 = +tails/SI masking but byte-classified liveness (B6L shadow
+        // smear on unallocated FRNs still vetoed every skip); 3 =
+        // bitmap-classified liveness but shadow-view record bytes (B6K/v10
+        // smear on ALLOCATED records still vetoed every skip); 4 =
+        // bitmap liveness + LIVE-view record bytes (design B) but atime
+        // churn still vetoed every skip (B6AB); 5 = current (+SI
+        // last-access masking for every FRN).
+        // The record gate requires current; older gens refuse once to the
+        // byte backstop, then self-heal (the next gen is written by current
+        // code). Omitted when 0, so old JSON loads 0 without a schema break.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public int MftRecordDigestVersion { get; set; }
         // Item 12b: BitLocker state DURING capture (post-suspend — the
         // on-disk state the image carries) + protector key IDs (IDs only,
         // never key material). Null on old/file-source manifests.
@@ -76,7 +106,8 @@ namespace Corpus
             string? partitionKey = null, int diskNumber = 0, int partitionNumber = 0,
             string? layoutFingerprint = null, List<string>? skippedExclusions = null,
             List<string>? mftChunkDigests = null, int mftRecordBytes = 0,
-            string? bitLockerState = null, List<string>? bitLockerKeyIds = null)
+            string? bitLockerState = null, List<string>? bitLockerKeyIds = null,
+            List<string>? mftRecordDigests = null)
         {
             return new SnapshotManifest
             {
@@ -96,6 +127,8 @@ namespace Corpus
                 SkippedExclusions = skippedExclusions,
                 MftChunkDigests = mftChunkDigests,
                 MftRecordBytes = mftRecordBytes,
+                MftRecordDigests = mftRecordDigests,
+                MftRecordDigestVersion = mftRecordDigests != null ? MftDigest.SkipRecordVersion : 0,
                 BitLockerState = bitLockerState,
                 BitLockerKeyIds = bitLockerKeyIds,
                 Chunks = chunks,

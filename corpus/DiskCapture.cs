@@ -690,7 +690,7 @@ namespace Corpus
     // bitmap runs, lazy MFT, USN planning from the frozen device) but the VSS
     // set + BitLocker scope live in the shared DiskCaptureLifetime, not per
     // source — one set freezes the whole disk.
-    internal sealed class DiskSnapshotSource : ISparseBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume
+    internal sealed class DiskSnapshotSource : ISparseBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume, ILiveMftVolumeProvider
     {
         private readonly DiskCaptureLifetime _lifetime;
         private readonly string _volume;
@@ -753,6 +753,38 @@ namespace Corpus
         public IReadOnlyList<MftEnumEntry> Enumerate() => Mft.Enumerate();
 
         public byte[] GetRecordBytes(ulong fileRef) => Mft.GetRecordBytes(fileRef);
+
+        byte[]? IMftVolume.GetMftAllocationBitmap() => Mft.GetMftAllocationBitmap();
+
+        // §9 design B, disk path: same live-view RECORD reader as
+        // VssBlockSource, over this partition's live volume (letter,
+        // mount, or GUID path — the letter shape opens via \\.\, the rest
+        // are already volume handles, mirroring ResolveImageExclusions).
+        // Status via the single `mft-live:` line (ok / null-reason).
+        IMftVolume? ILiveMftVolumeProvider.TryOpenLiveMft(ILogger log)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(log);
+            if (!OperatingSystem.IsWindows())
+            {
+                log.Info("mft-live: null (non-Windows)");
+                return null;
+            }
+            var device = _volume.Length == 2 && _volume[1] == ':' && char.IsAsciiLetter(_volume[0])
+                ? @"\\.\" + _volume
+                : _volume;
+            try
+            {
+                var live = new MftVolumeReader(device);
+                log.Info("mft-live: ok");
+                return live;
+            }
+            catch (Exception ex) when (ex is InvalidDataException || ex is IOException || ex is UnauthorizedAccessException || ex is PlatformNotSupportedException)
+            {
+                log.Info($"mft-live: null ({ex.GetType().Name})");
+                return null;
+            }
+        }
 
         public Stream OpenRead()
         {

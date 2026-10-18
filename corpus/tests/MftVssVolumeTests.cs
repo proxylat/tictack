@@ -140,6 +140,10 @@ public sealed class MftVssVolumeTests
         public IReadOnlyList<(long StartLcn, long ClusterCount)> MftRuns => _inner.MftRuns;
         public IReadOnlyList<MftEnumEntry> Enumerate() => _inner.Enumerate();
         public byte[] GetRecordBytes(ulong fileRef) => _inner.GetRecordBytes(fileRef);
+        // Explicit like the production decorators: a tracking wrapper must
+        // forward the bitmap, never fall back to the DIM default (silent
+        // null → the skip gate classifies from bytes exactly as before).
+        public byte[]? GetMftAllocationBitmap() => _inner.GetMftAllocationBitmap();
 
         public void Dispose()
         {

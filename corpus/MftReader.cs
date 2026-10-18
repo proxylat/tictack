@@ -26,6 +26,33 @@ namespace Corpus
         IReadOnlyList<(long StartLcn, long ClusterCount)> MftRuns { get; }
         IReadOnlyList<MftEnumEntry> Enumerate();
         byte[] GetRecordBytes(ulong fileRef);
+        // MFT record-allocation bitmap ($MFT/$BITMAP stream, bit N =
+        // record N allocated). B6L: FSCTL_GET_NTFS_FILE_RECORD through the
+        // VSS shadow returns unstable FILE-looking bytes for unallocated
+        // FRNs, so liveness-from-bytes can never gate the skip — the
+        // bitmap (an allocated data stream, the same stable read class
+        // §7's hole-skip relies on) is the source instead. Null =
+        // unreadable/absent → callers classify from bytes exactly as
+        // before (fail-safe: unknown is never unallocated).
+        byte[]? GetMftAllocationBitmap() => null;
+    }
+
+    // LIVE-view MFT seam for the §9 RECORD pass (design B). Implementors own
+    // both a frozen shadow device (IMftVolume reads there — capture truth)
+    // and the live volume path: the record pass (bitmap liveness classify
+    // + SkipRecordDigest) reads here, while groups, dirty-expansion, and
+    // bulk streaming stay on the shadow. FSCTL_GET_NTFS_FILE_RECORD works
+    // on a live handle (same FSCTL class the shadow reader uses — the
+    // B6H/B6K probes read stable user-record bytes live across a full VSS
+    // cycle), so this opens a second MftVolumeReader over the live path.
+    // Fresh owned instance per call — the caller disposes after the pass.
+    // Null = live unavailable → the caller falls back to the shadow view
+    // for the record pass (fail-safe: a shadow-smeared slot then vetoes,
+    // never wrong-skips). Never throws for expected unavailability
+    // (non-NTFS, no elevation); IO faults mid-read still propagate.
+    internal interface ILiveMftVolumeProvider
+    {
+        IMftVolume? TryOpenLiveMft(ILogger log);
     }
 
     // Pure FSCTL_ENUM_USN_DATA reply parser (Linux-testable): 8-byte next
@@ -151,6 +178,37 @@ namespace Corpus
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             return MftExtentReader.ReadFileRecord(_stream.SafeFileHandle, fileRef, BytesPerRecord);
+        }
+
+        // $MFT record-allocation bitmap over the FROZEN shadow (same
+        // device the record bytes come from). Null on anything
+        // unexpected — the caller treats unknown as allocated (fail to
+        // skip, never wrong-skip).
+        public byte[]? GetMftAllocationBitmap()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            try
+            {
+                var mftRecord = MftExtentReader.ReadFileRecord(_stream.SafeFileHandle, 0, BytesPerRecord);
+                return MftExtentReader.ReadMftBitmap(mftRecord, ReadClusterBytes, BytesPerCluster, (RecordCount + 7) / 8);
+            }
+            catch (Exception ex) when (ex is InvalidDataException || ex is IOException || ex is UnauthorizedAccessException)
+            {
+                return null;
+            }
+        }
+
+        private byte[] ReadClusterBytes(long lcn)
+        {
+            _stream.Seek(lcn * (long)BytesPerCluster, SeekOrigin.Begin);
+            var buf = new byte[BytesPerCluster];
+            var filled = 0;
+            int n;
+            while (filled < buf.Length && (n = _stream.Read(buf, filled, buf.Length - filled)) > 0)
+                filled += n;
+            if (filled != buf.Length)
+                throw new IOException($"short cluster read at LCN {lcn}");
+            return buf;
         }
 
         public void Dispose()

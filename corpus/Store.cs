@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Threading;
 using TicTack;
 
 namespace Corpus
@@ -316,18 +317,31 @@ namespace Corpus
         // group digests over the source's $MFT. Non-MFT sources (files, most
         // tests) yield nulls → the manifest omits the fields and the next
         // incremental uses the USN hint instead. Never throws.
-        private static (List<string>? Digests, int RecordBytes) TryMftBaseline(IBlockSource source, int chunkBytes, ILogger log)
+        private static (List<string>? Digests, List<string>? Records, int RecordBytes) TryMftBaseline(IBlockSource source, int chunkBytes, ILogger log, ILogger? bitmapLog = null)
         {
             if (source is not IMftVolume vol)
-                return (null, 0);
+                return (null, null, 0);
+            // §9 design B: stored record digests are LIVE-view (see the
+            // TOCTOU note in MftDigestPlanner.PlanDirty — a gap write is
+            // picked up by the next run, never lost).
+            var live = source is ILiveMftVolumeProvider provider ? provider.TryOpenLiveMft(bitmapLog ?? log) : null;
             try
             {
-                return (MftDigest.ComputeGroups(vol, chunkBytes), vol.BytesPerRecord);
+                try
+                {
+                    var both = MftDigest.ComputeGroupsAndRecords(vol, live ?? vol, chunkBytes, bitmapLog);
+                    return (both.Groups, both.Records, vol.BytesPerRecord);
+                }
+                catch (InvalidDataException ex)
+                {
+                    log.Info($"full image recorded without MFT digests ({ex.Message})");
+                    return (null, null, 0);
+                }
             }
-            catch (InvalidDataException ex)
+            finally
             {
-                log.Info($"full image recorded without MFT digests ({ex.Message})");
-                return (null, 0);
+                if (live != null && !ReferenceEquals(live, vol))
+                    live.Dispose();
             }
         }
 
@@ -447,14 +461,16 @@ namespace Corpus
             if (skipSince != null && newChunks == 0)
                 SkipUnchanged(skipSince.Value);
 
-            var (mftDigests, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log);
+            // Bitmap status logs only when a skip decision could consume
+            // these records (skipSince set); full images stay quiet.
+            var (mftDigests, mftRecords, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log, skipSince != null ? _log : null);
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries,
                 changeCursor: UsnChangeSource.TryCurrentCursor(source, _log),
                 layoutFingerprint: CurrentFingerprint(source, opts),
                 skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null,
-                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes,
+                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes, mftRecordDigests: mftRecords,
                 bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
                 bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
             ManifestStore.Save(_manifestsDir, manifest, _key);
@@ -553,6 +569,7 @@ namespace Corpus
                 layoutFingerprint: CurrentFingerprint(source, opts),
                 skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null,
                 mftChunkDigests: plan.NewMftDigests, mftRecordBytes: plan.NewMftRecordBytes,
+                mftRecordDigests: plan.NewMftRecordDigests,
                 bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
                 bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
             ManifestStore.Save(_manifestsDir, manifest, _key);
@@ -813,9 +830,12 @@ namespace Corpus
                 // MFT read only. Empty user-dirty → skip before ANY bulk
                 // streaming — without this the flag saves nothing on the
                 // default path. Sys-only dirt (FRN<16 churn) still skips:
-                // see PlanMatchesExceptSys.
+                // see PlanMatchesExceptSys. Group-flip-only dirt (any VSS
+                // touch flips group 0, unioning every live file's extents)
+                // falls through to the record-level decision below.
                 var skipPlan = (opts.ChangeSource ?? DefaultChangeSource()).Plan(skipParent, source, chunkBytes, _log);
-                if (skipPlan != null && PlanMatchesExceptSys(skipPlan, source, chunkBytes))
+                if (skipPlan != null && (PlanMatchesExceptSys(skipPlan, source, chunkBytes, _log)
+                    || RecordsMatchExceptSys(skipParent, skipPlan, source, _log)))
                     SkipUnchanged(skipParent.Generation);
             }
             Directory.CreateDirectory(_landingDir);
@@ -897,14 +917,15 @@ namespace Corpus
                     File.Delete(path);
                 SkipUnchanged(skipParent.Generation);
             }
-            var (mftDigests, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log);
+            // Same skip-gating as above: no parent, no future skip decision.
+            var (mftDigests, mftRecords, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log, skipParent != null ? _log : null);
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries,
                 changeCursor: UsnChangeSource.TryCurrentCursor(source, _log),
                 layoutFingerprint: CurrentFingerprint(source, opts),
                 skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null,
-                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes,
+                mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes, mftRecordDigests: mftRecords,
                 bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
                 bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
             ManifestStore.Save(_manifestsDir, manifest, _key);
@@ -966,28 +987,226 @@ namespace Corpus
 
         // §12.8 pre-stream gate: dirty confined to FRN<16 sys extents
         // (MFT/$MFTMirr/$LogFile churn, mapped through the CURRENT volume
-        // geometry) still skips. Non-MFT sources and unreadable sys runs
-        // stay strict. Capture plans are untouched — only the skip
+        // geometry) still skips, plus the named advisory mask ($TxfLog,
+        // $UsnJrnl — see MftSkipMask). Non-MFT sources and unreadable sys
+        // runs stay strict. Capture plans are untouched — only the skip
         // DECISION ignores sys dirt.
-        private static bool PlanMatchesExceptSys(IncrementalPlan plan, IBlockSource source, int chunkBytes)
+        private static bool PlanMatchesExceptSys(IncrementalPlan plan, IBlockSource source, int chunkBytes, ILogger log)
         {
             ArgumentNullException.ThrowIfNull(plan);
             ArgumentNullException.ThrowIfNull(source);
+            ArgumentNullException.ThrowIfNull(log);
             if (plan.DirtyChunks.Count == 0)
                 return true;
             if (source is not IMftVolume vol)
                 return false;
-            var sys = MftSysExtents.Runs(vol);
-            if (sys == null)
+            var mask = MftSkipMask.Resolve(vol, log);
+            if (mask == null)
                 return false;
-            var sysChunks = CapturePolicy.DirtyChunksForRuns(sys, vol.BytesPerCluster, chunkBytes);
+            var sysChunks = CapturePolicy.DirtyChunksForRuns(mask.Value.Runs, vol.BytesPerCluster, chunkBytes);
+            var anyOutside = false;
+            var firstOutside = new List<long>();
             foreach (var c in plan.DirtyChunks)
             {
-                if (!sysChunks.Contains(c))
-                    return false;
+                if (sysChunks.Contains(c))
+                    continue;
+                anyOutside = true;
+                if (firstOutside.Count < 8)
+                    firstOutside.Add(c);
             }
-            return true;
+            log.Info($"skip-plan: {plan.DirtyChunks.Count} dirty, {sysChunks.Count} sys-chunks, first-outside: [{string.Join(",", firstOutside)}]");
+            return !anyOutside;
         }
+
+        // §12.8 pre-stream record gate: per-record digest diff confined to
+        // sys FRNs 0..15 (EXCEPT the root, FRN 5: SI-masked, index-sensitive)
+        // plus the advisory set ($TxfLog subtree + $Tops/$TxfLog.blf,
+        // orphan TxF containers, $UsnJrnl host, the SVI dir + its {guid}
+        // diff files) still skips. This is what fires on live NTFS, where
+        // the LSN-inclusive group digest flips group 0 on any VSS touch and
+        // the group expansion above unions every live file's extents (MFT
+        // valid data ≪ records/group, so group 0 holds every file).
+        //
+        // No extent math here, deliberately: any live non-resident user
+        // record's runs are user chunks, so changed-user-record ⟹ refuse
+        // decides identically to an extent check; the sole divergence would
+        // be a resident-only user file (extents = its record cluster, inside
+        // the $MFT runs) — and a changed resident file IS a user change, so
+        // refusing is the correct call, not a missed skip.
+        //
+        // Live-only sets: a slot sentinel-absent on EITHER side (dead/empty:
+        // no restorable data, shadow-unstable) drops out of the changed-set
+        // computation — not a veto, not counted. A slot live in both with
+        // differing skip-digest = changed (FRN-membership rule vs advisory
+        // unchanged). Growth tail stays strict: a LIVE slot past the parent
+        // count is an unproven new allocation → refuse (the backstop
+        // decides); a sentinel tail slot is proven empty → drops out.
+        private static bool RecordsMatchExceptSys(SnapshotManifest parent, IncrementalPlan plan, IBlockSource source, ILogger log)
+        {
+            ArgumentNullException.ThrowIfNull(parent);
+            ArgumentNullException.ThrowIfNull(plan);
+            ArgumentNullException.ThrowIfNull(source);
+            ArgumentNullException.ThrowIfNull(log);
+            var parentRecords = parent.MftRecordDigests;
+            var currentRecords = plan.NewMftRecordDigests;
+            if (parentRecords == null || parentRecords.Count == 0
+                || currentRecords == null || currentRecords.Count == 0)
+                return false; // old manifest or non-MFT plan: abstain to the backstop
+            if (parent.MftRecordDigestVersion != MftDigest.SkipRecordVersion)
+                return false; // record-digest version drift (masking changed): refuse once to the backstop, self-heal next gen
+            if (source is not IMftVolume vol)
+                return false;
+            if (vol.BytesPerRecord != parent.MftRecordBytes)
+                return false;
+            if (currentRecords.Count < parentRecords.Count)
+                return false; // shrink: reformat-level surgery, like DiffGroups
+            // §9 design B: the compared record lists are LIVE-view (stored by
+            // TryMftBaseline, computed by PlanDirty — both live), so the
+            // advisory mask resolves from the LIVE geometry too. The live
+            // handle stays open through the comparison loop: when the veto
+            // rests on a tiny outside-sys set it is re-read below (race
+            // net), then released.
+            var liveVol = source is ILiveMftVolumeProvider provider ? provider.TryOpenLiveMft(log) : null;
+            try
+            {
+                var mask = MftSkipMask.Resolve(liveVol ?? vol, log);
+                if (mask == null)
+                    return false;
+            var changed = 0;
+            var live = 0;
+            var dead = 0;
+            var empty = 0;
+            var anyOutside = false;
+            var firstOutside = new List<long>();
+            var common = Math.Min(parentRecords.Count, currentRecords.Count);
+            for (var r = 0; r < currentRecords.Count; r++)
+            {
+                var cur = currentRecords[r];
+                if (!MftDigest.IsLiveDigest(cur))
+                {
+                    if (string.Equals(cur, MftDigest.DeadRecordSentinel, StringComparison.Ordinal))
+                        dead++;
+                    else
+                        empty++;
+                    continue;
+                }
+                live++;
+                if (r >= common)
+                {
+                    changed++; // live growth tail: unproven, refuse (backstop decides)
+                    if (IsSysMaskedRecord(r, mask.Value.AdvisoryRecords))
+                        continue;
+                    anyOutside = true;
+                    if (firstOutside.Count < 8)
+                        firstOutside.Add(r);
+                    continue;
+                }
+                if (!MftDigest.IsLiveDigest(parentRecords[r]))
+                    continue; // absent on the parent side → drops out, never a veto
+                if (string.Equals(parentRecords[r], cur, StringComparison.Ordinal))
+                    continue;
+                changed++;
+                if (IsSysMaskedRecord(r, mask.Value.AdvisoryRecords))
+                    continue;
+                anyOutside = true;
+                if (firstOutside.Count < 8)
+                    firstOutside.Add(r);
+            }
+            log.Info($"skip-records: {changed} changed of {live} records, outside-sys: [{string.Join(",", firstOutside)}], dead:{dead} empty:{empty}");
+                if (!anyOutside)
+                    return true;
+                return RetryOutsideSys(parentRecords, liveVol, firstOutside, log);
+            }
+            finally
+            {
+                if (liveVol != null && !ReferenceEquals(liveVol, vol))
+                    liveVol.Dispose();
+            }
+        }
+
+        // §9 design-B race net (B6P/B6Q: FRN 38 = U:\big re-stamps its USN on
+        // EVERY shadow create, and the live record sweep is N non-atomic
+        // per-record FSCTLs issued right after our own create): the sweep can
+        // catch one slot mid-rewrite and present transient bytes the
+        // quiescent raw probes never show, vetoing an idle pair. When the
+        // veto rests on a tiny outside-sys set, re-read JUST those slots live
+        // after a short settle and re-compare: a torn read won't repeat,
+        // persistent dirt will. Never wrong-skips (skip needs fresh bytes ==
+        // parent bytes), never blinds (no new masking — index/content bytes
+        // stay sensitive; a real child create/delete under the dir persists
+        // and still vetoes), never bulk-reads (a few record FSCTLs, not the
+        // volume stream). Growth-tail slots (no parent entry) keep vetoing.
+        internal const int SkipRecordRetryMaxOutside = 2;
+        internal const int SkipRecordRetryDelayMs = 250;
+        // Settle-across-the-boundary (B6S: the single +250ms re-read still
+        // lands inside the create-coupled transition — the sweep's
+        // stabilization agrees µs-apart on transitional bytes, so one retry
+        // cannot outlast a lazy-flush rewrite): re-read in bounded rounds
+        // until every veto slot matches the parent (transient → skip) or
+        // the fresh reads go byte-stable across rounds while still
+        // differing (persistent → veto). Round exhaustion vetoes
+        // (fail-safe). One log line, same format as before.
+        internal const int SkipRecordRetryAttempts = 12;
+
+        private static bool RetryOutsideSys(List<string> parentRecords, IMftVolume? liveVol, List<long> outside, ILogger log)
+        {
+            if (liveVol == null || outside.Count == 0 || outside.Count > SkipRecordRetryMaxOutside)
+                return false;
+            var still = new List<long>(outside);
+            Dictionary<long, string>? prevFresh = null;
+            var stableRounds = 0;
+            for (var attempt = 0; attempt < SkipRecordRetryAttempts && still.Count > 0; attempt++)
+            {
+                Thread.Sleep(SkipRecordRetryDelayMs);
+                byte[]? bitmap = null;
+                try
+                {
+                    bitmap = liveVol.GetMftAllocationBitmap();
+                }
+                catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+                {
+                    // Null → byte-fallback classification, same as the main pass.
+                }
+                var fresh = new Dictionary<long, string>();
+                var next = new List<long>();
+                foreach (var r in still)
+                {
+                    byte[] bytes;
+                    try
+                    {
+                        bytes = MftDigest.ReadStableRecordBytes(liveVol, (ulong)r);
+                    }
+                    catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+                    {
+                        return false; // unreadable → veto stands, fail-safe
+                    }
+                    var cur = MftDigest.ClassifySkipRecord(bytes, r, MftDigest.BitmapAllocated(bitmap, r));
+                    fresh[r] = cur;
+                    if (r >= parentRecords.Count
+                        || !MftDigest.IsLiveDigest(parentRecords[(int)r])
+                        || !string.Equals(parentRecords[(int)r], cur, StringComparison.Ordinal))
+                        next.Add(r);
+                }
+                still = next;
+                if (prevFresh != null && still.Count > 0
+                    && still.All(r => prevFresh.TryGetValue(r, out var p) && string.Equals(p, fresh[r], StringComparison.Ordinal)))
+                    stableRounds++;
+                else
+                    stableRounds = 0;
+                if (stableRounds >= 2)
+                    break; // byte-stable across rounds yet still different: persistent dirt, stop early
+                prevFresh = fresh;
+            }
+            log.Info($"skip-records-retry: re-read [{string.Join(",", outside)}] -> still-changed [{string.Join(",", still)}]");
+            return still.Count == 0;
+        }
+
+        // FRN<16 blanket-mask EXCEPT the root (FRN 5: architectural, cf.
+        // MftPathResolver.RootFileRef). The root record carries SI-timestamp
+        // churn on every VSS cycle (masked in its stored digest) but index
+        // changes are namespace changes — compared like any user record.
+        private static bool IsSysMaskedRecord(long r, HashSet<long> advisory) =>
+            (r < 16 && r != (long)MftPathResolver.RootFileRef) || advisory.Contains(r);
 
         // §12.8 post-stream backstop: manifests equal except within FRN<16
         // sys runs. Overlap-safe: for every differing data chunk the
@@ -1024,8 +1243,12 @@ namespace Corpus
                     sysResolved = true;
                     if (source is IMftVolume vol)
                     {
-                        sys = MftSysExtents.Runs(vol);
-                        bpc = vol.BytesPerCluster;
+                        var mask = MftSkipMask.Resolve(vol, _log);
+                        if (mask != null)
+                        {
+                            sys = mask.Value.Runs;
+                            bpc = vol.BytesPerCluster;
+                        }
                     }
                 }
                 if (sys == null || sys.Count == 0)
@@ -1055,13 +1278,20 @@ namespace Corpus
                 }
             }
             if (!overlaps)
+            {
+                _log.Info($"skip-compare: chunk {index} overlap=N reads=n/a masked-equal=n/a");
                 return false;
+            }
             var parentBytes = TryReadChunkBytes(prev.DigestHex, prev.Size);
             var currentBytes = TryReadLanding(cur.DigestHex);
-            if (parentBytes == null || currentBytes == null
-                || parentBytes.Length != prev.Size || currentBytes.Length != cur.Size
-                || parentBytes.Length != currentBytes.Length)
+            var reads = parentBytes == null || parentBytes.Length != prev.Size ? "parent-miss"
+                : currentBytes == null || currentBytes.Length != cur.Size || currentBytes.Length != parentBytes.Length ? "cur-miss"
+                : "ok";
+            if (!string.Equals(reads, "ok", StringComparison.Ordinal) || parentBytes == null || currentBytes == null)
+            {
+                _log.Info($"skip-compare: chunk {index} overlap=Y reads={reads} masked-equal=n/a");
                 return false;
+            }
             foreach (var (lcn, count) in sys)
             {
                 if (lcn < 0 || count <= 0)
@@ -1074,7 +1304,9 @@ namespace Corpus
                     Array.Clear(currentBytes, (int)(s - start), (int)(e - s));
                 }
             }
-            return parentBytes.SequenceEqual(currentBytes);
+            var equal = parentBytes.SequenceEqual(currentBytes);
+            _log.Info($"skip-compare: chunk {index} overlap=Y reads=ok masked-equal={(equal ? "Y" : "N")}");
+            return equal;
         }
 
         // Parent-side chunk bytes for the sys-masked compare: packs first

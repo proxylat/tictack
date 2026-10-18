@@ -5,7 +5,7 @@ namespace Corpus;
 // parser): MFT record header, non-resident attribute header (run offset past
 // the 60-byte fixed part), data-run varints (signed LCN deltas, sparse
 // offBytes==0), USN_RECORD_V2 rows, FRN seq>>48 reuse checks.
-internal sealed class FakeMftVolume : IBlockSource, IMftVolume, ISparseBlockSource
+internal sealed class FakeMftVolume : IBlockSource, IMftVolume, ISparseBlockSource, ILiveMftVolumeProvider
 {
     private readonly Dictionary<long, byte[]> _records;
     private readonly Func<ulong, Exception?>? _faultOnRecord;
@@ -21,6 +21,19 @@ internal sealed class FakeMftVolume : IBlockSource, IMftVolume, ISparseBlockSour
     public List<MftEnumEntry> Entries { get; } = new();
     public List<(long Start, long Count)> AllocRuns { get; }
     public long Length { get; }
+    // $MFT record-allocation bitmap for the skip gate (bit N = record N
+    // allocated). Null (default) = unreadable/absent → the gate classifies
+    // from bytes exactly as before.
+    public byte[]? MftBitmap { get; set; }
+    // LIVE-view seam for the §9 record pass (design B): when set, the
+    // IMftVolume members above keep serving the SHADOW view (bulk truth
+    // unchanged) while TryOpenLiveMft supplies the LIVE view for the
+    // record pass. Must return a FRESH owned instance per call — the gate
+    // disposes it after the pass (harmless here: live fakes carry no
+    // inner to release). Null (default) = shadow-only source → the record
+    // pass uses the shadow view, exactly as before.
+    public Func<IMftVolume>? LiveFactory { get; set; }
+    IMftVolume? ILiveMftVolumeProvider.TryOpenLiveMft(TicTack.ILogger log) => LiveFactory?.Invoke();
 
     public FakeMftVolume(int bytesPerRecord = 1024, int bytesPerCluster = 4096, long recordCount = 20,
         IReadOnlyList<(long StartLcn, long ClusterCount)>? mftRuns = null,
@@ -60,6 +73,8 @@ internal sealed class FakeMftVolume : IBlockSource, IMftVolume, ISparseBlockSour
     }
 
     public IReadOnlyList<MftEnumEntry> Enumerate() => Entries;
+
+    public byte[]? GetMftAllocationBitmap() => MftBitmap;
 
     public IReadOnlyList<(long Start, long Count)> GetAllocatedRuns() => AllocRuns;
 
@@ -129,6 +144,33 @@ internal static class MftRecordBuilder
         var attr = new byte[24];
         BitConverter.GetBytes(0x10u).CopyTo(attr, 0);
         BitConverter.GetBytes(24u).CopyTo(attr, 4);
+        return attr;
+    }
+
+    // Unnamed resident $BITMAP (0xB0) with exact content bytes — the shape
+    // $MFT carries on tiny volumes (NTFS: resident while it fits the record).
+    public static byte[] BitmapResidentAttr(byte[] content)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        var attr = new byte[24 + content.Length];
+        BitConverter.GetBytes(0xB0u).CopyTo(attr, 0);
+        BitConverter.GetBytes((uint)attr.Length).CopyTo(attr, 4);
+        attr[8] = 0; // resident
+        attr[9] = 0; // unnamed
+        BitConverter.GetBytes((uint)content.Length).CopyTo(attr, 16);
+        BitConverter.GetBytes((ushort)24).CopyTo(attr, 20);
+        content.CopyTo(attr, 24);
+        return attr;
+    }
+
+    // Unnamed non-resident $BITMAP with explicit logical size — the shape
+    // $MFT carries once the bitmap outgrows the record (the common case on
+    // real volumes; the size may exceed the record-count estimate when the
+    // MFT carries growth slack, which the reader caps instead of refusing).
+    public static byte[] BitmapNonResidentAttr(byte[] runs, long dataSize)
+    {
+        var attr = DataAttr(true, runs, 0, 0xB0);
+        BitConverter.GetBytes(dataSize).CopyTo(attr, 48);
         return attr;
     }
 

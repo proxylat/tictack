@@ -10,7 +10,7 @@ namespace Corpus
     // the shadow. Completion-aware: the read wrapper reports a full-length
     // read so writers get BackupComplete on success, AbortBackup on any
     // short or failed read (probes must never Complete — see VssSnapshot).
-    public sealed class VssBlockSource : ISparseBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume
+    public sealed class VssBlockSource : ISparseBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume, ILiveMftVolumeProvider
     {
         private readonly VssSnapshot? _snap;
         private readonly BitLockerCaptureScope? _bitlocker;
@@ -19,6 +19,11 @@ namespace Corpus
         private readonly bool _useUnbuffered;
         private bool _fullyRead;
         private bool _disposed;
+        // Live volume designator (e.g. "T:") for the §9 RECORD pass: the
+        // record gate opens its own MFT reader over the live volume while
+        // IMftVolume/bulk stay on the frozen shadow. Null in the test seam
+        // (no live volume there) → the record pass uses the shadow view.
+        private readonly string? _liveDrive;
 
         public VssBlockSource(string drive, ILogger log, bool useUnbuffered = true)
             : this(drive, log, ManageBdeBitLocker.Instance, useUnbuffered)
@@ -32,6 +37,7 @@ namespace Corpus
         {
             _bitlocker = BitLockerCaptureScope.Arm(drive, bitlocker, log);
             _useUnbuffered = useUnbuffered;
+            _liveDrive = drive;
             try
             {
                 _snap = VssSnapshot.Create(drive, log);
@@ -56,6 +62,7 @@ namespace Corpus
             _snap = null;
             _bitlocker = null;
             _device = device;
+            _liveDrive = null;
             Length = length;
             BytesPerCluster = bytesPerCluster;
             _useUnbuffered = useUnbuffered;
@@ -118,6 +125,38 @@ namespace Corpus
         public IReadOnlyList<MftEnumEntry> Enumerate() => Mft.Enumerate();
 
         public byte[] GetRecordBytes(ulong fileRef) => Mft.GetRecordBytes(fileRef);
+
+        byte[]? IMftVolume.GetMftAllocationBitmap() => Mft.GetMftAllocationBitmap();
+
+        // §9 design B: a LIVE-view MFT reader for the RECORD pass only
+        // (same FSCTL class the shadow reader uses — stable live bytes).
+        // Null with no log line in the test seam (no live volume by
+        // construction → shadow fallback, exactly like a shadow-only
+        // source); on a real box the single `mft-live:` status line fires
+        // (ok / null-reason, mirroring the `mft-bitmap:` vocabulary).
+        IMftVolume? ILiveMftVolumeProvider.TryOpenLiveMft(ILogger log)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(log);
+            if (_liveDrive == null)
+                return null;
+            if (!OperatingSystem.IsWindows())
+            {
+                log.Info("mft-live: null (non-Windows)");
+                return null;
+            }
+            try
+            {
+                var live = new MftVolumeReader(@"\\.\" + _liveDrive);
+                log.Info("mft-live: ok");
+                return live;
+            }
+            catch (Exception ex) when (ex is InvalidDataException || ex is IOException || ex is UnauthorizedAccessException || ex is PlatformNotSupportedException)
+            {
+                log.Info($"mft-live: null ({ex.GetType().Name})");
+                return null;
+            }
+        }
 
         public Stream OpenRead()
         {

@@ -19,7 +19,8 @@ namespace Corpus
         IExclusionResolver? Exclusions = null);      // item 4 zero-ranges seam (null = none)
 
     public sealed record IncrementalPlan(HashSet<long> DirtyChunks, string NewCursor,
-        List<string>? NewMftDigests = null, int NewMftRecordBytes = 0);
+        List<string>? NewMftDigests = null, int NewMftRecordBytes = 0,
+        List<string>? NewMftRecordDigests = null);
 
     public interface IChangeSource
     {
@@ -472,6 +473,77 @@ namespace Corpus
                 return DecodeDataRuns(record.AsSpan(off + runOff, (int)len - runOff));
             }
             throw new InvalidDataException("MFT has no non-resident $DATA");
+        }
+
+        // $MFT record-allocation bitmap ($BITMAP, 0xB0): bit N = record N
+        // allocated. Resident (tiny MFTs) → copy; non-resident → follow
+        // runs through readCluster. Null when the attribute is absent or
+        // the base VCN is nonzero (fail safe: unknown, never unallocated);
+        // throws on corrupt layout (the caller normalizes to null).
+        // dataSize is capped at maxBytes, never rejected: the bitmap may
+        // legitimately cover more records than MftValidDataLength accounts
+        // for (MFT growth slack / cluster-sized streams), while a corrupt
+        // dataSize still cannot OOM the alloc and runs still bound the
+        // read. Uncovered tail slots classify from bytes as before.
+        internal static byte[]? ReadMftBitmap(byte[] mftRecord, Func<long, byte[]> readCluster, int bytesPerCluster, long maxBytes)
+        {
+            ArgumentNullException.ThrowIfNull(mftRecord);
+            ArgumentNullException.ThrowIfNull(readCluster);
+            if (bytesPerCluster <= 0) throw new ArgumentOutOfRangeException(nameof(bytesPerCluster));
+            if (maxBytes < 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+            foreach (var (off, len) in AttributeSpans(mftRecord))
+            {
+                if (BitConverter.ToUInt32(mftRecord, off) != 0xB0)
+                    continue;
+                if (len < 9)
+                    throw new InvalidDataException("MFT bitmap attribute truncated");
+                if (mftRecord[off + 9] != 0)
+                    continue; // named stream, not the record bitmap
+                if (mftRecord[off + 8] == 0)
+                {
+                    if (len < 22)
+                        throw new InvalidDataException("MFT resident bitmap attribute truncated");
+                    var contentLen = BitConverter.ToUInt32(mftRecord, off + 16);
+                    var contentOff = BitConverter.ToUInt16(mftRecord, off + 20);
+                    if (contentLen > len || (long)off + contentOff + contentLen > mftRecord.Length)
+                        throw new InvalidDataException("MFT resident bitmap content outside attribute");
+                    var resident = new byte[contentLen];
+                    Buffer.BlockCopy(mftRecord, off + contentOff, resident, 0, (int)contentLen);
+                    return resident;
+                }
+                if (len < 64)
+                    throw new InvalidDataException("MFT non-resident bitmap attribute truncated");
+                if (BitConverter.ToInt64(mftRecord, off + 16) != 0)
+                    return null; // lowest VCN != 0: unsupported shape → unknown
+                var runOff = BitConverter.ToUInt16(mftRecord, off + 32);
+                if (runOff >= len)
+                    throw new InvalidDataException("MFT bitmap run offset outside attribute");
+                var dataSize = BitConverter.ToInt64(mftRecord, off + 48);
+                if (dataSize < 0)
+                    throw new InvalidDataException("MFT bitmap data size invalid");
+                var want = Math.Min(dataSize, maxBytes);
+                var runs = DecodeDataRuns(mftRecord.AsSpan(off + runOff, (int)len - runOff));
+                var out_ = new byte[want];
+                var done = 0L;
+                foreach (var (start, count) in runs)
+                {
+                    for (var i = 0L; i < count && done < want; i++)
+                    {
+                        var cluster = readCluster(start + i);
+                        if (cluster.Length != bytesPerCluster)
+                            throw new InvalidDataException("MFT bitmap cluster size mismatch");
+                        var take = (int)Math.Min((long)bytesPerCluster, want - done);
+                        Buffer.BlockCopy(cluster, 0, out_, (int)done, take);
+                        done += take;
+                    }
+                    if (done >= want)
+                        break;
+                }
+                if (done < want)
+                    throw new InvalidDataException("MFT bitmap runs shorter than data size");
+                return out_;
+            }
+            return null; // no $BITMAP → unknown, never unallocated
         }
 
         private static List<(int Offset, uint Length)> AttributeSpans(byte[] record)
