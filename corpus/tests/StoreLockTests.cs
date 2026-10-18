@@ -52,6 +52,17 @@ public sealed class StoreLockTests : IDisposable
             Assert.Throws<StoreLockException>(() => StoreLock.ParseRetryTimeout(bad));
     }
 
+
+    // Windows: the held lock handle is Share.Read, so a plain ReadAllText
+    // (Share.Read) self-conflicts with our own write access. ReadWrite share
+    // tolerates the holder (mirrors the product reader in StoreLock).
+    private static string ReadLockText(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var sr = new StreamReader(fs);
+        return sr.ReadToEnd();
+    }
+
     [Fact]
     public void Acquire_Release_Roundtrip()
     {
@@ -59,7 +70,7 @@ public sealed class StoreLockTests : IDisposable
         {
             Assert.Equal(LockPath, lck.LockPath);
             Assert.True(File.Exists(LockPath));
-            Assert.Contains("pid=" + OwnPid, File.ReadAllText(LockPath));
+            Assert.Contains("pid=" + OwnPid, ReadLockText(LockPath));
         }
         Assert.False(File.Exists(LockPath));
     }
@@ -92,7 +103,7 @@ public sealed class StoreLockTests : IDisposable
         // Fresh heartbeat but a pid that can never be alive.
         SeedHolder(int.MaxValue, Environment.MachineName, DateTime.UtcNow);
         using var lck = StoreLock.Acquire(_storeRoot, null, _log);
-        Assert.Contains("pid=" + OwnPid, File.ReadAllText(LockPath));
+        Assert.Contains("pid=" + OwnPid, ReadLockText(LockPath));
     }
 
     [Fact]
@@ -101,7 +112,7 @@ public sealed class StoreLockTests : IDisposable
         // Own (live) pid, but the heartbeat froze 10 min ago: crashed holder.
         SeedHolder(OwnPid, Environment.MachineName, DateTime.UtcNow.AddMinutes(-10));
         using var lck = StoreLock.Acquire(_storeRoot, null, _log);
-        Assert.Contains("pid=" + OwnPid, File.ReadAllText(LockPath));
+        Assert.Contains("pid=" + OwnPid, ReadLockText(LockPath));
     }
 
     [Fact]
@@ -145,11 +156,14 @@ public sealed class StoreLockTests : IDisposable
     public void Dispose_DeletesOnlyOwnFile()
     {
         var lck = StoreLock.Acquire(_storeRoot, null, _log);
+        lck.Dispose(); // releases the handle and deletes our own file
+        Assert.False(File.Exists(LockPath));
         // A stealer owns the path now: our Dispose must not remove theirs.
+        // (Written after release: Windows denies writes while held.)
         File.WriteAllText(LockPath, "pid=1 host=x since=y id=stealer");
         lck.Dispose();
         Assert.True(File.Exists(LockPath));
-        Assert.Contains("stealer", File.ReadAllText(LockPath));
+        Assert.Contains("stealer", ReadLockText(LockPath));
         lck.Dispose(); // idempotent
     }
 
@@ -209,7 +223,7 @@ public sealed class StoreLockTests : IDisposable
         try { holder.Kill(); } catch { }
         Assert.True(holder.WaitForExit(10_000), "sleep refused to die");
         using var lck = StoreLock.Acquire(_storeRoot, null, _log);
-        Assert.Contains("pid=" + OwnPid, File.ReadAllText(LockPath));
+        Assert.Contains("pid=" + OwnPid, ReadLockText(LockPath));
     }
 
     [Fact]
@@ -227,7 +241,7 @@ public sealed class StoreLockTests : IDisposable
             try { holder.Kill(); } catch { }
             Assert.True(holder.WaitForExit(10_000), "sleep refused to die");
             using var acquired = await waiter; // steals the dead pid, proceeds
-            Assert.Contains("pid=" + OwnPid, File.ReadAllText(LockPath));
+            Assert.Contains("pid=" + OwnPid, ReadLockText(LockPath));
         }
         finally
         {

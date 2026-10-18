@@ -127,19 +127,31 @@ public class VersioningTests : IDisposable
 
         var versioning = new TimestampVersioning(_verDir, _dstDir, 10);
         using var stop = new ManualResetEventSlim(false);
-        // Continuous whole-file rewrites, each state distinct: any copy
-        // window overlapping a write streams bytes the final re-read cannot
-        // match. Interrupted writes are expected on Windows (share
-        // violation against the open copy stream) and retried.
+        // The write handle is opened on the test thread BEFORE the copy, with
+        // FileShare.Read: the archiver's own File.OpenRead calls then succeed
+        // while continuous random writes guarantee the copy stream diverges
+        // from the post-copy dest re-read. (Opening per-write inside the loop
+        // loses the race on Windows — the reader's Share.Read lock turns
+        // every open attempt into a swallowed sharing violation and the file
+        // never mutates.)
+        using var fh = new FileStream(dest, FileMode.Open, FileAccess.Write, FileShare.Read);
         var writer = Task.Run(() =>
         {
+            var rnd = new Random(1234);
             var buf = new byte[size];
-            var i = 1;
             while (!stop.IsSet)
             {
-                Array.Fill(buf, (byte)i);
-                try { File.WriteAllBytes(dest, buf); } catch { }
-                if (++i > 250) i = 1;
+                rnd.NextBytes(buf);
+                try
+                {
+                    lock (fh)
+                    {
+                        fh.Seek(0, SeekOrigin.Begin);
+                        fh.Write(buf, 0, buf.Length);
+                        fh.Flush(true);
+                    }
+                }
+                catch { }
             }
         });
         ActionResult result;

@@ -51,7 +51,7 @@ namespace Corpus
             var handle = OperatingSystem.IsWindows() ? OpenWindows(path, withFlag) : OpenPlainLinux(path);
             try
             {
-                var stream = new UnbufferedReadStream(handle, length);
+                var stream = new UnbufferedReadStream(handle, length, path);
                 if (!withFlag || OperatingSystem.IsWindows() || stream.Probe())
                     return stream;
                 stream.Dispose();
@@ -76,7 +76,7 @@ namespace Corpus
                 var handle = OpenDirectLinux(path);
                 try
                 {
-                    var stream = new UnbufferedReadStream(handle, length);
+                    var stream = new UnbufferedReadStream(handle, length, path);
                     if (stream.Probe())
                         return stream;
                     stream.Dispose();
@@ -186,17 +186,27 @@ namespace Corpus
         private readonly SafeFileHandle _handle;
         private readonly long _length;
         private readonly AlignedBuffer _buffer;
+        private readonly string _fallbackPath;
+        private readonly long _tailStart;
+        private FileStream? _tail;
         private long _pos;
         private int _lastError;
         private bool _disposed;
 
-        internal UnbufferedReadStream(SafeFileHandle handle, long length)
+        internal UnbufferedReadStream(SafeFileHandle handle, long length, string fallbackPath)
         {
             ArgumentNullException.ThrowIfNull(handle);
             ArgumentOutOfRangeException.ThrowIfNegative(length);
+            ArgumentNullException.ThrowIfNull(fallbackPath);
             _handle = handle;
             _length = length;
             _buffer = new AlignedBuffer(BufBytes, SectorBytes);
+            _fallbackPath = fallbackPath;
+            // NO_BUFFERING reads past valid-data-length fail (win32 87) on
+            // some volumes; Linux pread just goes short. The final partial
+            // sector is therefore served by a plain buffered stream, opened
+            // lazily so sector-multiple volumes never pay for it.
+            _tailStart = (length / SectorBytes) * SectorBytes;
         }
 
         // Sector-aligned native scratch behind a SafeHandle (frees even if the
@@ -322,9 +332,23 @@ namespace Corpus
             var total = 0;
             while (total < count)
             {
+                // Past the last full sector: the buffered fallback owns it.
+                if (_pos >= _tailStart)
+                {
+                    var n = ReadTail(buffer, offset + total, count - total);
+                    if (n == 0)
+                        break;
+                    _pos += n;
+                    total += n;
+                    continue;
+                }
                 var rawOff = (_pos / SectorBytes) * SectorBytes;
                 var skip = (int)(_pos - rawOff);
+                // Never let the raw read cross into the tail sector: the
+                // cap lands on a sector boundary (both ends aligned), so the
+                // rounded length stays exact and never reaches past EOF.
                 var take = Math.Min(count - total, BufBytes - skip);
+                take = (int)Math.Min(take, _tailStart - _pos);
                 var rawLen = ((skip + take + SectorBytes - 1) / SectorBytes) * SectorBytes;
                 var got = ReadAt(rawOff, _buffer.Aligned, rawLen);
                 if (got < 0)
@@ -341,6 +365,15 @@ namespace Corpus
             return total;
         }
 
+        // Buffered read for the tail region (see _tailStart). Callers hold
+        // no alignment, so the request goes straight through.
+        private int ReadTail(byte[] buffer, int offset, int count)
+        {
+            _tail ??= new FileStream(_fallbackPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            _tail.Seek(_pos, SeekOrigin.Begin);
+            return _tail.Read(buffer, offset, count);
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (!_disposed)
@@ -348,7 +381,10 @@ namespace Corpus
                 _disposed = true;
                 _buffer.Dispose();
                 if (disposing)
+                {
+                    _tail?.Dispose();
                     _handle.Dispose();
+                }
             }
             base.Dispose(disposing);
         }

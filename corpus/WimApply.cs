@@ -105,9 +105,21 @@ namespace Corpus
             ArgumentException.ThrowIfNullOrWhiteSpace(targetDir);
             ArgumentNullException.ThrowIfNull(runner);
             ArgumentNullException.ThrowIfNull(log);
+            ApplyCore(wimPath, index, targetDir, runner, log, boot, Environment.SystemDirectory, OperatingSystem.IsWindows());
+        }
+
+        // Test seam: the live-OS guard needs the real machine paths in
+        // product, but tests must run on any drive (CI TEMP sits on the
+        // OS volume, which the guard rightly refuses).
+        internal static void ApplyCore(string wimPath, int? index, string targetDir, IWimRunner runner, ILogger log, IWimApplyBootRunner? boot, string systemDirectory, bool isWindows)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(wimPath);
+            ArgumentException.ThrowIfNullOrWhiteSpace(targetDir);
+            ArgumentNullException.ThrowIfNull(runner);
+            ArgumentNullException.ThrowIfNull(log);
             if (!File.Exists(wimPath))
                 throw new SingleFileSourceNotFoundException(wimPath);
-            GuardLiveOs(targetDir, Environment.SystemDirectory, OperatingSystem.IsWindows());
+            GuardLiveOs(targetDir, systemDirectory, isWindows);
 
             // Index rule reused verbatim from WimImageOps.Convert: probe
             // first, single-index defaults 1 (+INF), multi-index requires

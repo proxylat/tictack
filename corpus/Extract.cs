@@ -463,6 +463,18 @@ namespace Corpus
             {
                 try
                 {
+                    // File.* stamping throws UnauthorizedAccessException on
+                    // directories under Windows (Linux allows it).
+                    if (parsed.IsDir)
+                    {
+                        if (parsed.WrittenUtc != null)
+                            Directory.SetLastWriteTimeUtc(outPath, parsed.WrittenUtc.Value);
+                        if (parsed.AccessedUtc != null)
+                            Directory.SetLastAccessTimeUtc(outPath, parsed.AccessedUtc.Value);
+                        if (OperatingSystem.IsWindows() && parsed.CreatedUtc != null)
+                            Directory.SetCreationTimeUtc(outPath, parsed.CreatedUtc.Value);
+                        return;
+                    }
                     if (parsed.WrittenUtc != null)
                         File.SetLastWriteTimeUtc(outPath, parsed.WrittenUtc.Value);
                     if (parsed.AccessedUtc != null)

@@ -166,13 +166,23 @@ public sealed class StoreOptimizeTests : IDisposable
         Assert.True(store.Verify(1));
     }
 
+    // Windows denies plain reads on files another handle holds (the
+    // optimizer's pooled sqlite connection can outlive the throw).
+    private static byte[] ReadDbBytes(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var ms = new MemoryStream();
+        fs.CopyTo(ms);
+        return ms.ToArray();
+    }
+
     [Fact]
     public void HeadroomRefusal_FiresBeforeMutation()
     {
         ImageDisjointGen(1);
         ImageDisjointGen(2);
         var beforeTree = TreeHash(_storeRoot);
-        var beforeDb = File.ReadAllBytes(_dbPath);
+        var beforeDb = ReadDbBytes(_dbPath);
 
         var optimizer = NewOptimizer();
         optimizer.FreeSpaceOverride = _ => 0;
@@ -181,7 +191,7 @@ public sealed class StoreOptimizeTests : IDisposable
         Assert.Contains(_storeRoot, ex.Message); // names the store path
         Assert.Contains("pack-", ex.Message); // names the blocking pack
         Assert.Equal(beforeTree, TreeHash(_storeRoot)); // nothing touched
-        Assert.Equal(beforeDb, File.ReadAllBytes(_dbPath)); // index untouched too
+        Assert.Equal(beforeDb, ReadDbBytes(_dbPath)); // index untouched too
     }
 
     [Fact]

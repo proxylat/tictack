@@ -50,6 +50,11 @@ public sealed class GcHostTests : IDisposable
         return cond();
     }
 
+    private static string SafeReadStamp(string path)
+    {
+        try { return File.ReadAllText(path); } catch { return ""; }
+    }
+
     [Fact]
     public async Task HostedRunFiresScheduledGc()
     {
@@ -64,25 +69,31 @@ public sealed class GcHostTests : IDisposable
         Directory.CreateDirectory(stateDir);
         var now = DateTime.Now;
         File.WriteAllText(Path.Combine(stateDir, "gc-last-run"), now.AddDays(-2).ToString("o"));
-        File.WriteAllText(Path.Combine(stateDir, "optimize-last-run"), now.AddHours(-1).ToString("o"));
+        var optStamp = Path.Combine(stateDir, "optimize-last-run");
+        File.WriteAllText(optStamp, now.AddHours(-1).ToString("o"));
+        var seededOpt = SafeReadStamp(optStamp);
 
         var manifests = Path.Combine(_storeRoot, "manifests");
         var landing = Path.Combine(_storeRoot, "landing");
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         using (var host = new GcHost(_storeRoot, _dbPath,
             new CorpusRetentionConfig { KeepLast = 1 }, new TestLogger(), 1, 3,
             new GcSchedule(new TimeSpan(0, 0, 0), TimeSpan.FromMinutes(15))))
         {
             var run = Task.Run(() => host.Run(cts.Token));
-            // One tick does GC then optimize: wait for BOTH end-states
-            // (manifest drop alone races the still-running optimize pass).
+            // One tick does GC then optimize: wait for the END of the full
+            // pass (optimize stamp rewrite), not just intermediate
+            // end-states. Manifest-drop + landing-empty can both be true
+            // while Execute is still dropping packs; verifying then races
+            // the collector and fails on slow CI disks.
             var fired = WaitFor(() =>
                 Directory.GetFiles(manifests, "000001-*.json").Length == 0
-                && (!Directory.Exists(landing) || Directory.GetFiles(landing).Length == 0),
-                TimeSpan.FromSeconds(10));
+                && (!Directory.Exists(landing) || Directory.GetFiles(landing).Length == 0)
+                && SafeReadStamp(optStamp) != seededOpt,
+                TimeSpan.FromSeconds(25));
             cts.Cancel();
             await run.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.True(fired, "hosted scheduler never collected gen 1");
+            Assert.True(fired, "hosted scheduler never finished one full GC+optimize pass");
         }
         Assert.Single(Directory.GetFiles(manifests, "000002-*.json"));
         using (var store = new Store(_storeRoot, _dbPath, 1, 3, new TestLogger()))

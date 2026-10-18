@@ -81,7 +81,7 @@ public sealed class WimApplyTests : IDisposable
         };
         var boot = new FakeBoot();
         var log = new TestLogger();
-        WimApply.Apply(wim, null, target, runner, log, boot);
+        WimApply.ApplyCore(wim, null, target, runner, log, boot, @"Z:\Windows\system32", true);
         Assert.Equal(2, runner.Calls.Count);
         Assert.StartsWith("info ", runner.Calls[0], StringComparison.Ordinal);
         var apply = runner.Calls[1];
@@ -108,7 +108,7 @@ public sealed class WimApplyTests : IDisposable
                 ? new DismResult(0, DismInfo(1), "")
                 : new DismResult(0, "", ""),
         };
-        WimApply.Apply(wim, null, target, runner, new TestLogger(), new FakeBoot());
+        WimApply.ApplyCore(wim, null, target, runner, new TestLogger(), new FakeBoot(), @"Z:\Windows\system32", true);
         Assert.Equal(2, runner.Calls.Count);
         var apply = runner.Calls[1];
         Assert.StartsWith("/Apply-Image", apply, StringComparison.Ordinal);
@@ -134,7 +134,7 @@ public sealed class WimApplyTests : IDisposable
             };
             var boot = new FakeBoot();
             var ex = Assert.Throws<WimApplyRefusedException>(() =>
-                WimApply.Apply(wim, null, Path.Combine(_dir, "t"), runner, new TestLogger(), boot));
+                WimApply.ApplyCore(wim, null, Path.Combine(_dir, "t"), runner, new TestLogger(), boot, @"Z:\Windows\system32", true));
             Assert.Contains("3", ex.Message, StringComparison.Ordinal);
             Assert.Single(runner.Calls); // probe only, no apply
             Assert.Empty(boot.Calls);
@@ -156,7 +156,7 @@ public sealed class WimApplyTests : IDisposable
         };
         var boot = new FakeBoot();
         var ex = Assert.Throws<WimApplyRefusedException>(() =>
-            WimApply.Apply(wim, index, Path.Combine(_dir, "t"), runner, new TestLogger(), boot));
+            WimApply.ApplyCore(wim, index, Path.Combine(_dir, "t"), runner, new TestLogger(), boot, @"Z:\Windows\system32", true));
         Assert.Contains("2", ex.Message, StringComparison.Ordinal);
         Assert.Single(runner.Calls);
         Assert.Empty(boot.Calls);
@@ -212,7 +212,7 @@ public sealed class WimApplyTests : IDisposable
         };
         var dboot = new FakeBoot();
         var dex = Assert.Throws<SingleFileDismException>(() =>
-            WimApply.Apply(wim, null, Path.Combine(_dir, "t"), dism, new TestLogger(), dboot));
+            WimApply.ApplyCore(wim, null, Path.Combine(_dir, "t"), dism, new TestLogger(), dboot, @"Z:\Windows\system32", true));
         Assert.Contains(wim, dex.Message);
         Assert.Empty(dboot.Calls);
         var wimlib = new FakeWimRunner
@@ -224,7 +224,7 @@ public sealed class WimApplyTests : IDisposable
         };
         var wboot = new FakeBoot();
         var wex = Assert.Throws<WimBackendException>(() =>
-            WimApply.Apply(wim, null, Path.Combine(_dir, "t2"), wimlib, new TestLogger(), wboot));
+            WimApply.ApplyCore(wim, null, Path.Combine(_dir, "t2"), wimlib, new TestLogger(), wboot, @"Z:\Windows\system32", true));
         Assert.Contains(wim, wex.Message);
         Assert.Contains("boom", wex.Message);
         Assert.Empty(wboot.Calls);
@@ -244,7 +244,7 @@ public sealed class WimApplyTests : IDisposable
         var boot = new FakeBoot { Throw = true };
         var target = Path.Combine(_dir, "t");
         var ex = Assert.Throws<WimApplyBootException>(() =>
-            WimApply.Apply(wim, null, target, runner, new TestLogger(), boot));
+            WimApply.ApplyCore(wim, null, target, runner, new TestLogger(), boot, @"Z:\Windows\system32", true));
         Assert.Contains(Path.Combine(target, "Windows"), ex.Message, StringComparison.Ordinal);
         Assert.Equal(2, runner.Calls.Count); // apply greened before bcdboot failed
     }
@@ -261,7 +261,7 @@ public sealed class WimApplyTests : IDisposable
                 : new DismResult(0, "", ""),
         };
         var log = new TestLogger();
-        WimApply.Apply(wim, null, Path.Combine(_dir, "t"), runner, log, null);
+        WimApply.ApplyCore(wim, null, Path.Combine(_dir, "t"), runner, log, null, @"Z:\Windows\system32", true);
         Assert.Equal(2, runner.Calls.Count);
         Assert.Contains(log.Messages, m => m.Contains("skipping bcdboot", StringComparison.Ordinal));
     }
