@@ -159,3 +159,35 @@ jobs:
           name: hang-dumps-windows
           path: tests/TestResults/
           if-no-files-found: ignore
+
+  release:
+    # Tag push (v*) after green gates: AOT exe + version-stamped .iss
+    # installer, attached to the GitHub Release automatically.
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [test, corpus, native-windows]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Publish NativeAOT
+        run: |
+          dotnet publish src/TicTack.csproj -p:PublishProfile=Aot -o service/win
+          Remove-Item service/win/*.dll, service/win/*.runtimeconfig.json, service/win/*.deps.json, service/win/*.pdb -ErrorAction SilentlyContinue
+      - name: Stage config and stamp version
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          Copy-Item service/win/config_win.yaml.example service/win/config.yaml
+          (Get-Content service/win/setup.iss) -replace '#define MyAppVersion "[^"]*"', "#define MyAppVersion `"$version`"" | Set-Content service/win/setup.iss
+      - name: Build installer
+        run: |
+          choco install innosetup -y
+          iscc service/win/setup.iss
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: service/win/TicTackSetup-*.exe
