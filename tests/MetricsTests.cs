@@ -98,6 +98,21 @@ public class MetricsTests : IDisposable
         Assert.True(fsyncCatcher.Wait(), "no fsync-time-ms sample within 15s: " + fsyncCatcher.Dump());
     }
 
+    [Fact]
+    public async Task Metrics_CopyFailed_AndBytesRate_SurfaceAsCounters()
+    {
+        using var errCatcher = new CounterCatcher("copy-errors", d => CounterCatcher.AtLeast(d, "Increment", 2));
+        using var bytesCatcher = new CounterCatcher("bytes-copied", d => CounterCatcher.AtLeast(d, "Increment", 100));
+        // The enable-time poll captures the counters' baseline; increments
+        // after that show up as per-interval deltas on the next tick.
+        await Task.Delay(1200);
+        TicTackEventSource.Log.FileCopied(100);
+        TicTackEventSource.Log.CopyFailed();
+        TicTackEventSource.Log.CopyFailed();
+        Assert.True(errCatcher.Wait(), "no copy-errors increment >= 2 within 15s: " + errCatcher.Dump());
+        Assert.True(bytesCatcher.Wait(), "no bytes-copied increment >= 100 within 15s: " + bytesCatcher.Dump());
+    }
+
     // NoInlining so `owner` is unreachable once this returns; the only thing
     // that could keep it alive is the counter callback.
     [MethodImpl(MethodImplOptions.NoInlining)]

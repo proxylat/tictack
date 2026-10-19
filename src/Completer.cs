@@ -106,10 +106,12 @@ namespace TicTack
                         if (!result.Success)
                         {
                             _log.Error(item.FailLabel + ": " + src + ": " + result.ErrorMessage);
+                            TicTackEventSource.Log.CopyFailed();
                         }
                         else if (!FileSnapshot.TryRead(src, out var snap))
                         {
                             _log.Error(item.ValidationLabel + ": source disappeared: " + src);
+                            TicTackEventSource.Log.CopyFailed();
                         }
                         else
                         {
@@ -127,6 +129,7 @@ namespace TicTack
                             if (!valid)
                             {
                                 _log.Error(item.ValidationLabel + ": " + src + " -> " + dst);
+                                TicTackEventSource.Log.CopyFailed();
                             }
                             else if (await TryUpsertAsync(item, snap, src, ct))
                             {
@@ -144,6 +147,7 @@ namespace TicTack
                     catch (Exception ex)
                     {
                         _log.Error("Completion failed: " + item.Args.ChangeEvent.FullPath, ex);
+                        TicTackEventSource.Log.CopyFailed();
                     }
                     item.Done.TrySetResult(fresh);
                 }

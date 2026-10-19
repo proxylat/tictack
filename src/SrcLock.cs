@@ -247,6 +247,7 @@ namespace TicTack
                     _log.Warn("Lock held by " + what + " — lock acquisition failed" + waitedFor
                               + "; stop the other TicTack instance or raise lock_wait_seconds");
                 }
+                TicTackEventSource.Log.LockTimedOut();
                 return false;
             }
             attempt++;
@@ -258,6 +259,7 @@ namespace TicTack
                           + "; stop the running instance to proceed immediately");
             }
             else _log.Debug("Lock held by " + what + " — retrying...");
+            TicTackEventSource.Log.LockWaited();
             Thread.Sleep(NextLockWaitMs(attempt));
             return true;
         }

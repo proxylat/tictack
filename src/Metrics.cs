@@ -19,11 +19,17 @@ namespace TicTack
 
         private long _filesCopied;
         private long _bytesCopied;
+        private long _copyErrors;
+        private long _lockWaits;
+        private long _lockTimeouts;
         private readonly IncrementingPollingCounter _filesCopiedCounter;
-        private readonly PollingCounter _bytesCopiedCounter;
+        private readonly IncrementingPollingCounter _bytesCopiedCounter;
+        private readonly IncrementingPollingCounter _copyErrorsCounter;
+        private readonly IncrementingPollingCounter _lockWaitsCounter;
+        private readonly IncrementingPollingCounter _lockTimeoutsCounter;
         private readonly EventCounter _copyTime;
         private readonly EventCounter _fsyncTime;
-        private readonly List<PollingCounter> _queueCounters = new List<PollingCounter>();
+        private readonly List<DiagnosticCounter> _queueCounters = new List<DiagnosticCounter>();
         private readonly object _lock = new object();
 
         private TicTackEventSource()
@@ -35,9 +41,29 @@ namespace TicTack
                 DisplayName = "Files copied",
                 DisplayRateTimeScale = TimeSpan.FromSeconds(1)
             };
-            _bytesCopiedCounter = new PollingCounter("bytes-copied", this, () => Interlocked.Read(ref _bytesCopied))
+            _bytesCopiedCounter = new IncrementingPollingCounter("bytes-copied", this, () => Interlocked.Read(ref _bytesCopied))
             {
-                DisplayName = "Bytes copied (total)"
+                DisplayName = "Bytes copied",
+                DisplayUnits = "B",
+                DisplayRateTimeScale = TimeSpan.FromSeconds(1)
+            };
+            _copyErrorsCounter = new IncrementingPollingCounter("copy-errors", this, () => Interlocked.Read(ref _copyErrors))
+            {
+                DisplayName = "Copy errors",
+                DisplayUnits = "count",
+                DisplayRateTimeScale = TimeSpan.FromSeconds(1)
+            };
+            _lockWaitsCounter = new IncrementingPollingCounter("lock-waits", this, () => Interlocked.Read(ref _lockWaits))
+            {
+                DisplayName = "Lock waits",
+                DisplayUnits = "count",
+                DisplayRateTimeScale = TimeSpan.FromSeconds(1)
+            };
+            _lockTimeoutsCounter = new IncrementingPollingCounter("lock-timeouts", this, () => Interlocked.Read(ref _lockTimeouts))
+            {
+                DisplayName = "Lock timeouts",
+                DisplayUnits = "count",
+                DisplayRateTimeScale = TimeSpan.FromSeconds(1)
             };
             _copyTime = new EventCounter("copy-time-ms", this)
             {
@@ -70,6 +96,15 @@ namespace TicTack
         [NonEvent]
         public void FsyncCompleted(double milliseconds) => _fsyncTime.WriteMetric((float)milliseconds);
 
+        [NonEvent]
+        public void CopyFailed() => Interlocked.Increment(ref _copyErrors);
+
+        [NonEvent]
+        public void LockWaited() => Interlocked.Increment(ref _lockWaits);
+
+        [NonEvent]
+        public void LockTimedOut() => Interlocked.Increment(ref _lockTimeouts);
+
         // One pending-events gauge per pipeline, named with the source path so
         // multi-source setups get distinct rows instead of collapsing onto one
         // counter. The returned token MUST be disposed by the owner: until then
@@ -90,12 +125,27 @@ namespace TicTack
             return new QueueCounter(this, counter);
         }
 
+        // Deferred-hold depth gauge. Same shape as RegisterQueueCounter:
+        // caller captures only the count delegate, dispose token shared.
+        [NonEvent]
+        public IDisposable RegisterHoldCounter(Func<double> readHolds)
+        {
+            var counter = new PollingCounter("deferred-holds", this, readHolds)
+            {
+                DisplayName = "Deferred holds",
+                DisplayUnits = "count"
+            };
+            lock (_lock)
+                _queueCounters.Add(counter);
+            return new QueueCounter(this, counter);
+        }
+
         private sealed class QueueCounter : IDisposable
         {
             private readonly TicTackEventSource _source;
-            private PollingCounter? _counter;
+            private DiagnosticCounter? _counter;
 
-            public QueueCounter(TicTackEventSource source, PollingCounter counter)
+            public QueueCounter(TicTackEventSource source, DiagnosticCounter counter)
             {
                 _source = source;
                 _counter = counter;
@@ -117,6 +167,9 @@ namespace TicTack
             {
                 _filesCopiedCounter.Dispose();
                 _bytesCopiedCounter.Dispose();
+                _copyErrorsCounter.Dispose();
+                _lockWaitsCounter.Dispose();
+                _lockTimeoutsCounter.Dispose();
                 _copyTime.Dispose();
                 _fsyncTime.Dispose();
                 lock (_lock)

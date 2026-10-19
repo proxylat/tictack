@@ -24,6 +24,7 @@ namespace TicTack
         private readonly ILogger _log;
         private readonly IFileFilter? _filter;
         private readonly IDisposable? _queueCounter;
+        private readonly IDisposable? _holdCounter;
 
         private static readonly StringComparer PathComparer =
             OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
@@ -135,6 +136,10 @@ namespace TicTack
                 deferredDir ?? _config.Destination,
                 deferredFilePrefix ?? "tictack-deferred",
                 holdDays, _log);
+            // Capture the counter delegate only, not `this` (same leak rule
+            // as the queue counter above).
+            var deferred = _deferred;
+            _holdCounter = TicTackEventSource.Log.RegisterHoldCounter(() => (double)deferred.PendingCount);
 
             var filters = new List<IFileFilter>();
             if (_config.Filter != null && _config.Filter.Exclude != null && _config.Filter.Exclude.Count > 0)
@@ -912,12 +917,14 @@ namespace TicTack
                 if (!archiveResult.Success)
                 {
                     _log.Error("Versioning failed: " + dst + ": " + archiveResult.ErrorMessage);
+                    TicTackEventSource.Log.CopyFailed();
                     return null;
                 }
             }
             catch (Exception ex)
             {
                 _log.Error("Versioning failed: " + dst, ex);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
 
@@ -939,17 +946,20 @@ namespace TicTack
                 // Retryable failures surface here after the retry budget is
                 // exhausted; keep the caller's original log label.
                 _log.Error(failLabel + ": " + src + ": " + ex.Message);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
             if (!result.Success)
             {
                 _log.Error(failLabel + ": " + src + ": " + result.ErrorMessage);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
 
             if (!FileSnapshot.TryRead(src, out var freshSnapshot))
             {
                 _log.Error(validationLabel + ": source disappeared: " + src);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
             // Fast path: the copy loop already hashed the source bytes. Trusted only
@@ -969,6 +979,7 @@ namespace TicTack
             if (!valid)
             {
                 _log.Error(validationLabel + ": " + src + " -> " + dst);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
             return freshSnapshot;
@@ -1003,11 +1014,13 @@ namespace TicTack
             catch (Exception ex)
             {
                 _log.Error(failLabel + ": " + src + ": " + ex.Message);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
             if (!tmp.Success)
             {
                 _log.Error(failLabel + ": " + src + ": " + tmp.ErrorMessage);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
             try
@@ -1018,6 +1031,7 @@ namespace TicTack
             catch (Exception ex)
             {
                 _log.Error(failLabel + ": " + src + ": " + ex.Message);
+                TicTackEventSource.Log.CopyFailed();
                 return null;
             }
         }
@@ -1279,6 +1293,7 @@ namespace TicTack
             if (_cts != null) _cts.Dispose();
             _signal.Dispose();
             _queueCounter?.Dispose();
+            _holdCounter?.Dispose();
             _monitor.Dispose();
             if (_stateDb != null) _stateDb.Dispose();
             if (_verifyStore != null) _verifyStore.Dispose();
