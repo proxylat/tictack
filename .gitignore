@@ -2,11 +2,8 @@ bin/
 obj/
 .dotnet/
 *.log
-diag-out/
 TestResults/
 BenchmarkDotNet.Artifacts/
-.codemap/
-.code-review-graph/
 benchmarks/baseline-*.json
 service/win/TicTackSv.exe
 service/win/config.yaml
@@ -24,10 +21,3 @@ service/linux/*.runtimeconfig.json
 service/linux/*.so
 service/linux/runtimes/
 service/linux/createdump
-AGENTS.md
-docs/
-vm-harness/
-future-arch.md
-system-image.md
-VM-TESTS.md
-logs/

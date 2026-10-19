@@ -318,6 +318,36 @@ namespace Corpus
             return merged;
         }
 
+        // --parent gate input: EXPLICIT exclusions only (config key present
+        // plus CLI flags, $LogFile-stripped, deduped) — never the
+        // CapturePolicy defaults an absent key restores. An absent key and
+        // an explicit `exclude: []` both gate empty (identical); explicit
+        // names on either side refuse --parent. Rationale: the diff is a
+        // block compare that takes no exclusions, so only user-specified
+        // intent conflicts with it; refusing on defaults the user never
+        // typed (Windows) while passing them elsewhere (Linux, where the
+        // resolver comes back null) was platform-divergent.
+        internal static IReadOnlyList<string> ExplicitExclusionNames(IReadOnlyList<string>? configured, IReadOnlyList<string> cli)
+        {
+            ArgumentNullException.ThrowIfNull(cli);
+            var merged = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (configured != null)
+            {
+                foreach (var e in CapturePolicy.EffectiveSkip(configured))
+                {
+                    if (seen.Add(e))
+                        merged.Add(e);
+                }
+            }
+            foreach (var e in CapturePolicy.EffectiveSkip(cli))
+            {
+                if (seen.Add(e))
+                    merged.Add(e);
+            }
+            return merged;
+        }
+
         private static string? CurrentFingerprint(IBlockSource source, ImageOptions opts) =>
             opts.Layout?.LayoutFingerprint() ?? (source as ILayoutFingerprintProvider)?.LayoutFingerprint();
 

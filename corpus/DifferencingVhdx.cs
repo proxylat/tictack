@@ -105,6 +105,12 @@ namespace Corpus
         public const string SidecarSuffix = ".parent.json";
         public const int SidecarVersion = 1;
 
+        // Diff-plan log cap: the INF plan line names every dirty index up to
+        // this many, then `(+N more)`. True dirty is a handful of chunks, so
+        // the full list is normally visible; the cap only bounds log spam
+        // when the plan itself is sick.
+        internal const int MaxPlanIndexesLogged = 32;
+
         private const int IoBufferBytes = 1024 * 1024;
 
         public static string SidecarPath(string childPath)
@@ -138,6 +144,95 @@ namespace Corpus
             return parentCapacity;
         }
 
+        // Allocated runs snapshot for extent-aware live reads (null = dense
+        // source, full reads). Fail closed on a nonsense cluster size:
+        // guessing hole boundaries risks a child that verify approves on
+        // matching zeros.
+        private sealed record SparseRuns(IReadOnlyList<(long Start, long Count)> Runs, long BytesPerCluster);
+
+        private static SparseRuns? TakeSparseRuns(IBlockSource source, string parentPath)
+        {
+            if (source is not ISparseBlockSource sparse)
+                return null;
+            if (sparse.BytesPerCluster <= 0)
+                throw new DifferencingVhdxException($"cannot diff {parentPath}: sparse source reports BytesPerCluster={sparse.BytesPerCluster} — refusing to guess hole boundaries");
+            return new SparseRuns(sparse.GetAllocatedRuns(), sparse.BytesPerCluster);
+        }
+
+        // Extent-aware live fill of buf[0..length) for volume bytes
+        // [offset, offset+length): allocated subranges are seek+read, holes
+        // stay zero and are NEVER read — unallocated shadow regions are the
+        // B7d garbage source. Dense sources (runs null) keep the plain
+        // sequential-shape read. Short reads fail loud with the caller's
+        // message (plan, confirm, write, and verify each name their own).
+        private static void FillLiveChunk(Stream live, byte[] buf, long offset, int length, SparseRuns? runs, string shortReadMessage)
+        {
+            if (runs == null)
+            {
+                live.Seek(offset, SeekOrigin.Begin);
+                if (ReadExactly(live, buf, length) != length)
+                    throw new DifferencingVhdxException(shortReadMessage);
+                return;
+            }
+            Array.Clear(buf, 0, length);
+            foreach (var (start, len) in AllocatedByteRanges(runs.Runs, runs.BytesPerCluster, offset, length))
+            {
+                live.Seek(start, SeekOrigin.Begin);
+                var at = (int)(start - offset);
+                var filled = 0;
+                int n;
+                while (filled < len && (n = live.Read(buf, at + filled, len - filled)) > 0)
+                    filled += n;
+                if (filled != len)
+                    throw new DifferencingVhdxException(shortReadMessage);
+            }
+        }
+
+        // Allocated byte ranges intersecting [offset, offset+length), from
+        // cluster-unit runs (sorted, non-overlapping — the volume-bitmap
+        // shape). Lower-bound binary search + forward walk: O(log R +
+        // overlaps), no per-chunk full scan.
+        private static List<(long Start, int Length)> AllocatedByteRanges(
+            IReadOnlyList<(long Start, long Count)> runs, long bytesPerCluster, long offset, int length)
+        {
+            var ranges = new List<(long Start, int Length)>();
+            if (runs.Count == 0 || length <= 0)
+                return ranges;
+            var end = offset + length;
+            var lo = 0;
+            var hi = runs.Count;
+            while (lo < hi)
+            {
+                var mid = lo + (hi - lo) / 2;
+                if ((runs[mid].Start + runs[mid].Count) * bytesPerCluster <= offset)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            for (var i = lo; i < runs.Count; i++)
+            {
+                var rs = runs[i].Start * bytesPerCluster;
+                if (rs >= end)
+                    break;
+                var re = (runs[i].Start + runs[i].Count) * bytesPerCluster;
+                var s = Math.Max(rs, offset);
+                var e = Math.Min(re, end);
+                if (e > s)
+                    ranges.Add((s, (int)(e - s)));
+            }
+            return ranges;
+        }
+
+        // Index-list rendering for the plan line and the unstable refusal:
+        // full list when small, first-N + count when huge.
+        private static string FormatIndexes(IReadOnlyList<long> indexes)
+            => indexes.Count <= MaxPlanIndexesLogged
+                ? $"[{string.Join(", ", indexes)}]"
+                : $"[{string.Join(", ", indexes.Take(MaxPlanIndexesLogged))} (+{indexes.Count - MaxPlanIndexesLogged} more)]";
+
+        private static string UnstableSuffix(IReadOnlyList<long> unstableIndexes)
+            => unstableIndexes.Count == 0 ? "" : $"; unstable chunks: {FormatIndexes(unstableIndexes)}";
+
         // §12.6 dirty computation: chunk-wise compare of the live source
         // against the full parent VHDX on the store chunk grid. Byte
         // compare only — equality is all the child needs. Short parent
@@ -155,6 +250,19 @@ namespace Corpus
         // risks a poisoned child that verify could approve on matching
         // garbage). Only live bytes hashed here (32 B/chunk, bounded);
         // the parent is a stable file the base verify already pins.
+        //
+        // B7d root cause: reads over UNALLOCATED shadow regions return
+        // stable-membership / nondeterministic-byte garbage (412
+        // candidates vs ~3 true dirty, 56 cross-pass unstable, and two
+        // reads of one frozen vss-dump disagreeing — live writes cannot
+        // explain that). So sparse sources never traverse holes at all:
+        // allocated subranges are seek+read, holes stay zero (zeros by
+        // bitmap definition, matching the hole-skipped parent BackupVhdx
+        // writes). Dense sources (plain files don't desync) keep the full
+        // read. Every candidate logs a 3-way trace (index + pass hashes +
+        // parent-equal) BEFORE the loud refusal, so a refused diff still
+        // leaves its index list in the log; the INF plan line names the
+        // kept dirty indexes (capped).
         public static HashSet<long> ComputeDirtyVsParent(IBlockSource source, string parentPath, int chunkBytes, ILogger log)
         {
             ArgumentNullException.ThrowIfNull(source);
@@ -162,6 +270,7 @@ namespace Corpus
             if (chunkBytes <= 0) throw new ArgumentOutOfRangeException(nameof(chunkBytes));
             ArgumentNullException.ThrowIfNull(log);
             GateParent(source, parentPath);
+            SparseRuns? runs = TakeSparseRuns(source, parentPath);
             var candidates = new List<(long Index, byte[] Hash)>();
             long total = 0;
             using (var disk = new Disk(parentPath, FileAccess.Read))
@@ -173,8 +282,7 @@ namespace Corpus
                 for (long offset = 0; offset < source.Length; offset += chunkBytes, total++)
                 {
                     var length = (int)Math.Min(chunkBytes, source.Length - offset);
-                    if (ReadExactly(live, a, length) != length)
-                        throw new DifferencingVhdxException($"short source read at chunk {total} (offset {offset}) — cannot diff {parentPath}");
+                    FillLiveChunk(live, a, offset, length, runs, $"short source read at chunk {total} (offset {offset}) — cannot diff {parentPath}");
                     parent.Seek(offset, SeekOrigin.Begin);
                     var got = ReadExactly(parent, b, length);
                     if (got != length || !a.AsSpan(0, length).SequenceEqual(b.AsSpan(0, length)))
@@ -185,6 +293,7 @@ namespace Corpus
                 var dirty = new HashSet<long>();
                 var dropped = 0;
                 var unstable = 0;
+                var unstableIndexes = new List<long>();
                 if (candidates.Count > 0)
                 {
                     using var live2 = source.OpenRead();
@@ -194,25 +303,39 @@ namespace Corpus
                     {
                         var offset = index * (long)chunkBytes;
                         var length = (int)Math.Min(chunkBytes, source.Length - offset);
-                        live2.Seek(offset, SeekOrigin.Begin);
-                        if (ReadExactly(live2, c, length) != length)
-                            throw new DifferencingVhdxException($"short source re-read at chunk {index} (offset {offset}) — cannot diff {parentPath}");
+                        FillLiveChunk(live2, c, offset, length, runs, $"short source re-read at chunk {index} (offset {offset}) — cannot diff {parentPath}");
                         parent.Seek(offset, SeekOrigin.Begin);
                         // Short parent re-read mirrors pass 1 (dirty, never
                         // clean); a clean live2-vs-parent2 drops first-pass
                         // garbage from either side; anything else needs
                         // pass-1 agreement or it is untrustworthy.
-                        if (ReadExactly(parent, d, length) == length && c.AsSpan(0, length).SequenceEqual(d.AsSpan(0, length)))
+                        var parentEqual = ReadExactly(parent, d, length) == length && c.AsSpan(0, length).SequenceEqual(d.AsSpan(0, length));
+                        var hash2 = SHA256.HashData(c.AsSpan(0, length));
+                        var stable = hash2.AsSpan().SequenceEqual(hash);
+                        string decision;
+                        if (parentEqual)
+                        {
                             dropped++;
-                        else if (SHA256.HashData(c.AsSpan(0, length)).AsSpan().SequenceEqual(hash))
+                            decision = "dropped";
+                        }
+                        else if (stable)
+                        {
                             dirty.Add(index);
+                            decision = "kept";
+                        }
                         else
+                        {
                             unstable++;
+                            unstableIndexes.Add(index);
+                            decision = "unstable";
+                        }
+                        log.Info($"diff confirm chunk {index}: pass1={Convert.ToHexString(hash)} pass2={Convert.ToHexString(hash2)} parentEqual={(parentEqual ? "true" : "false")} decision={decision}");
                     }
                 }
                 if (unstable > 0)
-                    throw new DifferencingVhdxException($"cannot diff {parentPath}: live source reads disagree across two passes ({unstable} of {candidates.Count} candidates unstable) — refusing to build a child from untrustworthy bytes (re-run; if it persists, probe shadow-read stability with --vss-dump and the host disk SMART)");
-                log.Info($"diff plan vs {parentPath}: {dirty.Count} dirty of {total} chunks" + (dropped > 0 ? $" ({dropped} first-pass candidates dropped on confirm)" : ""));
+                    throw new DifferencingVhdxException($"cannot diff {parentPath}: live source reads disagree across two passes ({unstable} of {candidates.Count} candidates unstable{UnstableSuffix(unstableIndexes)}) — refusing to build a child from untrustworthy bytes (re-run; if it persists, probe shadow-read stability with --vss-dump and the host disk SMART)");
+                var kept = dirty.OrderBy(i => i).ToList();
+                log.Info($"diff plan vs {parentPath}: {dirty.Count} dirty of {total} chunks {FormatIndexes(kept)}" + (dropped > 0 ? $" ({dropped} first-pass candidates dropped on confirm)" : ""));
                 return dirty;
             }
         }
@@ -264,14 +387,13 @@ namespace Corpus
             using (var disk = Disk.InitializeDifferencing(target, fullParent))
             {
                 using var stream = source.OpenRead();
+                var runs = TakeSparseRuns(source, parentPath);
                 foreach (var index in record.DirtyChunks)
                 {
                     var offset = index * (long)chunkBytes;
                     var length = (int)Math.Min(chunkBytes, source.Length - offset);
                     var data = new byte[length];
-                    stream.Seek(offset, SeekOrigin.Begin);
-                    if (ReadExactly(stream, data, length) != length)
-                        throw new DifferencingVhdxException($"short source read at dirty chunk {index} (offset {offset}) — cannot write {target}");
+                    FillLiveChunk(stream, data, offset, length, runs, $"short source read at dirty chunk {index} (offset {offset}) — cannot write {target}");
                     // Every dirty chunk is written EVEN IF ALL ZERO: an
                     // unwritten block falls through to the parent, which
                     // holds the OLD bytes — a zeroed range would resurrect.
@@ -348,6 +470,7 @@ namespace Corpus
             if (disk.Capacity < source.Length)
                 throw new DifferencingVhdxException($"verify refuses {childPath}: pair capacity {disk.Capacity} < source length {source.Length}");
             using var src = source.OpenRead();
+            var runs = TakeSparseRuns(source, record.ParentPath);
             var bufA = new byte[IoBufferBytes];
             var bufB = new byte[IoBufferBytes];
             var compared = 0L;
@@ -357,7 +480,7 @@ namespace Corpus
                 var length = Math.Min((long)record.ChunkBytes, source.Length - offset);
                 try
                 {
-                    CompareRange(src, disk.Content, offset, length, bufA, bufB, childPath);
+                    CompareRange(src, disk.Content, offset, length, bufA, bufB, childPath, runs);
                 }
                 catch (PairMismatchException mismatch)
                 {
@@ -487,19 +610,21 @@ namespace Corpus
             return Convert.ToHexString(sha.Hash!);
         }
 
-        private static void CompareRange(Stream src, Stream content, long start, long length, byte[] bufA, byte[] bufB, string childPath)
+        private static void CompareRange(Stream src, Stream content, long start, long length, byte[] bufA, byte[] bufB, string childPath, SparseRuns? runs)
         {
-            src.Seek(start, SeekOrigin.Begin);
             content.Seek(start, SeekOrigin.Begin);
             var remaining = length;
             var pos = start;
             while (remaining > 0)
             {
                 var want = (int)Math.Min(bufA.Length, remaining);
-                var na = ReadExactly(src, bufA, want);
+                // Live side is extent-aware too: hole bytes are zeros by
+                // bitmap definition (the child carries explicit zeros for
+                // them), never re-read from the shadow.
+                FillLiveChunk(src, bufA, pos, want, runs, $"verify refuses {childPath}: short source re-read at offset {pos}");
                 var nb = ReadExactly(content, bufB, want);
-                if (na != want || nb != want)
-                    throw new DifferencingVhdxException($"verify refuses {childPath}: short read at offset {pos} (source {na}, pair {nb}, want {want})");
+                if (nb != want)
+                    throw new DifferencingVhdxException($"verify refuses {childPath}: short read at offset {pos} (pair {nb}, want {want})");
                 for (var i = 0; i < want; i++)
                 {
                     if (bufA[i] != bufB[i])

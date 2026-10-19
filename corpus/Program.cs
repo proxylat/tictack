@@ -1249,10 +1249,14 @@ namespace Corpus
                     }
                     using (var source = OpenSource(volume, log, useUnbuffered))
                     {
-                        var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
-                        if (excl != null)
+                        // The diff is a block compare: exclusions bake into a
+                        // full parent at creation and mean nothing here, so
+                        // EXPLICIT exclusions refuse (absent key and explicit
+                        // `exclude: []` both pass — identical).
+                        var explicitExcl = Store.ExplicitExclusionNames(cfg.Exclude, cliExcludes);
+                        if (explicitExcl.Count > 0)
                         {
-                            log.Error("--parent cannot combine with exclusions (baked into the full parent at creation; got: " + string.Join(", ", Store.MergeExclusionNames(cfg.Exclude, cliExcludes)) + ")");
+                            log.Error("--parent cannot combine with exclusions (baked into the full parent at creation; got: " + string.Join(", ", explicitExcl) + ")");
                             return 1;
                         }
                         var chunkBytes = cfg.ChunkMib * 1024 * 1024;

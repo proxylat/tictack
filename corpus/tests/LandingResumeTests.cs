@@ -323,4 +323,41 @@ public sealed class LandingResumeTests : IDisposable
         // Only the intact chunk counted as already landed.
         AssertHasLine(log, "resuming: 1/4 chunks already landed");
     }
+
+    [Fact]
+    public void SkipWithStaleLanding_SkipsAndLaterResumes()
+    {
+        // Skip × resume coexistence: gen1 committed, run2 killed mid-stream
+        // (partial landing, no manifest), run3 --skip-if-unchanged skips
+        // without clobbering the resumable landing, run4 resumes to a
+        // verifying gen. File sources have no MFT plan, so the skip comes
+        // from the post-stream zero-new path after resume read-through.
+        using (var store = NewStore())
+        using (var source = new FileBlockSource(_volPath))
+            store.ImageFast(source, "gen1");
+        using (var store = NewStore())
+        using (var killer = new KillerSource(_volPath, (2 * Mib) + (Mib / 2)))
+            Assert.Throws<IOException>(() => store.ImageFast(killer, "gen2"));
+        Assert.Equal(4, LandedCount()); // gen1's chunks; the kill landed only dupes
+
+        var log = new TestLogger();
+        using (var store = NewStore(log))
+        using (var source = new FileBlockSource(_volPath))
+        {
+            var ex = Assert.Throws<StoredSkippedException>(() =>
+                store.ImageFast(source, "gen3", skipIfUnchanged: true));
+            Assert.Equal(1, ex.Generation);
+        }
+        AssertHasLine(log, "unchanged since gen 1, skipping");
+        Assert.Equal(4, LandedCount()); // the skip deleted nothing resumable
+
+        using (var store = NewStore())
+        using (var source = new FileBlockSource(_volPath))
+        {
+            var m = store.ImageFast(source, "gen2");
+            Assert.Equal(2, m.Generation);
+            Assert.True(store.Verify(2));
+            Assert.Equal(File.ReadAllBytes(_volPath), ExportBytes(store, 2, Path.Combine(_dir, "skres.img")));
+        }
+    }
 }
