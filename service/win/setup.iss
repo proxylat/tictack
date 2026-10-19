@@ -28,9 +28,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Files]
 Source: "TicTackSv.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "config.yaml"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
-Source: "*.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "*.deps.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "*.runtimeconfig.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "*.deps.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "*.runtimeconfig.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Run]
 ; Install and start the service
