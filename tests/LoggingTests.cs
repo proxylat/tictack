@@ -293,7 +293,7 @@ public class LoggingTests
             for (int i = 1; i <= 10; i++)
                 try { if (File.Exists(path + "." + i)) all += File.ReadAllText(path + "." + i); } catch { }
             for (int i = 0; i < 5; i++)
-                Assert.Equal(1, Regex.Matches(all, "held-line-" + i).Count);
+                Assert.Single(Regex.Matches(all, "held-line-" + i));
         }
         finally
         {

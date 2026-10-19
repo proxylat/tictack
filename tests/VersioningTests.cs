@@ -127,18 +127,19 @@ public class VersioningTests : IDisposable
 
         var versioning = new TimestampVersioning(_verDir, _dstDir, 10);
         using var stop = new ManualResetEventSlim(false);
-        // The write handle is opened on the test thread BEFORE the copy, with
-        // FileShare.Read: the archiver's own File.OpenRead calls then succeed
-        // while continuous random writes guarantee the copy stream diverges
-        // from the post-copy dest re-read. (Opening per-write inside the loop
-        // loses the race on Windows — the reader's Share.Read lock turns
-        // every open attempt into a swallowed sharing violation and the file
-        // never mutates.)
+        // One handle, held open for the whole archive, doing small random
+        // writes in a tight loop. Deterministic on both OSes, for different
+        // reasons: on Windows File.OpenRead (Share.Read) can never open a
+        // file with a live Write handle, so the archive fails closed with a
+        // sharing message; on Linux share locks don't exist, so the stream
+        // hash (prefix bytes) always diverges from the post-copy re-read
+        // (hundreds of 4 KB mutations land during the ~100 ms copy window).
+        // Either way: fail, commit nothing, leave no temp.
         using var fh = new FileStream(dest, FileMode.Open, FileAccess.Write, FileShare.Read);
         var writer = Task.Run(() =>
         {
             var rnd = new Random(1234);
-            var buf = new byte[size];
+            var buf = new byte[4096];
             while (!stop.IsSet)
             {
                 rnd.NextBytes(buf);
@@ -146,7 +147,7 @@ public class VersioningTests : IDisposable
                 {
                     lock (fh)
                     {
-                        fh.Seek(0, SeekOrigin.Begin);
+                        fh.Seek(rnd.Next(size - buf.Length), SeekOrigin.Begin);
                         fh.Write(buf, 0, buf.Length);
                         fh.Flush(true);
                     }
@@ -159,7 +160,11 @@ public class VersioningTests : IDisposable
         finally { stop.Set(); await writer; }
 
         Assert.False(result.Success);
-        Assert.Contains("Version validation failed", result.ErrorMessage ?? "");
+        // Linux pins the validation path; Windows can never reach it (the
+        // open itself throws under a live Write handle), so there we pin
+        // only the fail-closed properties below.
+        if (OperatingSystem.IsLinux())
+            Assert.Contains("Version validation failed", result.ErrorMessage ?? "");
         var verSub = Path.Combine(_verDir, "Desktop");
         Assert.Empty(Directory.Exists(verSub) ? Directory.GetFiles(verSub) : Array.Empty<string>());
     }
