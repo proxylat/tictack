@@ -2,6 +2,10 @@
 set "DIR=%~dp0"
 rmdir /s /q "%DIR%..\..\benchmarks\bin" 2>nul
 rmdir /s /q "%DIR%..\..\benchmarks\obj" 2>nul
+rmdir /s /q "%DIR%..\..\corpus\bin" 2>nul
+rmdir /s /q "%DIR%..\..\corpus\obj" 2>nul
+rmdir /s /q "%DIR%..\..\corpus\tests\bin" 2>nul
+rmdir /s /q "%DIR%..\..\corpus\tests\obj" 2>nul
 rmdir /s /q "%DIR%..\..\src\bin" 2>nul
 rmdir /s /q "%DIR%..\..\src\obj" 2>nul
 rmdir /s /q "%DIR%..\..\tests\bin" 2>nul
