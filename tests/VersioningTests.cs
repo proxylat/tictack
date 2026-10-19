@@ -121,25 +121,30 @@ public class VersioningTests : IDisposable
     [Fact]
     public async Task TimestampVersioning_DetectsMidCopyModification()
     {
-        const int size = 24 * 1024 * 1024;
+        const int size = 64 * 1024 * 1024;
         var dest = Dst("race.bin");
         File.WriteAllBytes(dest, new byte[size]);
 
         var versioning = new TimestampVersioning(_verDir, _dstDir, 10);
         using var stop = new ManualResetEventSlim(false);
+        using var firstWrite = new ManualResetEventSlim(false);
         // One handle, held open for the whole archive, doing small random
-        // writes in a tight loop. Deterministic on both OSes, for different
-        // reasons: on Windows File.OpenRead (Share.Read) can never open a
-        // file with a live Write handle, so the archive fails closed with a
-        // sharing message; on Linux share locks don't exist, so the stream
-        // hash (prefix bytes) always diverges from the post-copy re-read
-        // (hundreds of 4 KB mutations land during the ~100 ms copy window).
+        // writes in a tight loop. The archive only starts after the first
+        // write has landed: without this gate a fast disk can finish the
+        // whole copy before the writer thread is first scheduled, and the
+        // archive (correctly) succeeds. Deterministic on both OSes, for
+        // different reasons: on Windows File.OpenRead (Share.Read) can never
+        // open a file with a live Write handle, so the archive fails closed
+        // with a sharing message; on Linux share locks don't exist, so the
+        // stream hash (prefix bytes) always diverges from the post-copy
+        // re-read (hundreds of 4 KB mutations land during the copy window).
         // Either way: fail, commit nothing, leave no temp.
         using var fh = new FileStream(dest, FileMode.Open, FileAccess.Write, FileShare.Read);
         var writer = Task.Run(() =>
         {
             var rnd = new Random(1234);
             var buf = new byte[4096];
+            var first = true;
             while (!stop.IsSet)
             {
                 rnd.NextBytes(buf);
@@ -151,10 +156,12 @@ public class VersioningTests : IDisposable
                         fh.Write(buf, 0, buf.Length);
                         fh.Flush(true);
                     }
+                    if (first) { first = false; firstWrite.Set(); }
                 }
                 catch { }
             }
         });
+        Assert.True(firstWrite.Wait(TimeSpan.FromSeconds(30)), "writer thread never started");
         ActionResult result;
         try { result = await versioning.ArchivePreviousVersionAsync(dest, CancellationToken.None); }
         finally { stop.Set(); await writer; }

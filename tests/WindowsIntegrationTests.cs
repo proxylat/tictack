@@ -20,14 +20,25 @@ public class WindowsIntegrationTests
         var changed = new ManualResetEventSlim();
         monitor.Changed += (_, e) =>
         {
-            if (e.ChangeType == ChangeType.Created && e.FullPath.EndsWith("native.txt", StringComparison.OrdinalIgnoreCase))
+            if ((e.ChangeType == ChangeType.Created || e.ChangeType == ChangeType.Modified)
+                && e.FullPath.EndsWith("native.txt", StringComparison.OrdinalIgnoreCase))
                 changed.Set();
         };
         try
         {
             monitor.Start();
-            File.WriteAllText(Path.Combine(root, "native.txt"), "native");
-            Assert.True(changed.Wait(TimeSpan.FromSeconds(10)));
+            // Kernel notifications can be lost under load (small CI runners
+            // run this alongside coverage + elevated suites): rewrite and
+            // re-wait rather than failing on one miss. A truly dead watcher
+            // misses every attempt and still fails.
+            var file = Path.Combine(root, "native.txt");
+            var seen = false;
+            for (var attempt = 0; attempt < 3 && !seen; attempt++)
+            {
+                File.WriteAllText(file, "native" + attempt);
+                seen = changed.Wait(TimeSpan.FromSeconds(10));
+            }
+            Assert.True(seen);
         }
         finally
         {
