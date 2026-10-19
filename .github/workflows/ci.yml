@@ -190,4 +190,6 @@ jobs:
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: service/win/TicTackSetup-*.exe
+          files: |
+            service/win/TicTackSetup-*.exe
+            service/win/TicTackSv.exe
