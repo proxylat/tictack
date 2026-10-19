@@ -515,7 +515,13 @@ public class UsnMonitorTests : IDisposable
         {
             for (var i = 0; i < 3; i++)
                 File.WriteAllText(Path.Combine(_dir, "c" + i + ".txt"), "v1");
-            WaitFor(events, gate, 3);
+            // Predicate, not a count barrier: the two members can double-
+            // deliver (watcher Created + USN Created/Modified), so N events
+            // may cover fewer than N files and Stop() would cut off the rest.
+            WaitUntil(events, gate, list =>
+                list.Any(e => e.FullPath == Path.Combine(_dir, "c0.txt")) &&
+                list.Any(e => e.FullPath == Path.Combine(_dir, "c1.txt")) &&
+                list.Any(e => e.FullPath == Path.Combine(_dir, "c2.txt")));
         }
         finally { composite.Stop(); }
 
