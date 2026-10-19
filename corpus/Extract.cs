@@ -541,6 +541,10 @@ namespace Corpus
         private readonly Queue<string> _order = new();
         private long _cacheBytes;
         private bool _disposed;
+        // BuzHash snapshots carry variable-size chunks: cumulative entry
+        // start offsets for volume offset → index lookup. Null on fixed
+        // snapshots, which keep the original O(1) grid division below.
+        private readonly long[]? _starts;
 
         public long Length => _manifest.VolumeLength;
 
@@ -554,12 +558,34 @@ namespace Corpus
             _packsDir = Path.Combine(storeRoot, "packs");
             _landingDir = Path.Combine(storeRoot, "landing");
             _chunkBytes = manifest.ChunkMib * 1024 * 1024;
+            if (string.Equals(manifest.Chunker, "buzhash", StringComparison.Ordinal))
+            {
+                _starts = new long[manifest.Chunks.Count + 1];
+                for (var i = 0; i < manifest.Chunks.Count; i++)
+                    _starts[i + 1] = _starts[i] + manifest.Chunks[i].Size;
+            }
             _index = new ChunkIndex(dbPath);
             _deltaCodec = deltaCodec;
             // ChunkId key is store-local; the id key binds digests, so the
             // resolver needs it for the reconstruction hash-check.
             _deltaReader = deltaCodec != null ? new DeltaChunkReader(_index, _packsDir, _landingDir, ChunkId.EnsureKey(storeRoot), deltaCodec) : null;
         }
+
+        // Volume offset → chunk index/offset. Fixed snapshots divide the
+        // grid (original math, unchanged); buzhash walks the cumulative
+        // starts (binary search — offsets are strictly increasing).
+        private long IndexAt(long pos)
+        {
+            if (_starts == null)
+                return pos / _chunkBytes;
+            var i = Array.BinarySearch(_starts, pos);
+            if (i < 0)
+                i = ~i - 1;
+            return i;
+        }
+
+        private long OffsetAt(long pos, long index) =>
+            _starts == null ? pos % _chunkBytes : pos - _starts[(int)index];
 
         public void Read(long offset, byte[] buffer, int bufOffset, int count)
         {
@@ -574,11 +600,11 @@ namespace Corpus
             var pos = offset;
             while (remaining > 0)
             {
-                var chunkIdx = pos / _chunkBytes;
+                var chunkIdx = IndexAt(pos);
                 if (chunkIdx >= _manifest.Chunks.Count)
                     throw new ExtractCorruptException(_generation, "chunk map shorter than volume");
                 var entry = _manifest.Chunks[(int)chunkIdx];
-                var chunkOff = (int)(pos % _chunkBytes);
+                var chunkOff = (int)OffsetAt(pos, chunkIdx);
                 if (chunkOff >= entry.Size)
                     throw new ExtractCorruptException(_generation, $"chunk {chunkIdx} map inconsistent");
                 var take = (int)Math.Min(entry.Size - chunkOff, remaining);
@@ -646,11 +672,11 @@ namespace Corpus
             var pos = volumeOffset;
             while (pos < end)
             {
-                var chunkIdx = pos / _chunkBytes;
+                var chunkIdx = IndexAt(pos);
                 if (chunkIdx >= _manifest.Chunks.Count)
                     return;
                 var entry = _manifest.Chunks[(int)chunkIdx];
-                var chunkOff = pos % _chunkBytes;
+                var chunkOff = OffsetAt(pos, chunkIdx);
                 if (chunkOff >= entry.Size)
                     return;
                 var take = Math.Min(entry.Size - chunkOff, end - pos);

@@ -13,9 +13,9 @@ namespace Corpus
         private readonly GcScheduler _scheduler;
         private bool _disposed;
 
-        public GcHost(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, GcSchedule? schedule = null, string? encryptHook = null)
+        public GcHost(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, GcSchedule? schedule = null, string? encryptHook = null, bool wormMode = false)
         {
-            _scheduler = new GcScheduler(storeRoot, dbPath, retention, log, chunkMib, zstdLevel, schedule, encryptHook);
+            _scheduler = new GcScheduler(storeRoot, dbPath, retention, log, chunkMib, zstdLevel, schedule, encryptHook, wormMode);
         }
 
         public void Start()

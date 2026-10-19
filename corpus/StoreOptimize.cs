@@ -228,6 +228,11 @@ namespace Corpus
                 using (var index = new ChunkIndex(_dbPath))
                     index.UpsertBatch(moved);
                 File.Delete(oldPath);
+                // Stale parity must not outlive its pack. The rewritten pack
+                // carries no sidecar (the knob lives on Store, unreachable
+                // here) — its chunks verify from bytes, unprotected, until a
+                // future ECC-on image re-packs them.
+                File.Delete(PackEcc.SidecarPath(oldPath));
             }
         }
 

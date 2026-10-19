@@ -67,6 +67,19 @@ namespace Corpus
         // daily GC wall-clock time and landing-optimize interval.
         public string GcDailyAt { get; set; }
         public string OptimizeEvery { get; set; }
+        // Chunker: "fixed" (ChunkMib blocks) or "buzhash" (content-defined,
+        // avg ~ChunkMib). Default fixed: old snapshots read unchanged.
+        public string Chunker { get; set; }
+        // Reed-Solomon parity per pack, percent of pack bytes. 0 = off.
+        public int EccOverheadPercent { get; set; }
+        // Background deep-verify: percent of packs re-hashed per run.
+        // 0 = off (verify-on-write only).
+        public int DeepVerifyPercent { get; set; }
+        // WORM: refuse prune/GC/delete paths loud. Default false.
+        public bool WormMode { get; set; }
+        // Change alarm: Error + alert when one generation changes more
+        // than this percent of stored bytes. 0 = off.
+        public double ChangeAlarmPercent { get; set; }
 
         public CorpusConfig()
         {
@@ -76,6 +89,11 @@ namespace Corpus
             Encrypt = string.Empty;
             GcDailyAt = "02:00";
             OptimizeEvery = "00:15:00";
+            Chunker = "fixed";
+            EccOverheadPercent = 0;
+            DeepVerifyPercent = 0;
+            WormMode = false;
+            ChangeAlarmPercent = 0;
             Compression = new CorpusCompressionConfig();
             Logging = new CorpusLoggingConfig();
             Retention = new CorpusRetentionConfig();
@@ -142,6 +160,26 @@ namespace Corpus
             if (!TimeSpan.TryParse(cfg.OptimizeEvery, out var every) || every <= TimeSpan.Zero)
             {
                 log.Error("optimize_every must be a positive interval (got: " + cfg.OptimizeEvery + ")");
+                valid = false;
+            }
+            if (cfg.Chunker != "fixed" && cfg.Chunker != "buzhash")
+            {
+                log.Error("chunker must be fixed or buzhash (got: " + cfg.Chunker + ")");
+                valid = false;
+            }
+            if (cfg.EccOverheadPercent < 0 || cfg.EccOverheadPercent > 50)
+            {
+                log.Error("ecc_overhead_percent must be 0..50 (got: " + cfg.EccOverheadPercent + ")");
+                valid = false;
+            }
+            if (cfg.DeepVerifyPercent < 0 || cfg.DeepVerifyPercent > 100)
+            {
+                log.Error("deep_verify_percent must be 0..100 (got: " + cfg.DeepVerifyPercent + ")");
+                valid = false;
+            }
+            if (cfg.ChangeAlarmPercent < 0 || cfg.ChangeAlarmPercent > 100)
+            {
+                log.Error("change_alarm_percent must be 0..100 (got: " + cfg.ChangeAlarmPercent + ")");
                 valid = false;
             }
             return valid;

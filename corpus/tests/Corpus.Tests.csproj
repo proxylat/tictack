@@ -27,6 +27,7 @@
 
   <ItemGroup>
     <Compile Include="../CorpusConfig.cs" Link="corpus/CorpusConfig.cs" />
+    <Compile Include="../DeepVerify.cs" Link="corpus/DeepVerify.cs" />
     <Compile Include="../DeltaCodec.cs" Link="corpus/DeltaCodec.cs" />
     <Compile Include="../ZstdDeltaCodec.cs" Link="corpus/ZstdDeltaCodec.cs" />
     <Compile Include="../Chunker.cs" Link="corpus/Chunker.cs" />
@@ -52,10 +53,12 @@
     <Compile Include="../recovery/DiskpartScript.cs" Link="corpus/recovery/DiskpartScript.cs" />
     <Compile Include="../recovery/VolumeLock.cs" Link="corpus/recovery/VolumeLock.cs" />
     <Compile Include="../PackWriter.cs" Link="corpus/PackWriter.cs" />
+    <Compile Include="../RsCodec.cs" Link="corpus/RsCodec.cs" />
     <Compile Include="../PackHook.cs" Link="corpus/PackHook.cs" />
     <Compile Include="../ChunkIndex.cs" Link="corpus/ChunkIndex.cs" />
     <Compile Include="../Gc.cs" Link="corpus/Gc.cs" />
     <Compile Include="../GcHost.cs" Link="corpus/GcHost.cs" />
+    <Compile Include="../Hardening.cs" Link="corpus/Hardening.cs" />
     <Compile Include="../ChangeSource.cs" Link="corpus/ChangeSource.cs" />
     <Compile Include="../MftReader.cs" Link="corpus/MftReader.cs" />
     <Compile Include="../MftDigest.cs" Link="corpus/MftDigest.cs" />
@@ -78,6 +81,7 @@
     <Compile Include="../PartitionTable.cs" Link="corpus/PartitionTable.cs" />
     <Compile Include="../EspLiveSource.cs" Link="corpus/EspLiveSource.cs" />
     <Compile Include="../Extract.cs" Link="corpus/Extract.cs" />
+    <Compile Include="../Mount.cs" Link="corpus/Mount.cs" />
     <Compile Include="../SingleFileBackup.cs" Link="corpus/SingleFileBackup.cs" />
     <Compile Include="../OptimizeVhd.cs" Link="corpus/OptimizeVhd.cs" />
     <Compile Include="../WimBackend.cs" Link="corpus/WimBackend.cs" />

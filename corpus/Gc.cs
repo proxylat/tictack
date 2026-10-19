@@ -28,8 +28,9 @@ namespace Corpus
         private readonly string _dbPath;
         private readonly CorpusRetentionConfig _retention;
         private readonly ILogger _log;
+        private readonly bool _wormMode;
 
-        public GarbageCollector(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log)
+        public GarbageCollector(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, bool wormMode = false)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
@@ -41,6 +42,7 @@ namespace Corpus
             _dbPath = dbPath;
             _retention = retention;
             _log = log;
+            _wormMode = wormMode;
         }
 
         public GcPlan Plan()
@@ -243,6 +245,9 @@ namespace Corpus
         public void Execute(GcPlan plan)
         {
             ArgumentNullException.ThrowIfNull(plan);
+            // WORM gate (gap 4): refuse LOUD before touching anything; an
+            // empty (metadata-only) plan passes through untouched.
+            Hardening.ThrowIfWormBlocked(_wormMode, plan, _log);
             // Crash-safe order: manifests + layouts first, then index rows,
             // then pack files. A crash between steps only orphans pack
             // bytes — never a live chunk. Single-writer assumption: no
@@ -257,7 +262,12 @@ namespace Corpus
             // needs its own crash protocol; per-image packs make unique packs
             // go fully dead, so survivors stay rare).
             foreach (var path in plan.DropPacks)
+            {
                 File.Delete(path);
+                // ECC sidecars share the pack lifetime (additive file, never
+                // indexed); absent when the pack predates ECC or ECC is off.
+                File.Delete(PackEcc.SidecarPath(path));
+            }
             _log.Info($"gc: dropped {plan.DropManifests.Count} snapshots, {plan.DeadChunks} chunks, {plan.DeadBytes} bytes, {plan.DropPacks.Count} packs");
         }
     }
@@ -280,6 +290,7 @@ namespace Corpus
         private readonly int _chunkMib;
         private readonly int _zstdLevel;
         private readonly string? _encryptHook;
+        private readonly bool _wormMode;
         private readonly GcSchedule _schedule;
         private readonly string _gcStamp;
         private readonly string _optStamp;
@@ -288,7 +299,7 @@ namespace Corpus
         private bool _disposed;
         private bool _running;
 
-        public GcScheduler(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, GcSchedule? schedule = null, string? encryptHook = null)
+        public GcScheduler(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, GcSchedule? schedule = null, string? encryptHook = null, bool wormMode = false)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
@@ -303,6 +314,7 @@ namespace Corpus
             _chunkMib = chunkMib;
             _zstdLevel = zstdLevel;
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
+            _wormMode = wormMode;
             _schedule = schedule ?? GcSchedule.Default;
             var stateDir = Path.GetDirectoryName(dbPath) ?? storeRoot;
             _gcStamp = Path.Combine(stateDir, "gc-last-run");
@@ -408,7 +420,7 @@ namespace Corpus
 
         private void RunGc(DateTime now)
         {
-            var gc = new GarbageCollector(_storeRoot, _dbPath, _retention, _log);
+            var gc = new GarbageCollector(_storeRoot, _dbPath, _retention, _log, _wormMode);
             var plan = gc.Plan();
             if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0 && plan.DropLayouts.Count == 0)
                 _log.Info("scheduled gc: nothing to collect");

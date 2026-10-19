@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Tasks;
 using TicTack;
 
 namespace Corpus
@@ -133,6 +134,12 @@ namespace Corpus
                         break;
                     case "--verify":
                         verb = "verify";
+                        break;
+                    case "--deep-verify":
+                        verb = "deep-verify";
+                        break;
+                    case "--mount-snapshot":
+                        verb = "mount-snapshot";
                         break;
                     case "--list-snapshots":
                         verb = "list-snapshots";
@@ -674,6 +681,20 @@ namespace Corpus
                         }
                         using (var store = CreateStore(cfg, log))
                             return store.Verify(verifyGen, chain) ? 0 : 1;
+                    case "deep-verify":
+                        if (!TrySnapshot(snapshotArg, log, out var deepGen))
+                        {
+                            log.Error("--deep-verify requires --snapshot <gen>");
+                            return 1;
+                        }
+                        return RunDeepVerify(cfg, baseDir, deepGen, log);
+                    case "mount-snapshot":
+                        if (!TrySnapshot(snapshotArg, log, out var mountGen))
+                        {
+                            log.Error("--mount-snapshot requires --snapshot <gen>");
+                            return 1;
+                        }
+                        return RunMountSnapshot(cfg, baseDir, mountGen, null, log);
                     case "list-snapshots":
                         using (var store = CreateStore(cfg, log))
                         {
@@ -790,7 +811,10 @@ namespace Corpus
                 cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.ChunkMib, cfg.Compression.Level, log,
-                cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
+                cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level),
+                changeAlarmPercent: cfg.ChangeAlarmPercent,
+                chunker: cfg.Chunker,
+                eccOverheadPercent: cfg.EccOverheadPercent);
         }
 
         private static int RunListVolumes(ILogger log)
@@ -1322,6 +1346,30 @@ namespace Corpus
         // --gc: manual only, never automatic. Bare prints the plan and
         // asks for --confirm (exit 1); --dry-run plans without deleting
         // (exit 0); --confirm executes (exit 0).
+        private static int RunDeepVerify(CorpusConfig cfg, string baseDir, int gen, ILogger log)
+        {
+            SnapshotManifest manifest;
+            using (var store = CreateStore(cfg, log))
+                manifest = store.GetManifest(gen);
+            var db = Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            var summary = DeepVerifyJob.Run(cfg.StorePath, db, manifest, cfg.DeepVerifyPercent, log,
+                CancellationToken.None, new ZstdDeltaCodec(cfg.Compression.Level));
+            log.Info("deep-verify: " + summary.Checked + "/" + summary.TotalChunks + " checked, " + summary.Failed + " failed");
+            return summary.Ok ? 0 : 1;
+        }
+
+        private static int RunMountSnapshot(CorpusConfig cfg, string baseDir, int gen, string? parentDir, ILogger log)
+        {
+            var db = Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            using var mount = SnapshotMount.Mount(cfg.StorePath, db, gen, log,
+                new SnapshotMountOptions(parentDir), CancellationToken.None);
+            log.Info("snapshot " + gen + " mounted at " + mount.MountPath + " (Ctrl+C to unmount)");
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+            try { Task.Delay(Timeout.Infinite, cts.Token).Wait(); } catch (AggregateException) { }
+            return 0;
+        }
+
         private static int RunGc(CorpusConfig cfg, bool dryRun, bool confirm, ILogger log)
         {
             if (dryRun && confirm)
@@ -1332,7 +1380,8 @@ namespace Corpus
             var gc = new GarbageCollector(
                 cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
-                cfg.Retention ?? new CorpusRetentionConfig(), log);
+                cfg.Retention ?? new CorpusRetentionConfig(), log,
+                wormMode: cfg.WormMode);
             var plan = gc.Plan();
             if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0 && plan.DropLayouts.Count == 0)
             {
@@ -1391,7 +1440,7 @@ namespace Corpus
             using var host = new GcHost(cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, level,
-                new GcSchedule(dailyAt, every), cfg.Encrypt);
+                new GcSchedule(dailyAt, every), cfg.Encrypt, cfg.WormMode);
             log.Info("service running: gc daily at " + cfg.GcDailyAt + ", optimize every " + cfg.OptimizeEvery + " (Ctrl+C to stop)");
             host.Run(cts.Token);
             return 0;
@@ -1910,6 +1959,8 @@ namespace Corpus
             Console.WriteLine("  --bitmap-stats --volume <X:> Used-cluster stats over a snapshot (Windows, elevated)");
             Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
             Console.WriteLine("  --verify --snapshot <gen> [--chain]              Verify a snapshot (exit 1 on failure; --chain also walks parent links to genesis, a gap fails loud even if the target alone verifies)");
+            Console.WriteLine("  --deep-verify --snapshot <gen>                   Re-read deep_verify_percent of chunks from packs, hash-compare (exit 1 on mismatch; percent 0 = no-op)");
+            Console.WriteLine("  --mount-snapshot --snapshot <gen>                Materialize a snapshot read-only under temp (Ctrl+C to unmount)");
             Console.WriteLine("  --list-snapshots                     List snapshots (\"gen name\" lines)");
             Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual; --service runs this on schedule)");
             Console.WriteLine("      retention: keep_last/keep_within_days/pin from config; exports outside the store are untouched");

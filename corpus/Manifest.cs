@@ -27,6 +27,13 @@ namespace Corpus
         public string CreatedUtc { get; set; } = "";
         public long VolumeLength { get; set; }
         public int ChunkMib { get; set; }
+        // Chunker that wrote this snapshot: null = fixed grid (every
+        // snapshot before CDC existed omits the field, so old JSON stays
+        // byte-identical and loads as fixed). "buzhash" = content-defined
+        // boundaries; restore walks cumulative entry sizes instead of the
+        // fixed grid. Mixed repos work: each snapshot carries its own shape.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? Chunker { get; set; }
         public int CompressionLevel { get; set; }
         public string KeyId { get; set; } = "";
         public string PrevDigest { get; set; } = "";
@@ -113,7 +120,8 @@ namespace Corpus
             string? layoutFingerprint = null, List<string>? skippedExclusions = null,
             List<string>? mftChunkDigests = null, int mftRecordBytes = 0,
             string? bitLockerState = null, List<string>? bitLockerKeyIds = null,
-            List<string>? mftRecordDigests = null)
+            List<string>? mftRecordDigests = null,
+            string? chunker = null)
         {
             return new SnapshotManifest
             {
@@ -121,6 +129,7 @@ namespace Corpus
                 Name = name,
                 VolumeLength = volumeLength,
                 ChunkMib = chunkMib,
+                Chunker = chunker,
                 CompressionLevel = compressionLevel,
                 KeyId = keyId,
                 PrevDigest = prevDigest,

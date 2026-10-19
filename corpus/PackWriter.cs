@@ -24,6 +24,7 @@ namespace Corpus
         private readonly string _packsDir;
         private readonly long _maxPackBytes;
         private readonly string? _encryptHook;
+        private readonly int _eccOverheadPercent;
         private readonly List<(byte[] Digest, long Offset, uint Stored, uint Plain, byte Codec)> _index = new List<(byte[] Digest, long Offset, uint Stored, uint Plain, byte Codec)>();
         private FileStream? _stream;
         private string? _tmpPath;
@@ -31,13 +32,15 @@ namespace Corpus
         private long _currentSize;
         private bool _disposed;
 
-        public PackWriter(string packsDir, long maxPackBytes = DefaultMaxPackBytes, string? encryptHook = null)
+        public PackWriter(string packsDir, long maxPackBytes = DefaultMaxPackBytes, string? encryptHook = null, int eccOverheadPercent = 0)
         {
             ArgumentNullException.ThrowIfNull(packsDir);
             if (maxPackBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxPackBytes));
+            if (eccOverheadPercent < 0 || eccOverheadPercent > 50) throw new ArgumentOutOfRangeException(nameof(eccOverheadPercent));
             _packsDir = packsDir;
             _maxPackBytes = maxPackBytes;
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
+            _eccOverheadPercent = eccOverheadPercent;
             Directory.CreateDirectory(_packsDir);
         }
 
@@ -139,6 +142,10 @@ namespace Corpus
             _currentSize = 0;
             if (_encryptHook != null)
                 PackHook.Seal(_encryptHook, sealedPath);
+            // Parity covers the final bytes (post-hook ciphertext when
+            // encrypted); a missing sidecar just reads like an old pack.
+            if (_eccOverheadPercent > 0)
+                PackEcc.WriteSidecar(sealedPath, _eccOverheadPercent);
         }
     }
 
@@ -147,6 +154,23 @@ namespace Corpus
     public static class PackReader
     {
         public static PackBlob ReadBlob(string packPath, long offset, int storedBytes)
+        {
+            try
+            {
+                return ReadBlobCore(packPath, offset, storedBytes);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+            {
+                // ECC second chance: a repairable pack bitflip throws here
+                // (length/crc/truncation); one repair + single re-read.
+                // No sidecar or unrecoverable = the original throw stands.
+                if (!PackEcc.TryRepairPack(packPath))
+                    throw;
+                return ReadBlobCore(packPath, offset, storedBytes);
+            }
+        }
+
+        private static PackBlob ReadBlobCore(string packPath, long offset, int storedBytes)
         {
             if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
             if (storedBytes < 0) throw new ArgumentOutOfRangeException(nameof(storedBytes));

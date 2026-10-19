@@ -39,10 +39,14 @@ namespace Corpus
         private readonly ILogger _log;
         private readonly byte[] _key;
         private readonly string? _encryptHook;
+        private readonly int _eccOverheadPercent;
         private readonly ChunkIndex _index;
         // §12.7 seam: null = no delta codec wired (old behavior; delta reads
         // refuse loud). The winning codec plugs in here post-spike.
         private readonly IDeltaCodec? _deltaCodec;
+        // Change-alarm threshold (gap 4): percent of gen churn that refuses
+        // the commit unless --force-full. 0 = off (current behavior).
+        private readonly double _changeAlarmPercent;
         private readonly DeltaChunkReader? _deltaReader;
         private bool _disposed;
 
@@ -165,11 +169,22 @@ namespace Corpus
             return volumeLength - holes;
         }
 
-        public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log, string? encryptHook = null, IDeltaCodec? deltaCodec = null)
+        // BuzHash CDC chunker for this store (gap 2): "fixed" (ChunkMib
+        // blocks, default, old snapshots read unchanged) or "buzhash"
+        // (content-defined, avg ~ChunkMib). Recorded per snapshot, so
+        // mixed repos work; cross-chunker parents fall back to full.
+        private readonly string _chunker;
+
+        public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log, string? encryptHook = null, IDeltaCodec? deltaCodec = null, double changeAlarmPercent = 0, string chunker = "fixed", int eccOverheadPercent = 0)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
             ArgumentNullException.ThrowIfNull(log);
+            ArgumentNullException.ThrowIfNull(chunker);
+            if (changeAlarmPercent < 0 || changeAlarmPercent > 100)
+                throw new ArgumentOutOfRangeException(nameof(changeAlarmPercent), "change alarm percent must be 0..100");
+            if (!string.Equals(chunker, "fixed", StringComparison.OrdinalIgnoreCase) && !string.Equals(chunker, "buzhash", StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("chunker must be fixed or buzhash (got: " + chunker + ")", nameof(chunker));
             if (deltaCodec != null && (deltaCodec.CodecId == Compression.CodecRaw || deltaCodec.CodecId == Compression.CodecZstd))
                 throw new ArgumentException("delta codec id must not collide with 0 (raw) or 1 (zstd)", nameof(deltaCodec));
             _packsDir = Path.Combine(storeRoot, "packs");
@@ -184,6 +199,9 @@ namespace Corpus
             _key = ChunkId.EnsureKey(storeRoot);
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
             _deltaCodec = deltaCodec;
+            _changeAlarmPercent = changeAlarmPercent;
+            _chunker = string.Equals(chunker, "buzhash", StringComparison.OrdinalIgnoreCase) ? "buzhash" : "fixed";
+            _eccOverheadPercent = eccOverheadPercent;
             _index = new ChunkIndex(dbPath);
             _deltaReader = deltaCodec != null ? new DeltaChunkReader(_index, _packsDir, _landingDir, _key, deltaCodec) : null;
         }
@@ -210,6 +228,13 @@ namespace Corpus
                 latest = ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{snap}.json"), _key);
             }
             var prevDigest = latest?.Hmac ?? "";
+            // BuzHash snapshots are always full images: content-defined
+            // boundaries have no stable grid, so index-based incrementals
+            // cannot address them — content-hash dedup still packs only
+            // new bytes, so the steady-state cost matches incremental.
+            if (_chunker == "buzhash")
+                return ImageFull(source, name, generation, prevDigest, opts,
+                    skipIfUnchanged && !opts.ForceFull && existing.Count > 0 ? existing[existing.Count - 1].Generation : null, progress);
             SnapshotManifest? parent = null;
             if (!opts.ForceFull && (opts.Incremental || opts.ParentGeneration > 0))
             {
@@ -397,6 +422,11 @@ namespace Corpus
                 _log.Info($"full image: parent gen {parent.Generation} chunk {parent.ChunkMib} MiB != current {_chunkMib} MiB");
                 return null;
             }
+            if (!string.Equals(parent.Chunker ?? "fixed", _chunker, StringComparison.Ordinal))
+            {
+                _log.Info($"full image: parent gen {parent.Generation} chunker {parent.Chunker ?? "fixed"} != current {_chunker}");
+                return null;
+            }
             var grid = GridCount(source.Length, _chunkMib);
             if (parent.Chunks.Count != grid)
             {
@@ -434,15 +464,28 @@ namespace Corpus
             var excl = ResolveExclusions(source, opts);
             var exclBpc = excl?.BytesPerCluster ?? 0;
             var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook))
+            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent))
             using (var stream = source.OpenRead())
             {
                 bool[]? holeMap = null;
-                if (source is ISparseBlockSource sparse)
-                    holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
-                var enumerable = holeMap != null
-                    ? Chunker.ReadSparse(stream, chunkBytes, i => i < holeMap.Length && holeMap[i])
-                    : Chunker.Read(stream, chunkBytes);
+                IEnumerable<Chunk> enumerable;
+                if (_chunker == "buzhash")
+                {
+                    // CDC has no grid: sparse holes stream as zeros (same
+                    // bytes, deduped by content hash); hole markers stay a
+                    // fixed-grid optimization.
+                    // shortcut: sparse hole-skipping is fixed-grid only — a sparse source under buzhash streams dense (correct, possibly larger). Revisit if sparse+buzhash volumes show bloat.
+                    var (minBytes, maxBytes) = Chunker.BuzHashBounds(chunkBytes);
+                    enumerable = Chunker.ReadVariable(stream, chunkBytes, minBytes, maxBytes);
+                }
+                else
+                {
+                    if (source is ISparseBlockSource sparse)
+                        holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
+                    enumerable = holeMap != null
+                        ? Chunker.ReadSparse(stream, chunkBytes, i => i < holeMap.Length && holeMap[i])
+                        : Chunker.Read(stream, chunkBytes);
+                }
                 // Denominator = planned bytes (whole volume; holes excluded
                 // above). A caller-supplied progress (disk aggregate) owns
                 // the throttle; direct calls get their own reporter.
@@ -502,6 +545,22 @@ namespace Corpus
             // Bitmap status logs only when a skip decision could consume
             // these records (skipSince set); full images stay quiet.
             var (mftDigests, mftRecords, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log, skipSince != null ? _log : null);
+            // Ransomware alarm (gap 4): a full re-read compares against the
+            // latest gen; over-threshold churn refuses the commit
+            // (fail-closed) unless --force-full. Orphaned pack/index rows
+            // from this run are unreferenced and GC-swept, never restorable
+            // data — same withhold shape as the §12.8 skip above.
+            if (_changeAlarmPercent > 0)
+            {
+                SnapshotManifest? alarmParent = null;
+                var alarmListed = ManifestStore.List(_manifestsDir);
+                if (alarmListed.Count > 0)
+                {
+                    var (alarmGen, alarmSnap) = alarmListed[alarmListed.Count - 1];
+                    alarmParent = ManifestStore.Load(Path.Combine(_manifestsDir, $"{alarmGen:D6}-{alarmSnap}.json"), _key);
+                }
+                Hardening.CheckChangeAlarm(alarmParent, entries, _changeAlarmPercent, opts.ForceFull, _log);
+            }
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries,
@@ -510,7 +569,8 @@ namespace Corpus
                 skippedExclusions: excl != null && excl.ExclusionNames.Count > 0 ? new List<string>(excl.ExclusionNames) : null,
                 mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes, mftRecordDigests: mftRecords,
                 bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
-                bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
+                bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds,
+                chunker: _chunker == "buzhash" ? "buzhash" : null);
             ManifestStore.Save(_manifestsDir, manifest, _key);
             if (manifest.SkippedExclusions != null)
                 _log.Warn($"excluded extents restored as zeros: {string.Join(", ", manifest.SkippedExclusions)}");
@@ -536,7 +596,7 @@ namespace Corpus
             var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
             var reread = 0;
             var newChunks = 0;
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook))
+            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent))
             using (var stream = source.OpenRead())
             {
                 bool[]? holeMap = null;
@@ -625,6 +685,9 @@ namespace Corpus
             if (skip && newChunks == 0)
                 SkipUnchanged(parent.Generation);
 
+            // Ransomware alarm (gap 4): over-threshold churn vs the parent
+            // refuses the commit (fail-closed) unless --force-full.
+            Hardening.CheckChangeAlarm(parent, entries, _changeAlarmPercent, opts.ForceFull, _log);
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries, parent.Generation, plan.NewCursor,
@@ -946,15 +1009,19 @@ namespace Corpus
             opts ??= new ImageOptions();
             if (opts.Incremental || opts.ParentGeneration > 0)
                 throw new InvalidOperationException("ImageFast is full-capture only (incremental+landing is a later rung)");
+            if (_chunker == "buzhash")
+                throw new InvalidOperationException("ImageFast (landing ingest) is fixed-chunker only; use Image for buzhash snapshots");
             var generation = ManifestStore.NextGeneration(_manifestsDir);
             var existing = ManifestStore.List(_manifestsDir);
             var prevDigest = "";
             SnapshotManifest? skipParent = null;
+            SnapshotManifest? alarmParent = null;
             if (existing.Count > 0)
             {
                 var (gen, snap) = existing[existing.Count - 1];
                 var latest = ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{snap}.json"), _key);
                 prevDigest = latest.Hmac;
+                alarmParent = latest;
                 if (skipIfUnchanged && !opts.ForceFull)
                     skipParent = latest;
             }
@@ -1054,6 +1121,10 @@ namespace Corpus
             }
             // Same skip-gating as above: no parent, no future skip decision.
             var (mftDigests, mftRecords, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log, skipParent != null ? _log : null);
+            // Ransomware alarm (gap 4): see ImageFull. Refused fast-images
+            // leave hash-verified landed chunks behind; the next run resumes
+            // or discards them by fingerprint — never silently mixed.
+            Hardening.CheckChangeAlarm(alarmParent, entries, _changeAlarmPercent, opts.ForceFull, _log);
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries,
@@ -1677,7 +1748,7 @@ namespace Corpus
             var dropped = 0;
             var pending = new List<ChunkRow>();
             var pendingPaths = new List<string>();
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook))
+            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent))
             {
                 var window = new EncodeWindow(pack, pending, _zstdLevel, pendingPaths);
                 foreach (var path in paths)
@@ -1945,12 +2016,26 @@ namespace Corpus
                     // frames, IO/pack faults throw their own — all mean failure.
                     catch (Exception ex)
                     {
-                        failed = true;
-                        if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: unreadable ({ex.Message})");
-                        continue;
+                        // ECC second chance: a repairable pack bitflip throws
+                        // on read or decode; one repair + full re-read before
+                        // calling the chunk unreadable. No sidecar or
+                        // unrecoverable keeps the original error, never a new one.
+                        var revived = TryEccSecondChance(row, entry, digest);
+                        if (revived == null)
+                        {
+                            failed = true;
+                            if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: unreadable ({ex.Message})");
+                            continue;
+                        }
+                        plain = revived;
                     }
                     var verified = plain.Length == entry.Size
                         && CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key), digest);
+                    // Payload bitflips decode fine but fail the digest (the
+                    // ReadBlob repair only fires on read throws), so the
+                    // mismatch case gets its own repair + re-read here.
+                    if (!verified && TryEccSecondChance(row, entry, digest) != null)
+                        verified = true;
                     if (!verified)
                     {
                         failed = true;
@@ -1974,6 +2059,29 @@ namespace Corpus
             {
                 _log.Error($"snapshot {generation} verify failed", ex);
                 return false;
+            }
+        }
+
+        // ECC second chance for Verify: repair the pack (sidecar-gated,
+        // no sidecar = null) then re-read + decode + digest-check. Null =
+        // unrecoverable; the caller keeps its own error. Never throws.
+        private byte[]? TryEccSecondChance(ChunkRow row, ManifestEntry entry, byte[] digest)
+        {
+            var packPath = Path.Combine(_packsDir, row.Pack);
+            if (!PackEcc.TryRepairPack(packPath))
+                return null;
+            try
+            {
+                var blob = PackReader.ReadBlob(packPath, row.PackOffset, (int)row.StoredBytes);
+                var plain = Compression.Decode(blob.Payload, blob.Codec);
+                if (plain.Length != entry.Size
+                    || !CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key), digest))
+                    return null;
+                return plain;
+            }
+            catch (Exception)
+            {
+                return null;
             }
         }
 
