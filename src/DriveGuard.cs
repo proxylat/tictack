@@ -13,19 +13,20 @@ namespace TicTack
     {
         private static readonly Func<DriveInfo[]> DefaultProbe = static () => DriveInfo.GetDrives();
         private static readonly object CacheLock = new();
-        private static List<(string Root, bool Ready)>? _cache;
-        private static DateTime _cacheAt;
-        private static Func<DriveInfo[]>? _cacheProbe;
+        private static readonly Dictionary<Func<DriveInfo[]>, (List<(string Root, bool Ready)> Drives, DateTime At)> _caches = new();
 
         private static List<(string Root, bool Ready)> GetCachedDrives(Func<DriveInfo[]>? getDrives)
         {
             getDrives ??= DefaultProbe;
             lock (CacheLock)
             {
-                if (_cache != null && ReferenceEquals(_cacheProbe, getDrives)
-                    && DateTime.UtcNow - _cacheAt < TimeSpan.FromSeconds(30))
-                    return _cache;
-                _cache = getDrives()
+                // Per-probe entries: concurrent callers with different probes
+                // (tests, future call sites) must not evict each other, or a
+                // second call within TTL reprobes and the count drifts.
+                if (_caches.TryGetValue(getDrives, out var hit)
+                    && DateTime.UtcNow - hit.At < TimeSpan.FromSeconds(30))
+                    return hit.Drives;
+                var fresh = getDrives()
                     .Select(d =>
                     {
                         bool ready;
@@ -33,9 +34,8 @@ namespace TicTack
                         return (d.RootDirectory.FullName, ready);
                     })
                     .ToList();
-                _cacheAt = DateTime.UtcNow;
-                _cacheProbe = getDrives;
-                return _cache;
+                _caches[getDrives] = (fresh, DateTime.UtcNow);
+                return fresh;
             }
         }
 
