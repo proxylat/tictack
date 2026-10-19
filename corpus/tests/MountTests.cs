@@ -77,10 +77,27 @@ public sealed class MountTests : IDisposable
         using var mount = SnapshotMount.Mount(_storeRoot, _dbPath, 1, new TestLogger());
         var target = Path.Combine(mount.MountPath, "hello.txt");
 
-        Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(target, "evil"));
-        Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(Path.Combine(mount.MountPath, "new.txt"), "evil"));
-        Assert.Equal("hello world", File.ReadAllText(target));
+        // Read-only bits are the enforcement; admins/root bypass them, so
+        // the write-fails check only holds non-elevated (CI runs elevated).
+        Assert.True((File.GetAttributes(target) & FileAttributes.ReadOnly) != 0);
+        if (!IsElevated())
+        {
+            Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(target, "evil"));
+            Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(Path.Combine(mount.MountPath, "new.txt"), "evil"));
+            Assert.Equal("hello world", File.ReadAllText(target));
+        }
         Assert.Equal(before, StoreTree(_storeRoot));
+    }
+
+    private static bool IsElevated()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+            return new System.Security.Principal.WindowsPrincipal(id)
+                .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        return Environment.UserName == "root";
     }
 
     [Fact]
