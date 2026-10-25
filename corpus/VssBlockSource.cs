@@ -46,8 +46,9 @@ namespace Corpus
                 BytesPerCluster = VolumeBitmap.BytesPerCluster(drive + "\\");
                 _mft = new Lazy<IMftVolume>(() => new MftVolumeReader(_device));
             }
-            catch
+            catch (Exception ex)
             {
+                VssHealth.ReportSnapshotFailure(log, ex);
                 _bitlocker.Dispose();
                 throw;
             }

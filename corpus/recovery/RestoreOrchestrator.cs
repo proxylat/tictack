@@ -42,6 +42,10 @@ namespace Corpus
     // the CLI checks again before constructing one (no Store ctor change).
     public sealed class RestoreOrchestrator
     {
+        // Restic-style console progress wiring (set from cfg at construction
+        // sites). Null = classic 2 Hz % lines everywhere.
+        internal LiveProgressOptions? ProgressOpts { get; set; }
+
         private readonly Store _store;
         private readonly ILogger _log;
         private readonly Func<string, IBlockTarget> _targets;
@@ -148,7 +152,7 @@ namespace Corpus
             try
             {
                 using (var stream = target.OpenWrite())
-                    _store.ExportToStream(opts.Generation, stream, new ThrottledProgress(_log, manifest.VolumeLength, sw, progress));
+                    _store.ExportToStream(opts.Generation, stream, LiveProgress.Create(_log, ProgressOpts, "restore", manifest.VolumeLength, null, progress) ?? new ThrottledProgress(_log, manifest.VolumeLength, sw, progress));
                 if (target is FileBlockTarget file)
                     FixFileLength(file.Path, manifest.VolumeLength);
             }
@@ -394,7 +398,7 @@ namespace Corpus
             var progressTotal = 0L;
             foreach (var p in extents)
                 progressTotal += p.LengthBytes;
-            var throttle = new ThrottledProgress(_log, progressTotal, sw, progress);
+            var throttle = LiveProgress.Create(_log, ProgressOpts, "restore", progressTotal, null, progress) ?? new ThrottledProgress(_log, progressTotal, sw, progress);
             var done = 0L;
             var manifests = new List<(PartitionRecord Part, SnapshotManifest Manifest)>();
             try

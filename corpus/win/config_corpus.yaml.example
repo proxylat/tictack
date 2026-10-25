@@ -1,5 +1,9 @@
 # Corpus — system imaging config (scaffold: store + index + log only).
 # Snake_case keys (UnderscoredNamingConvention), like TicTack's config.yaml.
+# Requirements for imaging (Windows): the VSS service, the COM+ Event
+# System service (EventSystem) and the volsnap driver must be present and
+# running; the swprv service is also required. `corpus --validate` reports their state; a snapshot failure logs
+# what is wrong and how to fix it.
 
 # Chunk packs + manifests live here. Required.
 store_path: '/var/lib/corpus/store'
@@ -26,7 +30,18 @@ logging:
   level: info
   # Empty = corpus.log beside the exe.
   path: ''
-  console: false
+  console: true
+  # Daily corpus.log.bak copy: single-file lane lands beside the output
+  # file, store lane under the state dir. False disables the copy.
+  backup: true
+  # Restic-style live console progress: auto = live line when stdout is a
+  # real console, classic % lines when redirected; on = force live;
+  # off = classic % lines everywhere (no MFT filename map, zero extra cost).
+  progress: auto
+  # Live-line filename display (single-file capture only; anything unmapped
+  # shows @offset). Path wins when both are on; both off = stats only.
+  progress_name: true
+  progress_path: false
 
 # GC retention: roots are the UNION of newest keep_last generations,
 # snapshots imaged within keep_within_days (0 = off, by CreatedUtc),

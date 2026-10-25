@@ -77,6 +77,9 @@
     <Compile Include="../DiffFloor.cs" Link="corpus/DiffFloor.cs" />
     <Compile Include="../VolumeBitmap.cs" Link="corpus/VolumeBitmap.cs" />
     <Compile Include="../VssBlockSource.cs" Link="corpus/VssBlockSource.cs" />
+    <Compile Include="../CorpusJsonContext.cs" Link="corpus/CorpusJsonContext.cs" />
+    <Compile Include="../LiveProgress.cs" Link="corpus/LiveProgress.cs" />
+    <Compile Include="../VssHealth.cs" Link="corpus/VssHealth.cs" />
     <Compile Include="../UnbufferedIo.cs" Link="corpus/UnbufferedIo.cs" />
     <Compile Include="../PartitionTable.cs" Link="corpus/PartitionTable.cs" />
     <Compile Include="../EspLiveSource.cs" Link="corpus/EspLiveSource.cs" />

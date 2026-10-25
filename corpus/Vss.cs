@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Xml.Linq;
@@ -152,6 +153,10 @@ namespace Corpus
         // The factory export is C++-MANGLED (verified via export-table dump
         // on Win11 26100: the undecorated name does not exist, GetProcAddress
         // → NULL). x64 ignores the calling convention, Cdecl documents it.
+        // AOT: built-in COM interop on NativeAOT Windows; the interfaces are
+        // rooted via TrimmerRootAssembly Corpus and proven by --validate +
+        // vss-list smoke on an AOT binary.
+        [UnconditionalSuppressMessage("Trimming", "IL2050", Justification = "Built-in COM interop on NativeAOT Windows; interfaces rooted via TrimmerRootAssembly Corpus, proven by smoke test.")]
         [DllImport("vssapi.dll", EntryPoint = "?CreateVssBackupComponents@@YAJPEAPEAVIVssBackupComponents@@@Z", CallingConvention = CallingConvention.Cdecl, PreserveSig = true)]
         internal static extern int CreateVssBackupComponents(out IVssBackupComponents components);
 
@@ -195,6 +200,9 @@ namespace Corpus
             _log = log;
         }
 
+        // AOT: the VSS COM entry point above; same justification (built-in COM
+        // interop on NativeAOT Windows, proven by smoke test).
+        [UnconditionalSuppressMessage("Trimming", "IL2050", Justification = "Built-in COM interop on NativeAOT Windows; VSS API surface rooted, proven by smoke test.")]
         public static VssSnapshot Create(string drive, ILogger log)
         {
             ArgumentNullException.ThrowIfNull(drive);
@@ -357,7 +365,11 @@ namespace Corpus
         private static void Hr(int hr, string op)
         {
             if (hr < 0)
-                throw new IOException($"{op} failed (0x{hr:X8})", Marshal.GetExceptionForHR(hr));
+            {
+                var ex = new IOException($"{op} failed (0x{hr:X8})", Marshal.GetExceptionForHR(hr));
+                ex.Data["VssHr"] = hr; // VssHealth.TryGetHr reads this on the failure path.
+                throw ex;
+            }
         }
 
         // Writer-metadata XML → selectable components. Schema (v1.2,

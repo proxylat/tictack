@@ -49,10 +49,10 @@ namespace Corpus
 
     public sealed record MediaInfo(int AdkBuild, string CorpusVersion, string[] PePackages, string[] Drivers, int[] StoreGens, string BuiltUtc)
     {
-        public string ToJson() => JsonSerializer.Serialize(this);
+        public string ToJson() => JsonSerializer.Serialize(this, CorpusJsonContext.Default.MediaInfo);
 
         public static MediaInfo FromJson(string json) =>
-            JsonSerializer.Deserialize<MediaInfo>(json) ?? throw new InvalidDataException("media-info.json is empty.");
+            JsonSerializer.Deserialize(json, CorpusJsonContext.Default.MediaInfo) ?? throw new InvalidDataException("media-info.json is empty.");
 
         public void Save(string path)
         {

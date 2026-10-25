@@ -90,8 +90,8 @@ Requires: .NET 10 SDK. Dependencies: **YamlDotNet 16.3.0**, **Microsoft.Data.Sql
 ### Windows
 
 1. Copy `service\win\config_win.yaml.example` to `service\win\config.yaml` and edit your source/destination paths.
-2. Run `service\win\install-service.bat` as Administrator — compiles (`dotnet publish`), registers the `TicTackSv` Windows service, and starts it.
-   AOT alternative: `service\win\install-service-aot.bat` — same flow, publishes a self-contained NativeAOT exe (~8 MB, no .NET runtime needed; requires VS Build Tools with MSVC).
+2. Run `service\win\build-service.bat` as Administrator — compiles (`dotnet publish`), registers the `TicTackSv` Windows service, and starts it.
+   Lanes: `--jit` (single exe with runtime bundled, compiles at startup), `--aot` (native single exe, ~8 MB, instant start; requires VS Build Tools with MSVC).
 3. `sc stop TicTackSv` / `sc start TicTackSv` to restart after config changes.
 
 Or run manually: `service\win\TicTackSv.exe --cli` (interactive) or `service\win\TicTackSv.exe --once` (single pass).
@@ -99,7 +99,7 @@ Or run manually: `service\win\TicTackSv.exe --cli` (interactive) or `service\win
 ### Linux
 
 1. Copy `service/linux/config_linux.yaml.example` to `service/linux/config.yaml` and edit your paths.
-2. Run `cd service/linux && ./install-service.sh` — publishes, installs to `/opt/tictack`, and enables the `tictack` systemd service.
+2. Run `cd service/linux && ./build-service.sh` — publishes, installs to `/opt/tictack`, and enables the `tictack` systemd service.
 3. `sudo systemctl restart tictack` to restart after config changes.
 
 ### Tests
@@ -387,5 +387,5 @@ Unit name: `tictack`, runs `TicTackSv --cli` under systemd with SIGINT shutdown.
 Notes:
 - Config paths use Linux separators with full absolute paths (`/home/user/Pictures`) — `~` is not expanded and `[VolumeLabel]` syntax is Windows-only.
 - The unit sends SIGINT on stop for a graceful shutdown; deploy dir is `/opt/tictack`.
-- `install-service.sh` auto-detects `dotnet`: with a system runtime it publishes framework-dependent, without one it publishes self-contained (~80 MB, no host runtime required).
+- `build-service.sh` auto-detects `dotnet`: with a system runtime it publishes framework-dependent, without one it publishes a JIT single exe (~80 MB, no host runtime required).
 - Jobs and commands run via `/bin/sh -c`; use Linux syntax and paths in `jobs:` / `external_drives.command`.

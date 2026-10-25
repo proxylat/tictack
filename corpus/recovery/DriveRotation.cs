@@ -43,7 +43,7 @@ namespace Corpus
             RotationState? state;
             try
             {
-                state = JsonSerializer.Deserialize<RotationState>(File.ReadAllText(_path));
+                state = JsonSerializer.Deserialize(File.ReadAllText(_path), CorpusJsonContext.Default.RotationState);
             }
             catch (JsonException ex)
             {
@@ -61,7 +61,7 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(state);
             Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
             var tmp = _path + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(state));
+            File.WriteAllText(tmp, JsonSerializer.Serialize(state, CorpusJsonContext.Default.RotationState));
             File.Move(tmp, _path, overwrite: true);
         }
 

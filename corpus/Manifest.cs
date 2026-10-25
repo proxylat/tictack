@@ -155,9 +155,9 @@ namespace Corpus
             Directory.CreateDirectory(manifestsDir);
             m.CreatedUtc = DateTime.UtcNow.ToString("o");
             m.Hmac = "";
-            m.Hmac = ComputeHmac(JsonSerializer.Serialize(m), key);
+            m.Hmac = ComputeHmac(JsonSerializer.Serialize(m, CorpusJsonContext.Default.SnapshotManifest), key);
             var path = Path.Combine(manifestsDir, $"{m.Generation:D6}-{Sanitize(m.Name)}.json");
-            File.WriteAllText(path, JsonSerializer.Serialize(m));
+            File.WriteAllText(path, JsonSerializer.Serialize(m, CorpusJsonContext.Default.SnapshotManifest));
             return path;
         }
 
@@ -166,7 +166,7 @@ namespace Corpus
             SnapshotManifest? m;
             try
             {
-                m = JsonSerializer.Deserialize<SnapshotManifest>(File.ReadAllText(path));
+                m = JsonSerializer.Deserialize(File.ReadAllText(path), CorpusJsonContext.Default.SnapshotManifest);
             }
             catch (JsonException ex)
             {
@@ -175,7 +175,7 @@ namespace Corpus
             if (m is null) throw new InvalidDataException($"Manifest {path} is empty.");
             var stored = m.Hmac ?? "";
             m.Hmac = "";
-            var expected = ComputeHmac(JsonSerializer.Serialize(m), key);
+            var expected = ComputeHmac(JsonSerializer.Serialize(m, CorpusJsonContext.Default.SnapshotManifest), key);
             if (!string.Equals(stored, expected, StringComparison.Ordinal))
                 throw new InvalidDataException($"Manifest {path} failed HMAC verification.");
             m.Hmac = stored;

@@ -11,6 +11,12 @@ service/win/*.dll
 service/win/*.pdb
 service/win/*.deps.json
 service/win/*.runtimeconfig.json
+corpus/win/Corpus.exe
+corpus/win/config_corpus.yaml
+corpus/win/*.dll
+corpus/win/*.pdb
+corpus/win/*.deps.json
+corpus/win/*.runtimeconfig.json
 service/linux/TicTackSv
 service/linux/TicTackSv.dll
 service/linux/config.yaml

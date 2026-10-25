@@ -10,7 +10,7 @@ No -p flag = all three phases. -p1 -p2 = first two only, -p1 alone = triage only
 Phases: p1 live triage (process + dotnet-counters + optional -Full depth),
         p2 static analysis + unit tests, p3 fixtured copy scenarios + microbenchmarks.
 -Published (p3): measure the shipped artifact — dotnet publish (ReadyToRun, same
-  as service\win\install-service.bat) instead of the JIT build output.
+  as service\win\build-service.bat) instead of the JIT build output.
 
 Every run writes diag-out\<timestamp>-perf\ (or -test) with a SUMMARY.md recording
 the exact commands used and the file each one produced.
@@ -1051,7 +1051,7 @@ function Run-P3 {
 
     if ($Published) {
         # Shipped artifact: dotnet publish with ReadyToRun (from the csproj),
-        # same as service\win\install-service.bat. Published into the artifact
+        # same as service\win\build-service.bat. Published into the artifact
         # dir so service\ stays untouched.
         $pubDir = Join-Path $out 'p3-publish'
         Step (Join-Path $out 'p3-build.log') 'publish Release (R2R)' 'dotnet publish src\TicTack.csproj -c Release -o <artifact>\p3-publish' {

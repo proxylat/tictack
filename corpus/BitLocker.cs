@@ -234,8 +234,19 @@ namespace Corpus
                     log.Info($"BitLocker: volume {volume} is unprotected, no suspension needed");
                     return new BitLockerCaptureScope(controller, volume, log, false, info.State.ToString(), keyIds);
                 default:
-                    log.Warn($"BitLocker: could not determine protection state of {volume}, proceeding without suspension");
+                {
+                    // Unknown is not Silent: BitLocker absence/disability is
+                    // provable (no fvevol = no encryption possible), so only
+                    // warn when the state is genuinely indeterminate.
+                    var env = VssHealth.QueryBitLockerEnv();
+                    if (VssHealth.IsAbsentOrDisabled(env))
+                    {
+                        log.Info($"BitLocker not present or disabled by policy ({VssHealth.Summarize(env)}); capturing {volume} without suspension");
+                        return new BitLockerCaptureScope(controller, volume, log, false, BitLockerState.Unprotected.ToString(), keyIds);
+                    }
+                    log.Warn($"BitLocker: could not determine protection state of {volume} ({VssHealth.Summarize(env)}), proceeding without suspension");
                     return new BitLockerCaptureScope(controller, volume, log, false, info.State.ToString(), keyIds);
+                }
             }
         }
 

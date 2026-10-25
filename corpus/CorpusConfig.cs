@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Diagnostics.CodeAnalysis;
 using TicTack;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
@@ -23,10 +24,19 @@ namespace Corpus
         public string? Path { get; set; }
         public bool Console { get; set; }
 
+        public bool Backup { get; set; } = true;
+
+        // Live console progress: auto = restic-style line when stdout is a
+        // real console, classic % lines when redirected; on = force live;
+        // off = classic % lines everywhere (no MFT filename map, zero cost).
+        public string Progress { get; set; } = "auto";
+        public bool ProgressName { get; set; } = true;
+        public bool ProgressPath { get; set; }
+
         public CorpusLoggingConfig()
         {
             Level = "info";
-            Console = false;
+            Console = true;
         }
     }
 
@@ -100,6 +110,9 @@ namespace Corpus
             Exclude = null;
         }
 
+        // AOT: fixed config shape, rooted via TrimmerRootAssembly Corpus and
+        // proven by --validate smoke on an AOT binary.
+        [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Fixed config shape rooted via TrimmerRootAssembly Corpus; proven by smoke test.")]
         public static CorpusConfig? Load(string path)
         {
             if (!File.Exists(path)) return null;
@@ -193,6 +206,37 @@ namespace Corpus
             return OperatingSystem.IsWindows()
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Corpus")
                 : "/var/lib/corpus";
+        }
+
+        // Log-backup target: output-file dir on the single-file lane when the
+        // knob is on, else null (store lane keeps StateRoot, knob-off disables).
+        // Pure (no probe) so Main can compare it against the resolved dir.
+        internal static string? LogBackupTargetDir(CorpusConfig? cfg, string? toVhdx, string? toWim, string? toEsd)
+        {
+            if (cfg == null || cfg.Logging == null || !cfg.Logging.Backup)
+                return null;
+            var firstOutput = toVhdx ?? toWim ?? toEsd;
+            if (string.IsNullOrEmpty(firstOutput))
+                return null;
+            return Path.GetDirectoryName(Path.GetFullPath(firstOutput));
+        }
+
+        // Resolved dir: target when writable, else StateRoot; null only when off.
+        internal static string? ResolveLogBackupDir(CorpusConfig? cfg, string? toVhdx, string? toWim, string? toEsd, string stateRoot)
+        {
+            var target = LogBackupTargetDir(cfg, toVhdx, toWim, toEsd);
+            if (string.IsNullOrEmpty(target))
+                return cfg == null || cfg.Logging == null || cfg.Logging.Backup ? stateRoot : null;
+            var probePath = Path.Combine(target, ".corpus-write-test-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                using var probe = new FileStream(probePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.DeleteOnClose);
+                return target;
+            }
+            catch
+            {
+                return stateRoot;
+            }
         }
     }
 }

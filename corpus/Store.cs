@@ -175,6 +175,14 @@ namespace Corpus
         // mixed repos work; cross-chunker parents fall back to full.
         private readonly string _chunker;
 
+        // Restic-style console progress wiring (Program.CreateStore sets it
+        // from cfg). Null = classic 2 Hz % lines everywhere.
+        internal LiveProgressOptions? ProgressOpts { get; set; }
+
+        // The MFT view is borrowed for filename display, never disposed here.
+        private static Func<IMftVolume?>? MftOf(IBlockSource source)
+            => source is IMftVolume vol ? () => vol : null;
+
         public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log, string? encryptHook = null, IDeltaCodec? deltaCodec = null, double changeAlarmPercent = 0, string chunker = "fixed", int eccOverheadPercent = 0)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
@@ -490,7 +498,7 @@ namespace Corpus
                 // above). A caller-supplied progress (disk aggregate) owns
                 // the throttle; direct calls get their own reporter.
                 var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
-                var reporter = progress ?? new ImageProgress(_log, planned);
+                var reporter = progress ?? LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source), progress) ?? new ImageProgress(_log, planned);
                 var done = 0L;
                 var window = new EncodeWindow(pack, pending, _zstdLevel);
                 foreach (var chunk in enumerable)
@@ -614,7 +622,7 @@ namespace Corpus
                         continue;
                     planned += Math.Min((long)chunkBytes, source.Length - i * (long)chunkBytes);
                 }
-                var reporter = progress ?? new ImageProgress(_log, planned);
+                var reporter = progress ?? LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source), progress) ?? new ImageProgress(_log, planned);
                 var done = 0L;
                 var window = new EncodeWindow(pack, pending, _zstdLevel);
                 for (var i = 0; i < grid; i++)
@@ -839,7 +847,9 @@ namespace Corpus
                 if (!part.Skipped && part.Source != null)
                     diskTotal += part.Source.Length;
             }
-            ImageProgress? diskProgress = diskTotal > 0 ? new ImageProgress(_log, diskTotal) : null;
+            IProgress<long>? diskProgress = null;
+            if (diskTotal > 0)
+                diskProgress = LiveProgress.Create(_log, ProgressOpts, "image", diskTotal, null) ?? new ImageProgress(_log, diskTotal);
             var diskDone = 0L;
             try
             {
@@ -1066,7 +1076,7 @@ namespace Corpus
                 // sparse sources, plain length otherwise. Resumed chunks
                 // still stream through here, so they advance the series.
                 var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
-                var reporter = new ImageProgress(_log, planned);
+                var reporter = LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source)) ?? new ImageProgress(_log, planned);
                 var done = 0L;
                 foreach (var chunk in enumerable)
                 {
@@ -1592,7 +1602,7 @@ namespace Corpus
         // temp+rename like every other crash-safe write here.
         private const string LandingFingerprintName = "resume.json";
 
-        private sealed class LandingFingerprint
+        internal sealed class LandingFingerprint
         {
             public string? VolumeId { get; set; }
             public long Length { get; set; }
@@ -1661,7 +1671,7 @@ namespace Corpus
         {
             var path = Path.Combine(_landingDir, LandingFingerprintName);
             var tmp = path + "." + Guid.NewGuid().ToString("n") + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(fingerprint));
+            File.WriteAllText(tmp, JsonSerializer.Serialize(fingerprint, CorpusJsonContext.Default.LandingFingerprint));
             File.Move(tmp, path, true);
         }
 
@@ -1679,7 +1689,7 @@ namespace Corpus
             {
                 try
                 {
-                    previous = JsonSerializer.Deserialize<LandingFingerprint>(File.ReadAllText(fpPath));
+                    previous = JsonSerializer.Deserialize(File.ReadAllText(fpPath), CorpusJsonContext.Default.LandingFingerprint);
                 }
                 catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
                 {

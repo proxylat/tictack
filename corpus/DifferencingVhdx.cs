@@ -443,7 +443,7 @@ namespace Corpus
             DifferencingParentRecord? record;
             try
             {
-                record = JsonSerializer.Deserialize<DifferencingParentRecord>(File.ReadAllText(sidecar));
+                record = JsonSerializer.Deserialize(File.ReadAllText(sidecar), CorpusJsonContext.Default.DifferencingParentRecord);
             }
             catch (Exception ex) when (ex is IOException || ex is JsonException)
             {
@@ -594,7 +594,7 @@ namespace Corpus
             if (File.Exists(sidecar) || Directory.Exists(sidecar))
                 throw new SingleFileTargetExistsException(sidecar);
             var partial = sidecar + ".tmp";
-            File.WriteAllText(partial, JsonSerializer.Serialize(record));
+            File.WriteAllText(partial, JsonSerializer.Serialize(record, CorpusJsonContext.Default.DifferencingParentRecord));
             File.Move(partial, sidecar);
         }
 

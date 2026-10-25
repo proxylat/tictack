@@ -134,7 +134,7 @@ namespace Corpus
             };
             var path = Path.Combine(manifestsDir, $"{generation:D6}.compact.json");
             var tmp = path + "." + Guid.NewGuid().ToString("n") + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(record));
+            File.WriteAllText(tmp, JsonSerializer.Serialize(record, CorpusJsonContext.Default.CompactStateRecord));
             File.Move(tmp, path, true);
             log.Info($"recorded CompactOS state for gen {generation}: {(state.Enabled ? "on" : "off")}");
             return path;
@@ -149,7 +149,7 @@ namespace Corpus
             CompactStateRecord? record;
             try
             {
-                record = JsonSerializer.Deserialize<CompactStateRecord>(File.ReadAllText(path));
+                record = JsonSerializer.Deserialize(File.ReadAllText(path), CorpusJsonContext.Default.CompactStateRecord);
             }
             catch (JsonException ex)
             {

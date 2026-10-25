@@ -495,7 +495,11 @@ namespace Corpus
                 Console.Error.WriteLine("Invalid config " + cfgPath + ": " + ex.Message);
                 return 1;
             }
-            var log = CreateLogger(cfg, baseDir);
+            var backupDir = CorpusConfig.ResolveLogBackupDir(cfg, toVhdx, toWim, toEsd, cfg != null ? CorpusConfig.StateRoot(cfg) : baseDir);
+            var log = CreateLogger(cfg, baseDir, backupDir);
+            var backupTarget = CorpusConfig.LogBackupTargetDir(cfg, toVhdx, toWim, toEsd);
+            if (!string.IsNullOrEmpty(backupTarget) && !string.Equals(backupDir, backupTarget, StringComparison.OrdinalIgnoreCase))
+                log.Warn("Log backup dir " + backupTarget + " not writable; using " + backupDir + " instead.");
             try
             {
                 // Probes are config-free diagnostics: they run before the
@@ -573,6 +577,7 @@ namespace Corpus
                     case "validate":
                         log.Info("store: " + cfg.StorePath);
                         log.Info("state root: " + CorpusConfig.StateRoot(cfg));
+                        VssHealth.ReportServiceStates(log);
                         log.Info("chunk: " + cfg.ChunkMib + " MiB, zstd level " + cfg.Compression.Level);
                         log.Info("exclusions: " + string.Join(", ", CapturePolicy.EffectiveSkip(cfg.Exclude)));
                         log.Info("Corpus config valid");
@@ -789,12 +794,24 @@ namespace Corpus
             }
         }
 
-        private static ILogger CreateLogger(CorpusConfig? cfg, string baseDir)
+        private static ILogger CreateLogger(CorpusConfig? cfg, string baseDir, string? backupDir)
         {
             var logPath = cfg != null && cfg.Logging != null && !string.IsNullOrEmpty(cfg.Logging.Path)
                 ? cfg.Logging.Path
                 : Path.Combine(baseDir, "corpus.log");
-            var backupDir = cfg != null ? CorpusConfig.StateRoot(cfg) : baseDir;
+            var dir = string.IsNullOrEmpty(backupDir) ? (cfg != null ? CorpusConfig.StateRoot(cfg) : baseDir) : backupDir;
+            if (!string.IsNullOrEmpty(backupDir))
+            {
+                var probePath = Path.Combine(backupDir, ".corpus-write-test-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    using var probe = new FileStream(probePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.DeleteOnClose);
+                }
+                catch
+                {
+                    dir = cfg != null ? CorpusConfig.StateRoot(cfg) : baseDir;
+                }
+            }
             // Shared factory (primitive params, no TicTack config model):
             // size-rotated primary + time-bounded .bak + optional console.
             return LoggerFactory.Create(
@@ -802,12 +819,12 @@ namespace Corpus
                 logPath, 10, 5, null,
                 console: cfg == null || cfg.Logging == null || cfg.Logging.Console,
                 eventLog: false,
-                backupPath: Path.Combine(backupDir, "corpus.log.bak"));
+                backupPath: Path.Combine(dir, "corpus.log.bak"));
         }
 
         private static Store CreateStore(CorpusConfig cfg, ILogger log)
         {
-            return new Store(
+            var store = new Store(
                 cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
                 cfg.ChunkMib, cfg.Compression.Level, log,
@@ -815,6 +832,8 @@ namespace Corpus
                 changeAlarmPercent: cfg.ChangeAlarmPercent,
                 chunker: cfg.Chunker,
                 eccOverheadPercent: cfg.EccOverheadPercent);
+            store.ProgressOpts = LiveProgressOptions.FromConfig(cfg.Logging);
+            return store;
         }
 
         private static int RunListVolumes(ILogger log)
@@ -851,7 +870,7 @@ namespace Corpus
                 Console.Error.WriteLine("--disk-layout needs Windows");
                 return 1;
             }
-            Console.WriteLine(JsonSerializer.Serialize(PartitionTable.ReadDisk(diskNumber, log)));
+            Console.WriteLine(JsonSerializer.Serialize(PartitionTable.ReadDisk(diskNumber, log), CorpusJsonContext.Default.DiskLayout));
             return 0;
         }
 
@@ -925,7 +944,9 @@ namespace Corpus
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
             indexPath = EnsureWritableIndex(indexPath, log);
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
+            store.ProgressOpts = LiveProgressOptions.FromConfig(cfg.Logging);
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
+            orch.ProgressOpts = LiveProgressOptions.FromConfig(cfg.Logging);
             return orch.Restore(new RestoreOptions(gen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun));
         }
 
@@ -1027,7 +1048,9 @@ namespace Corpus
                 : Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
             indexPath = EnsureWritableIndex(indexPath, log);
             using var store = new Store(storePath, indexPath, cfg.ChunkMib, cfg.Compression.Level, log, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
+            store.ProgressOpts = LiveProgressOptions.FromConfig(cfg.Logging);
             var orch = new RestoreOrchestrator(store, log, RestoreOrchestrator.OpenTarget);
+            orch.ProgressOpts = LiveProgressOptions.FromConfig(cfg.Logging);
             return orch.RestoreDisk(new DiskRestoreOptions(layoutGen, target, storePath, indexPath, confirmToken, allowBootDisk, skipVerify, dryRun, RepairBoot: repairBoot, Partitions: partitions));
         }
 
@@ -1948,6 +1971,7 @@ namespace Corpus
             Console.WriteLine("      --buffered-io  Opt out of unbuffered (O_DIRECT/NO_BUFFERING) extent reads for weird drivers (bulk capture only)");
             Console.WriteLine("      --parent <base.vhdx>  Differencing child holding dirty-vs-parent chunks only (depth 1, parent immutable while the child lives; no --exclude)");
             Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> | --to-esd <file|dir>  Single-file WIM/ESD via inbox DISM from the VSS snapshot (Windows, elevated)");
+            Console.WriteLine("  Imaging requires: VSS + EventSystem services and volsnap driver running, swprv service enabled ('corpus --validate' reports them)");
             Console.WriteLine("      --to-wim <base.wim> --append  New image index in an existing WIM (gen = count+1; ESD/solid refused)");
             Console.WriteLine("  --retry-lock <90|10m|2h>  Wait up to the duration for a contended store lock (writers: image/gc/optimize-to-fit; default fails loud naming the holder)");
             Console.WriteLine("  --optimize-to-fit [--bytes N]  Compact the chunk store in place (+ prune oldest gens to N bytes via GC)");

@@ -6,7 +6,7 @@
 #
 # No -p flag = all three phases. -p1 -p2 = first two only, -p1 alone = triage only.
 # --published (p3): measure the shipped artifact — dotnet publish (ReadyToRun,
-#   same as service/linux/install-service.sh) instead of the JIT build output.
+#   same as service/linux/build-service.sh) instead of the JIT build output.
 #
 # No -p flag = all three phases. -p1 -p2 = first two only, -p1 alone = triage only.
 # Phases: p1 live triage (process + dotnet-counters + optional --full depth),
@@ -915,7 +915,7 @@ cmd_p3() {
 
     if [ "$published" = 1 ]; then
         # Shipped artifact: dotnet publish with ReadyToRun (from the csproj),
-        # same as service/linux/install-service.sh. Published into the artifact
+        # same as service/linux/build-service.sh. Published into the artifact
         # dir so service/ stays untouched.
         record "$out/p3-build.log" "publish Release (R2R)" \
             "$DOTNET publish src/TicTack.csproj -c Release -o '$out/p3-publish' -v q --nologo"

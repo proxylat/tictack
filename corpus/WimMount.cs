@@ -58,7 +58,7 @@ namespace Corpus
     {
         public const string MarkerFileName = ".corpus-mount.json";
 
-        private sealed record Marker(string ImagePath, int Index, long MountedUtcTicks);
+        internal sealed record Marker(string ImagePath, int Index, long MountedUtcTicks);
 
         // Read/write mount (servicing needs write — deliberately NO
         // /ReadOnly; the read-only verify path in SingleFileBackup keeps
@@ -156,7 +156,7 @@ namespace Corpus
             string? failure = null;
             try
             {
-                marker = JsonSerializer.Deserialize<Marker>(File.ReadAllText(markerPath));
+                marker = JsonSerializer.Deserialize(File.ReadAllText(markerPath), CorpusJsonContext.Default.Marker);
             }
             catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
             {
@@ -171,7 +171,7 @@ namespace Corpus
         {
             var path = Path.Combine(mountDir, MarkerFileName);
             var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(marker));
+            File.WriteAllText(tmp, JsonSerializer.Serialize(marker, CorpusJsonContext.Default.Marker));
             File.Move(tmp, path, overwrite: true);
         }
     }

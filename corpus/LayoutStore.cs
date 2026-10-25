@@ -52,9 +52,9 @@ namespace Corpus
         {
             Directory.CreateDirectory(layoutsDir);
             layout.Hmac = "";
-            layout.Hmac = ComputeHmac(JsonSerializer.Serialize(layout), key);
+            layout.Hmac = ComputeHmac(JsonSerializer.Serialize(layout, CorpusJsonContext.Default.DiskLayout), key);
             var path = Path.Combine(layoutsDir, $"{layout.Generation:D6}-disk{layout.DiskNumber}.json");
-            File.WriteAllText(path, JsonSerializer.Serialize(layout));
+            File.WriteAllText(path, JsonSerializer.Serialize(layout, CorpusJsonContext.Default.DiskLayout));
             return path;
         }
 
@@ -63,7 +63,7 @@ namespace Corpus
             DiskLayout? layout;
             try
             {
-                layout = JsonSerializer.Deserialize<DiskLayout>(File.ReadAllText(path));
+                layout = JsonSerializer.Deserialize(File.ReadAllText(path), CorpusJsonContext.Default.DiskLayout);
             }
             catch (JsonException ex)
             {
@@ -72,7 +72,7 @@ namespace Corpus
             if (layout is null) throw new InvalidDataException($"Disk layout {path} is empty.");
             var stored = layout.Hmac ?? "";
             layout.Hmac = "";
-            var expected = ComputeHmac(JsonSerializer.Serialize(layout), key);
+            var expected = ComputeHmac(JsonSerializer.Serialize(layout, CorpusJsonContext.Default.DiskLayout), key);
             if (!string.Equals(stored, expected, StringComparison.Ordinal))
                 throw new InvalidDataException($"Disk layout {path} failed HMAC verification.");
             layout.Hmac = stored;

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Xml.Linq;
@@ -466,6 +467,8 @@ namespace Corpus
             _log = log;
         }
 
+        // AOT: same VSS COM entry point as VssSnapshot.Create (see Vss.cs).
+        [UnconditionalSuppressMessage("Trimming", "IL2050", Justification = "Built-in COM interop on NativeAOT Windows; VSS API surface rooted, proven by smoke test.")]
         public static VssSnapshotSet Create(IReadOnlyList<string> volumes, ILogger log, IReadOnlySet<string>? knownStaticVolumes = null)
         {
             ArgumentNullException.ThrowIfNull(volumes);
@@ -587,9 +590,10 @@ namespace Corpus
                 }
                 return new VssSnapshotSet(com, devices, selected, log);
             }
-            catch
+            catch (Exception ex)
             {
-                try { com.AbortBackup(); } catch (Exception ex) { log.Warn("VSS AbortBackup after failure: " + ex.Message); }
+                VssHealth.ReportSnapshotFailure(log, ex);
+                try { com.AbortBackup(); } catch (Exception abex) { log.Warn("VSS AbortBackup after failure: " + abex.Message); }
                 Marshal.ReleaseComObject(com);
                 throw;
             }
@@ -659,7 +663,11 @@ namespace Corpus
         private static void Hr(int hr, string op)
         {
             if (hr < 0)
-                throw new IOException($"{op} failed (0x{hr:X8})", Marshal.GetExceptionForHR(hr));
+            {
+                var ex = new IOException($"{op} failed (0x{hr:X8})", Marshal.GetExceptionForHR(hr));
+                ex.Data["VssHr"] = hr; // VssHealth.TryGetHr reads this on the failure path.
+                throw ex;
+            }
         }
 
         private static List<(int Type, string? Path, string Name)> ParseComponents(string xml)
