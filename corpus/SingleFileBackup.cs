@@ -97,11 +97,13 @@ namespace Corpus
     public sealed class SingleFileVerifyException : SingleFileBackupException
     {
         public string ImagePath { get; }
+        public long? MismatchOffset { get; }
 
-        public SingleFileVerifyException(string imagePath, string detail)
+        public SingleFileVerifyException(string imagePath, string detail, long? mismatchOffset = null)
             : base($"verify failed for {imagePath}: {detail}")
         {
             ImagePath = imagePath;
+            MismatchOffset = mismatchOffset;
         }
     }
 
@@ -637,7 +639,7 @@ namespace Corpus
             }
             if (resolver != null && resolver.ExclusionNames.Count > 0)
                 log.Warn($"excluded extents restored as zeros: {string.Join(", ", resolver.ExclusionNames)}");
-            VerifyVhdx(target, source, written, skipped, log, exclRuns, exclBpc);
+            VerifyWithRepair(target, source, written, skipped, log, exclRuns, exclBpc);
             log.Info($"backed up volume {volume} ({source.Length} bytes, {written.Count} extents, {skipped.Count} sparse) to {target}");
             return target;
         }
@@ -648,6 +650,97 @@ namespace Corpus
         // etc.) read back zero by design — asserted as zero, never compared
         // to the live source (proven on-box 2026-10-17: comparing them
         // false-fails against live pagefile bytes).
+        // Verify with repair: a live system volume can race volsnap COW
+        // mid-copy, so a copied chunk can hold torn bytes while the snapshot
+        // itself stays consistent (proven by two B9 runs failing at different
+        // offsets with real-on-both-sides data). Worse, the re-reads
+        // themselves flake: batch-b10 failed seven passes at seven different
+        // offsets, one of which had passed twice before. So a mismatch means
+        // almost nothing until re-polled: settle, re-read the source chunk
+        // twice AND re-read the image chunk. Rewrite only when the settled
+        // source reads agree with each other and disagree with the image;
+        // anything else is a transient read flake (either side) and just
+        // retries. A persistent mismatch means genuine corruption and still
+        // throws. Never rewrites on a single flaky read: batch-b10 proved a
+        // same-offset repeat can be the reads, not the bytes.
+        private static void VerifyWithRepair(string target, IBlockSource source, IReadOnlyList<(long Start, long Length)> written, IReadOnlyList<(long Start, long Length)> skipped, ILogger log, IReadOnlyList<(long StartLcn, long ClusterCount)>? exclRuns, long exclBpc)
+        {
+            // Sparseness is layout, checked once: repairs only ever rewrite
+            // inside written ranges, never into holes.
+            VerifySparseness(target, skipped, log);
+            var resumeFrom = 0L;
+            const int MaxVerifyAttempts = 64; // repairs converge forward (b10c: 11 distinct chunks); cap is a backstop, not the fix
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    VerifyWrittenRanges(target, source, written, log, exclRuns, exclBpc, resumeFrom);
+                    log.Info($"verified {target}: clean{(attempt > 0 ? $" after {attempt} repair pass(es)" : "")}, {skipped.Count} skipped ranges sparse");
+                    return;
+                }
+                catch (SingleFileVerifyException ex) when (ex.MismatchOffset is long bad && attempt + 1 < MaxVerifyAttempts)
+                {
+                    var (chunkStart, chunkLen) = RepairChunkFor(bad, source.Length);
+                    if (!written.Any(w => chunkStart >= w.Start && chunkStart < w.Start + w.Length))
+                        throw; // outside written data (hole/exempt): not repairable
+                    Thread.Sleep(5000); // let volsnap COW settle
+                    var first = new byte[chunkLen];
+                    var second = new byte[chunkLen];
+                    var imaged = new byte[chunkLen];
+                    using (var rs = source.OpenRead())
+                    {
+                        rs.Seek(chunkStart, SeekOrigin.Begin);
+                        if (ReadExactly(rs, first, chunkLen) != chunkLen)
+                            throw; // source won't yield the range: keep the failure
+                    }
+                    using (var rs = source.OpenRead())
+                    {
+                        rs.Seek(chunkStart, SeekOrigin.Begin);
+                        if (ReadExactly(rs, second, chunkLen) != chunkLen)
+                            throw; // source won't yield the range: keep the failure
+                    }
+                    using (var disk = new Disk(target, FileAccess.Read))
+                    {
+                        var content = disk.Content;
+                        content.Seek(chunkStart, SeekOrigin.Begin);
+                        if (ReadExactly(content, imaged, chunkLen) != chunkLen)
+                            throw; // image won't yield the range: keep the failure
+                    }
+                    if (!first.SequenceEqual(second))
+                    {
+                        log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): source re-reads disagree, transient read flake, resuming at {chunkStart}");
+                        resumeFrom = chunkStart;
+                        continue;
+                    }
+                    if (imaged.SequenceEqual(first))
+                    {
+                        log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): image matches settled source on re-poll, transient read flake, resuming at {chunkStart}");
+                        resumeFrom = chunkStart;
+                        continue;
+                    }
+                    if (exclRuns != null)
+                        CapturePolicy.ZeroExcludedRanges(first, chunkStart, exclRuns, exclBpc);
+                    // Writer handle is already disposed (verify runs after the
+                    // copy using-block): reopen read-write for the repair.
+                    using (var disk = new Disk(target, FileAccess.ReadWrite))
+                    {
+                        var content = disk.Content;
+                        content.Seek(chunkStart, SeekOrigin.Begin);
+                        content.Write(first, 0, chunkLen);
+                        content.Flush();
+                    }
+                    log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): rewrote {chunkLen} bytes from settled agreeing reads, resuming at {chunkStart}");
+                    resumeFrom = chunkStart;
+                }
+            }
+        }
+
+        internal static (long Start, int Length) RepairChunkFor(long offset, long total)
+        {
+            var start = offset - (offset % ExtentChunkBytes);
+            return (start, (int)Math.Min((long)ExtentChunkBytes, total - start));
+        }
+
         public static void VerifyVhdx(string vhdxPath, IBlockSource source, IReadOnlyList<(long Start, long Length)> written, IReadOnlyList<(long Start, long Length)> skipped, ILogger log, IReadOnlyList<(long StartLcn, long ClusterCount)>? exclRuns = null, long exclBpc = 0)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(vhdxPath);
@@ -655,6 +748,41 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(written);
             ArgumentNullException.ThrowIfNull(skipped);
             ArgumentNullException.ThrowIfNull(log);
+            VerifySparseness(vhdxPath, skipped, log);
+            var compared = VerifyWrittenRanges(vhdxPath, source, written, log, exclRuns, exclBpc, 0);
+            log.Info($"verified {vhdxPath}: {compared} bytes re-read OK, {skipped.Count} skipped ranges sparse");
+        }
+
+        private static void VerifySparseness(string vhdxPath, IReadOnlyList<(long Start, long Length)> skipped, ILogger log)
+        {
+            using var disk = new Disk(vhdxPath, FileAccess.Read);
+            var content = disk.Content;
+            var bufB = new byte[VerifyBufferBytes];
+            foreach (var (start, length) in skipped)
+            {
+                AssertZeroRange(content, start, length, bufB, vhdxPath);
+                if (content is SparseStream sparse && sparse.GetExtentsInRange(start, length).Any())
+                    throw new SingleFileVerifyException(vhdxPath, $"skipped range [{start},{start + length}) is allocated on disk (not sparse)");
+            }
+        }
+
+        // Ranges at/after resumeFrom, with a straddling head trimmed. Pure so
+        // the repair loop's resume math is unit-testable.
+        internal static List<(long Start, long Length)> ResumeRanges(IReadOnlyList<(long Start, long Length)> written, long resumeFrom)
+        {
+            var kept = new List<(long Start, long Length)>();
+            foreach (var (start, length) in written)
+            {
+                if (start + length <= resumeFrom)
+                    continue;
+                var skip = Math.Max(0, resumeFrom - start);
+                kept.Add((start + skip, length - skip));
+            }
+            return kept;
+        }
+
+        private static long VerifyWrittenRanges(string vhdxPath, IBlockSource source, IReadOnlyList<(long Start, long Length)> written, ILogger log, IReadOnlyList<(long StartLcn, long ClusterCount)>? exclRuns, long exclBpc, long resumeFrom)
+        {
             using var disk = new Disk(vhdxPath, FileAccess.Read);
             if (disk.Capacity < source.Length)
                 throw new SingleFileVerifyException(vhdxPath, $"capacity {disk.Capacity} < source length {source.Length}");
@@ -664,18 +792,12 @@ namespace Corpus
             var bufB = new byte[VerifyBufferBytes];
             var excl = ExcludedByteRanges(exclRuns, exclBpc);
             var compared = 0L;
-            foreach (var (start, length) in written)
+            foreach (var (start, length) in ResumeRanges(written, resumeFrom))
             {
                 CompareRange(src, content, start, length, bufA, bufB, vhdxPath, excl);
                 compared += length;
             }
-            foreach (var (start, length) in skipped)
-            {
-                AssertZeroRange(content, start, length, bufB, vhdxPath);
-                if (content is SparseStream sparse && sparse.GetExtentsInRange(start, length).Any())
-                    throw new SingleFileVerifyException(vhdxPath, $"skipped range [{start},{start + length}) is allocated on disk (not sparse)");
-            }
-            log.Info($"verified {vhdxPath}: {compared} bytes re-read OK, {skipped.Count} skipped ranges sparse");
+            return compared;
         }
 
         // Snapshot-dir liveness: VSS shadow device paths
@@ -1094,7 +1216,7 @@ namespace Corpus
                 var na = ReadExactly(src, bufA, want);
                 var nb = ReadExactly(content, bufB, want);
                 if (na != want || nb != want)
-                    throw new SingleFileVerifyException(vhdxPath, $"short read at offset {pos} (source {na}, image {nb}, want {want})");
+                    throw new SingleFileVerifyException(vhdxPath, $"short read at offset {pos} (source {na}, image {nb}, want {want})", pos);
                 for (var i = 0; i < want; i++, pos++)
                 {
                     while (e < (excl?.Count ?? 0) && pos >= excl![e].Start + excl[e].Length)
@@ -1105,7 +1227,7 @@ namespace Corpus
                             throw new SingleFileVerifyException(vhdxPath, $"excluded byte at offset {pos} reads 0x{bufB[i]:X2} (want 0x00)");
                     }
                     else if (bufA[i] != bufB[i])
-                        throw new SingleFileVerifyException(vhdxPath, $"byte mismatch at offset {pos} (source 0x{bufA[i]:X2}, image 0x{bufB[i]:X2})");
+                        throw new SingleFileVerifyException(vhdxPath, $"byte mismatch at offset {pos} (source 0x{bufA[i]:X2}, image 0x{bufB[i]:X2})", pos);
                 }
                 remaining -= want;
             }
@@ -1121,7 +1243,7 @@ namespace Corpus
                 var want = (int)Math.Min(buf.Length, remaining);
                 var n = ReadExactly(content, buf, want);
                 if (n != want)
-                    throw new SingleFileVerifyException(vhdxPath, $"short read at offset {pos} ({n}, want {want})");
+                    throw new SingleFileVerifyException(vhdxPath, $"short read at offset {pos} ({n}, want {want})", pos);
                 for (var i = 0; i < want; i++)
                 {
                     if (buf[i] != 0)

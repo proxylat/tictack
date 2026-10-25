@@ -389,3 +389,25 @@ Notes:
 - The unit sends SIGINT on stop for a graceful shutdown; deploy dir is `/opt/tictack`.
 - `build-service.sh` auto-detects `dotnet`: with a system runtime it publishes framework-dependent, without one it publishes a JIT single exe (~80 MB, no host runtime required).
 - Jobs and commands run via `/bin/sh -c`; use Linux syntax and paths in `jobs:` / `external_drives.command`.
+
+---
+
+## Corpus
+
+System imaging to VHDX/VHD/WIM/ESD (elevated, Windows only). Build with `corpus/win/build-corpus.bat` (default framework-dependent, `--jit` single exe, `--aot` experimental without VSS support); releases attach `Corpus.exe` to the same `v*` tag as TicTack.
+
+Example: `Corpus.exe --image --volume C: --to-vhdx D:\backup.vhdx` (run `Corpus.exe --help` for all verbs; `Corpus.exe --validate` reports VSS service states and config health).
+
+### Exclusions (`--exclude`, repeatable; also `exclude:` in config)
+
+NTFS-name based, matched against the volume-relative path (no drive letter — stored paths look like `Users\Bob\Desktop`). Case-insensitive throughout.
+
+| Form | Meaning |
+|---|---|
+| `--exclude Desktop` | Every *directory* named `Desktop` at any depth, plus its subtree (bare *file* names match at the volume root only) |
+| `--exclude Users\Bob\Desktop` | Exactly that path from the volume root, file or dir (either slash direction; edge slashes ignored; `:stream` suffixes cut before matching) |
+
+Gotchas:
+- **No drive prefix**: `--exclude C:\Users\Bob\Desktop` silently matches nothing — stored paths never contain `C:`. Drop the drive letter.
+- **No `%VAR%` expansion in the exe**: a literal `%USERPROFILE%\Desktop` reaching `Corpus.exe` matches nothing. `cmd.exe` expands `%...%` before the exe sees it, so it works from cmd; PowerShell needs `$env:USERPROFILE\Desktop`. Note `%USERPROFILE%` already includes `C:\Users\<you>`, so never prefix it with `C:\Users\`.
+- Exclusions are refused on incremental-with-`--parent` runs (a parent-relative delete plus a name exclusion is ambiguous).

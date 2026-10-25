@@ -512,4 +512,51 @@ public sealed class SingleFileBackupTests : IDisposable
             return;
         Assert.Throws<PlatformNotSupportedException>(() => new DismRunner().Run("/Get-WimInfo /WimFile:x"));
     }
+
+    [Theory]
+    [InlineData(101089280L, 100663296L, 1048576)] // B9 offset: start of its 1 MiB chunk
+    [InlineData(0L, 0L, 1048576)]
+    [InlineData(1048575L, 0L, 1048576)]
+    [InlineData(1048576L, 1048576L, 1048576)]
+    public void RepairChunkFor_ChunkAligned(long offset, long expectedStart, int expectedLen)
+    {
+        var (start, len) = SingleFileBackup.RepairChunkFor(offset, 100L * 1024 * 1024 * 1024);
+        Assert.Equal(expectedStart, start);
+        Assert.Equal(expectedLen, len);
+    }
+
+    [Fact]
+    public void RepairChunkFor_TailChunk_Truncated()
+    {
+        var total = 100L * 1048576 + 123;
+        var (start, len) = SingleFileBackup.RepairChunkFor(total - 1, total);
+        Assert.Equal(100L * 1048576, start);
+        Assert.Equal(123, len);
+    }
+
+    [Fact]
+    public void VerifyException_CarriesMismatchOffset()
+    {
+        var ex = new SingleFileVerifyException("x.vhdx", "byte mismatch at offset 5", 5);
+        Assert.Equal(5, ex.MismatchOffset);
+        Assert.Equal(null, new SingleFileVerifyException("x.vhdx", "other").MismatchOffset);
+    }
+
+    [Fact]
+    public void ResumeRanges_FromZero_KeepsAll()
+    {
+        var written = new List<(long Start, long Length)> { (0, 10), (10, 10), (20, 10) };
+        Assert.Equal(written, SingleFileBackup.ResumeRanges(written, 0));
+    }
+
+    [Fact]
+    public void ResumeRanges_SkipsVerified_TrimsStraddler()
+    {
+        var written = new List<(long Start, long Length)> { (0, 10), (10, 10), (20, 10) };
+        Assert.Equal(new List<(long Start, long Length)> { (10, 10), (20, 10) },
+            SingleFileBackup.ResumeRanges(written, 10));
+        Assert.Equal(new List<(long Start, long Length)> { (15, 5), (20, 10) },
+            SingleFileBackup.ResumeRanges(written, 15));
+        Assert.Empty(SingleFileBackup.ResumeRanges(written, 30));
+    }
 }
