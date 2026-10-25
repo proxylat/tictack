@@ -4,10 +4,12 @@ using TicTack;
 namespace Corpus;
 
 // Items 3+4: convert + SWM merge. All backend surface runs behind
-// FakeWimRunner — the DISM /Export-Image shapes are knowledge-sourced
-// (on-box Windows probe owed); wimlib export/join shapes verified against
-// wimlib-imagex 1.14.5 on this box. The Linux E2E at the bottom runs the
-// REAL binary: capture -> convert -> info -> split -> merge -> apply.
+// FakeWimRunner — DISM /Export-Image shapes verified on-box 2026-10-25
+// (probe-1219: exact vector accepted, exit 0, outputs DISM-readable;
+// failure exits 87 with the error on STDOUT, stderr empty;
+// /Compress:recovery yields .esd); wimlib export/join shapes verified
+// against wimlib-imagex 1.14.5 on this box. The Linux E2E at the bottom
+// runs the REAL binary: capture -> convert -> info -> split -> merge -> apply.
 
 public sealed class WimConvertTests : IDisposable
 {
@@ -105,7 +107,8 @@ public sealed class WimConvertTests : IDisposable
                 ? new DismResult(0, DismInfo(2), "")
                 : new DismResult(0, "", ""),
         };
-        // On-box-owed: needs Windows + real DISM; the fake pins shape only.
+        // Shape verified on-box 2026-10-25 (probe-1219): same vector,
+        // exit 0, output readable by DISM /Get-ImageInfo.
         WimImageOps.Convert(src, dest, 2, WimCompression.Recovery, runner, new TestLogger());
         Assert.Equal(2, runner.Calls.Count);
         var export = runner.Calls[1];
@@ -263,7 +266,8 @@ public sealed class WimConvertTests : IDisposable
     [Fact]
     public void MergeSwm_Dism_ExportShapeWithSwmGlob()
     {
-        // On-box-owed: needs Windows + real DISM; the fake pins shape only.
+        // Shape verified on-box 2026-10-25 (probe-1219): same vector,
+        // exit 0, output readable by DISM /Get-ImageInfo.
         var first = Path.Combine(_dir, "m.swm");
         File.WriteAllText(first, "1");
         File.WriteAllText(Path.Combine(_dir, "m2.swm"), "2");

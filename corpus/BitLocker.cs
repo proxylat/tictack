@@ -7,7 +7,10 @@ using TicTack;
 namespace Corpus
 {
     // Item 12b: BitLocker orchestration around VSS capture. The 12a verdict
-    // (proven on-box) is load-bearing: VSS snapshot creation succeeds on
+    // (proven on-box, re-verified 2026-10-25 probe-1231c on a scratch
+    // encrypted VHD: suspended→VSS 0, unlocked+protected→VSS 0,
+    // locked→VSS ReturnValue 4; our exact -protectors -disable/-enable
+    // commands exit 0) is load-bearing: VSS snapshot creation succeeds on
     // unlocked-protected AND protectors-suspended volumes, and fails loud on
     // locked ones — so suspend suffices, decrypt is unnecessary, and locked
     // must refuse loud (never a silent unlock attempt).

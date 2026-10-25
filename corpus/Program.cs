@@ -1996,7 +1996,7 @@ namespace Corpus
             Console.WriteLine("      Offline storage-driver inject (DISM) + NIC/GPU first-boot staging into a restored tree");
             Console.WriteLine("      [--trim-resetbase] [--trim-disable-feature <name>]... [--trim-remove-package <id>]... [--trim-no-hibernate]");
             Console.WriteLine("      Footprint trim = REMOVAL (ResetBase is irreversible; feature/package lists are caller-named, never builtin; hibernate stages to SetupComplete.cmd for first boot)");
-            Console.WriteLine("      [--unattend <file>] [--lang-pack <cab>]... [--remove-kb <KBnnn>]... [--reg-hive <f> --reg-key <k> --reg-name <n> --reg-type <t> --reg-data <d>]");
+            Console.WriteLine("      [--unattend <file>] [--lang-pack <cab>]... [--remove-kb <KB|identity-fragment>]... [--reg-hive <f> --reg-key <k> --reg-name <n> --reg-type <t> --reg-data <d>]");
             Console.WriteLine("      Servicing order: drivers, first-boot staging, lang packs, unattend, trim, KB removal, registry; KB guard refuses the live OS");
             Console.WriteLine("  --convert --wim <src> --to <dest> [--index N] [--compress max|recovery]  Convert WIM<->ESD or re-export single-index (.esd implies recovery; multi-image source requires --index)");
             Console.WriteLine("  --merge-swm --swm <first.swm> --to <dest.wim>  Reunite a split set (join needs ALL parts)");

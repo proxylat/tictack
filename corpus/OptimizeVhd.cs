@@ -93,7 +93,12 @@ namespace Corpus
         }
 
         // Best-effort match on the stock PowerShell "term is not recognized"
-        // text — exact on-box wording OWED (never captured off-Windows).
+        // text — on-box template captured 2026-10-25 ("<name> : The term
+        // '<name>' is not recognized as the name of a cmdlet, function,
+        // script file, or operable program.", exit 1, stderr). Unelevated
+        // capture was attempted but the temp-user child cannot start over
+        // SSH (0xC0000142); any elevation failure still surfaces via
+        // OptimizeVhdException.
         internal static bool IsModuleMissing(string output)
         {
             ArgumentNullException.ThrowIfNull(output);

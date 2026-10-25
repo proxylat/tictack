@@ -1,9 +1,9 @@
 namespace Corpus;
 
 // Item 9 tests: offline-only KB removal through the shared ITrimRunner
-// fake (Linux-green). DISM /Get-Packages shape + identity-contains-KB
-// match are training-knowledge, on-box-unprobed — pinned so a VM run can
-// diff them.
+// fake (Linux-green). Probe-1225 diffed the shapes against a real Win11
+// 26100 box: only .NET security fixes embed the KB; the LCU/SSU/rollup
+// identities carry none, so callers pass identity fragments for those.
 public sealed class OfflineKbTests : IDisposable
 {
     private readonly string _dir;
@@ -56,6 +56,24 @@ public sealed class OfflineKbTests : IDisposable
             ["Package_for_RollupFix_KB5034441~31bf3856ad364e35~amd64~~22621.1234.1.9"], ids);
         Assert.Empty(OfflineKb.ParseIdentities(ListOutput, "KB9999999"));
         Assert.Empty(OfflineKb.ParseIdentities(string.Empty, "KB5034441"));
+    }
+
+    [Fact]
+    public void ParseIdentities_Win11Shapes_FragmentMatchesKbLessLcu()
+    {
+        // Probe-1225 (real Win11 26100 /Get-Packages): the LCU carries no
+        // KB, so callers match it by build-version fragment instead.
+        const string Win11 =
+            "Package Identity : Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.6584.1.20\r\n" +
+            "Package Identity : Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.1742.1.10\r\n" +
+            "Package Identity : Package_for_KB5054156~31bf3856ad364e35~amd64~~26100.5503.1.1\r\n";
+        Assert.Equal(
+            ["Package_for_KB5054156~31bf3856ad364e35~amd64~~26100.5503.1.1"],
+            OfflineKb.ParseIdentities(Win11, "KB5054156"));
+        Assert.Equal(
+            ["Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.6584.1.20"],
+            OfflineKb.ParseIdentities(Win11, "26100.6584.1.20"));
+        Assert.Equal(2, OfflineKb.ParseIdentities(Win11, "RollupFix").Count);
     }
 
     [Fact]

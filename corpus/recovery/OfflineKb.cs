@@ -6,19 +6,21 @@ using TicTack;
 namespace Corpus
 {
     // Prepare-universal cluster item 9: remove Windows packages by KB
-    // number, OFFLINE ONLY. Each caller-named KB resolves via /Get-Packages
-    // to a servicing identity containing the KB string, then
-    // /Remove-Package removes that identity. No match is a WRN + continue
-    // (KB not installed isn't failure); query/remove failures fail loud per
-    // KB but continue with the next (ops-continue, like OfflineTrim).
+    // number or identity fragment, OFFLINE ONLY. Each caller-named token
+    // resolves via /Get-Packages to servicing identities containing the
+    // token, then /Remove-Package removes each identity. No match is a
+    // WRN + continue (not installed isn't failure); query/remove failures
+    // fail loud per token but continue with the next (ops-continue).
     // OFFLINE-ONLY: the target must never be the live OS. The guard refuses
     // any dir resolving to the live Windows dir (System32-parent and
     // %SystemRoot% candidates); there is deliberately no online path —
     // wusa/DISM against the running OS has no method here (that surface is
     // live servicing, not prepare-universal).
-    // DISM shapes (/Get-Packages listing, identity-contains-KB match) are
-    // training-knowledge, on-box-unprobed: whether real identities embed KB
-    // numbers at all is on-box-owed (VM diff; may need a CBS/WMI rework).
+    // Probe-1225 (real Win11 26100 /Get-Packages, 140 identities): only
+    // .NET security fixes embed the KB; LCU/SSU/.NET-rollup/FOD identities
+    // carry none (e.g. Package_for_RollupFix~...~~26100.6584.1.20). No CBS
+    // rework needed: pass a build-version fragment for KB-less packages.
+    // Ambiguous fragments remove every match, so refine them first.
     public static class OfflineKb
     {
         // 0 = all KBs removed/absent (or plan / nothing to do);
