@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -50,207 +51,30 @@ namespace TicTack
             try
             {
                 var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var cfgPath = Path.Combine(baseDir, "config.yaml");
-            bool isService = false, isCli = false, isOnce = false, isValidate = false, isExternalDrives = false, isRebuild = false;
-            bool isDeferredList = false;
-            string? deferredVerb = null, deferredTarget = null;
-            bool isForget = false, forgetDryRun = false, versionsJson = false;
-            string? forgetKeepLast = null, forgetKeepWithin = null, forgetKeepDaily = null, forgetKeepWeekly = null, forgetKeepMonthly = null;
-            bool isVersionsList = false;
-            string? versionsGlob = null, versionsLatest = null;
-            string? pinVerb = null, pinTarget = null;
-            bool isOsCapture = false, isOsRestore = false;
-            string? osSource = null, osDest = null;
-
-            for (int i = 0; i < args.Length; i++)
-            {
-                switch (args[i].ToLowerInvariant())
-                {
-                    case "--config":
-                        if (i + 1 < args.Length) cfgPath = args[++i];
-                        break;
-                    case "--help":
-                    case "-h":
-                    case "-?":
-                        PrintHelp();
-                        return 0;
-                    case "--version":
-                    case "-v":
-                        PrintVersion();
-                        return 0;
-                    case "--service": isService = true; break;
-                    case "--cli": isCli = true; break;
-                    case "--once": isOnce = true; break;
-                    case "--validate": isValidate = true; break;
-                    case "--external-drives": isExternalDrives = true; break;
-                    case "--rebuild": isRebuild = true; break;
-                    case "--forget": isForget = true; break;
-                    case "--dry-run": forgetDryRun = true; break;
-                    case "--keep-last":
-                        if (i + 1 < args.Length) forgetKeepLast = args[++i];
-                        break;
-                    case "--keep-within":
-                        if (i + 1 < args.Length) forgetKeepWithin = args[++i];
-                        break;
-                    case "--keep-daily":
-                        if (i + 1 < args.Length) forgetKeepDaily = args[++i];
-                        break;
-                    case "--keep-weekly":
-                        if (i + 1 < args.Length) forgetKeepWeekly = args[++i];
-                        break;
-                    case "--keep-monthly":
-                        if (i + 1 < args.Length) forgetKeepMonthly = args[++i];
-                        break;
-                    case "--versions-list":
-                        isVersionsList = true;
-                        if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
-                            versionsGlob = args[++i];
-                        break;
-                    case "--latest":
-                        if (i + 1 < args.Length) versionsLatest = args[++i];
-                        break;
-                    case "--json": versionsJson = true; break;
-                    case "--versions-pin":
-                    case "--versions-unpin":
-                    case "--unpin":
-                        pinVerb = args[i].ToLowerInvariant();
-                        if (i + 1 < args.Length) pinTarget = args[++i];
-                        break;
-                    case "--deferred-list": isDeferredList = true; break;
-                    case "--os-capture": isOsCapture = true; break;
-                    case "--os-restore": isOsRestore = true; break;
-                    case "--os-source":
-                        if (i + 1 < args.Length) osSource = args[++i];
-                        break;
-                    case "--os-dest":
-                        if (i + 1 < args.Length) osDest = args[++i];
-                        break;
-                    case "--deferred-approve":
-                    case "--deferred-check":
-                    case "--reprove":
-                    case "--deferred-cancel":
-                        deferredVerb = args[i].ToLowerInvariant();
-                        if (i + 1 < args.Length) deferredTarget = args[++i];
-                        break;
-                }
-            }
-
-            TicTackConfig? cfg;
-            try
-            {
-                cfg = Config.Load(cfgPath);
-            }
-            catch (YamlDotNet.Core.YamlException ex)
-            {
-                // User error, not a crash: plain message on stderr, no stack
-                // trace, no crash log. Scanner errors already carry their own
-                // (Line/Col); escape errors get a hint because the classic is
-                // a double-quoted Windows path ("C:\Users\..." — \U wants 8
-                // hex digits, \x wants 2).
-                var msg = "Invalid config " + cfgPath + ": " + ex.Message + ConfigErrorHint(ex);
-                Console.Error.WriteLine(msg);
-                if (OperatingSystem.IsWindows())
-                {
-                    try { EventLog.WriteEntry("TicTackSv", msg, EventLogEntryType.Error); } catch { }
-                }
+                var o = new MainOptions { CfgPath = Path.Combine(baseDir, "config.yaml") };
+                int? parsed = ParseMainArgs(o, args);
+                if (parsed.HasValue)
+                    return parsed.Value;
+                TicTackConfig? cfg = LoadConfigOrDie(o.CfgPath);
+                if (cfg == null)
+                    return 1;
+                // Pre-logger pass so the log/alert files themselves land on
+                // resolved volumes; the post-logger EnsureResolved below
+                // adds the wait-for-volume gate once logging exists.
+                VolumeResolver.ResolveConfig(cfg);
+                var (log, _) = OpenRootLogger(o, cfg);
+                if (log == null)
+                    return 1;
+                rootLogger = log;
+                if (!VolumeResolver.EnsureResolved(cfg, cfg.VolumeWaitMinutes, log))
                 return 1;
-            }
-            if (cfg == null)
-            {
-                Console.Error.WriteLine("config.yaml not found or invalid");
+                if (!Config.Validate(cfg, log))
                 return 1;
-            }
-
-            // Pre-logger pass so the log/alert files themselves land on
-            // resolved volumes; the post-logger EnsureResolved below
-            // adds the wait-for-volume gate once logging exists.
-            VolumeResolver.ResolveConfig(cfg);
-
-            var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                ? Path.Combine(baseDir, "tictack.log")
-                : cfg.Logging.Path;
-            var log = LoggerFactory.Create(
-                cfg.Logging.Level,
-                logPath,
-                cfg.Logging.MaxSizeMb,
-                cfg.Logging.MaxFiles,
-                cfg.Logging.AlertPath,
-                console: isCli || isOnce || isValidate || isRebuild || isDeferredList || deferredVerb != null || isForget || isVersionsList || pinVerb != null || isOsCapture || isOsRestore || cfg.Logging.Console,
-                eventLog: OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive),
-                backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"));
-            rootLogger = log;
-
-            if (!VolumeResolver.EnsureResolved(cfg, cfg.VolumeWaitMinutes, log))
-                return 1;
-
-            if (!Config.Validate(cfg, log))
-                return 1;
-
-            PowerGuard.Cleanup(cfg, log);
-
-            if (isExternalDrives)
-            {
-                await RunExternalDrivesAsync(cfg, log);
-                return 0;
-            }
-
-            if (isRebuild)
-            {
-                await RunRebuildAsync(cfg, log);
-                return 0;
-            }
-
-            if (isDeferredList || deferredVerb != null)
-            {
-                return await RunDeferredAsync(cfg, log, isDeferredList, deferredVerb, deferredTarget);
-            }
-
-            if (isForget)
-            {
-                return RunForget(cfg, log, forgetDryRun, forgetKeepLast, forgetKeepWithin, forgetKeepDaily, forgetKeepWeekly, forgetKeepMonthly);
-            }
-
-            if (isVersionsList)
-            {
-                return RunVersionsList(cfg, log, versionsGlob, versionsLatest, versionsJson);
-            }
-
-            if (pinVerb != null)
-            {
-                return RunVersionsPin(cfg, log, pinTarget, pin: pinVerb == "--versions-pin");
-            }
-
-            if (isOsCapture || isOsRestore)
-            {
-                return await RunOsAsync(cfg, log, isOsRestore, osSource, osDest);
-            }
-
-            if (isValidate)
-            {
-                log.Info("Configuration OK");
-                return 0;
-            }
-
-            if (isOnce)
-            {
-                await RunOnceAsync(cfg, log);
-                return 0;
-            }
-
-            if (isCli)
-            {
-                RunCli(cfg, log);
-                return 0;
-            }
-
-            if (OperatingSystem.IsWindows() && (isService || !Environment.UserInteractive))
-            {
-                RunService(cfgPath);
-                return 0;
-            }
-
-            log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --external-drives | --forget [--dry-run] | --versions-list [glob] | --versions-pin <file@ts> | --versions-unpin <file@ts> | --deferred-list | --deferred-approve <source> | --deferred-check <source> | --reprove <source> | --os-capture --os-source <dir> --os-dest <dir> | --os-restore --os-source <dir> --os-dest <dir> | --service | --help | --version | --config <path>");
-            return 0;
+                PowerGuard.Cleanup(cfg, log);
+                int? maint = await RunMaintenanceModesAsync(o, args, cfg, log);
+                if (maint.HasValue)
+                    return maint.Value;
+            return await RunSelectedModeAsync(o, cfg, log);
             }
             catch (Exception ex)
             {
@@ -265,6 +89,243 @@ namespace TicTack
             }
         }
 
+
+        private static async Task<int> RunSelectedModeAsync(MainOptions o, TicTackConfig cfg, ILogger log)
+        {
+        if (o.isValidate)
+        {
+            log.Info("Configuration OK");
+            return 0;
+        }
+
+        if (o.isOnce)
+        {
+            await RunOnceAsync(cfg, log);
+            return 0;
+        }
+
+        if (o.isCli)
+        {
+            RunCli(cfg, log);
+            return 0;
+        }
+
+        if (OperatingSystem.IsWindows() && (o.isService || !Environment.UserInteractive))
+        {
+            RunService(o.CfgPath);
+            return 0;
+        }
+
+        log.Info("Usage: TicTackSv.exe --cli | --once | --rebuild | --validate | --external-drives | --forget [--dry-run] | --versions-list [glob] | --versions-pin <file@ts> | --versions-unpin <file@ts> | --deferred-list | --deferred-approve <source> | --deferred-check <source> | --reprove <source> | --os-capture --os-source <dir> --os-dest <dir> | --os-restore --os-source <dir> --os-dest <dir> | --service | --help | --version | --config <path>");
+        return 0;
+        }
+
+        private sealed class MainOptions
+        {
+            public bool isService = false, isCli = false, isOnce = false, isValidate = false, isExternalDrives = false, isRebuild = false;
+            public bool isDeferredList = false;
+            public string? deferredVerb = null, deferredTarget = null;
+            public bool isForget = false, forgetDryRun = false, versionsJson = false;
+            public string? forgetKeepLast = null, forgetKeepWithin = null, forgetKeepDaily = null, forgetKeepWeekly = null, forgetKeepMonthly = null;
+            public bool isVersionsList = false;
+            public string? versionsGlob = null, versionsLatest = null;
+            public string? pinVerb = null, pinTarget = null;
+            public bool isOsCapture = false, isOsRestore = false;
+            public string? osSource = null, osDest = null;
+            public string CfgPath = "";
+        }
+
+        private static bool ApplyModeFlag(MainOptions o, string arg)
+        {
+            switch (arg)
+            {
+                case "--service": o.isService = true; return true;
+                case "--cli": o.isCli = true; return true;
+                case "--once": o.isOnce = true; return true;
+                case "--validate": o.isValidate = true; return true;
+                case "--external-drives": o.isExternalDrives = true; return true;
+                case "--rebuild": o.isRebuild = true; return true;
+                case "--forget": o.isForget = true; return true;
+                case "--dry-run": o.forgetDryRun = true; return true;
+                case "--json": o.versionsJson = true; return true;
+                case "--deferred-list": o.isDeferredList = true; return true;
+                case "--os-capture": o.isOsCapture = true; return true;
+                case "--os-restore": o.isOsRestore = true; return true;
+                default: return false;
+            }
+        }
+
+        private static bool ParseValuedArg(MainOptions o, string[] args, ref int i)
+        {
+            switch (args[i].ToLowerInvariant())
+            {
+                case "--config":
+                    if (i + 1 < args.Length) o.CfgPath = args[++i];
+                    return true;
+                case "--keep-last":
+                    if (i + 1 < args.Length) o.forgetKeepLast = args[++i];
+                    return true;
+                case "--keep-within":
+                    if (i + 1 < args.Length) o.forgetKeepWithin = args[++i];
+                    return true;
+                case "--keep-daily":
+                    if (i + 1 < args.Length) o.forgetKeepDaily = args[++i];
+                    return true;
+                case "--keep-weekly":
+                    if (i + 1 < args.Length) o.forgetKeepWeekly = args[++i];
+                    return true;
+                case "--keep-monthly":
+                    if (i + 1 < args.Length) o.forgetKeepMonthly = args[++i];
+                    return true;
+                case "--versions-list":
+                    o.isVersionsList = true;
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                        o.versionsGlob = args[++i];
+                    return true;
+                case "--latest":
+                    if (i + 1 < args.Length) o.versionsLatest = args[++i];
+                    return true;
+                case "--versions-pin":
+                case "--versions-unpin":
+                case "--unpin":
+                    return ParsePinArg(o, args, ref i);
+                case "--os-source":
+                    if (i + 1 < args.Length) o.osSource = args[++i];
+                    return true;
+                case "--os-dest":
+                    if (i + 1 < args.Length) o.osDest = args[++i];
+                    return true;
+                case "--deferred-approve":
+                case "--deferred-check":
+                case "--reprove":
+                case "--deferred-cancel":
+                    o.deferredVerb = args[i].ToLowerInvariant();
+                    if (i + 1 < args.Length) o.deferredTarget = args[++i];
+                    return true;
+                default: return false;
+            }
+        }
+
+        private static int? ParseMainArgs(MainOptions o, string[] args)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                var a = args[i].ToLowerInvariant();
+                if (ApplyModeFlag(o, a)) continue;
+                if (ParseValuedArg(o, args, ref i)) continue;
+            switch (a)
+            {
+                case "--help":
+                case "-h":
+                case "-?":
+                    PrintHelp();
+                    return 0;
+                case "--version":
+                case "-v":
+                    PrintVersion();
+                    return 0;
+                }
+            }
+            return null;
+        }
+
+
+        private static bool ParsePinArg(MainOptions o, string[] args, ref int i)
+        {
+            o.pinVerb = args[i].ToLowerInvariant();
+            if (i + 1 < args.Length) o.pinTarget = args[++i];
+            return true;
+        }
+        private static TicTackConfig? LoadConfigOrDie(string cfgPath) // sole caller passes non-null o.CfgPath
+        {
+            TicTackConfig? cfg;
+        try
+        {
+            cfg = Config.Load(cfgPath);
+        }
+        catch (YamlDotNet.Core.YamlException ex)
+        {
+            // User error, not a crash: plain message on stderr, no stack
+            // trace, no crash log. Scanner errors already carry their own
+            // (Line/Col); escape errors get a hint because the classic is
+            // a double-quoted Windows path ("C:\Users\..." — \U wants 8
+            // hex digits, \x wants 2).
+            var msg = "Invalid config " + cfgPath + ": " + ex.Message + ConfigErrorHint(ex);
+            Console.Error.WriteLine(msg);
+            if (OperatingSystem.IsWindows())
+            {
+                try { EventLog.WriteEntry("TicTackSv", msg, EventLogEntryType.Error); } catch { }
+            }
+            return null;
+        }
+        if (cfg == null)
+        {
+            Console.Error.WriteLine("config.yaml not found or invalid");
+            return null;
+        }
+            return cfg;
+        }
+
+        private static (ILogger? log, string? logPath) OpenRootLogger(MainOptions o, TicTackConfig cfg)
+        {
+            string? logPath = null;
+            logPath = string.IsNullOrEmpty(cfg.Logging.Path)
+                ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tictack.log")
+                : cfg.Logging.Path;
+            var log = LoggerFactory.Create(
+                cfg.Logging.Level,
+                logPath,
+                cfg.Logging.MaxSizeMb,
+                cfg.Logging.MaxFiles,
+                cfg.Logging.AlertPath,
+                console: o.isCli || o.isOnce || o.isValidate || o.isRebuild || o.isDeferredList || o.deferredVerb != null || o.isForget || o.isVersionsList || o.pinVerb != null || o.isOsCapture || o.isOsRestore || cfg.Logging.Console,
+                eventLog: OperatingSystem.IsWindows() && (o.isService || !Environment.UserInteractive),
+                backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"));
+            return (log, logPath);
+        }
+
+        private static async Task<int?> RunMaintenanceModesAsync(MainOptions o, string[] args, TicTackConfig cfg, ILogger log)
+        {
+            if (o.isExternalDrives)
+            {
+                await RunExternalDrivesAsync(cfg, log);
+                return 0;
+            }
+
+            if (o.isRebuild)
+            {
+                await RunRebuildAsync(cfg, log);
+                return 0;
+            }
+
+            if (o.isDeferredList || o.deferredVerb != null)
+            {
+                return await RunDeferredAsync(cfg, log, o.isDeferredList, o.deferredVerb, o.deferredTarget);
+            }
+
+            if (o.isForget)
+            {
+                return RunForget(cfg, log, o.forgetDryRun, o.forgetKeepLast, o.forgetKeepWithin, o.forgetKeepDaily, o.forgetKeepWeekly, o.forgetKeepMonthly);
+            }
+
+            if (o.isVersionsList)
+            {
+                return RunVersionsList(cfg, log, o.versionsGlob, o.versionsLatest, o.versionsJson);
+            }
+
+            if (o.pinVerb != null)
+            {
+                return RunVersionsPin(cfg, log, o.pinTarget, pin: o.pinVerb == "--versions-pin");
+            }
+
+            if (o.isOsCapture || o.isOsRestore)
+            {
+                return await RunOsAsync(cfg, log, o.isOsRestore, o.osSource, o.osDest);
+            }
+
+            return null;
+        }
+
         static async Task RunExternalDrivesAsync(TicTackConfig cfg, ILogger log)
         {
             if (cfg.ExternalDrives == null || string.IsNullOrEmpty(cfg.ExternalDrives.Command))
@@ -275,21 +336,10 @@ namespace TicTack
 
             var cmd = cfg.ExternalDrives.Command;
             var sourcePaths = cfg.Sources != null && cfg.Sources.Count > 0
-                ? string.Join(" ", cfg.Sources.ConvertAll(s => "\"" + s.Path + "\""))
+                ? string.Join(" ", cfg.Sources.Select(s => "\"" + s.Path + "\"").ToList())
                 : null;
 
-            var destinationDrives = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (cfg.Sources != null)
-            {
-                foreach (var src in cfg.Sources)
-                {
-                    if (string.IsNullOrEmpty(src.Destination)) continue;
-                    var root = Path.GetPathRoot(src.Destination);
-                    if (!string.IsNullOrEmpty(root))
-                        destinationDrives.Add(root.TrimEnd('\\'));
-                }
-            }
-
+            var destinationDrives = CollectDestinationRoots(cfg);
             var drives = DriveDiscoverer.GetEligibleDrives(cfg.ExternalDrives, destinationDrives, log);
 
             if (drives.Count == 0)
@@ -298,52 +348,79 @@ namespace TicTack
                 return;
             }
 
-            Console.WriteLine("Eligible drives:");
-            foreach (var drive in drives)
-            {
-                var repoPath = cmd.Contains("{drive}", StringComparison.Ordinal)
-                    ? cmd.Split(new[] { "-r " }, StringSplitOptions.None).LastOrDefault()?.Replace("{drive}", drive.TrimEnd('\\'))
-                    : null;
-                Console.WriteLine("  " + drive + (repoPath != null ? " → " + repoPath : ""));
-            }
-            Console.WriteLine();
-            Console.Write("Proceed? (y/n): ");
-            var input = Console.ReadLine();
-            if (string.IsNullOrEmpty(input) || !input.TrimStart().StartsWith("y", StringComparison.OrdinalIgnoreCase))
-            {
-                log.Info("External drive backups cancelled by user");
-                return;
-            }
+            if (!ConfirmExternalDrives(cmd, drives, log)) return;
 
             var wd = cfg.ExternalDrives.WorkingDir ?? AppDomain.CurrentDomain.BaseDirectory;
 
             foreach (var drive in drives)
             {
-                var fullCmd = cmd.Replace("{drive}", drive.TrimEnd('\\'));
-                if (sourcePaths != null)
-                    fullCmd = fullCmd.Replace("{source}", sourcePaths);
-
-                log.Info("Running backup for " + drive + ": " + fullCmd);
-
-                try
-                {
-                    // No redirection: the backup tool's output stays on the
-                    // console; the runner owns the timeout and tree kill.
-                    var (exitCode, _, _, timedOut) = await ProcessRunner.RunAsync(fullCmd, wd, redirect: false);
-                    if (timedOut)
-                        log.Error("Backup on " + drive + " timed out after 10 minutes, killed");
-                    else if (exitCode != 0)
-                        log.Error("Backup on " + drive + " exited " + exitCode);
-                    else
-                        log.Info("Backup on " + drive + " completed");
-                }
-                catch (Exception ex)
-                {
-                    log.Error("Backup on " + drive + " failed", ex);
-                }
+                await RunDriveBackupAsync(drive, cmd, sourcePaths, wd, log);
             }
 
             log.Info("All external drive backups complete");
+        }
+
+        internal static HashSet<string> CollectDestinationRoots(TicTackConfig cfg)
+        {
+                var destinationDrives = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (cfg.Sources != null)
+                {
+                    foreach (var src in cfg.Sources)
+                    {
+                        if (string.IsNullOrEmpty(src.Destination)) continue;
+                        var root = Path.GetPathRoot(src.Destination);
+                        if (!string.IsNullOrEmpty(root))
+                            destinationDrives.Add(root.TrimEnd('\\'));
+                    }
+                }
+            return destinationDrives;
+        }
+
+        internal static bool ConfirmExternalDrives(string cmd, IReadOnlyList<string> drives, ILogger log)
+        {
+                Console.WriteLine("Eligible drives:");
+                foreach (var drive in drives)
+                {
+                    var repoPath = cmd.Contains("{drive}", StringComparison.Ordinal)
+                        ? cmd.Split(new[] { "-r " }, StringSplitOptions.None).LastOrDefault()?.Replace("{drive}", drive.TrimEnd('\\'))
+                        : null;
+                    Console.WriteLine("  " + drive + (repoPath != null ? " → " + repoPath : ""));
+                }
+                Console.WriteLine();
+                Console.Write("Proceed? (y/n): ");
+                var input = Console.ReadLine();
+                if (string.IsNullOrEmpty(input) || !input.TrimStart().StartsWith("y", StringComparison.OrdinalIgnoreCase))
+                {
+                    log.Info("External drive backups cancelled by user");
+                    return false;
+                }
+            return true;
+        }
+
+        internal static async Task RunDriveBackupAsync(string drive, string cmd, string? sourcePaths, string wd, ILogger log)
+        {
+                    var fullCmd = cmd.Replace("{drive}", drive.TrimEnd('\\'));
+                    if (sourcePaths != null)
+                        fullCmd = fullCmd.Replace("{source}", sourcePaths);
+    
+                    log.Info("Running backup for " + drive + ": " + fullCmd);
+    
+                    try
+                    {
+                        // No redirection: the backup tool's output stays on the
+                        // console; the runner owns the timeout and tree kill.
+                        var (exitCode, _, _, timedOut) = await ProcessRunner.RunAsync(fullCmd, wd, redirect: false);
+                        if (timedOut)
+                            log.Error("Backup on " + drive + " timed out after 10 minutes, killed");
+                        else if (exitCode != 0)
+                            log.Error("Backup on " + drive + " exited " + exitCode);
+                        else
+                            log.Info("Backup on " + drive + " completed");
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error("Backup on " + drive + " failed", ex);
+                    }
         }
 
         internal static async Task<bool> RunOnceAsync(TicTackConfig cfg, ILogger log)
@@ -449,7 +526,7 @@ namespace TicTack
         // asks for it (Windows + available), direct otherwise.
         internal static IFileAccessor CreateOsAccessor(TicTackConfig cfg, ILogger log)
         {
-            var wantVss = cfg.Sources != null && cfg.Sources.Exists(s =>
+            var wantVss = cfg.Sources != null && cfg.Sources.Any(s =>
                 string.Equals(s.Sync != null ? s.Sync.FileAccess : null, "vss", StringComparison.OrdinalIgnoreCase));
             if (!wantVss)
                 return new FileAccessor();
@@ -476,61 +553,17 @@ namespace TicTack
             log.Info("Full rebuild starting");
             var baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
             var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                ? Path.Combine(baseDir, "tictack.log")
+                ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tictack.log")
                 : cfg.Logging.Path;
             var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
             var failures = 0;
 
+
             foreach (var src in cfg.Sources)
             {
-                if (!Directory.Exists(src.Path))
-                {
-                    log.Error("Source folder missing, rebuild skipped: " + src.Path);
-                    failures++;
-                    continue;
-                }
-                if (!DriveGuard.IsReady(src.Destination))
-                {
-                    log.Error("Destination drive is not ready: " + src.Destination);
-                    return;
-                }
-
-                try
-                {
-                    using var pipeline = BuildPipeline(src, cfg, log);
-                    // Holds clear through the pipeline's own store: it owns
-                    // the SQLite handle, and Windows refuses to delete open
-                    // files. A lock here means another process — the running
-                    // service — holds the store, so say so instead of
-                    // dumping a sharing-violation stack.
-                    try { pipeline.ClearDeferredHolds(); }
-                    catch (IOException ex) { throw new IOException("Rebuild blocked: stop the TicTackSv service first, then retry (" + ex.Message + ")", ex); }
-                    // Rebuild resets everything: state rows, every legacy
-                    // batch file and legacy name, then re-syncs from scratch.
-                    var deferredPrefix = DeferredFilePrefix(src);
-                    try
-                    {
-                        foreach (var f in Directory.EnumerateFiles(deferredDir, deferredPrefix + "-*.json"))
-                            DeleteWithRetry(f);
-                    }
-                    catch (Exception ex) { log.Debug("Rebuild deferred cleanup skipped: " + ex.Message); }
-                    DeleteWithRetry(Path.Combine(deferredDir, LegacyDeferredFileName(src)));
-                    DeleteWithRetry(Path.Combine(src.Destination, ".tictack-deferred.json"));
-                    var rebuilt = await pipeline.RunOnceAsync(() =>
-                    {
-                        pipeline.ResetState();
-                        return Task.CompletedTask;
-                    });
-                    if (rebuilt)
-                        log.Info("Rebuild complete: " + src.Path);
-                    else
-                        log.Warn("Rebuild skipped: " + src.Path);
-                }
-                catch (Exception ex)
-                {
-                    failures++;
-                    log.Error("Rebuild failed: " + src.Path, ex);
-                }
+                var rebuildResult = await RebuildOneSourceAsync(src, cfg, log, deferredDir);
+                if (rebuildResult < 0) return;
+                failures += rebuildResult;
             }
 
             if (failures > 0)
@@ -538,6 +571,59 @@ namespace TicTack
             else
                 log.Info("Full rebuild finished. All databases cleared, source re-scanned, parity enforced.");
         }
+
+        static async Task<int> RebuildOneSourceAsync(SourceConfig src, TicTackConfig cfg, ILogger log, string deferredDir)
+        {
+            if (!Directory.Exists(src.Path))
+            {
+                log.Error("Source folder missing, rebuild skipped: " + src.Path);
+                return 1;
+            }
+            if (!DriveGuard.IsReady(src.Destination))
+            {
+                log.Error("Destination drive is not ready: " + src.Destination);
+                return -1;
+            }
+
+            try
+            {
+                using var pipeline = BuildPipeline(src, cfg, log);
+                // Holds clear through the pipeline's own store: it owns
+                // the SQLite handle, and Windows refuses to delete open
+                // files. A lock here means another process — the running
+                // service — holds the store, so say so instead of
+                // dumping a sharing-violation stack.
+                try { pipeline.ClearDeferredHolds(); }
+                catch (IOException ex) { throw new IOException("Rebuild blocked: stop the TicTackSv service first, then retry (" + ex.Message + ")", ex); }
+                // Rebuild resets everything: state rows, every legacy
+                // batch file and legacy name, then re-syncs from scratch.
+                var deferredPrefix = DeferredFilePrefix(src);
+                try
+                {
+                    foreach (var f in Directory.EnumerateFiles(deferredDir, deferredPrefix + "-*.json"))
+                        DeleteWithRetry(f);
+                }
+                catch (Exception ex) { log.Debug("Rebuild deferred cleanup skipped: " + ex.Message); }
+                DeleteWithRetry(Path.Combine(deferredDir, LegacyDeferredFileName(src)));
+                DeleteWithRetry(Path.Combine(src.Destination, ".tictack-deferred.json"));
+                var rebuilt = await pipeline.RunOnceAsync(() =>
+                {
+                    pipeline.ResetState();
+                    return Task.CompletedTask;
+                });
+                if (rebuilt)
+                    log.Info("Rebuild complete: " + src.Path);
+                else
+                    log.Warn("Rebuild skipped: " + src.Path);
+            }
+            catch (Exception ex)
+            {
+                log.Error("Rebuild failed: " + src.Path, ex);
+                return 1;
+            }
+                return 0;
+        }
+
 
         internal static int DeferredHoldDays(SourceConfig src) =>
             src.Sync != null && src.Sync.DeleteHoldDays > 0 ? src.Sync.DeleteHoldDays : SyncConfig.DefaultDeleteHoldDays;
@@ -569,7 +655,7 @@ namespace TicTack
 
         // Next due across batches: earliest of per-batch expiry and daily
         // warning, labelled so the list shows what the timer waits for.
-        internal static string FormatNextDue(List<BatchSummary> batches, int holdDays, DateTime now)
+        internal static string FormatNextDue(IReadOnlyList<BatchSummary> batches, int holdDays, DateTime now)
         {
             string? best = null;
             var bestDue = DateTime.MaxValue;
@@ -590,98 +676,106 @@ namespace TicTack
         // races the drain (Linux). List and check are read-only.
         internal static async Task<int> RunDeferredAsync(TicTackConfig cfg, ILogger log, bool list, string? verb, string? target)
         {
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                ? Path.Combine(baseDir, "tictack.log")
-                : cfg.Logging.Path;
-            var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
+                    var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                    var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
+                        ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tictack.log")
+                        : cfg.Logging.Path;
+                    var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
 
-            if (list)
-            {
-                var any = false;
-                foreach (var src in cfg.Sources)
-                {
-                    using var dd = new DeferredDeletion(deferredDir, DeferredFilePrefix(src), DeferredHoldDays(src), log);
-                    var batches = dd.GetBatchSummaries();
-                    if (batches.Count == 0) continue;
-                    any = true;
-                    var now = DateTime.UtcNow;
-                    var oldest = batches.Min(b => b.BlockedAt);
-                    log.Info(DeferredFilePrefix(src) + "  " + src.Path + "  batches=" + batches.Count
-                        + " files=" + batches.Sum(b => b.Files)
-                        + " oldest=" + FormatAge(now - oldest) + " ago"
-                        + " next=" + FormatNextDue(batches, DeferredHoldDays(src), now));
-                }
-                if (!any) log.Info("No deferred holds.");
-                return 0;
-            }
 
-            if (string.IsNullOrEmpty(target))
-            {
-                log.Error("Missing <source>: " + verb + " needs a source stem, see --deferred-list");
-                return 1;
-            }
-            var match = ResolveDeferredSource(cfg, target, log);
-            if (match == null) return 1;
-            var stem = DeferredFilePrefix(match);
+            if (list) return ListDeferredHolds(cfg, log, deferredDir);
 
-            if (verb == "--deferred-check")
-            {
-                using var dd = new DeferredDeletion(deferredDir, stem, DeferredHoldDays(match), log);
-                if (!dd.HasPending) log.Info("No deferred holds for " + stem);
-                else dd.CheckWarnings();
-                return 0;
-            }
-
-            if (verb == "--reprove" || verb == "--deferred-cancel")
-            {
-                using var dd = new DeferredDeletion(deferredDir, stem, DeferredHoldDays(match), log);
-                if (!dd.HasPending && !File.Exists(DeferredDbPath(deferredDir, match)))
-                {
-                    log.Info("No deferred holds for " + stem);
-                    return 0;
-                }
-                try { dd.ClearStore("reprove"); }
-                catch (IOException)
-                {
-                    log.Error("Hold store is locked — stop the TicTackSv service first, then retry");
-                    return 1;
-                }
-                log.Info("Hold cancelled for " + stem + ", destination files kept");
-                return 0;
-            }
-
-            if (verb == "--deferred-approve")
-            {
-                SyncPipeline? pipeline = null;
-                try
-                {
-                    pipeline = BuildPipeline(match, cfg, log);
-                    var (ran, proceeded, cancelled) = await pipeline.DrainExpiredAsync();
-                    if (!ran)
+                    if (string.IsNullOrEmpty(target))
                     {
-                        log.Error("Exclusive lock unavailable — stop the TicTackSv service first, then retry");
+                        log.Error("Missing <source>: " + verb + " needs a source stem, see --deferred-list");
                         return 1;
                     }
-                    if (proceeded > 0) log.Warn("Deferred deletion: proceeding with " + proceeded + " files");
-                    else if (cancelled > 0) log.Info("Deferred deletion: cancelled, files reappeared");
-                    else log.Info("Nothing to approve for " + stem + ": no expired batches");
-                    return 0;
-                }
-                catch (Exception ex)
-                {
-                    log.Error("Deferred approve failed: " + match.Path, ex);
-                    return 1;
-                }
-                finally
-                {
-                    pipeline?.Dispose();
-                }
-            }
+                    var match = ResolveDeferredSource(cfg, target, log);
+                    if (match == null) return 1;
+                    var stem = DeferredFilePrefix(match);
 
-            log.Error("Unknown deferred verb '" + verb + "'");
-            return 1;
+            if (verb == "--deferred-check") return CheckDeferredHold(match, log, deferredDir, stem);
+            if (verb == "--reprove" || verb == "--deferred-cancel") return CancelDeferredHold(match, log, deferredDir, stem);
+            if (verb == "--deferred-approve") return await ApproveDeferredHoldAsync(match, cfg, log, stem);
+
+                    log.Error("Unknown deferred verb '" + verb + "'");
+                    return 1;
         }
+
+        static int ListDeferredHolds(TicTackConfig cfg, ILogger log, string deferredDir)
+        {
+                        var any = false;
+                        foreach (var src in cfg.Sources)
+                        {
+                            using var dd = new DeferredDeletion(deferredDir, DeferredFilePrefix(src), DeferredHoldDays(src), log);
+                            var batches = dd.GetBatchSummaries();
+                            if (batches.Count == 0) continue;
+                            any = true;
+                            var now = DateTime.UtcNow;
+                            var oldest = batches.Min(b => b.BlockedAt);
+                            log.Info(DeferredFilePrefix(src) + "  " + src.Path + "  batches=" + batches.Count
+                                + " files=" + batches.Sum(b => b.Files)
+                                + " oldest=" + FormatAge(now - oldest) + " ago"
+                                + " next=" + FormatNextDue(batches, DeferredHoldDays(src), now));
+                        }
+                        if (!any) log.Info("No deferred holds.");
+                        return 0;
+        }
+
+        static int CheckDeferredHold(SourceConfig match, ILogger log, string deferredDir, string stem)
+        {
+                        using var dd = new DeferredDeletion(deferredDir, stem, DeferredHoldDays(match), log);
+                        if (!dd.HasPending) log.Info("No deferred holds for " + stem);
+                        else dd.CheckWarnings();
+                        return 0;
+        }
+
+        static int CancelDeferredHold(SourceConfig match, ILogger log, string deferredDir, string stem)
+        {
+                        using var dd = new DeferredDeletion(deferredDir, stem, DeferredHoldDays(match), log);
+                        if (!dd.HasPending && !File.Exists(DeferredDbPath(deferredDir, match)))
+                        {
+                            log.Info("No deferred holds for " + stem);
+                            return 0;
+                        }
+                        try { dd.ClearStore("reprove"); }
+                        catch (IOException)
+                        {
+                            log.Error("Hold store is locked — stop the TicTackSv service first, then retry");
+                            return 1;
+                        }
+                        log.Info("Hold cancelled for " + stem + ", destination files kept");
+                        return 0;
+        }
+
+        static async Task<int> ApproveDeferredHoldAsync(SourceConfig match, TicTackConfig cfg, ILogger log, string stem)
+        {
+                        SyncPipeline? pipeline = null;
+                        try
+                        {
+                            pipeline = BuildPipeline(match, cfg, log);
+                            var (ran, proceeded, cancelled) = await pipeline.DrainExpiredAsync();
+                            if (!ran)
+                            {
+                                log.Error("Exclusive lock unavailable — stop the TicTackSv service first, then retry");
+                                return 1;
+                            }
+                            if (proceeded > 0) log.Warn("Deferred deletion: proceeding with " + proceeded + " files");
+                            else if (cancelled > 0) log.Info("Deferred deletion: cancelled, files reappeared");
+                            else log.Info("Nothing to approve for " + stem + ": no expired batches");
+                            return 0;
+                        }
+                        catch (Exception ex)
+                        {
+                            log.Error("Deferred approve failed: " + match.Path, ex);
+                            return 1;
+                        }
+                        finally
+                        {
+                            pipeline?.Dispose();
+                        }
+        }
+
 
         static void PrintVersion()
         {
@@ -737,84 +831,101 @@ namespace TicTack
         internal static int RunForget(TicTackConfig cfg, ILogger log, bool dryRun,
             string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly)
         {
-            RetentionPolicy? overrides = null;
-            if (keepLast != null || keepWithin != null || keepDaily != null || keepWeekly != null || keepMonthly != null)
-            {
-                overrides = new RetentionPolicy();
-                int? Num(string? raw, string flag)
-                {
-                    if (raw == null) return null;
-                    if (!int.TryParse(raw.Trim(), out var n) || n < 0)
-                        throw new InvalidOperationException("Invalid " + flag + " '" + raw + "' (use >= 0)");
-                    return n;
-                }
-                try
-                {
-                    overrides.KeepLast = Num(keepLast, "--keep-last");
-                    overrides.KeepDaily = Num(keepDaily, "--keep-daily");
-                    overrides.KeepWeekly = Num(keepWeekly, "--keep-weekly");
-                    overrides.KeepMonthly = Num(keepMonthly, "--keep-monthly");
-                    if (keepWithin != null)
-                    {
-                        if (!Config.TryParseDuration(keepWithin, out var within))
-                            throw new InvalidOperationException("Invalid --keep-within '" + keepWithin + "' (use 30d/12h)");
-                        overrides.KeepWithin = within;
-                    }
-                }
-                catch (InvalidOperationException ex)
-                {
-                    log.Error(ex.Message);
-                    return 1;
-                }
-            }
-
+            var (overrides, orc) = ParseForgetOverrides(keepLast, keepWithin, keepDaily, keepWeekly, keepMonthly, log);
+            if (orc != 0) return orc;
             var removedTotal = 0;
             var keptTotal = 0;
             foreach (var src in cfg.Sources)
             {
-                var vcfg = src.Sync?.Versioning;
-                if (vcfg == null || string.IsNullOrEmpty(vcfg.Path)) continue;
-                if (!Directory.Exists(vcfg.Path))
-                {
-                    log.Info("forget: no versions dir for " + src.Path);
-                    continue;
-                }
-                var policy = overrides ?? RetentionPolicy.FromConfig(vcfg, log);
-                if (policy.IsEmpty) policy = new RetentionPolicy { KeepLast = 10 };
-                try
-                {
-                    var groups = GroupVersions(vcfg.Path);
-                    foreach (var group in groups.Values)
-                    {
-                        var files = group.Select(e => new VersionFile(e.FullPath, e.Stamp, e.HasStamp, e.Pinned)).ToList();
-                        var kept = 0;
-                        foreach (var d in policy.Evaluate(files, DateTime.Now))
-                        {
-                            if (d.Keep) { kept++; continue; }
-                            if (dryRun)
-                                log.Info("would remove " + d.Path + " (" + d.Reason + ")");
-                            else
-                            {
-                                try { File.Delete(d.Path); removedTotal++; }
-                                catch (Exception ex) { log.Warn("forget: cannot delete " + d.Path + ": " + ex.Message); }
-                            }
-                        }
-                        keptTotal += kept;
-                        if (dryRun) log.Info("would keep " + kept + " version(s) of " + group[0].Display);
-                    }
-                    if (!dryRun)
-                    {
-                        foreach (var dir in groups.Values.SelectMany(g => g).Select(e => Path.GetDirectoryName(e.FullPath)).Distinct(StringComparer.Ordinal))
-                            if (dir != null) CopyAction.FlushDirectory(dir);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    log.Error("forget failed: " + src.Path, ex);
-                }
+                var (r, kept) = ForgetSourceVersions(src, overrides, dryRun, log);
+                removedTotal += r;
+                keptTotal += kept;
             }
             log.Info(dryRun ? "forget --dry-run: change nothing" : "forget: removed " + removedTotal + ", kept " + keptTotal);
             return 0;
+        }
+
+        internal static (RetentionPolicy? Overrides, int Rc) ParseForgetOverrides(
+            string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly, ILogger log)
+        {
+                RetentionPolicy? overrides = null;
+                if (keepLast != null || keepWithin != null || keepDaily != null || keepWeekly != null || keepMonthly != null)
+                {
+                    overrides = new RetentionPolicy();
+                    int? Num(string? raw, string flag)
+                    {
+                        if (raw == null) return null;
+                        if (!int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) || n < 0)
+                            throw new InvalidOperationException("Invalid " + flag + " '" + raw + "' (use >= 0)");
+                        return n;
+                    }
+                    try
+                    {
+                        overrides.KeepLast = Num(keepLast, "--keep-last");
+                        overrides.KeepDaily = Num(keepDaily, "--keep-daily");
+                        overrides.KeepWeekly = Num(keepWeekly, "--keep-weekly");
+                        overrides.KeepMonthly = Num(keepMonthly, "--keep-monthly");
+                        if (keepWithin != null)
+                        {
+                            if (!Config.TryParseDuration(keepWithin, out var within))
+                                throw new InvalidOperationException("Invalid --keep-within '" + keepWithin + "' (use 30d/12h)");
+                            overrides.KeepWithin = within;
+                        }
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        log.Error(ex.Message);
+                        return (null, 1);
+                    }
+                }
+            return (overrides, 0);
+        }
+
+        internal static (int Removed, int Kept) ForgetSourceVersions(SourceConfig src, RetentionPolicy? overrides, bool dryRun, ILogger log)
+        {
+            var removed = 0;
+            var keptTotal = 0;
+                    var vcfg = src.Sync?.Versioning;
+                    if (vcfg == null || string.IsNullOrEmpty(vcfg.Path)) return (removed, keptTotal);
+                    if (!Directory.Exists(vcfg.Path))
+                    {
+                        log.Info("forget: no versions dir for " + src.Path);
+                        return (removed, keptTotal);
+                    }
+                    var policy = overrides ?? RetentionPolicy.FromConfig(vcfg, log);
+                    if (policy.IsEmpty) policy = new RetentionPolicy { KeepLast = 10 };
+                    try
+                    {
+                        var groups = GroupVersions(vcfg.Path);
+                        foreach (var group in groups.Values)
+                        {
+                            var files = group.Select(e => new VersionFile(e.FullPath, e.Stamp, e.HasStamp, e.Pinned)).ToList();
+                            var kept = 0;
+                            foreach (var d in policy.Evaluate(files, DateTime.Now))
+                            {
+                                if (d.Keep) { kept++; continue; }
+                                if (dryRun)
+                                    log.Info("would remove " + d.Path + " (" + d.Reason + ")");
+                                else
+                                {
+                                    try { File.Delete(d.Path); removed++; }
+                                    catch (Exception ex) { log.Warn("forget: cannot delete " + d.Path + ": " + ex.Message); }
+                                }
+                            }
+                            keptTotal += kept;
+                            if (dryRun) log.Info("would keep " + kept + " version(s) of " + group[0].Display);
+                        }
+                        if (!dryRun)
+                        {
+                            foreach (var dir in groups.Values.SelectMany(g => g).Select(e => Path.GetDirectoryName(e.FullPath)).Distinct(StringComparer.Ordinal))
+                                if (dir != null) CopyAction.FlushDirectory(dir);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error("forget failed: " + src.Path, ex);
+                    }
+            return (removed, keptTotal);
         }
 
         internal sealed class VersionEntry
@@ -874,7 +985,7 @@ namespace TicTack
             int? latest = null;
             if (latestRaw != null)
             {
-                if (!int.TryParse(latestRaw.Trim(), out var n) || n < 1)
+                if (!int.TryParse(latestRaw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) || n < 1)
                 {
                     log.Error("Invalid --latest '" + latestRaw + "' (use >= 1)");
                     return 1;
@@ -912,7 +1023,7 @@ namespace TicTack
                 for (int i = 0; i < rows.Count; i++)
                 {
                     var (source, e) = rows[i];
-                    var stamp = e.HasStamp ? "\"" + e.Stamp.ToString("yyyy-MM-ddTHH:mm:ss") + "\"" : "null";
+                    var stamp = e.HasStamp ? "\"" + e.Stamp.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture) + "\"" : "null";
                     Console.WriteLine("  {\"source\": \"" + JsonEscape(source) + "\", \"file\": \"" + JsonEscape(e.Display)
                         + "\", \"timestamp\": " + stamp + ", \"size\": " + e.Size
                         + ", \"pinned\": " + (e.Pinned ? "true" : "false") + "}" + (i + 1 < rows.Count ? "," : ""));
@@ -924,7 +1035,7 @@ namespace TicTack
                 if (rows.Count == 0) log.Info("No versions found.");
                 foreach (var (_, e) in rows)
                 {
-                    var stamp = e.HasStamp ? e.Stamp.ToString("yyyy-MM-dd HH:mm:ss") : "-";
+                    var stamp = e.HasStamp ? e.Stamp.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : "-";
                     log.Info(stamp + "  " + FormatSize(e.Size).PadLeft(9) + "  " + e.Display + (e.Pinned ? "  [pinned]" : ""));
                 }
             }
@@ -981,23 +1092,7 @@ namespace TicTack
         // the same versions. Null = hard error (message already logged).
         internal static List<string>? ResolvePinTargets(TicTackConfig cfg, string spec, ILogger log)
         {
-            if (File.Exists(spec))
-            {
-                var full = Path.GetFullPath(spec);
-                foreach (var src in cfg.Sources)
-                {
-                    var vpath = src.Sync?.Versioning?.Path;
-                    if (string.IsNullOrEmpty(vpath)) continue;
-                    var root = Path.GetFullPath(vpath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-                    var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-                    if (full.StartsWith(root, cmp)
-                        && !full.EndsWith(".pinned", StringComparison.Ordinal)
-                        && !full.EndsWith(".tictack.tmp", StringComparison.Ordinal))
-                        return new List<string> { full };
-                }
-                log.Error("Not a version file: " + spec);
-                return null;
-            }
+            if (File.Exists(spec)) return ResolvePinDirectFile(cfg, spec, log);
             var at = spec.LastIndexOf('@');
             if (at < 0)
             {
@@ -1024,7 +1119,7 @@ namespace TicTack
                     foreach (var e in group)
                     {
                         if (!e.HasStamp) continue;
-                        if (!e.Stamp.ToString("yyyyMMddHHmmssfff").StartsWith(tsPrefix, StringComparison.Ordinal))
+                        if (!e.Stamp.ToString("yyyyMMddHHmmssfff", CultureInfo.InvariantCulture).StartsWith(tsPrefix, StringComparison.Ordinal))
                             continue;
                         if (pattern.Length > 0 && !MatchesFileFilter(e.Display, pattern))
                             continue;
@@ -1033,6 +1128,24 @@ namespace TicTack
                 }
             }
             return hits;
+        }
+
+        internal static List<string>? ResolvePinDirectFile(TicTackConfig cfg, string spec, ILogger log)
+        {
+            var full = Path.GetFullPath(spec);
+            foreach (var src in cfg.Sources)
+            {
+                var vpath = src.Sync?.Versioning?.Path;
+                if (string.IsNullOrEmpty(vpath)) continue;
+                var root = Path.GetFullPath(vpath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                if (full.StartsWith(root, cmp)
+                    && !full.EndsWith(".pinned", StringComparison.Ordinal)
+                    && !full.EndsWith(".tictack.tmp", StringComparison.Ordinal))
+                    return new List<string> { full };
+            }
+            log.Error("Not a version file: " + spec);
+            return null;
         }
 
         internal static bool WildcardMatch(string text, string pattern)
@@ -1062,9 +1175,9 @@ namespace TicTack
         internal static string FormatSize(long bytes)
         {
             if (bytes < 1024) return bytes + " B";
-            if (bytes < 1024L * 1024) return (bytes / 1024.0).ToString("0.0") + " KB";
-            if (bytes < 1024L * 1024 * 1024) return (bytes / (1024.0 * 1024)).ToString("0.0") + " MB";
-            return (bytes / (1024.0 * 1024 * 1024)).ToString("0.0") + " GB";
+            if (bytes < 1024L * 1024) return (bytes / 1024.0).ToString("0.0", CultureInfo.InvariantCulture) + " KB";
+            if (bytes < 1024L * 1024 * 1024) return (bytes / (1024.0 * 1024)).ToString("0.0", CultureInfo.InvariantCulture) + " MB";
+            return (bytes / (1024.0 * 1024 * 1024)).ToString("0.0", CultureInfo.InvariantCulture) + " GB";
         }
 
         internal static string JsonEscape(string s) =>
@@ -1257,30 +1370,28 @@ namespace TicTack
             var versioning = VersioningFactory.Create(src.Sync != null ? src.Sync.Versioning : null, src.Destination, log);
             var deletion = DeletionStrategyFactory.Create(src.Sync != null ? src.Sync.Deletion : null, src.Destination);
 
-            var durability = FileDurability.Full;
-            if (src.Sync != null)
-            {
-                if (string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.RenameOnly;
-                else if (string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.FDataSync;
-            }
+            var durability = ParseDurability(src);
+
             var copyAction = new CopyAction(accessor, durability, log);
             var renameAction = new RenameAction(deletion, log);
 
-            StateDb? stateDb = null;
-            try
-            {
-                var dbPath = GetStateDbPath(src);
-                stateDb = new StateDb(dbPath, log);
-            }
-            catch (Exception ex)
-            {
-                log.Warn("StateDB init failed, continuing without: " + ex.Message);
-            }
+            var stateDb = OpenStateDbOrNull(src, log);
 
-            IFileMonitor monitor;
-            List<IFileMonitor>? compositeMembers = null;
             var monitorConfig = cfg.Monitor ?? new MonitorConfig();
-            IFileAccessor CreateAccessorOrFallback(SourceConfig s, ILogger l)
+            var (monitor, compositeMembers) = CreateMonitor(monitorConfig, src, stateDb, log, logMonitorStartup);
+
+            var (excludes, deferredDir, deferredPrefix) = ResolveSourcePaths(src, cfg, log);
+
+            var pipeline = new SyncPipeline(src, monitor, comparer, copyAction, renameAction,
+                retry, validator, versioning, deletion, log, stateDb,
+                autoExcludePrefixes: excludes,
+                deferredDir: deferredDir,
+                deferredFilePrefix: deferredPrefix);
+            WireGapRescan(compositeMembers, pipeline);
+            return pipeline;
+        }
+
+        private static IFileAccessor CreateAccessorOrFallback(SourceConfig s, ILogger l)
             {
                 if (!string.Equals(s.Sync != null ? s.Sync.FileAccess : null, "vss", StringComparison.OrdinalIgnoreCase))
                     return new FileAccessor();
@@ -1301,10 +1412,12 @@ namespace TicTack
                     return new FileAccessor();
                 }
             }
-            IFileMonitor CreateWatcher() => OperatingSystem.IsWindows()
-                ? new FileWatcherMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds)
-                : new FsWatchMonitor(src.Path, monitorConfig.WatcherBufferKb, monitorConfig.RestartDelaySeconds);
-            IFileMonitor? TryCreateUsn(string fallbackMsg)
+
+        internal static IFileMonitor CreateWatcher(string path, MonitorConfig mc) => OperatingSystem.IsWindows()
+            ? new FileWatcherMonitor(path, mc.WatcherBufferKb, mc.RestartDelaySeconds)
+            : new FsWatchMonitor(path, mc.WatcherBufferKb, mc.RestartDelaySeconds);
+
+        internal static IFileMonitor? TryCreateUsn(string path, MonitorConfig mc, StateDb? stateDb, ILogger log, string fallbackMsg)
             {
                 if (!OperatingSystem.IsWindows())
                 {
@@ -1313,7 +1426,7 @@ namespace TicTack
                 }
                 try
                 {
-                    var m = new UsnJournalMonitor(src.Path, monitorConfig.RestartDelaySeconds, monitorConfig.UsnPollIntervalMs, monitorConfig.UsnParentPrefilter, log, monitorConfig.UsnResolveGap, monitorConfig.UsnCheckpoint, stateDb);
+                    var m = new UsnJournalMonitor(path, mc.RestartDelaySeconds, mc.UsnPollIntervalMs, mc.UsnParentPrefilter, log, mc.UsnResolveGap, mc.UsnCheckpoint, stateDb);
                     m.ProbeVolume();
                     return m;
                 }
@@ -1323,74 +1436,109 @@ namespace TicTack
                     return null;
                 }
             }
-            IFileMonitor CreateUsnOrFallback()
-            {
-                return TryCreateUsn("falling back to watcher") ?? CreateWatcher();
-            }
-            switch (monitorConfig.Type != null ? monitorConfig.Type.ToLowerInvariant() : "")
-            {
-                case "watcher":
-                    monitor = CreateWatcher();
-                    if (logMonitorStartup)
-                        log.Info("Syncing: " + SourceName(src) + " (watcher).");
-                    break;
-                case "usn":
-                    monitor = CreateUsnOrFallback();
-                    if (logMonitorStartup)
-                        log.Info("Syncing: " + SourceName(src) + (monitor is UsnJournalMonitor ? " (usn)." : " (watcher, USN unavailable)."));
-                    break;
-                case "polling":
-                    monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
-                    if (logMonitorStartup)
-                        log.Info("Syncing: " + SourceName(src) + " (polling every " + monitorConfig.PollingIntervalSeconds + "s).");
-                    break;
-                default:
-                    compositeMembers = BuildCompositeMembers(
-                        monitorConfig, src.Path, CreateWatcher, () => TryCreateUsn("skipping USN member"));
-                    monitor = new CompositeMonitor(compositeMembers.ToArray());
-                    if (logMonitorStartup)
-                        log.Info("Syncing: " + SourceName(src) + " (composite: " + string.Join(" + ", compositeMembers.Select(MemberShortName)) + ").");
-                    break;
-            }
 
-            var sep = Path.DirectorySeparatorChar;
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + sep;
-            var srcDir = src.Path.TrimEnd('\\', '/') + sep;
-            var excludes = new List<string>();
-            if (baseDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase))
-                excludes.Add(baseDir);
-            var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
-                ? Path.Combine(baseDir, "tictack.log")
-                : cfg.Logging.Path;
-            var logDir = (Path.GetDirectoryName(logPath) ?? baseDir).TrimEnd('\\', '/') + sep;
-            if (logDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase) && !excludes.Contains(logDir))
-                excludes.Add(logDir);
+        internal static IFileMonitor CreateUsnOrFallback(string path, MonitorConfig mc, StateDb? stateDb, ILogger log)
+        {
+            return TryCreateUsn(path, mc, stateDb, log, "falling back to watcher") ?? CreateWatcher(path, mc);
+        }
 
-            var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
-            var deferredPrefix = DeferredFilePrefix(src);
-            var legacyDeferred = Path.Combine(src.Destination, ".tictack-deferred.json");
-            try
-            {
-                // Old dest-side single file moves to the legacy per-source
-                // name; DeferredDeletion migrates it into the hold database.
-                var legacyTarget = Path.Combine(deferredDir, LegacyDeferredFileName(src));
-                // Legacy dest file first: short-circuits before any directory
-                // enumeration on fresh installs.
-                if (File.Exists(legacyDeferred) && !File.Exists(legacyTarget)
-                    && Directory.EnumerateFiles(deferredDir, deferredPrefix + "-*.json").FirstOrDefault() == null)
+        internal static FileDurability ParseDurability(SourceConfig src)
+        {
+                var durability = FileDurability.Full;
+                if (src.Sync != null)
                 {
-                    if (!Directory.Exists(deferredDir))
-                        Directory.CreateDirectory(deferredDir);
-                    File.Move(legacyDeferred, legacyTarget);
+                    if (string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.RenameOnly;
+                    else if (string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.FDataSync;
                 }
-            }
-            catch (Exception ex) { log.Warn("Legacy deferred-state migration failed: " + ex.Message); }
+            return durability;
+        }
 
-            var pipeline = new SyncPipeline(src, monitor, comparer, copyAction, renameAction,
-                retry, validator, versioning, deletion, log, stateDb,
-                autoExcludePrefixes: excludes.ToArray(),
-                deferredDir: deferredDir,
-                deferredFilePrefix: deferredPrefix);
+        internal static StateDb? OpenStateDbOrNull(SourceConfig src, ILogger log)
+        {
+                StateDb? stateDb = null;
+                try
+                {
+                    var dbPath = GetStateDbPath(src);
+                    stateDb = new StateDb(dbPath, log);
+                }
+                catch (Exception ex)
+                {
+                    log.Warn("StateDB init failed, continuing without: " + ex.Message);
+                }
+            return stateDb;
+        }
+
+        internal static (string[] Excludes, string DeferredDir, string DeferredPrefix) ResolveSourcePaths(SourceConfig src, TicTackConfig cfg, ILogger log)
+        {
+                var sep = Path.DirectorySeparatorChar;
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/') + sep;
+                var srcDir = src.Path.TrimEnd('\\', '/') + sep;
+                var excludes = new List<string>();
+                if (baseDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase))
+                    excludes.Add(baseDir);
+                var logPath = string.IsNullOrEmpty(cfg.Logging.Path)
+                    ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tictack.log")
+                    : cfg.Logging.Path;
+                var logDir = (Path.GetDirectoryName(logPath) ?? baseDir).TrimEnd('\\', '/') + sep;
+                if (logDir.StartsWith(srcDir, StringComparison.OrdinalIgnoreCase) && !excludes.Contains(logDir))
+                    excludes.Add(logDir);
+                var deferredDir = Path.GetDirectoryName(logPath) ?? baseDir;
+                var deferredPrefix = DeferredFilePrefix(src);
+                var legacyDeferred = Path.Combine(src.Destination, ".tictack-deferred.json");
+                try
+                {
+                    // Old dest-side single file moves to the legacy per-source
+                    // name; DeferredDeletion migrates it into the hold database.
+                    var legacyTarget = Path.Combine(deferredDir, LegacyDeferredFileName(src));
+                    // Legacy dest file first: short-circuits before any directory
+                    // enumeration on fresh installs.
+                    if (File.Exists(legacyDeferred) && !File.Exists(legacyTarget)
+                        && Directory.EnumerateFiles(deferredDir, deferredPrefix + "-*.json").FirstOrDefault() == null)
+                    {
+                        if (!Directory.Exists(deferredDir))
+                            Directory.CreateDirectory(deferredDir);
+                        File.Move(legacyDeferred, legacyTarget);
+                    }
+                }
+                catch (Exception ex) { log.Warn("Legacy deferred-state migration failed: " + ex.Message); }
+            return (excludes.ToArray(), deferredDir, deferredPrefix);
+        }
+
+        internal static (IFileMonitor Monitor, List<IFileMonitor>? CompositeMembers) CreateMonitor(
+            MonitorConfig monitorConfig, SourceConfig src, StateDb? stateDb, ILogger log, bool logMonitorStartup)
+        {
+                IFileMonitor monitor;
+                List<IFileMonitor>? compositeMembers = null;
+                switch (monitorConfig.Type != null ? monitorConfig.Type.ToLowerInvariant() : "")
+                {
+                    case "watcher":
+                        monitor = CreateWatcher(src.Path, monitorConfig);
+                        if (logMonitorStartup)
+                            log.Info("Syncing: " + SourceName(src) + " (watcher).");
+                        break;
+                    case "usn":
+                        monitor = CreateUsnOrFallback(src.Path, monitorConfig, stateDb, log);
+                        if (logMonitorStartup)
+                            log.Info("Syncing: " + SourceName(src) + (monitor is UsnJournalMonitor ? " (usn)." : " (watcher, USN unavailable)."));
+                        break;
+                    case "polling":
+                        monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
+                        if (logMonitorStartup)
+                            log.Info("Syncing: " + SourceName(src) + " (polling every " + monitorConfig.PollingIntervalSeconds + "s).");
+                        break;
+                    default:
+                        compositeMembers = BuildCompositeMembers(
+                            monitorConfig, src.Path, () => CreateWatcher(src.Path, monitorConfig), () => TryCreateUsn(src.Path, monitorConfig, stateDb, log, "skipping USN member"));
+                        monitor = new CompositeMonitor(compositeMembers.ToArray());
+                        if (logMonitorStartup)
+                            log.Info("Syncing: " + SourceName(src) + " (composite: " + string.Join(" + ", compositeMembers.Select(MemberShortName)) + ").");
+                        break;
+                }
+            return (monitor, compositeMembers);
+        }
+
+        internal static void WireGapRescan(List<IFileMonitor>? compositeMembers, SyncPipeline pipeline)
+        {
             // Gap-triggered covering scans: watcher overflows and USN
             // re-baselines fire GapDetected; the pipeline answers with an
             // on-demand scan (creates + modifies + deletes, nothing
@@ -1403,7 +1551,6 @@ namespace TicTack
                         gap.GapDetected += (s, e) => { try { _ = pipeline.RequestRescanAsync(); } catch { } };
                 }
             }
-            return pipeline;
         }
     }
 }

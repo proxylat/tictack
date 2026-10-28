@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.IO;
 using System.Threading;
@@ -53,9 +54,9 @@ namespace TicTack
                         // re-cleans), so a failed sync never fails the clean.
                         if (!CopyAction.FlushDirectory(Path.GetDirectoryName(tmp)))
                             log.Debug("PowerGuard: directory sync failed after cleaning " + Path.GetFileName(tmp));
-                        log.Warn(string.Format("Cleaned stale temp {0}", Path.GetFileName(tmp)));
+                        log.Warn(string.Format(CultureInfo.InvariantCulture, "Cleaned stale temp {0}", Path.GetFileName(tmp)));
                     }
-                    catch (Exception ex) { log.Warn(string.Format("Could not clean {0}: {1}", Path.GetFileName(tmp), ex.Message)); }
+                    catch (Exception ex) { log.Warn(string.Format(CultureInfo.InvariantCulture, "Could not clean {0}: {1}", Path.GetFileName(tmp), ex.Message)); }
                 }
             }
             catch (UnauthorizedAccessException ex)
@@ -79,14 +80,14 @@ namespace TicTack
                     File.Move(tmp, dest);
                     // Same barrier for the crash-recovery commit itself.
                     CopyAction.FlushDirectory(Path.GetDirectoryName(dest));
-                    log.Warn(string.Format("Recovered {0} from validated temp", Path.GetFileName(dest)));
+                    log.Warn(string.Format(CultureInfo.InvariantCulture, "Recovered {0} from validated temp", Path.GetFileName(dest)));
                     return;
                 }
                 catch (Exception ex)
                 {
                     if (attempt >= 15)
                     {
-                        log.Warn(string.Format("PowerGuard: could not recover {0}: {1} (temp kept for next startup)", Path.GetFileName(dest), ex.Message));
+                        log.Warn(string.Format(CultureInfo.InvariantCulture, "PowerGuard: could not recover {0}: {1} (temp kept for next startup)", Path.GetFileName(dest), ex.Message));
                         return;
                     }
                     Thread.Sleep(200);

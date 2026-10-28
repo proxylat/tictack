@@ -6,28 +6,31 @@
 [*.cs]
 
 # Grouped files are the convention (Interfaces.cs, Comparer.cs, ...).
-dotnet_diagnostic.MA0048.severity = none # File name must match type name
+dotnet_diagnostic.MA0048.severity = suggestion # File name must match type name
 
 # No SynchronizationContext in a service; ConfigureAwait everywhere is noise.
-dotnet_diagnostic.MA0004.severity = none # Use Task.ConfigureAwait
+dotnet_diagnostic.MA0004.severity = suggestion # Use Task.ConfigureAwait
 
 # string == is already ordinal; string.Equals adds nothing.
-dotnet_diagnostic.MA0006.severity = none # Use string.Equals instead of ==/!=
+dotnet_diagnostic.MA0006.severity = suggestion # Use string.Equals instead of ==/!=
 
 # InvariantGlobalization=true: current culture IS invariant, so the
-# IFormatProvider overloads change no behavior.
-dotnet_diagnostic.MA0011.severity = none # Format/ToString/TryParse provider
+# IFormatProvider overloads change no behavior. Suggestion keeps the signal
+# without gating the build.
+dotnet_diagnostic.MA0011.severity = warning # Format/ToString/TryParse provider
 
-# YAML models expose List<T>; the serializer owns that surface.
-dotnet_diagnostic.MA0016.severity = none # Collection abstraction over impl
+# YAML models expose List<T>; the serializer owns that surface. Suggestion
+# keeps new public API visible without churning DTOs.
+dotnet_diagnostic.MA0016.severity = warning # Collection abstraction over impl
 
-# Method length is a review concern, not a build gate.
-dotnet_diagnostic.MA0051.severity = none # Method is too long
+# Method length is a review concern, not a build gate. Suggestion surfaces
+# Pipeline:448/Cli:161/Parse:110 for refactor without failing CI.
+dotnet_diagnostic.MA0051.severity = warning # Method is too long
 
 # Lock modernization without a contention profile to justify touching
 # locking code. Revisit if pstacks/syncblk ever implicate a lock.
-dotnet_diagnostic.MA0158.severity = none # Use System.Threading.Lock
+dotnet_diagnostic.MA0158.severity = suggestion # Use System.Threading.Lock
 
 # CompositeMonitor re-raises child events with the ORIGINAL sender on
 # purpose, so subscribers keep the true origin.
-dotnet_diagnostic.MA0091.severity = none # Sender should be 'this'
+dotnet_diagnostic.MA0091.severity = suggestion # Sender should be 'this'

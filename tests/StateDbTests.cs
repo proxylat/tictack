@@ -56,12 +56,12 @@ public class StateDbTests : IDisposable
     [Fact]
     public async Task UpsertBatch_RoundTripsAndOverwrites()
     {
-        _db.UpsertBatch(new[]
+        await _db.UpsertBatchAsync(new[]
         {
             (path: "file1.txt", size: 100L, mtime: 1000L),
             (path: "file2.txt", size: 200L, mtime: 2000L)
         });
-        _db.UpsertBatch(new[]
+        await _db.UpsertBatchAsync(new[]
         {
             (path: "file1.txt", size: 300L, mtime: 3000L)
         });
@@ -190,10 +190,10 @@ public class StateDbTests : IDisposable
     [Fact]
     public async Task Reconnect_AfterConnectionBreak_RoundTrips()
     {
-        _db.UpsertBatch(new[] { ("keep.txt", 5L, 50L) });
+        await _db.UpsertBatchAsync(new[] { ("keep.txt", 5L, 50L) });
         BreakConnection();
 
-        _db.UpsertBatch(new[] { ("after.txt", 6L, 60L) });
+        await _db.UpsertBatchAsync(new[] { ("after.txt", 6L, 60L) });
 
         var all = await _db.GetStatesAsync(new[] { "keep.txt", "after.txt" });
         Assert.Equal((5L, 50L), all["keep.txt"]);
@@ -214,14 +214,14 @@ public class StateDbTests : IDisposable
     }
 
     [Fact]
-    public void AfterDispose_OperationsThrowObjectDisposed()
+    public async Task AfterDispose_OperationsThrowObjectDisposed()
     {
         _db.Dispose();
         _db.Dispose();
 
         var clearEx = Assert.Throws<ObjectDisposedException>(() => _db.Clear());
         Assert.Equal(nameof(StateDb), clearEx.ObjectName);
-        var batchEx = Assert.Throws<ObjectDisposedException>(() => _db.UpsertBatch(new[] { ("a.txt", 1L, 10L) }));
+        var batchEx = await Assert.ThrowsAsync<ObjectDisposedException>(() => _db.UpsertBatchAsync(new[] { ("a.txt", 1L, 10L) }));
         Assert.Equal(nameof(StateDb), batchEx.ObjectName);
     }
 

@@ -489,9 +489,9 @@ logging:
     }
 
     [Fact]
-    public void LockWaitSeconds_DefaultsTo600()
+    public void LockWaitSeconds_DefaultsTo60()
     {
-        Assert.Equal(600, new SyncConfig().LockWaitSeconds);
+        Assert.Equal(60, new SyncConfig().LockWaitSeconds);
     }
 
     [Fact]

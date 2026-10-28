@@ -195,15 +195,15 @@ namespace TicTack
         }
 
         // Unknown identity: seed callers that have no file_id/ctime/hash.
-        public void UpsertBatch(IEnumerable<(string path, long size, long mtime)> entries) =>
-            UpsertBatch(entries.Select(e => (e.path, e.size, e.mtime, (string?)null, 0L, (string?)null)));
+        public Task UpsertBatchAsync(IEnumerable<(string path, long size, long mtime)> entries, CancellationToken token = default) =>
+            UpsertBatchAsync(entries.Select(e => (e.path, e.size, e.mtime, (string?)null, 0L, (string?)null)), token);
 
-        public void UpsertBatch(IEnumerable<(string path, long size, long mtime, string? fileId, long ctime, string? hash)> entries)
+        public async Task UpsertBatchAsync(IEnumerable<(string path, long size, long mtime, string? fileId, long ctime, string? hash)> entries, CancellationToken token = default)
         {
-            Enter();
+            await EnterAsync().ConfigureAwait(false);
             try
             {
-                EnsureConnected();
+                await EnsureConnectedAsync().ConfigureAwait(false);
                 using (var tx = _conn.BeginTransaction())
                 using (var cmd = _conn.CreateCommand())
                 {
@@ -223,7 +223,7 @@ namespace TicTack
                         fileId.Value = (object?)entry.fileId ?? DBNull.Value;
                         ctime.Value = entry.ctime;
                         hash.Value = (object?)entry.hash ?? DBNull.Value;
-                        cmd.ExecuteNonQuery();
+                        await cmd.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                     }
                     tx.Commit();
                 }
@@ -273,7 +273,7 @@ namespace TicTack
         // Callers must confirm size+mtime and that the old source path is
         // gone — NTFS MFT indexes (and inode numbers) can be reused after
         // deletion, so an ID match alone never proves a rename.
-        public async Task<List<(string path, long size, long mtime)>> FindByFileIdAsync(string fileId)
+        public async Task<IReadOnlyList<(string path, long size, long mtime)>> FindByFileIdAsync(string fileId)
         {
             await EnterAsync().ConfigureAwait(false);
             try
@@ -423,7 +423,7 @@ namespace TicTack
             finally { _gate.Release(); }
         }
 
-        public async Task<Dictionary<string, (long size, long mtime)>> GetStatesAsync(IEnumerable<string> paths)
+        public async Task<IDictionary<string, (long size, long mtime)>> GetStatesAsync(IEnumerable<string> paths)
         {
             var result = new Dictionary<string, (long size, long mtime)>(StringComparer.OrdinalIgnoreCase);
             var batch = new List<string>(500);
@@ -483,7 +483,7 @@ namespace TicTack
 
         // Bounded random sample for proof-by-restore: index-only scan,
         // result capped at count. Monthly cadence, never a hot path.
-        public async Task<List<string>> GetRandomPathsAsync(int count)
+        public async Task<IReadOnlyList<string>> GetRandomPathsAsync(int count)
         {
             var paths = new List<string>();
             if (count <= 0) return paths;

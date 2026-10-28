@@ -5,7 +5,7 @@ using System.Linq;
 
 namespace TicTack
 {
-    public class CompositeFilter : IFileFilter
+    public sealed class CompositeFilter : IFileFilter
     {
         private readonly IFileFilter[] _filters;
         public CompositeFilter(IEnumerable<IFileFilter> filters)
@@ -61,7 +61,7 @@ namespace TicTack
         {
             if (_patterns.Length == 0) return true;
             var fileName = Path.GetFileName(fullPath);
-            var normPath = _anyPathPattern ? fullPath.Replace('\\', '/') : null;
+            var normPath = _anyPathPattern && fullPath.Contains('\\') ? fullPath.Replace('\\', '/') : fullPath;
             foreach (var p in _patterns)
             {
                 if (MatchWildcard(p.Value, fileName)) return false;
@@ -96,7 +96,7 @@ namespace TicTack
         }
     }
 
-    public class PathPrefixFilter : IFileFilter
+    public sealed class PathPrefixFilter : IFileFilter
     {
         private readonly string[] _prefixes;
         // Windows paths are case-insensitive; Linux is not.

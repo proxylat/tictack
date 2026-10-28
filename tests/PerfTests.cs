@@ -315,7 +315,7 @@ public sealed class PerfTests
                 rows.Add((p, i * 1024L, 637000000000000000L + i));
                 keys.Add(p);
             }
-            db.UpsertBatch(rows);
+            await db.UpsertBatchAsync(rows);
 
             var allocBefore = GC.GetTotalAllocatedBytes(true);
             var all = await db.GetStatesAsync(keys);

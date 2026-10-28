@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -32,7 +33,7 @@ namespace TicTack
         {
             var orig = Console.ForegroundColor;
             Console.ForegroundColor = color;
-            Console.WriteLine("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg);
+            Console.WriteLine("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] [" + level + "] " + msg);
             Console.ForegroundColor = orig;
         }
     }
@@ -144,7 +145,7 @@ namespace TicTack
                     Rotate();
                     EnsureOpenLocked();
                 }
-                var line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg + Environment.NewLine;
+                var line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] [" + level + "] " + msg + Environment.NewLine;
                 _writer!.Write(line);
                 _unflushedBytes += Encoding.UTF8.GetByteCount(line);
                 if (_unflushedBytes >= FlushThresholdBytes
@@ -260,7 +261,7 @@ namespace TicTack
             {
                 try
                 {
-                    var today = now.ToString("yyyy-MM-dd");
+                    var today = now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
                     if (today != _day)
                     {
                         var prev = _path + ".1";
@@ -269,7 +270,7 @@ namespace TicTack
                         _day = today;
                     }
                     File.AppendAllText(_path,
-                        "[" + now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + level + "] " + msg + Environment.NewLine);
+                        "[" + now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] [" + level + "] " + msg + Environment.NewLine);
                 }
                 catch { }
             }
@@ -277,9 +278,9 @@ namespace TicTack
 
         private static string LastWriteDay(string path)
         {
-            try { if (File.Exists(path)) return File.GetLastWriteTime(path).ToString("yyyy-MM-dd"); }
+            try { if (File.Exists(path)) return File.GetLastWriteTime(path).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture); }
             catch { }
-            return DateTime.Now.ToString("yyyy-MM-dd");
+            return DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         }
     }
 

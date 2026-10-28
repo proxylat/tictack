@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
@@ -10,7 +11,7 @@ using System.Threading.Tasks;
 
 namespace TicTack
 {
-    public class SyncPipeline : IDisposable
+    public sealed class SyncPipeline : IDisposable
     {
         private readonly SourceConfig _config;
         private readonly IFileMonitor _monitor;
@@ -22,8 +23,8 @@ namespace TicTack
         private readonly IVersioningStrategy _versioning;
         private readonly IDeletionStrategy _deletion;
         private readonly ILogger _log;
-        private readonly IFileFilter? _filter;
-        private readonly IDisposable? _queueCounter;
+        private IFileFilter? _filter;
+        private IDisposable? _queueCounter;
         private readonly IDisposable? _holdCounter;
 
         private static readonly StringComparer PathComparer =
@@ -48,19 +49,19 @@ namespace TicTack
         private Timer? _deferredCheckTimer;
         private SrcLock? _lock;
         private TimeSpan? _lockTimeout;
-        private readonly ChurnMonitor _churn;
+        private ChurnMonitor _churn = null!; // assigned in InitSyncState before use
         private bool _churnArmed;
         private readonly StateDb? _stateDb;
         private readonly DeferredDeletion _deferred;
-        private readonly TrackedDeleter _deleter;
-        private readonly ParityScanner _parityScanner;
-        private readonly Scrubber _scrubber;
+        private TrackedDeleter _deleter = null!; // assigned in InitCompleter before use
+        private ParityScanner _parityScanner = null!; // assigned in InitCompleter before use
+        private Scrubber _scrubber = null!; // assigned in InitSyncState before use
         private readonly Func<string, bool> _directoryExists;
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateFiles;
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateDirectories;
         private readonly Func<string, bool> _driveReady;
-        private readonly DeletionGuard _deletions;
-        private readonly FileCompleter? _completer;
+        private DeletionGuard _deletions = null!; // assigned in InitSyncState before use
+        private FileCompleter? _completer;
         private Timer? _parityTimer;
         private EventHandler<MonitorErrorEventArgs>? _monitorErrorHandler;
         private EventHandler? _monitorGapHandler;
@@ -71,9 +72,9 @@ namespace TicTack
         // Full routine-check cadence store (own JobRunStore, own file): last
         // date a full content re-verify completed. Null when
         // FullRoutineCheckDays <= 0.
-        private readonly JobRunStore? _verifyStore;
-        private readonly string _verifyKey;
-        private readonly string _restoreKey;
+        private JobRunStore? _verifyStore;
+        private string _verifyKey = null!; // assigned in InitVerifyStore before use
+        private string _restoreKey = null!; // assigned in InitVerifyStore before use
         public SyncPipeline(
             SourceConfig config,
             IFileMonitor monitor,
@@ -114,22 +115,7 @@ namespace TicTack
             // Hash-during-copy: only the real CopyAction paired with a HashValidator
             // can produce a trusted copy-time hash. Test wrappers (RecordingAction)
             // leave the flag off and take the classic double-read fallback below.
-            if (copyAction is CopyAction copy && validator is HashValidator) copy.ComputeSourceHash = true;
-            // Pipelined completion: the completer owns flush -> rename ->
-            // validate -> upsert on one thread; workers only copy. Capacity
-            // is derived from the worker count (2x) for backpressure. Test
-            // wrappers (RecordingAction) stay inline — same fallback shape
-            // as the hash flag above.
-            _completer = _config.Sync != null
-                && string.Equals(_config.Sync.CompleteMode, "pipelined", StringComparison.OrdinalIgnoreCase)
-                && copyAction is CopyAction realCopy
-                ? new FileCompleter(realCopy, validator, log, 2 * Math.Max(1, _config.Sync.InitialSyncWorkers))
-                : null;
-            // Capture the queue itself, not `this`: a constructor that throws
-            // after this point would otherwise leak the whole pipeline through
-            // the static EventSource's counter callback.
-            var pendingEvents = _pendingEvents;
-            _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(_config.Path, () => pendingEvents.Count);
+            InitCompleter(copyAction, validator, log);
 
             var holdDays = _config.Sync != null && _config.Sync.DeleteHoldDays > 0 ? _config.Sync.DeleteHoldDays : SyncConfig.DefaultDeleteHoldDays;
             _deferred = new DeferredDeletion(
@@ -141,55 +127,14 @@ namespace TicTack
             var deferred = _deferred;
             _holdCounter = TicTackEventSource.Log.RegisterHoldCounter(() => (double)deferred.PendingCount);
 
-            var filters = new List<IFileFilter>();
-            if (_config.Filter != null && _config.Filter.Exclude != null && _config.Filter.Exclude.Count > 0)
-                filters.Add(new PatternFilter(_config.Filter.Exclude.ToArray()));
-            if (autoExcludePrefixes != null && autoExcludePrefixes.Length > 0)
-                filters.Add(new PathPrefixFilter(autoExcludePrefixes));
-            long? maxSize = _config.Filter != null ? Config.ParseFileSizeLimit(_config.Filter.MaxFileSizeMb) : null;
-            if (maxSize.HasValue && maxSize.Value > 0)
-                filters.Add(new SizeFilter(maxSize.Value));
-            _filter = filters.Count > 0 ? new CompositeFilter(filters) : null;
-            _deleter = new TrackedDeleter(_deletion, _stateDb, _log);
-            _parityScanner = new ParityScanner(_config, _filter, _directoryExists, _enumerateFiles, _enumerateDirectories, _deleter, _log);
-            // Anomaly brake: feeds on copies/deletes/renames, freezes all
-            // three funnels on trip. Disarmed until the first full scan
-            // completes (ResetState disarms again); the marker file is the
-            // human clear switch. Exempt while disarmed or initial sync runs.
-            var syncCfg = _config.Sync;
-            _churnArmed = false;
-            _churn = new ChurnMonitor(Path.Combine(_config.Destination, ".tictack-churn-hold"),
-                TimeSpan.FromMinutes(syncCfg != null && syncCfg.SpikeWindowMinutes > 0 ? syncCfg.SpikeWindowMinutes : 60),
-                (long)((syncCfg != null && syncCfg.SpikeBytesGb > 0 ? syncCfg.SpikeBytesGb : 100) * 1024L * 1024L * 1024L),
-                syncCfg != null && syncCfg.SpikeFiles > 0 ? syncCfg.SpikeFiles : 50000,
-                syncCfg != null && syncCfg.SpikeRenames > 0 ? syncCfg.SpikeRenames : 10000,
-                _log, null,
-                () => !_churnArmed || (_initialSync != null && !_initialSync.IsCompleted));
-            _deletions = new DeletionGuard(_config, stateDb, _deleter, _deferred, log, () => ArmDeferredCheckTimer(), _churn);
+            InitSyncState(autoExcludePrefixes, deferredDir, deferredFilePrefix, log);
             // Own cadence file, not the scheduler's jobs.db: keyed per source
             // like the state DB name. Carries the full-verify stamp and the
             // scrub shard index. Failures fall back to always-verify.
             // Always created (not gated on FullRoutineCheckDays): the scrub shard
             // rotation persists here too, and FullVerifyDue still returns
             // false when days <= 0, so behavior is unchanged.
-            _verifyKey = "fullverify-" + SourceLeaf(_config).ToLowerInvariant() + "-" + DeferredDeletion.StableHash(_config.Path);
-            _restoreKey = "restore-" + SourceLeaf(_config).ToLowerInvariant() + "-" + DeferredDeletion.StableHash(_config.Path);
-            try
-            {
-                var dir = !string.IsNullOrEmpty(_config.StateDbPath) ? _config.StateDbPath
-                    : OperatingSystem.IsWindows()
-                        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TicTack")
-                        : "/var/lib/tictack";
-                if (!Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
-                _verifyStore = new JobRunStore(Path.Combine(dir, "verify.db"));
-            }
-            catch (Exception ex) { _log.Debug("Verify cadence store unavailable, verifying every run: " + ex.Message); }
-            _scrubber = new Scrubber(_config, _filter, stateDb, _deleter.DeleteAsync, _verifyStore, log, _directoryExists, _enumerateFiles);
-            // Opt-in vault mode: harden the destination root at startup.
-            // Service mode only — a CLI run as the user locks itself out.
-            if (syncCfg != null && syncCfg.DestinationProtect)
-                DestinationGuard.Enforce(_config.Destination, log);
+            InitVerifyStore(log);
         }
 
         public void Start()
@@ -225,7 +170,7 @@ namespace TicTack
             if (_started) return;
             _started = true;
             var lockTimeout = _config.Sync != null && _config.Sync.LockHandling == "retry"
-                ? (TimeSpan?)TimeSpan.FromSeconds(_config.Sync.LockWaitSeconds > 0 ? _config.Sync.LockWaitSeconds : 600)
+                ? (TimeSpan?)TimeSpan.FromSeconds(_config.Sync.LockWaitSeconds > 0 ? _config.Sync.LockWaitSeconds : 60)
                 : null;
             try { Directory.CreateDirectory(_config.Destination); }
             catch (Exception ex) { _log.Debug("Destination create failed: " + ex.Message); }
@@ -450,11 +395,6 @@ namespace TicTack
             if (!_directoryExists(_config.Path)) return false;
             // No snapshot: batched point lookups via GetStatesAsync keep
             // startup memory flat no matter how large the state table grows.
-            var sourcePaths = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
-            var pendingState = new List<(string path, long size, long mtime, string? fileId, long ctime, string? hash)>();
-            var stateLock = new object();
-            var scanFailed = 0;
-            long scanned = 0, copied = 0, skipped = 0, moved = 0;
             // dir_sync=per-batch: one dir fsync per distinct parent per
             // 500-file checkpoint instead of per file. Wired onto the shared
             // CopyAction (cast: wrappers like RecordingAction keep per-file,
@@ -470,217 +410,20 @@ namespace TicTack
             // every scan start at Info doubles that line and spams startup.
             _log.Debug(reason + " scan starting: " + _config.Path);
 
-            void FlushState()
-            {
-                if (_stateDb == null || pendingState.Count == 0) return;
-                lock (stateLock)
-                {
-                    try
-                    {
-                        // Crash invariant: directory entries durable BEFORE
-                        // state claims the files copied. A failed dir fsync
-                        // drops the batch (next run re-copies, safe) instead
-                        // of upserting ahead of durability (divergence).
-                        if (dirBatch != null && !dirBatch.FlushAll(_log))
-                        {
-                            Interlocked.Exchange(ref scanFailed, 1);
-                            _log.Warn("Directory fsync failed, state batch dropped (will re-copy): " + _config.Path);
-                            pendingState.Clear();
-                            return;
-                        }
-                        _stateDb.UpsertBatch(pendingState);
-                        pendingState.Clear();
-                    }
-                    catch (Exception ex) { _log.Debug("StateDb batch upsert failed: " + ex.Message); }
-                }
-            }
-
+            var st = new ScanScope(this, reason, scanStart);
+            st.DirBatch = dirBatch;
             try
             {
-                var files = _enumerateFiles(_config.Path, SearchOption.AllDirectories)
-                    .Where(f => _filter == null || _filter.ShouldProcess(f));
-                var options = new ParallelOptions
-                {
-                    CancellationToken = _cts!.Token,
-                    MaxDegreeOfParallelism = Math.Max(1, _config.Sync != null ? _config.Sync.InitialSyncWorkers : 2)
-                };
-                // Chunked bulk-fetch: state rows for a bounded file chunk are
-                // read with a few IN-queries under one gate hold instead of one
-                // point lookup per file. Memory stays bounded (chunk-sized list
-                // plus dict); a failed fetch degrades to copy-everything, the
-                // same decision the old per-file catch made.
-                var chunk = new List<(string f, string rel)>(2000);
-                foreach (var path in files)
-                {
-                    chunk.Add((path, PathUtil.Relative(path, _config.Path)));
-                    if (chunk.Count < 2000) continue;
-                    await ProcessChunkAsync(chunk, options);
-                    chunk.Clear();
-                }
-                if (chunk.Count > 0) await ProcessChunkAsync(chunk, options);
-
-                async Task ProcessChunkAsync(List<(string f, string rel)> batch, ParallelOptions opts)
-                {
-                    _cts!.Token.ThrowIfCancellationRequested();
-                    var states = new Dictionary<string, (long size, long mtime)>(StringComparer.OrdinalIgnoreCase);
-                    if (_stateDb != null)
-                    {
-                        try { states = await _stateDb.GetStatesAsync(batch.Select(x => x.rel)); }
-                        catch (Exception ex) { _log.Debug("StateDb bulk lookup failed, copying: " + ex.Message); }
-                    }
-                    await Parallel.ForEachAsync(batch, opts, async (item, token) => await ProcessFileAsync(item, states, token));
-                }
-
-                async Task ProcessFileAsync((string f, string rel) item, Dictionary<string, (long size, long mtime)> states, CancellationToken token)
-                {
-                    var (f, rel) = item;
-                    try
-                    {
-                        var n = Interlocked.Increment(ref scanned);
-                        if (n % 1000 == 0)
-                            _log.Debug($"{reason} progress: {n} scanned, {Interlocked.Read(ref copied)} copied, {Interlocked.Read(ref skipped)} skipped ({(DateTime.UtcNow - scanStart).TotalSeconds:F0}s): " + _config.Path);
-                        if (!FileSnapshot.TryRead(f, out var sourceSnapshot))
-                        {
-                            Interlocked.Exchange(ref scanFailed, 1);
-                            return;
-                        }
-                        sourcePaths.TryAdd(rel, 0);
-                        var dst = Path.Combine(_config.Destination, rel);
-
-                        if (!_driveReady(_config.Destination))
-                        {
-                            _log.Warn("Destination drive is not ready, initial copy blocked: " + f);
-                            return;
-                        }
-
-                        var unchanged = states.TryGetValue(rel, out var s)
-                            && s.size == sourceSnapshot.Length
-                            && s.mtime == sourceSnapshot.LastWriteTimeUtcTicks;
-                        if (unchanged && _comparer.RequiresContentRead && File.Exists(dst) && !FullVerifyDue())
-                        {
-                            // State hit under a content comparer: skip without
-                            // re-hashing. The Exists gate stays here because the
-                            // comparer below would otherwise re-read both files
-                            // on every warm run; metadata comparers stat dst
-                            // themselves, so they fall through and the extra
-                            // Exists stat is gone on every path.
-                            Interlocked.Increment(ref skipped);
-                            return;
-                        }
-
-                        // Full-verify run under a metadata comparer: the
-                        // comparer below cannot see same-size corruption, so
-                        // byte-compare once (constant memory, early exit).
-                        // Equal still skips; a mismatch copies below WITHOUT
-                        // consulting the comparer (it would size-match and
-                        // skip, hiding the corruption the verify just found).
-                        var verifyFailed = unchanged && FullVerifyDue() && File.Exists(dst) && !ContentEqual(f, dst);
-                        if (unchanged && FullVerifyDue() && File.Exists(dst) && !verifyFailed)
-                        {
-                            Interlocked.Increment(ref skipped);
-                            return;
-                        }
-
-                        // Create-time move replay: an untracked path whose file ID
-                        // matches one tracked row is a rename, not a new file.
-                        if (!unchanged && _stateDb != null && FileIdentity.TryGet(f, out var moveId, out var moveCtime)
-                            && moveId != null
-                            && await TryReplayMoveAsync(f, rel, sourceSnapshot, moveId, moveCtime))
-                        {
-                            Interlocked.Increment(ref moved);
-                            return;
-                        }
-
-                        if (!verifyFailed && _comparer.AreEqual(f, dst, sourceSnapshot))
-                        {
-                            Interlocked.Increment(ref skipped);
-                            return;
-                        }
-                        var e = new FileChangedEventArgs(ChangeType.Created, f);
-                        var args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
-                        // Pipelined upsert: the completer owns the batch add
-                        // (plus the 500-file FlushState) under the same lock,
-                        // so the checkpoint cadence is unchanged.
-                        Func<FileSnapshot, CancellationToken, Task> batchUpsert = (snap, _) =>
-                        {
-                            if (_stateDb == null) return Task.CompletedTask;
-                            // Lazy identity: captured after the durable rename
-                            // the completer just performed, outside the gate.
-                            string? fid = null;
-                            long fctime = 0;
-                            try
-                            {
-                                if (FileIdentity.TryGet(f, out var bid, out var bct)) { fid = bid; fctime = bct; }
-                            }
-                            catch { }
-                            lock (stateLock)
-                            {
-                                pendingState.Add((rel, snap.Length, snap.LastWriteTimeUtcTicks, fid, fctime, null));
-                                if (pendingState.Count >= 500) FlushState();
-                            }
-                            return Task.CompletedTask;
-                        };
-                        var fresh = await ExecuteCopyAsync(args,
-                            CopyWithRetryAsync,
-                            reason + " failed", reason + " validation FAILED", token, batchUpsert);
-                        if (fresh == null) return;
-                        _churn.ReportCopy(fresh.Value.Length);
-
-                        if (!UsePipelined(batchUpsert) && _stateDb != null)
-                        {
-                            string? nfid = null;
-                            long nfctime = 0;
-                            try
-                            {
-                                if (FileIdentity.TryGet(f, out var nid, out var nct)) { nfid = nid; nfctime = nct; }
-                            }
-                            catch { }
-                            lock (stateLock)
-                            {
-                                pendingState.Add((rel, fresh.Value.Length, fresh.Value.LastWriteTimeUtcTicks, nfid, nfctime, null));
-                                if (pendingState.Count >= 500) FlushState();
-                            }
-                        }
-                        Interlocked.Increment(ref copied);
-                    }
-                    catch (OperationCanceledException) { }
-                    catch (Exception ex)
-                    {
-                        Interlocked.Exchange(ref scanFailed, 1);
-                        _log.Error(reason + " failed: " + f, ex);
-                    }
-                }
-
-                FlushState();
-                if (scanFailed != 0)
-                {
-                    _log.Warn("Initial source scan incomplete, parity cleanup blocked: " + _config.Path);
-                    return false;
-                }
-                await WithExclusiveLockAsync(async () =>
-                {
-                    await _parityScanner.EnforceAsync(new HashSet<string>(sourcePaths.Keys, StringComparer.OrdinalIgnoreCase), _cts!.Token);
-                    await _scrubber.RunAsync(_cts!.Token);
-                });
-                // A full scan just completed: arm the anomaly brake (and
-                // re-arm after a ResetState disarm).
-                _churnArmed = true;
-                // Successful scan + parity: stamp the full-verify cadence.
-                // Never fails the sync if the store is unavailable — but a
-                // failed stamp re-runs the full check every scan, so say so.
-                if (_verifyStore != null)
-                {
-                    try { _verifyStore.SetLastRun(_verifyKey, DateTime.UtcNow); }
-                    catch (Exception ex) { _log.Debug("Full-verify stamp failed, rechecking next scan: " + ex.Message); }
-                }
-                await RunRestoreVerifyAsync(_cts!.Token);
+                var (files, options) = PrepareScanFiles();
+                await DrainScanFilesAsync(st, files, options);
+                if (!await FinishScanAsync(st)) return false;
             }
             catch (UnauthorizedAccessException) { _log.Warn("Access denied scanning " + _config.Path); return false; }
             catch (PathTooLongException) { _log.Warn("Path too long scanning " + _config.Path); return false; }
             catch (OperationCanceledException) { return false; }
             catch (Exception ex) { _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message); return false; }
             finally { if (_copyAction is CopyAction doneCopy) doneCopy.DirBatch = null; }
-            _log.Info($"Sync complete: {_config.Path} ({scanned} scanned, {copied} copied, {moved} moved, {skipped} skipped, {scanned - copied - skipped - moved} failed, {(DateTime.UtcNow - scanStart).TotalSeconds:F0}s)");
+            _log.Info($"Sync complete: {_config.Path} ({st.Scanned} scanned, {st.Copied} copied, {st.Moved} moved, {st.Skipped} skipped, {st.Scanned - st.Copied - st.Skipped - st.Moved} failed, {(DateTime.UtcNow - st.ScanStart).TotalSeconds:F0}s)");
             return true;
         }
 
@@ -728,7 +471,7 @@ namespace TicTack
                 _log.Error("Routine check: destination unavailable, backups unverifiable: " + _config.Destination);
                 return;
             }
-            List<string> sample;
+            IReadOnlyList<string> sample;
             try { sample = await _stateDb.GetRandomPathsAsync(count); }
             catch (Exception ex) { _log.Debug("Routine check sample failed: " + ex.Message); return; }
             if (sample.Count == 0) return;
@@ -736,31 +479,10 @@ namespace TicTack
             foreach (var rel in sample)
             {
                 if (ct.IsCancellationRequested) return;
-                // Cheap gate first: differing sizes already prove a mismatch,
-                // so neither side is hashed. Equal sizes still hash both —
-                // bitrot preserves stat metadata, so size/mtime agreement
-                // cannot stand in for content comparison.
-                FileInfo srcInfo, dstInfo;
-                try
-                {
-                    srcInfo = new FileInfo(PathUtil.EnsureExtended(Path.Combine(_config.Path, rel)));
-                    dstInfo = new FileInfo(PathUtil.EnsureExtended(Path.Combine(_config.Destination, rel)));
-                }
-                catch { skipped++; continue; }
-                if (!srcInfo.Exists || !dstInfo.Exists) { skipped++; continue; }
-                if (srcInfo.Length != dstInfo.Length)
-                {
-                    failed++;
-                    _log.Error("Routine check FAILED (destination differs from source): " + rel);
-                    continue;
-                }
-                string hs, hd;
-                try { hs = FileHasher.ComputeHex(PathUtil.EnsureExtended(Path.Combine(_config.Path, rel)), null); }
-                catch { skipped++; continue; }
-                try { hd = FileHasher.ComputeHex(PathUtil.EnsureExtended(Path.Combine(_config.Destination, rel)), null); }
-                catch { skipped++; continue; }
-                if (hs == hd) ok++;
-                else { failed++; _log.Error("Routine check FAILED (destination differs from source): " + rel); }
+                var r = VerifyOneSample(rel);
+                if (r == 0) ok++;
+                else if (r == 1) failed++;
+                else skipped++;
             }
             if (failed > 0)
             {
@@ -771,6 +493,35 @@ namespace TicTack
             _log.Info("Routine check: " + ok + "/" + sample.Count + " sampled files match (" + skipped + " skipped)");
             try { _verifyStore.SetLastRun(_restoreKey, DateTime.UtcNow); }
             catch (Exception ex) { _log.Debug("Routine-check stamp failed, rechecking next scan: " + ex.Message); }
+        }
+
+        // Single sampled file: 0 = match, 1 = differs, 2 = skipped.
+        private int VerifyOneSample(string rel)
+        {
+            FileInfo srcInfo = null!, dstInfo = null!;
+            // Cheap gate first: differing sizes already prove a mismatch,
+            // so neither side is hashed. Equal sizes still hash both —
+            // bitrot preserves stat metadata, so size/mtime agreement
+            // cannot stand in for content comparison.
+            try
+            {
+                srcInfo = new FileInfo(PathUtil.EnsureExtended(Path.Combine(_config.Path, rel)));
+                dstInfo = new FileInfo(PathUtil.EnsureExtended(Path.Combine(_config.Destination, rel)));
+            }
+            catch { return 2; }
+            if (!srcInfo.Exists || !dstInfo.Exists) { return 2; }
+            if (srcInfo.Length != dstInfo.Length)
+            {
+                _log.Error("Routine check FAILED (destination differs from source): " + rel);
+                return 1;
+            }
+            string hs, hd;
+            try { hs = FileHasher.ComputeHex(PathUtil.EnsureExtended(Path.Combine(_config.Path, rel)), null); }
+            catch { return 2; }
+            try { hd = FileHasher.ComputeHex(PathUtil.EnsureExtended(Path.Combine(_config.Destination, rel)), null); }
+            catch { return 2; }
+            if (hs == hd) return 0;
+            _log.Error("Routine check FAILED (destination differs from source): " + rel); return 1;
         }
 
         // Full routine-check cadence: due when enabled and never stamped, or
@@ -837,59 +588,67 @@ namespace TicTack
         // Ambiguous or unsafe cases return false and the caller copies fresh.
         private async Task<bool> TryReplayMoveAsync(string f, string rel, FileSnapshot snap, string fileId, long ctime)
         {
-            List<(string path, long size, long mtime)> donors;
+            string? donorRel = await FindMoveDonorAsync(rel, snap, fileId);
+            if (donorRel is null || donorRel == rel)
+                return false;
+        var oldDst = Path.Combine(_config.Destination, donorRel);
+        var newDst = Path.Combine(_config.Destination, rel);
+        bool oldDstExists;
+        try
+        {
+            oldDstExists = File.Exists(PathUtil.EnsureExtended(oldDst));
+            if (File.Exists(PathUtil.EnsureExtended(newDst))) return false;
+        }
+        catch { return false; }
+        if (!oldDstExists)
+        {
+            // Stale donor row (dest manually deleted): drop it so it
+            // cannot skew the delete-guard denominator, copy fresh.
+            try { await _stateDb!.DeleteAsync(donorRel); } catch { }
+            return false;
+        }
+        // No versioning/archive of oldDst: the bytes move with it, and
+        // the new name's history starts here.
+        try
+        {
+            var newDir = Path.GetDirectoryName(newDst);
+            if (!string.IsNullOrEmpty(newDir) && !Directory.Exists(newDir))
+                Directory.CreateDirectory(PathUtil.EnsureExtended(newDir));
+            File.Move(PathUtil.EnsureExtended(oldDst), PathUtil.EnsureExtended(newDst));
+        }
+        catch (Exception ex) { _log.Debug("Move replay failed, copying: " + rel + " (" + ex.Message + ")"); return false; }
+        try
+        {
+            await _stateDb!.DeleteAsync(donorRel);
+            await _stateDb.UpsertAsync(rel, snap.Length, snap.LastWriteTimeUtcTicks, fileId, ctime);
+        }
+        catch (Exception ex) { _log.Debug("Move replay state update failed: " + rel + " (" + ex.Message + ")"); }
+        _churn.ReportRename();
+        _log.Info("Replayed move: " + donorRel + " -> " + rel);
+        return true;
+        }
+
+        private async Task<string?> FindMoveDonorAsync(string rel, FileSnapshot snap, string fileId)
+        {
+            IReadOnlyList<(string path, long size, long mtime)> donors;
             try { donors = await _stateDb!.FindByFileIdAsync(fileId); }
-            catch (Exception ex) { _log.Debug("Move lookup failed, copying: " + rel + " (" + ex.Message + ")"); return false; }
+            catch (Exception ex) { _log.Debug("Move lookup failed, copying: " + rel + " (" + ex.Message + ")"); return null; }
             string? donorRel = null;
             foreach (var d in donors)
             {
                 if (d.size == snap.Length && d.mtime == snap.LastWriteTimeUtcTicks) { donorRel = d.path; break; }
             }
-            if (donorRel == null || string.Equals(donorRel, rel, StringComparison.OrdinalIgnoreCase)) return false;
+            if (donorRel == null || string.Equals(donorRel, rel, StringComparison.OrdinalIgnoreCase)) return null;
             // Old source must be gone: still-present means a hardlink or a
             // copy sharing the ID space, not a move. Directories checked too:
             // a renamed-away file never leaves a directory behind.
             var oldSrc = Path.Combine(_config.Path, donorRel);
             try
             {
-                if (File.Exists(oldSrc) || _directoryExists(oldSrc)) return false;
+                if (File.Exists(oldSrc) || _directoryExists(oldSrc)) return null;
             }
-            catch { return false; }
-            var oldDst = Path.Combine(_config.Destination, donorRel);
-            var newDst = Path.Combine(_config.Destination, rel);
-            bool oldDstExists;
-            try
-            {
-                oldDstExists = File.Exists(PathUtil.EnsureExtended(oldDst));
-                if (File.Exists(PathUtil.EnsureExtended(newDst))) return false;
-            }
-            catch { return false; }
-            if (!oldDstExists)
-            {
-                // Stale donor row (dest manually deleted): drop it so it
-                // cannot skew the delete-guard denominator, copy fresh.
-                try { await _stateDb!.DeleteAsync(donorRel); } catch { }
-                return false;
-            }
-            // No versioning/archive of oldDst: the bytes move with it, and
-            // the new name's history starts here.
-            try
-            {
-                var newDir = Path.GetDirectoryName(newDst);
-                if (!string.IsNullOrEmpty(newDir) && !Directory.Exists(newDir))
-                    Directory.CreateDirectory(PathUtil.EnsureExtended(newDir));
-                File.Move(PathUtil.EnsureExtended(oldDst), PathUtil.EnsureExtended(newDst));
-            }
-            catch (Exception ex) { _log.Debug("Move replay failed, copying: " + rel + " (" + ex.Message + ")"); return false; }
-            try
-            {
-                await _stateDb!.DeleteAsync(donorRel);
-                await _stateDb.UpsertAsync(rel, snap.Length, snap.LastWriteTimeUtcTicks, fileId, ctime);
-            }
-            catch (Exception ex) { _log.Debug("Move replay state update failed: " + rel + " (" + ex.Message + ")"); }
-            _churn.ReportRename();
-            _log.Info("Replayed move: " + donorRel + " -> " + rel);
-            return true;
+            catch { return null; }
+                return donorRel;
         }
 
         // Shared copy flow for InitialSyncAsync and ProcessEvent: version the
@@ -911,22 +670,8 @@ namespace TicTack
             }
             var src = args.ChangeEvent.FullPath;
             var dst = args.DestPath;
-            try
-            {
-                var archiveResult = await _versioning.ArchivePreviousVersionAsync(dst, ct);
-                if (!archiveResult.Success)
-                {
-                    _log.Error("Versioning failed: " + dst + ": " + archiveResult.ErrorMessage);
-                    TicTackEventSource.Log.CopyFailed();
-                    return null;
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.Error("Versioning failed: " + dst, ex);
-                TicTackEventSource.Log.CopyFailed();
+            if (!await ArchiveForCopyAsync(dst, ct))
                 return null;
-            }
 
             // Pipelined mode: copy on this worker, complete (flush -> rename
             // -> validate -> upsert) on the completer thread. The upsert
@@ -956,33 +701,65 @@ namespace TicTack
                 return null;
             }
 
-            if (!FileSnapshot.TryRead(src, out var freshSnapshot))
-            {
-                _log.Error(validationLabel + ": source disappeared: " + src);
-                TicTackEventSource.Log.CopyFailed();
-                return null;
-            }
-            // Fast path: the copy loop already hashed the source bytes. Trusted only
-            // when the source is byte-identical to the pre-copy snapshot (mid-copy
-            // changes force fresh != pre and fall back to the double-read below).
-            bool valid;
-            if (result.SourceHash != null && args.SourceSnapshot.HasValue
-                && freshSnapshot.Equals(args.SourceSnapshot.Value)
-                && _validator is HashValidator hashValidator)
-            {
-                valid = await hashValidator.ValidateWithSourceHashAsync(dst, result.SourceHash, freshSnapshot);
-            }
-            else
-            {
-                valid = await _validator.ValidateAsync(src, dst, freshSnapshot);
-            }
+            var (snap, valid) = await ValidateFreshCopyAsync(src, dst, result, args.SourceSnapshot, validationLabel);
             if (!valid)
-            {
-                _log.Error(validationLabel + ": " + src + " -> " + dst);
-                TicTackEventSource.Log.CopyFailed();
                 return null;
+            return snap;
+        }
+
+        // Archive the previous destination version before overwriting. False = already logged.
+        private async Task<bool> ArchiveForCopyAsync(string dst, CancellationToken ct)
+        {
+        try
+        {
+            var archiveResult = await _versioning.ArchivePreviousVersionAsync(dst, ct);
+            if (!archiveResult.Success)
+            {
+                _log.Error("Versioning failed: " + dst + ": " + archiveResult.ErrorMessage);
+                TicTackEventSource.Log.CopyFailed();
+                return false;
             }
-            return freshSnapshot;
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Versioning failed: " + dst, ex);
+            TicTackEventSource.Log.CopyFailed();
+            return false;
+        }
+            return true;
+        }
+
+        // Re-read the source after copy and validate. Null snap = already logged.
+        private async Task<(FileSnapshot? snap, bool valid)> ValidateFreshCopyAsync(
+            string src, string dst, ActionResult result, FileSnapshot? sourceSnapshot, string validationLabel)
+        {
+        if (!FileSnapshot.TryRead(src, out var freshSnapshot))
+        {
+            _log.Error(validationLabel + ": source disappeared: " + src);
+            TicTackEventSource.Log.CopyFailed();
+            return (null, false);
+        }
+        // Fast path: the copy loop already hashed the source bytes. Trusted only
+        // when the source is byte-identical to the pre-copy snapshot (mid-copy
+        // changes force fresh != pre and fall back to the double-read below).
+        bool valid;
+        if (result.SourceHash != null && sourceSnapshot.HasValue
+            && freshSnapshot.Equals(sourceSnapshot.Value)
+            && _validator is HashValidator hashValidator)
+        {
+            valid = await hashValidator.ValidateWithSourceHashAsync(dst, result.SourceHash, freshSnapshot);
+        }
+        else
+        {
+            valid = await _validator.ValidateAsync(src, dst, freshSnapshot);
+        }
+        if (!valid)
+        {
+            _log.Error(validationLabel + ": " + src + " -> " + dst);
+            TicTackEventSource.Log.CopyFailed();
+            return (null, false);
+        }
+        return (freshSnapshot, true);
         }
 
         private Task<ActionResult> CopyWithRetryAsync(FileActionArgs args, CancellationToken ct) =>
@@ -1068,141 +845,16 @@ namespace TicTack
                 switch (e.ChangeType)
                 {
                     case ChangeType.Deleted:
-                        if (!_directoryExists(_config.Path))
-                        {
-                            _log.Warn("Source folder missing, deletion blocked: " + e.FullPath);
-                            break;
-                        }
-                        var delRel = PathUtil.Relative(e.FullPath, _config.Path);
-                        long size = 0;
-                        if (_stateDb != null)
-                        {
-                            try { size = await _stateDb.GetSizeAsync(delRel) ?? 0; }
-                            catch (Exception ex) { _log.Warn("StateDb size lookup failed, using destination size: " + ex.Message); }
-                        }
-                        _deletions.Add(new DeletionGuard.PendingDeletion { Path = e.FullPath, DestPath = args.DestPath, SizeBytes = size });
+                        await HandleDeletedAsync(e, args.DestPath, ct);
                         break;
 
                     case ChangeType.Renamed:
-                        await _deletions.FlushAsync(ct);
-                        if (args.OldDestPath != null && (File.Exists(args.OldDestPath) || _directoryExists(args.OldDestPath)))
-                        {
-                            await _retry.ExecuteAsync(async () =>
-                            {
-                                var renameResult = await _renameAction.ExecuteAsync(args, ct);
-                                if (!renameResult.Success && renameResult.Retryable)
-                                    throw new IOException(renameResult.ErrorMessage);
-                                return renameResult;
-                            }, ct);
-                        }
-                        if (_stateDb != null)
-                        {
-                            var oldRel = PathUtil.Relative(e.OldFullPath!, _config.Path);
-                            var newRel = PathUtil.Relative(e.FullPath, _config.Path);
-                            if (_directoryExists(e.FullPath))
-                            {
-                                await _stateDb.DeleteAsync(oldRel);
-                                await _stateDb.UpdatePrefixAsync(oldRel, newRel);
-                            }
-                            else
-                            {
-                                await _stateDb.DeleteAsync(oldRel);
-                                try
-                                {
-                                    if (File.Exists(e.FullPath))
-                                    {
-                                        var fi = new FileInfo(e.FullPath);
-                                        await _stateDb.UpsertAsync(newRel, fi.Length, fi.LastWriteTimeUtc.Ticks);
-                                        // Identity follows the rename: capture
-                                        // lazily, never fail the rename for it.
-                                        try
-                                        {
-                                            if (FileIdentity.TryGet(e.FullPath, out var rid, out var rctime) && rid != null)
-                                                await _stateDb.UpdateIdentityAsync(newRel, rid, rctime);
-                                        }
-                                        catch (Exception ex) { _log.Debug("Rename identity capture skipped: " + ex.Message); }
-                                    }
-                                }
-                                catch (FileNotFoundException) { }
-                                catch (DirectoryNotFoundException) { }
-                            }
-                        }
-                        _log.Debug("Renamed: " + e.OldFullPath + " -> " + e.FullPath);
+                        await HandleRenamedAsync(e, args, ct);
                         break;
 
                     case ChangeType.Created:
                     case ChangeType.Modified:
-                        await _deletions.FlushAsync(ct);
-                        if (!File.Exists(e.FullPath))
-                        {
-                            if (_directoryExists(e.FullPath))
-                                return;
-                            if (File.Exists(args.DestPath))
-                            {
-                                // Route through TrackedDeleter so the state row is
-                                // removed too; a stale row inflates CountAsync and
-                                // skews the percent delete guard's denominator.
-                                await _deleter.DeleteAsync(e.FullPath, args.DestPath, PathUtil.Relative(e.FullPath, _config.Path), "Deletion failed", ct);
-                            }
-                            return;
-                        }
-                        if (!FileSnapshot.TryRead(e.FullPath, out var sourceSnapshot))
-                        {
-                            _log.Warn("Source unreadable, copy skipped: " + e.FullPath);
-                            return;
-                        }
-                        args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
-                        // Event-time move replay: same create-time rule as the
-                        // scan path, before the comparer burns two full reads.
-                        if (_stateDb != null && !File.Exists(args.DestPath)
-                            && FileIdentity.TryGet(e.FullPath, out var emoveId, out var emoveCtime) && emoveId != null
-                            && await TryReplayMoveAsync(e.FullPath, PathUtil.Relative(e.FullPath, _config.Path), sourceSnapshot, emoveId, emoveCtime))
-                            return;
-                        if (_comparer.AreEqual(e.FullPath, args.DestPath, sourceSnapshot)) return;
-
-                        // Pipelined upsert: mirrors the single-row update
-                        // below; the completer runs it after durable rename.
-                        Func<FileSnapshot, CancellationToken, Task> singleUpsert = async (snap, _) =>
-                        {
-                            if (_stateDb != null)
-                            {
-                                try
-                                {
-                                    var rel = PathUtil.Relative(e.FullPath, _config.Path);
-                                    string? fid = null;
-                                    long fctime = 0;
-                                    try
-                                    {
-                                        if (FileIdentity.TryGet(e.FullPath, out var sid, out var sct)) { fid = sid; fctime = sct; }
-                                    }
-                                    catch { }
-                                    await _stateDb.UpsertAsync(rel, snap.Length, snap.LastWriteTimeUtcTicks, fid, fctime);
-                                }
-                                catch (Exception ex) { _log.Debug("StateDb update skipped: " + ex.Message); }
-                            }
-                        };
-                        var fresh = await ExecuteCopyAsync(args,
-                            CopyWithRetryAsync,
-                            "Copy failed", "Validation FAILED", ct, singleUpsert);
-                        if (fresh == null) return;
-                        _churn.ReportCopy(fresh.Value.Length);
-                        var freshSnapshot = fresh.Value;
-                        if (!UsePipelined(singleUpsert) && _stateDb != null)
-                        {
-                            try
-                            {
-                                var rel = PathUtil.Relative(e.FullPath, _config.Path);
-                                string? fid = null;
-                                long fctime = 0;
-                                try
-                                {
-                                    if (FileIdentity.TryGet(e.FullPath, out var eid, out var ect)) { fid = eid; fctime = ect; }
-                                }
-                                catch { }
-                                await _stateDb.UpsertAsync(rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks, fid, fctime);
-                            }
-                            catch (Exception ex) { _log.Debug("StateDb update skipped: " + ex.Message); }
-                        }
+                        await HandleCreatedOrModifiedAsync(e, args, ct);
                         break;
                 }
             }
@@ -1211,6 +863,158 @@ namespace TicTack
             {
                 _log.Error("Processing " + e.FullPath, ex);
             }
+        }
+
+        private async Task HandleDeletedAsync(FileChangedEventArgs e, string destPath, CancellationToken ct)
+        {
+                    if (!_directoryExists(_config.Path))
+                    {
+                        _log.Warn("Source folder missing, deletion blocked: " + e.FullPath);
+                        return;
+                    }
+                    var delRel = PathUtil.Relative(e.FullPath, _config.Path);
+                    long size = 0;
+                    if (_stateDb != null)
+                    {
+                        try { size = await _stateDb.GetSizeAsync(delRel) ?? 0; }
+                        catch (Exception ex) { _log.Warn("StateDb size lookup failed, using destination size: " + ex.Message); }
+                    }
+                    _deletions.Add(new DeletionGuard.PendingDeletion { Path = e.FullPath, DestPath = destPath, SizeBytes = size });
+            return;
+        }
+
+        private async Task HandleRenamedAsync(FileChangedEventArgs e, FileActionArgs args, CancellationToken ct)
+        {
+                    await _deletions.FlushAsync(ct);
+                    if (args.OldDestPath != null && (File.Exists(args.OldDestPath) || _directoryExists(args.OldDestPath)))
+                    {
+                        await _retry.ExecuteAsync(async () =>
+                        {
+                            var renameResult = await _renameAction.ExecuteAsync(args, ct);
+                            if (!renameResult.Success && renameResult.Retryable)
+                                throw new IOException(renameResult.ErrorMessage);
+                            return renameResult;
+                        }, ct);
+                    }
+                    if (_stateDb != null)
+                    {
+                        var oldRel = PathUtil.Relative(e.OldFullPath!, _config.Path);
+                        var newRel = PathUtil.Relative(e.FullPath, _config.Path);
+                        if (_directoryExists(e.FullPath))
+                        {
+                            await _stateDb.DeleteAsync(oldRel);
+                            await _stateDb.UpdatePrefixAsync(oldRel, newRel);
+                        }
+                        else
+                        {
+                            await _stateDb.DeleteAsync(oldRel);
+                            try
+                            {
+                                if (File.Exists(e.FullPath))
+                                {
+                                    var fi = new FileInfo(e.FullPath);
+                                    await _stateDb.UpsertAsync(newRel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+                                    // Identity follows the rename: capture
+                                    // lazily, never fail the rename for it.
+                                    try
+                                    {
+                                        if (FileIdentity.TryGet(e.FullPath, out var rid, out var rctime) && rid != null)
+                                            await _stateDb.UpdateIdentityAsync(newRel, rid, rctime);
+                                    }
+                                    catch (Exception ex) { _log.Debug("Rename identity capture skipped: " + ex.Message); }
+                                }
+                            }
+                            catch (FileNotFoundException) { }
+                            catch (DirectoryNotFoundException) { }
+                        }
+                    }
+                    _log.Debug("Renamed: " + e.OldFullPath + " -> " + e.FullPath);
+        }
+
+        private Func<FileSnapshot, CancellationToken, Task> BuildSingleUpsert(FileChangedEventArgs e)
+        {
+            return async (snap, _) =>
+            {
+                    if (_stateDb != null)
+                    {
+                        try
+                            {
+                                var rel = PathUtil.Relative(e.FullPath, _config.Path);
+                                string? fid = null;
+                                long fctime = 0;
+                                try
+                                {
+                                    if (FileIdentity.TryGet(e.FullPath, out var sid, out var sct)) { fid = sid; fctime = sct; }
+                                }
+                                catch { }
+                                await _stateDb.UpsertAsync(rel, snap.Length, snap.LastWriteTimeUtcTicks, fid, fctime);
+                            }
+                            catch (Exception ex) { _log.Debug("StateDb update skipped: " + ex.Message); }
+                        }
+            };
+        }
+
+        private async Task UpsertFreshStateAsync(FileChangedEventArgs e, FileSnapshot freshSnapshot, CancellationToken ct,
+            Func<FileSnapshot, CancellationToken, Task> singleUpsert)
+        {
+                    if (!UsePipelined(singleUpsert) && _stateDb != null)
+                    {
+                        try
+                        {
+                            var rel = PathUtil.Relative(e.FullPath, _config.Path);
+                            string? fid = null;
+                            long fctime = 0;
+                            try
+                            {
+                                if (FileIdentity.TryGet(e.FullPath, out var eid, out var ect)) { fid = eid; fctime = ect; }
+                            }
+                            catch { }
+                            await _stateDb.UpsertAsync(rel, freshSnapshot.Length, freshSnapshot.LastWriteTimeUtcTicks, fid, fctime);
+                        }
+                        catch (Exception ex) { _log.Debug("StateDb update skipped: " + ex.Message); }
+                    }
+        }
+
+        private async Task HandleCreatedOrModifiedAsync(FileChangedEventArgs e, FileActionArgs args, CancellationToken ct)
+        {
+                    await _deletions.FlushAsync(ct);
+                    if (!File.Exists(e.FullPath))
+                    {
+                        if (_directoryExists(e.FullPath))
+                            return;
+                        if (File.Exists(args.DestPath))
+                        {
+                            // Route through TrackedDeleter so the state row is
+                            // removed too; a stale row inflates CountAsync and
+                            // skews the percent delete guard's denominator.
+                            await _deleter.DeleteAsync(e.FullPath, args.DestPath, PathUtil.Relative(e.FullPath, _config.Path), "Deletion failed", ct);
+                        }
+                        return;
+                    }
+                    if (!FileSnapshot.TryRead(e.FullPath, out var sourceSnapshot))
+                    {
+                        _log.Warn("Source unreadable, copy skipped: " + e.FullPath);
+                        return;
+                    }
+                    args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
+                    // Event-time move replay: same create-time rule as the
+                    // scan path, before the comparer burns two full reads.
+                    if (_stateDb != null && !File.Exists(args.DestPath)
+                        && FileIdentity.TryGet(e.FullPath, out var emoveId, out var emoveCtime) && emoveId != null
+                        && await TryReplayMoveAsync(e.FullPath, PathUtil.Relative(e.FullPath, _config.Path), sourceSnapshot, emoveId, emoveCtime))
+                        return;
+                    if (_comparer.AreEqual(e.FullPath, args.DestPath, sourceSnapshot)) return;
+
+                    // Pipelined upsert: mirrors the single-row update
+                    // below; the completer runs it after durable rename.
+            var singleUpsert = BuildSingleUpsert(e);
+                    var fresh = await ExecuteCopyAsync(args,
+                        CopyWithRetryAsync,
+                        "Copy failed", "Validation FAILED", ct, singleUpsert);
+                    if (fresh == null) return;
+                    _churn.ReportCopy(fresh.Value.Length);
+                    var freshSnapshot = fresh.Value;
+            await UpsertFreshStateAsync(e, freshSnapshot, ct, singleUpsert);
         }
 
         public async Task StopAsync()
@@ -1277,7 +1081,7 @@ namespace TicTack
             if (processorError != null)
                 return "processor task faulted: " + processorError.GetBaseException().Message;
             if (pendingCount > 0 && now - lastProgressUtc > stallAfter)
-                return "no progress for " + (now - lastProgressUtc).TotalMinutes.ToString("F0")
+                return "no progress for " + (now - lastProgressUtc).TotalMinutes.ToString("F0", CultureInfo.InvariantCulture)
                     + " min with " + pendingCount + " queued events";
             return null;
         }
@@ -1468,5 +1272,326 @@ namespace TicTack
             return (ran, total, cancelled);
         }
 
+        private sealed class ScanScope
+        {
+            private readonly SyncPipeline _p;
+            internal readonly string Reason;
+            internal readonly DateTime ScanStart;
+            internal DirSyncBatcher? DirBatch;
+            internal readonly ConcurrentDictionary<string, byte> SourcePaths = new(StringComparer.OrdinalIgnoreCase);
+            internal readonly object StateLock = new();
+            internal readonly List<(string path, long size, long mtime, string? fileId, long ctime, string? hash)> Pending = new();
+            internal long Scanned, Copied, Moved, Skipped;
+            internal int ScanFailed;
+            internal ScanScope(SyncPipeline p, string reason, DateTime scanStart) { _p = p; Reason = reason; ScanStart = scanStart; }
+
+            internal async Task FlushStateAsync()
+            {
+                if (_p._stateDb == null || Pending.Count == 0) return;
+                List<(string path, long size, long mtime, string? fileId, long ctime, string? hash)> snap;
+                lock (StateLock)
+                {
+                    try
+                    {
+                        // Crash invariant: directory entries durable BEFORE
+                        // state claims the files copied. A failed dir fsync
+                        // drops the batch (next run re-copies, safe) instead
+                        // of upserting ahead of durability (divergence).
+                        if (DirBatch != null && !DirBatch.FlushAll(_p._log))
+                        {
+                            Interlocked.Exchange(ref ScanFailed, 1);
+                            _p._log.Warn("Directory fsync failed, state batch dropped (will re-copy): " + _p._config.Path);
+                            Pending.Clear();
+                            return;
+                        }
+                        snap = Pending.ToList();
+                        Pending.Clear();
+                    }
+                    catch (Exception ex) { _p._log.Debug("StateDb batch upsert failed: " + ex.Message); return; }
+                }
+                try { await _p._stateDb.UpsertBatchAsync(snap).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _p._log.Debug("StateDb batch upsert failed: " + ex.Message);
+                    lock (StateLock) { Pending.InsertRange(0, snap); }
+                }
+            }
+
+            internal bool TryBeginFile(string f, string rel, out FileSnapshot snap, out string dst)
+            {
+                var n = Interlocked.Increment(ref Scanned);
+                if (n % 1000 == 0)
+                    _p._log.Debug($"{Reason} progress: {n} scanned, {Interlocked.Read(ref Copied)} copied, {Interlocked.Read(ref Skipped)} skipped ({(DateTime.UtcNow - ScanStart).TotalSeconds:F0}s): " + _p._config.Path);
+                if (!FileSnapshot.TryRead(f, out var s))
+                {
+                    Interlocked.Exchange(ref ScanFailed, 1);
+                    snap = default;
+                    dst = "";
+                    return false;
+                }
+                SourcePaths.TryAdd(rel, 0);
+                dst = Path.Combine(_p._config.Destination, rel);
+                if (!_p._driveReady(_p._config.Destination))
+                {
+                    _p._log.Warn("Destination drive is not ready, initial copy blocked: " + f);
+                    snap = default;
+                    dst = "";
+                    return false;
+                }
+                snap = s;
+                return true;
+            }
+
+            internal bool ShouldSkipFile(string f, string rel, string dst, FileSnapshot snap, IDictionary<string, (long size, long mtime)> states, out bool verifyFailed, out bool unchanged)
+            {
+                unchanged = states.TryGetValue(rel, out var s)
+                    && s.size == snap.Length
+                    && s.mtime == snap.LastWriteTimeUtcTicks;
+                if (unchanged && _p._comparer.RequiresContentRead && File.Exists(dst) && !_p.FullVerifyDue())
+                {
+                    // State hit under a content comparer: skip without
+                    // re-hashing (comparer would re-read both files).
+                    Interlocked.Increment(ref Skipped);
+                    verifyFailed = false;
+                    return true;
+                }
+                // Full-verify run under a metadata comparer: byte-compare
+                // once; a mismatch copies below WITHOUT consulting the
+                // comparer (it would size-match and hide the corruption).
+                verifyFailed = unchanged && _p.FullVerifyDue() && File.Exists(dst) && !SyncPipeline.ContentEqual(f, dst);
+                if (unchanged && _p.FullVerifyDue() && File.Exists(dst) && !verifyFailed)
+                {
+                    Interlocked.Increment(ref Skipped);
+                    return true;
+                }
+                return false;
+            }
+
+            internal async Task CopyScanFileAsync(string f, string rel, string dst, FileSnapshot snap, bool verifyFailed, CancellationToken token)
+            {
+                if (!verifyFailed && _p._comparer.AreEqual(f, dst, snap))
+                {
+                    Interlocked.Increment(ref Skipped);
+                    return;
+                }
+                var e = new FileChangedEventArgs(ChangeType.Created, f);
+                var args = new FileActionArgs(e, _p._config.Path, _p._config.Destination, snap);
+                // Pipelined upsert: the completer owns the batch add
+                // (plus the 500-file FlushState) under the same lock,
+                // so the checkpoint cadence is unchanged.
+                Func<FileSnapshot, CancellationToken, Task> batchUpsert = async (s, _) =>
+                {
+                    if (_p._stateDb == null) return;
+                    // Lazy identity: captured after the durable rename
+                    // the completer just performed, outside the gate.
+                    string? fid = null;
+                    long fctime = 0;
+                    try
+                    {
+                        if (FileIdentity.TryGet(f, out var bid, out var bct)) { fid = bid; fctime = bct; }
+                    }
+                    catch { }
+                    bool needFlushA;
+                    lock (StateLock)
+                    {
+                        Pending.Add((rel, s.Length, s.LastWriteTimeUtcTicks, fid, fctime, null));
+                        needFlushA = Pending.Count >= 500;
+                    }
+                    if (needFlushA)
+                        await FlushStateAsync().ConfigureAwait(false);
+                };
+                var fresh = await _p.ExecuteCopyAsync(args,
+                    _p.CopyWithRetryAsync,
+                    Reason + " failed", Reason + " validation FAILED", token, batchUpsert);
+                if (fresh == null) return;
+                _p._churn.ReportCopy(fresh.Value.Length);
+                if (!_p.UsePipelined(batchUpsert) && _p._stateDb != null)
+                {
+                    string? nfid = null;
+                    long nfctime = 0;
+                    try
+                    {
+                        if (FileIdentity.TryGet(f, out var nid, out var nct)) { nfid = nid; nfctime = nct; }
+                    }
+                    catch { }
+                    bool needFlushB;
+                    lock (StateLock)
+                    {
+                        Pending.Add((rel, fresh.Value.Length, fresh.Value.LastWriteTimeUtcTicks, nfid, nfctime, null));
+                        needFlushB = Pending.Count >= 500;
+                    }
+                    if (needFlushB)
+                        await FlushStateAsync().ConfigureAwait(false);
+                }
+                Interlocked.Increment(ref Copied);
+            }
+
+            internal async Task ProcessChunkAsync(List<(string f, string rel)> batch, ParallelOptions options)
+            {
+                _p._cts!.Token.ThrowIfCancellationRequested();
+                IDictionary<string, (long size, long mtime)> states = new Dictionary<string, (long size, long mtime)>(StringComparer.OrdinalIgnoreCase);
+                if (_p._stateDb != null)
+                {
+                    try { states = await _p._stateDb.GetStatesAsync(batch.Select(x => x.rel)); }
+                    catch (Exception ex) { _p._log.Debug("StateDb bulk lookup failed, copying: " + ex.Message); }
+                }
+                await Parallel.ForEachAsync(batch, options, async (item, token) => await ProcessFileAsync(item, states, token));
+            }
+
+            internal async Task ProcessFileAsync((string f, string rel) item, IDictionary<string, (long size, long mtime)> states, CancellationToken token)
+            {
+                var (f, rel) = item;
+                try
+                {
+                    if (!TryBeginFile(f, rel, out var snap, out var dst)) return;
+                    if (ShouldSkipFile(f, rel, dst, snap, states, out var verifyFailed, out var unchanged)) return;
+                    // Create-time move replay: an untracked path whose file ID
+                    // matches one tracked row is a rename, not a new file.
+                    if (!unchanged && _p._stateDb != null && FileIdentity.TryGet(f, out var moveId, out var moveCtime)
+                        && moveId != null
+                        && await _p.TryReplayMoveAsync(f, rel, snap, moveId, moveCtime))
+                    {
+                        Interlocked.Increment(ref Moved);
+                        return;
+                    }
+                    await CopyScanFileAsync(f, rel, dst, snap, verifyFailed, token);
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    Interlocked.Exchange(ref ScanFailed, 1);
+                    _p._log.Error(Reason + " failed: " + f, ex);
+                }
+            }
+        }
+
+        private (IEnumerable<string> files, ParallelOptions options) PrepareScanFiles()
+        {
+            var files = _enumerateFiles(_config.Path, SearchOption.AllDirectories)
+                .Where(f => _filter == null || _filter.ShouldProcess(f));
+            var options = new ParallelOptions
+            {
+                CancellationToken = _cts!.Token,
+                MaxDegreeOfParallelism = Math.Max(1, _config.Sync != null ? _config.Sync.InitialSyncWorkers : 2)
+            };
+            return (files, options);
+        }
+
+        private async Task DrainScanFilesAsync(ScanScope st, IEnumerable<string> files, ParallelOptions options)
+        {
+            // Chunked bulk-fetch: state rows for a bounded file chunk are
+            // read with a few IN-queries under one gate hold instead of one
+            // point lookup per file. Memory stays bounded (chunk-sized list
+            // plus dict); a failed fetch degrades to copy-everything.
+            var chunk = new List<(string f, string rel)>(2000);
+            foreach (var path in files)
+            {
+                chunk.Add((path, PathUtil.Relative(path, _config.Path)));
+                if (chunk.Count < 2000) continue;
+                await st.ProcessChunkAsync(chunk, options);
+                chunk.Clear();
+            }
+            if (chunk.Count > 0) await st.ProcessChunkAsync(chunk, options);
+        }
+
+        private async Task<bool> FinishScanAsync(ScanScope st)
+        {
+            await st.FlushStateAsync().ConfigureAwait(false);
+            if (st.ScanFailed != 0)
+            {
+                _log.Warn("Initial source scan incomplete, parity cleanup blocked: " + _config.Path);
+                return false;
+            }
+            await WithExclusiveLockAsync(async () =>
+            {
+                await _parityScanner.EnforceAsync(new HashSet<string>(st.SourcePaths.Keys, StringComparer.OrdinalIgnoreCase), _cts!.Token);
+                await _scrubber.RunAsync(_cts!.Token);
+            });
+            // A full scan just completed: arm the anomaly brake (and
+            // re-arm after a ResetState disarm).
+            _churnArmed = true;
+            // Successful scan + parity: stamp the full-verify cadence.
+            // Never fails the sync if the store is unavailable — but a
+            // failed stamp re-runs the full check every scan, so say so.
+            if (_verifyStore != null)
+            {
+                try { _verifyStore.SetLastRun(_verifyKey, DateTime.UtcNow); }
+                catch (Exception ex) { _log.Debug("Full-verify stamp failed, rechecking next scan: " + ex.Message); }
+            }
+            await RunRestoreVerifyAsync(_cts!.Token);
+            return true;
+        }
+
+        private void InitCompleter(IFileAction copyAction, IValidator validator, ILogger log)
+        {
+        if (copyAction is CopyAction copy && validator is HashValidator) copy.ComputeSourceHash = true;
+        // Pipelined completion: the completer owns flush -> rename ->
+        // validate -> upsert on one thread; workers only copy. Capacity
+        // is derived from the worker count (2x) for backpressure. Test
+        // wrappers (RecordingAction) stay inline — same fallback shape
+        // as the hash flag above.
+        _completer = _config.Sync != null
+            && string.Equals(_config.Sync.CompleteMode, "pipelined", StringComparison.OrdinalIgnoreCase)
+            && copyAction is CopyAction realCopy
+            ? new FileCompleter(realCopy, validator, log, 2 * Math.Max(1, _config.Sync.InitialSyncWorkers))
+            : null;
+        // Capture the queue itself, not `this`: a constructor that throws
+        // after this point would otherwise leak the whole pipeline through
+        // the static EventSource's counter callback.
+        var pendingEvents = _pendingEvents;
+        _queueCounter = TicTackEventSource.Log.RegisterQueueCounter(_config.Path, () => pendingEvents.Count);
+        }
+
+        private void InitSyncState(string[]? autoExcludePrefixes, string? deferredDir, string? deferredFilePrefix, ILogger log)
+        {
+        var filters = new List<IFileFilter>();
+        if (_config.Filter != null && _config.Filter.Exclude != null && _config.Filter.Exclude.Count > 0)
+            filters.Add(new PatternFilter(_config.Filter.Exclude.ToArray()));
+        if (autoExcludePrefixes != null && autoExcludePrefixes.Length > 0)
+            filters.Add(new PathPrefixFilter(autoExcludePrefixes));
+        long? maxSize = _config.Filter != null ? Config.ParseFileSizeLimit(_config.Filter.MaxFileSizeMb) : null;
+        if (maxSize.HasValue && maxSize.Value > 0)
+            filters.Add(new SizeFilter(maxSize.Value));
+        _filter = filters.Count > 0 ? new CompositeFilter(filters) : null;
+        _deleter = new TrackedDeleter(_deletion, _stateDb, _log);
+        _parityScanner = new ParityScanner(_config, _filter, _directoryExists, _enumerateFiles, _enumerateDirectories, _deleter, _log);
+        // Anomaly brake: feeds on copies/deletes/renames, freezes all
+        // three funnels on trip. Disarmed until the first full scan
+        // completes (ResetState disarms again); the marker file is the
+        // human clear switch. Exempt while disarmed or initial sync runs.
+        var syncCfg = _config.Sync;
+        _churnArmed = false;
+        _churn = new ChurnMonitor(Path.Combine(_config.Destination, ".tictack-churn-hold"),
+            TimeSpan.FromMinutes(syncCfg != null && syncCfg.SpikeWindowMinutes > 0 ? syncCfg.SpikeWindowMinutes : 60),
+            (long)((syncCfg != null && syncCfg.SpikeBytesGb > 0 ? syncCfg.SpikeBytesGb : 100) * 1024L * 1024L * 1024L),
+            syncCfg != null && syncCfg.SpikeFiles > 0 ? syncCfg.SpikeFiles : 50000,
+            syncCfg != null && syncCfg.SpikeRenames > 0 ? syncCfg.SpikeRenames : 10000,
+            _log, null,
+            () => !_churnArmed || (_initialSync != null && !_initialSync.IsCompleted));
+        _deletions = new DeletionGuard(_config, _stateDb, _deleter, _deferred, log, () => ArmDeferredCheckTimer(), _churn);
+        }
+
+        private void InitVerifyStore(ILogger log)
+        {
+        var syncCfg = _config.Sync;
+        _verifyKey = "fullverify-" + SourceLeaf(_config).ToLowerInvariant() + "-" + DeferredDeletion.StableHash(_config.Path);
+        _restoreKey = "restore-" + SourceLeaf(_config).ToLowerInvariant() + "-" + DeferredDeletion.StableHash(_config.Path);
+        try
+        {
+            var dir = !string.IsNullOrEmpty(_config.StateDbPath) ? _config.StateDbPath
+                : OperatingSystem.IsWindows()
+                    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TicTack")
+                    : "/var/lib/tictack";
+            if (!Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+            _verifyStore = new JobRunStore(Path.Combine(dir, "verify.db"));
+        }
+        catch (Exception ex) { _log.Debug("Verify cadence store unavailable, verifying every run: " + ex.Message); }
+        _scrubber = new Scrubber(_config, _filter, _stateDb, _deleter.DeleteAsync, _verifyStore, log, _directoryExists, _enumerateFiles);
+        // Opt-in vault mode: harden the destination root at startup.
+        // Service mode only — a CLI run as the user locks itself out.
+        if (syncCfg != null && syncCfg.DestinationProtect)
+            DestinationGuard.Enforce(_config.Destination, log);
+    }
     }
 }

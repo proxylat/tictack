@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.IO;
 using System.Threading;
@@ -28,7 +29,7 @@ namespace TicTack
                     cmd.Parameters.AddWithValue("@n", name);
                     var r = cmd.ExecuteScalar();
                     if (r == null || r is DBNull) return null;
-                    return DateTime.TryParse((string)r, out var d) ? d.Date : (DateTime?)null;
+                    return DateTime.TryParse((string)r, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d.Date : (DateTime?)null;
                 }
             }
         }
@@ -41,7 +42,7 @@ namespace TicTack
                 {
                     cmd.CommandText = "INSERT OR REPLACE INTO job_runs (name, last_run) VALUES (@n, @d)";
                     cmd.Parameters.AddWithValue("@n", name);
-                    cmd.Parameters.AddWithValue("@d", date.ToString("yyyy-MM-dd"));
+                    cmd.Parameters.AddWithValue("@d", date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
                     cmd.ExecuteNonQuery();
                 }
             }
@@ -61,7 +62,7 @@ namespace TicTack
                     cmd.Parameters.AddWithValue("@n", name);
                     var r = cmd.ExecuteScalar();
                     if (r == null || r is DBNull) return null;
-                    return DateTime.TryParse((string)r, out var d) ? d : (DateTime?)null;
+                    return DateTime.TryParse((string)r, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d : (DateTime?)null;
                 }
             }
         }
@@ -74,7 +75,7 @@ namespace TicTack
                 {
                     cmd.CommandText = "INSERT OR REPLACE INTO job_runs (name, last_run) VALUES (@n, @d)";
                     cmd.Parameters.AddWithValue("@n", name);
-                    cmd.Parameters.AddWithValue("@d", stamp.ToString("yyyy-MM-dd HH:mm:ss"));
+                    cmd.Parameters.AddWithValue("@d", stamp.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
                     cmd.ExecuteNonQuery();
                 }
             }

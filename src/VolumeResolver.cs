@@ -7,15 +7,11 @@ using System.Threading;
 
 namespace TicTack
 {
-    public static class VolumeResolver
+    public static partial class VolumeResolver
     {
-        // MA0009/MA0023 false positives, kept explicit: the pattern is a
-        // negated character class (linear time, no ReDoS shape) and group 1
-        // is load-bearing (m.Groups[1].Value below), which ExplicitCapture
-        // would stop capturing.
-#pragma warning disable MA0009, MA0023
-        private static readonly Regex VolumePattern = new Regex(@"\[([^\]]+)\]", RegexOptions.Compiled);
-#pragma warning restore MA0009, MA0023
+        // Linear-time pattern, no ReDoS shape; 100ms timeout satisfies MA0009 without a pragma.
+        [GeneratedRegex(@"\[(?<label>[^\]]+)\]", RegexOptions.None, matchTimeoutMilliseconds: 100)]
+        private static partial Regex VolumePattern();
 
         public static string Resolve(string path)
         {
@@ -31,7 +27,7 @@ namespace TicTack
         {
             if (string.IsNullOrEmpty(path)) return path;
             if (map.Count == 0) return path;
-            return VolumePattern.Replace(path, m =>
+            return VolumePattern().Replace(path, m =>
             {
                 var label = m.Groups[1].Value;
                 return map.TryGetValue(label, out var root) ? root : m.Value;
@@ -116,7 +112,7 @@ namespace TicTack
             foreach (var field in fields)
             {
                 if (string.IsNullOrEmpty(field)) continue;
-                foreach (Match m in VolumePattern.Matches(field))
+                foreach (Match m in VolumePattern().Matches(field))
                     if (seen.Add(m.Groups[1].Value))
                         labels.Add(m.Groups[1].Value);
             }

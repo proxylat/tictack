@@ -85,7 +85,7 @@ namespace TicTack
             new TempCopyResult { Success = false, ErrorMessage = message, Retryable = retryable };
     }
 
-    public class CopyAction : IFileAction
+    public sealed class CopyAction : IFileAction
     {
         private readonly IFileAccessor _accessor;
         private readonly FileDurability _durability;
@@ -205,9 +205,6 @@ namespace TicTack
                     probe.ReadByte();
                 }
 
-                long bytesCopied = 0;
-                double copyMs = -1;
-                string? sourceHash = null;
 
                 // Snapshot-first: the caller usually statted the source already,
                 // so this costs zero syscalls; the re-read fallback replaces
@@ -217,69 +214,8 @@ namespace TicTack
                     srcAttributes = currentSnap.Attributes;
                 var isSparse = (srcAttributes.GetValueOrDefault() & FileAttributes.SparseFile) == FileAttributes.SparseFile;
 
-                using (var srcStream = _accessor.OpenRead(src))
-                using (var dstStream = File.Create(tmp))
-                {
-                    _checkpoint?.Invoke(CopyCheckpoint.TempCreated);
-                    // Timed only while a counters listener is attached — otherwise
-                    // this path stays allocation-free apart from the copy itself.
-                    var timed = TicTackEventSource.Log.IsEnabled();
-                    var sw = timed ? Stopwatch.StartNew() : null;
-                    if (isSparse)
-                    {
-                        uint dummy;
-                        DeviceIoControl(dstStream.SafeFileHandle.DangerousGetHandle(),
-                            FSCTL_SET_SPARSE, IntPtr.Zero, 0, IntPtr.Zero, 0, out dummy, IntPtr.Zero);
-                    }
-                    else
-                    {
-                        dstStream.SetLength(srcStream.Length);
-                    }
-                    if (ComputeSourceHash)
-                    {
-                        // Hash the bytes as streamed: one pass serves both
-                        // the copy and a hash validator. Same buffer size as
-                        // CopyToAsync's default so throughput is unchanged.
-                        using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                        var buffer = ArrayPool<byte>.Shared.Rent(FileHasher.BufferSize);
-                        try
-                        {
-                            int read;
-                            while ((read = await srcStream.ReadAsync(buffer, 0, FileHasher.BufferSize, ct)) > 0)
-                            {
-                                hasher.AppendData(buffer, 0, read);
-                                await dstStream.WriteAsync(buffer, 0, read, ct);
-                            }
-                        }
-                        finally { ArrayPool<byte>.Shared.Return(buffer); }
-                        sourceHash = Convert.ToHexStringLower(hasher.GetHashAndReset());
-                    }
-                    else
-                    {
-                        await srcStream.CopyToAsync(dstStream, 81920, ct);
-                    }
-                    // Prefer the bytes actually written: a source appended
-                    // mid-copy makes Length a lie.
-                    bytesCopied = dstStream.Position;
-                    if (sw != null) copyMs = sw.Elapsed.TotalMilliseconds;
-                }
-                // No flush here: durability is the complete phase's job.
-
-                try
-                {
-                    var sourceSnapshot = args.SourceSnapshot;
-                    if (!sourceSnapshot.HasValue && FileSnapshot.TryRead(src, out var current))
-                        sourceSnapshot = current;
-                    if (sourceSnapshot.HasValue)
-                        File.SetLastWriteTimeUtc(tmp, sourceSnapshot.Value.LastWriteTimeUtc);
-                }
-                catch (Exception ex)
-                {
-                    // Without the source mtime the destination re-copies on
-                    // every date/size comparison; never fail the copy for it.
-                    _log?.Warn("Could not preserve source timestamp on " + dst + ": " + ex.Message);
-                }
-
+                var (bytesCopied, copyMs, sourceHash) = await StreamToTempAsync(src, tmp, isSparse, ct);
+                StampTempMtime(tmp, src, args, dst);
                 return new TempCopyResult
                 {
                     Success = true,
@@ -298,6 +234,82 @@ namespace TicTack
             // these into ExponentialBackoffRetry.
             catch (IOException ex) { return TempCopyResult.Fail(ex.Message, retryable: true); }
             catch (Win32Exception ex) { return TempCopyResult.Fail(ex.Message, retryable: true); }
+        }
+        // Byte pump: sparse flag or preallocate, then hashed or plain
+        // copy. Returns what the temp actually holds (bytes, hash, ms).
+        private async Task<(long BytesCopied, double CopyMs, string? SourceHash)> StreamToTempAsync(string src, string tmp, bool isSparse, CancellationToken ct)
+        {
+            long bytesCopied = 0;
+            double copyMs = -1;
+            string? sourceHash = null;
+            using (var srcStream = _accessor.OpenRead(src))
+            using (var dstStream = File.Create(tmp))
+            {
+                _checkpoint?.Invoke(CopyCheckpoint.TempCreated);
+                // Timed only while a counters listener is attached — otherwise
+                // this path stays allocation-free apart from the copy itself.
+                var timed = TicTackEventSource.Log.IsEnabled();
+                var sw = timed ? Stopwatch.StartNew() : null;
+                if (isSparse)
+                {
+                    uint dummy;
+                    DeviceIoControl(dstStream.SafeFileHandle.DangerousGetHandle(),
+                        FSCTL_SET_SPARSE, IntPtr.Zero, 0, IntPtr.Zero, 0, out dummy, IntPtr.Zero);
+                }
+                else
+                {
+                    dstStream.SetLength(srcStream.Length);
+                }
+                if (ComputeSourceHash)
+                {
+                    // Hash the bytes as streamed: one pass serves both
+                    // the copy and a hash validator. Same buffer size as
+                    // CopyToAsync's default so throughput is unchanged.
+                    using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                    var buffer = ArrayPool<byte>.Shared.Rent(FileHasher.BufferSize);
+                    try
+                    {
+                        int read;
+                        while ((read = await srcStream.ReadAsync(buffer, 0, FileHasher.BufferSize, ct)) > 0)
+                        {
+                            hasher.AppendData(buffer, 0, read);
+                            await dstStream.WriteAsync(buffer, 0, read, ct);
+                        }
+                    }
+                    finally { ArrayPool<byte>.Shared.Return(buffer); }
+                    sourceHash = Convert.ToHexStringLower(hasher.GetHashAndReset());
+                }
+                else
+                {
+                    await srcStream.CopyToAsync(dstStream, 81920, ct);
+                }
+                // Prefer the bytes actually written: a source appended
+                // mid-copy makes Length a lie.
+                bytesCopied = dstStream.Position;
+                if (sw != null) copyMs = sw.Elapsed.TotalMilliseconds;
+            }
+            // No flush here: durability is the complete phase's job.
+
+            return (bytesCopied, copyMs, sourceHash);
+        }
+
+        // Best-effort mtime stamp; never fails the copy when it cannot.
+        private void StampTempMtime(string tmp, string src, FileActionArgs args, string dst)
+        {
+            try
+            {
+                var sourceSnapshot = args.SourceSnapshot;
+                if (!sourceSnapshot.HasValue && FileSnapshot.TryRead(src, out var current))
+                    sourceSnapshot = current;
+                if (sourceSnapshot.HasValue)
+                    File.SetLastWriteTimeUtc(tmp, sourceSnapshot.Value.LastWriteTimeUtc);
+            }
+            catch (Exception ex)
+            {
+                // Without the source mtime the destination re-copies on
+                // every date/size comparison; never fail the copy for it.
+                _log?.Warn("Could not preserve source timestamp on " + dst + ": " + ex.Message);
+            }
         }
 
         // Complete phase: flush, atomic rename, directory sync. Fires
@@ -464,61 +476,10 @@ namespace TicTack
 
             try
             {
-                if (Directory.Exists(oldDest))
-                {
-                    if (!Directory.Exists(dest))
-                    {
-                        Directory.Move(oldDest, dest);
-                        SyncParents(oldDest, dest);
-                    }
-                    else
-                    {
-                        // Collision: the old-name tree holds destination-only content.
-                        // Never raw-delete it; route through the configured deletion
-                        // strategy (archive or mirror) or refuse when none is wired.
-                        if (_deletion == null)
-                        {
-                            var msg = "Rename target exists, old tree preserved: " + args.OldDestPath;
-                            _log?.Warn(msg);
-                            return ActionResult.Fail(msg);
-                        }
-                        var deleted = await _deletion.HandleDeletionAsync(null, args.OldDestPath, ct);
-                        if (!deleted.Success)
-                        {
-                            _log?.Error("Rename cleanup failed: " + args.OldDestPath + ": " + deleted.ErrorMessage);
-                            return deleted;
-                        }
-                        // The strategy consumed the old tree (mirror deletes, archive
-                        // moves it aside); move only if something is left to move.
-                        if (Directory.Exists(oldDest))
-                        {
-                            Directory.Move(oldDest, dest);
-                            SyncParents(oldDest, dest);
-                        }
-                    }
-                }
-                else if (File.Exists(oldDest))
-                {
-                    var dir = Path.GetDirectoryName(dest);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                    if (File.Exists(dest))
-                    {
-                        if (_deletion == null)
-                        {
-                            var msg = "Rename target exists, old file preserved: " + args.OldDestPath;
-                            _log?.Warn(msg);
-                            return ActionResult.Fail(msg);
-                        }
-                        var deleted = await _deletion.HandleDeletionAsync(null, args.DestPath, ct);
-                        if (!deleted.Success)
-                        {
-                            _log?.Error("Rename cleanup failed: " + args.DestPath + ": " + deleted.ErrorMessage);
-                            return deleted;
-                        }
-                    }
-                    File.Move(oldDest, dest);
-                    SyncParents(oldDest, dest);
-                }
+                var r = await MoveDirectoryTreeAsync(oldDest, dest, args, ct);
+                if (r == null && File.Exists(oldDest))
+                    r = await MoveFileAsync(oldDest, dest, args, ct);
+                if (r != null) return r;
             }
             catch (IOException ex)
             {
@@ -536,26 +497,95 @@ namespace TicTack
                 return ActionResult.Fail(ex.Message);
             }
             return ActionResult.Ok();
-
-            // A directory fsync flushes every pending entry change in that
-            // dir, so one sync per affected parent covers the whole
-            // delete-then-move sequence above. Never fails the rename:
-            // a lost entry resurrects and the next scan replays it.
-            void SyncParents(string oldPath, string newPath)
+        }
+        // Directory rename: move the tree, or clear the collision through
+        // the deletion strategy first. Never raw-deletes either side.
+        private async Task<ActionResult?> MoveDirectoryTreeAsync(string oldDest, string dest, FileActionArgs args, CancellationToken ct)
+        {
+            if (Directory.Exists(oldDest))
             {
-                string? synced = null;
-                foreach (var p in new[] { newPath, oldPath })
+                if (!Directory.Exists(dest))
                 {
-                    string? parent = null;
-                    try { parent = Path.GetDirectoryName(p); } catch { }
-                    if (string.IsNullOrEmpty(parent)) continue;
-                    if (parent.Equals(synced, StringComparison.Ordinal)) continue;
-                    synced = parent;
-                    if (!CopyAction.FlushDirectory(parent))
-                        _log?.Debug("Rename directory sync failed: " + parent);
+                    Directory.Move(oldDest, dest);
+                    SyncParents(oldDest, dest);
+                }
+                else
+                {
+                    // Collision: the old-name tree holds destination-only content.
+                    // Never raw-delete it; route through the configured deletion
+                    // strategy (archive or mirror) or refuse when none is wired.
+                    if (_deletion == null)
+                    {
+                        var msg = "Rename target exists, old tree preserved: " + args.OldDestPath;
+                        _log?.Warn(msg);
+                        return ActionResult.Fail(msg);
+                    }
+                    var deleted = await _deletion.HandleDeletionAsync(null, args.OldDestPath!, ct); // null returns Ok() at method top
+                    if (!deleted.Success)
+                    {
+                        _log?.Error("Rename cleanup failed: " + args.OldDestPath + ": " + deleted.ErrorMessage);
+                        return deleted;
+                    }
+                    // The strategy consumed the old tree (mirror deletes, archive
+                    // moves it aside); move only if something is left to move.
+                    if (Directory.Exists(oldDest))
+                    {
+                        Directory.Move(oldDest, dest);
+                        SyncParents(oldDest, dest);
+                    }
                 }
             }
+            return null;
+        }
+
+        // File rename with the same collision rule as directories.
+        private async Task<ActionResult?> MoveFileAsync(string oldDest, string dest, FileActionArgs args, CancellationToken ct)
+        {
+            if (File.Exists(oldDest))
+            {
+                var dir = Path.GetDirectoryName(dest);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                if (File.Exists(dest))
+                {
+                    if (_deletion == null)
+                    {
+                        var msg = "Rename target exists, old file preserved: " + args.OldDestPath;
+                        _log?.Warn(msg);
+                        return ActionResult.Fail(msg);
+                    }
+                    var deleted = await _deletion.HandleDeletionAsync(null, args.DestPath, ct);
+                    if (!deleted.Success)
+                    {
+                        _log?.Error("Rename cleanup failed: " + args.DestPath + ": " + deleted.ErrorMessage);
+                        return deleted;
+                    }
+                }
+                File.Move(oldDest, dest);
+                SyncParents(oldDest, dest);
+            }
+            return null;
+        }
+
+        // A directory fsync flushes every pending entry change in that
+        // dir, so one sync per affected parent covers the whole
+        // delete-then-move sequence above. Never fails the rename:
+        // a lost entry resurrects and the next scan replays it.
+        
+        private void SyncParents(string oldPath, string newPath)
+        {
+
+            string? synced = null;
+            foreach (var p in new[] { newPath, oldPath })
+            {
+                string? parent = null;
+                try { parent = Path.GetDirectoryName(p); } catch { }
+                if (string.IsNullOrEmpty(parent)) continue;
+                if (parent.Equals(synced, StringComparison.Ordinal)) continue;
+                synced = parent;
+                if (!CopyAction.FlushDirectory(parent))
+                    _log?.Debug("Rename directory sync failed: " + parent);
+            }
+        
         }
     }
-
 }

@@ -5,11 +5,13 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- Required by [GeneratedComInterface] in linked src/Handler.cs (source-generated
          COM marshalling only; no hand-written unsafe code in this repo). -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsPackable>false</IsPackable>
-    <NoWarn>$(NoWarn);NU1903;CS8892</NoWarn>
+    <!-- CS8892: tests reference the Exe (src/TicTack.cs) so its Main doubles as entry point; no test code triggers it. -->
+    <NoWarn>$(NoWarn);CS8892</NoWarn>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 

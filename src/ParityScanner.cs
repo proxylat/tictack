@@ -73,12 +73,23 @@ namespace TicTack
         {
             if (!_directoryExists(_config.Destination)) return;
 
+            var staleFiles = CollectStaleFiles(sourcePaths, ct);
+            if (staleFiles == null) return;
+            await SweepStaleFilesAsync(staleFiles, ct);
+
+            var sourceDirectories = CollectSourceDirs(sourcePaths);
+            await SweepStaleDirsAsync(sourceDirectories, ct);
+        }
+
+        // Destination files with no source twin. Null = scan failed, fail closed.
+        private List<(string path, string rel)>? CollectStaleFiles(HashSet<string> sourcePaths, CancellationToken ct)
+        {
             var staleFiles = new List<(string path, string rel)>();
             try
             {
                 foreach (var f in _enumerateFiles(_config.Destination, SearchOption.AllDirectories))
                 {
-                    if (ct.IsCancellationRequested) return;
+                    if (ct.IsCancellationRequested) return null;
                     var name = Path.GetFileName(f);
                     if (name == ".tictack.lock" || name == ".tictack-deferred.json") continue;
                     // Our own hold ledger must never look like a stale file:
@@ -96,18 +107,24 @@ namespace TicTack
             catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException || ex is DirectoryNotFoundException)
             {
                 _log.Warn("Destination scan incomplete, parity cleanup blocked: " + ex.Message);
-                return;
+                return null;
             }
+            return staleFiles;
+        }
 
-            if (staleFiles.Count > 0)
+        private async Task SweepStaleFilesAsync(List<(string path, string rel)> staleFiles, CancellationToken ct)
+        {
+            if (staleFiles.Count == 0) return;
+            foreach (var sf in staleFiles)
             {
-                foreach (var sf in staleFiles)
-                {
-                    await _deleter.DeleteAsync(null, sf.path, sf.rel, "Parity deletion failed", ct);
-                }
-                _log.Info("Cleanup: archived " + staleFiles.Count + " stale files");
+                await _deleter.DeleteAsync(null, sf.path, sf.rel, "Parity deletion failed", ct);
             }
+            _log.Info("Cleanup: archived " + staleFiles.Count + " stale files");
+        }
 
+        // Every ancestor dir of every source file.
+        private static HashSet<string> CollectSourceDirs(HashSet<string> sourcePaths)
+        {
             var sourceDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var file in sourcePaths)
             {
@@ -118,7 +135,11 @@ namespace TicTack
                     parent = Path.GetDirectoryName(parent);
                 }
             }
+            return sourceDirectories;
+        }
 
+        private async Task SweepStaleDirsAsync(HashSet<string> sourceDirectories, CancellationToken ct)
+        {
             IEnumerable<string> destinationDirectories;
             try
             {

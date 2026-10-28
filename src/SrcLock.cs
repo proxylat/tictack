@@ -130,6 +130,7 @@ namespace TicTack
         {
             var waited = false;
             var attempt = 0;
+                var liveNow = LiveExclusive(staleAfter, out var liveHolder);
             while (true)
             {
                 if (LiveExclusive(staleAfter, out var holder))
@@ -293,7 +294,7 @@ namespace TicTack
                 {
                     _handle?.Dispose();
                     _handle = null;
-                    if (_heldPath != null && File.Exists(_heldPath)) File.Delete(_heldPath);
+                    if (_heldPath != null && File.Exists(_heldPath)) { File.Delete(_heldPath); }
                 }
                 catch (Exception ex) { _log.Debug("Lock release failed: " + ex.Message); }
             }

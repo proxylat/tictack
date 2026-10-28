@@ -1,14 +1,16 @@
+using System.Globalization;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace TicTack
 {
-    public class TimerScheduler
+    public sealed class TimerScheduler
     {
         private Timer? _timer;
         private readonly List<JobEntry> _jobs;
@@ -31,7 +33,7 @@ namespace TicTack
             }
 
             if (config.Sources != null && config.Sources.Count > 0)
-                _sourcePaths = string.Join(" ", config.Sources.ConvertAll(s => "\"" + s.Path + "\""));
+                _sourcePaths = string.Join(" ", config.Sources.Select(s => "\"" + s.Path + "\""));
 
             _store = CreateStore(config);
 
@@ -67,45 +69,55 @@ namespace TicTack
                     TimeoutMinutes = EffectiveTimeout(job, defaults),
                 };
                 if (!ParseSchedule(job, entry, defaultMissed, log)) continue;
-                if (entry.Kind == JobKind.Interval)
+                SeedJobHistory(job, entry, log);
+                SeedJobEntry(job, entry, log);
+                _jobs.Add(entry);
+            }
+        }
+
+        private void SeedJobEntry(JobConfig job, JobEntry entry, ILogger log)
+        {
+        if (entry.Kind != JobKind.Interval)
+        {
+            var last = _store!.GetLastRun(job.Name!); // set unless zero jobs; runs once per parsed job
+            if (last == null && entry.Kind != JobKind.Once)
+            {
+                // Fresh store (first install or post-quarantine rebuild):
+                // no history would read as overdue-since-forever and
+                // fire every periodic job on the first tick. Seed today
+                // instead — the job waits for its next scheduled slot.
+                // One-shots keep MinValue: a reached run_once_on with no
+                // record has never fired and must still catch up.
+                entry.LastRunOn = DateTime.Today;
+                try { _store.SetLastRun(job.Name!, DateTime.Today); }
+                catch (Exception ex) { log.Debug("Job seed failed for '" + job.Name + "': " + ex.Message); }
+                log.Info("Job '" + job.Name + "' has no run history, waiting for its next scheduled time");
+            }
+            else
+            {
+                entry.LastRunOn = last ?? DateTime.MinValue;
+            }
+        }
+        }
+
+        private void SeedJobHistory(JobConfig job, JobEntry entry, ILogger log)
+        {
+            if (entry.Kind == JobKind.Interval)
+            {
+                var lastAt = _store!.GetLastRunAt(job.Name!); // set unless zero jobs; runs once per parsed job
+                if (lastAt == null)
                 {
-                    var lastAt = _store.GetLastRunAt(job.Name!);
-                    if (lastAt == null)
-                    {
-                        // Fresh store: the clock starts now, so the first fire
-                        // waits one full interval (systemd OnUnitActiveSec).
-                        entry.LastRunAt = DateTime.Now;
-                        try { _store.SetLastRunAt(job.Name!, entry.LastRunAt); }
-                        catch (Exception ex) { log.Debug("Job seed failed for '" + job.Name + "': " + ex.Message); }
-                        log.Info("Job '" + job.Name + "' has no run history, waiting one interval (" + job.Every + ")");
-                    }
-                    else
-                    {
-                        entry.LastRunAt = lastAt.Value;
-                    }
+                    // Fresh store: the clock starts now, so the first fire
+                    // waits one full interval (systemd OnUnitActiveSec).
+                    entry.LastRunAt = DateTime.Now;
+                    try { _store.SetLastRunAt(job.Name!, entry.LastRunAt); }
+                    catch (Exception ex) { log.Debug("Job seed failed for '" + job.Name + "': " + ex.Message); }
+                    log.Info("Job '" + job.Name + "' has no run history, waiting one interval (" + job.Every + ")");
                 }
                 else
                 {
-                    var last = _store.GetLastRun(job.Name!);
-                    if (last == null && entry.Kind != JobKind.Once)
-                    {
-                        // Fresh store (first install or post-quarantine rebuild):
-                        // no history would read as overdue-since-forever and
-                        // fire every periodic job on the first tick. Seed today
-                        // instead — the job waits for its next scheduled slot.
-                        // One-shots keep MinValue: a reached run_once_on with no
-                        // record has never fired and must still catch up.
-                        entry.LastRunOn = DateTime.Today;
-                        try { _store.SetLastRun(job.Name!, DateTime.Today); }
-                        catch (Exception ex) { log.Debug("Job seed failed for '" + job.Name + "': " + ex.Message); }
-                        log.Info("Job '" + job.Name + "' has no run history, waiting for its next scheduled time");
-                    }
-                    else
-                    {
-                        entry.LastRunOn = last ?? DateTime.MinValue;
-                    }
+                    entry.LastRunAt = lastAt.Value;
                 }
-                _jobs.Add(entry);
             }
         }
 
@@ -314,92 +326,24 @@ namespace TicTack
 
             if (hasEvery)
             {
-                if (schedule != "daily" || hasDay || hasDays || hasOnce || hasTime)
-                {
-                    log.Warn("Job '" + job.Name + "': every is mutually exclusive with schedule/day/days/time/run_once_on, skipping");
-                    return false;
-                }
-                if (!Config.TryParseDuration(job.Every, out var interval) || interval < TimeSpan.FromSeconds(30))
-                {
-                    log.Warn("Invalid every '" + job.Every + "' for job '" + job.Name + "' (use 30s/15m/6h/1d, minimum 30s), skipping");
-                    return false;
-                }
-                entry.Kind = JobKind.Interval;
-                entry.Interval = interval;
+                if (!ParseIntervalOption(job, entry, schedule, hasDay, hasDays, hasOnce, hasTime, log)) return false;
             }
-            else if (hasDays && schedule != "weekly")
-            {
-                log.Warn("Job '" + job.Name + "': days is only valid with schedule weekly, skipping");
-                return false;
-            }
-            else if (hasDays && hasDay)
-            {
-                log.Warn("Job '" + job.Name + "': day and days are mutually exclusive, skipping");
-                return false;
-            }
-            else if (hasOnce && (schedule != "daily" || hasDay))
-            {
-                log.Warn("Job '" + job.Name + "': run_once_on is mutually exclusive with schedule/day, skipping");
-                return false;
-            }
+            else if (!ValidateScheduleConflicts(job, schedule, hasDay, hasDays, hasOnce, log)) return false; // fall through to kind dispatch when clean
             else if (schedule == "daily" && !hasOnce)
             {
-                if (hasDay)
-                    log.Warn("Job '" + job.Name + "': day is ignored for daily schedules");
-                entry.Kind = JobKind.Daily;
+                ParseDailyOption(job, entry, hasDay, log);
             }
             else if (schedule == "weekly")
             {
-                if (hasDays)
-                {
-                    var mask = new List<DayOfWeek>();
-                    foreach (var raw in job.Days!)
-                    {
-                        if (!TryParseWeekday(raw, out var weekday))
-                        {
-                            log.Warn("Invalid days entry '" + raw + "' for weekly job '" + job.Name + "' (use mon-sun), skipping");
-                            return false;
-                        }
-                        if (!mask.Contains(weekday)) mask.Add(weekday);
-                    }
-                    if (mask.Count == 0)
-                    {
-                        log.Warn("Empty days for weekly job '" + job.Name + "', skipping");
-                        return false;
-                    }
-                    entry.Kind = JobKind.Weekly;
-                    entry.MaskDays = mask;
-                }
-                else
-                {
-                    if (!Enum.TryParse<DayOfWeek>(job.Day?.Trim(), ignoreCase: true, out var weekday))
-                    {
-                        log.Warn("Invalid day '" + job.Day + "' for weekly job '" + job.Name + "' (use Monday-Sunday)");
-                        return false;
-                    }
-                    entry.Kind = JobKind.Weekly;
-                    entry.TargetDay = weekday;
-                }
+                if (!ParseWeeklyOption(job, entry, hasDays, log)) return false;
             }
             else if (schedule == "monthly")
             {
-                if (!int.TryParse(job.Day?.Trim(), out var dom) || dom < 1 || dom > 31)
-                {
-                    log.Warn("Invalid day '" + job.Day + "' for monthly job '" + job.Name + "' (use 1-31)");
-                    return false;
-                }
-                entry.Kind = JobKind.Monthly;
-                entry.DayOfMonth = dom;
+                if (!ParseMonthlyOption(job, entry, log)) return false;
             }
             else if (schedule == "once" || hasOnce)
             {
-                if (!DateTime.TryParse(job.RunOnceOn?.Trim(), out var date))
-                {
-                    log.Warn("Invalid run_once_on '" + job.RunOnceOn + "' for job '" + job.Name + "' (use YYYY-MM-DD)");
-                    return false;
-                }
-                entry.Kind = JobKind.Once;
-                entry.RunDate = date.Date;
+                if (!ParseOnceOption(job, entry, log)) return false;
             }
             else
             {
@@ -417,6 +361,117 @@ namespace TicTack
                 entry.TimeOfDay = ts;
             }
 
+            ParseExecutionOptions(job, entry, defaultMissed, log);
+
+            return true;
+        }
+
+
+        private static bool ParseIntervalOption(JobConfig job, JobEntry entry, string schedule, bool hasDay, bool hasDays, bool hasOnce, bool hasTime, ILogger log)
+        {
+            if (schedule != "daily" || hasDay || hasDays || hasOnce || hasTime)
+            {
+                log.Warn("Job '" + job.Name + "': every is mutually exclusive with schedule/day/days/time/run_once_on, skipping");
+                return false;
+            }
+            if (!Config.TryParseDuration(job.Every, out var interval) || interval < TimeSpan.FromSeconds(30))
+            {
+                log.Warn("Invalid every '" + job.Every + "' for job '" + job.Name + "' (use 30s/15m/6h/1d, minimum 30s), skipping");
+                return false;
+            }
+            entry.Kind = JobKind.Interval;
+            entry.Interval = interval;
+            return true;
+        }
+
+        private static bool ValidateScheduleConflicts(JobConfig job, string schedule, bool hasDay, bool hasDays, bool hasOnce, ILogger log)
+        {
+            if (hasDays && schedule != "weekly")
+            {
+                log.Warn("Job '" + job.Name + "': days is only valid with schedule weekly, skipping");
+                return false;
+            }
+            if (hasDays && hasDay)
+            {
+                log.Warn("Job '" + job.Name + "': day and days are mutually exclusive, skipping");
+                return false;
+            }
+            if (hasOnce && (schedule != "daily" || hasDay))
+            {
+                log.Warn("Job '" + job.Name + "': run_once_on is mutually exclusive with schedule/day, skipping");
+                return false;
+            }
+            return true;
+        }
+
+        private static void ParseDailyOption(JobConfig job, JobEntry entry, bool hasDay, ILogger log)
+        {
+            if (hasDay)
+                log.Warn("Job '" + job.Name + "': day is ignored for daily schedules");
+            entry.Kind = JobKind.Daily;
+        }
+
+        private static bool ParseWeeklyOption(JobConfig job, JobEntry entry, bool hasDays, ILogger log)
+        {
+            if (hasDays)
+            {
+                var mask = new List<DayOfWeek>();
+                foreach (var raw in job.Days!)
+                {
+                    if (!TryParseWeekday(raw, out var weekday))
+                    {
+                        log.Warn("Invalid days entry '" + raw + "' for weekly job '" + job.Name + "' (use mon-sun), skipping");
+                        return false;
+                    }
+                    if (!mask.Contains(weekday)) mask.Add(weekday);
+                }
+                if (mask.Count == 0)
+                {
+                    log.Warn("Empty days for weekly job '" + job.Name + "', skipping");
+                    return false;
+                }
+                entry.Kind = JobKind.Weekly;
+                entry.MaskDays = mask;
+            }
+            else
+            {
+                if (!Enum.TryParse<DayOfWeek>(job.Day?.Trim(), ignoreCase: true, out var weekday))
+                {
+                    log.Warn("Invalid day '" + job.Day + "' for weekly job '" + job.Name + "' (use Monday-Sunday)");
+                    return false;
+                }
+                entry.Kind = JobKind.Weekly;
+                entry.TargetDay = weekday;
+            }
+            return true;
+        }
+
+        private static bool ParseMonthlyOption(JobConfig job, JobEntry entry, ILogger log)
+        {
+            if (!int.TryParse(job.Day?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var dom) || dom < 1 || dom > 31)
+            {
+                log.Warn("Invalid day '" + job.Day + "' for monthly job '" + job.Name + "' (use 1-31)");
+                return false;
+            }
+            entry.Kind = JobKind.Monthly;
+            entry.DayOfMonth = dom;
+            return true;
+        }
+
+        private static bool ParseOnceOption(JobConfig job, JobEntry entry, ILogger log)
+        {
+            if (!DateTime.TryParse(job.RunOnceOn?.Trim(), CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
+            {
+                log.Warn("Invalid run_once_on '" + job.RunOnceOn + "' for job '" + job.Name + "' (use YYYY-MM-DD)");
+                return false;
+            }
+            entry.Kind = JobKind.Once;
+            entry.RunDate = date.Date;
+            return true;
+        }
+
+        private static void ParseExecutionOptions(JobConfig job, JobEntry entry, MissedPolicy defaultMissed, ILogger log)
+        {
             if (string.IsNullOrWhiteSpace(job.MissedRun))
                 entry.Missed = defaultMissed;
             else if (!TryParseMissedPolicy(job.MissedRun, out var missed))
@@ -453,8 +508,6 @@ namespace TicTack
                     entry.Jitter = jitter;
                 }
             }
-
-            return true;
         }
 
         // Pure overlap decision, extracted for tests: an idle job (no run or
@@ -549,7 +602,7 @@ namespace TicTack
                     // Deliberate fire-and-forget: jobs must not block the
                     // timer. Tracked so Stop() can cancel and wait instead of
                     // letting a job race into a disposed store/logger.
-#pragma warning disable MA0134 // Observe result of async calls
+#pragma warning disable MA0134 // Fire-and-forget kill at shutdown: awaiting would block process exit on a hung child.
                     var task = System.Threading.Tasks.Task.Run(() => RunJobAsync(job));
 #pragma warning restore MA0134
                     job.Running = task;
@@ -608,18 +661,7 @@ namespace TicTack
 
             if (!string.IsNullOrWhiteSpace(cfg.PreCommand))
             {
-                var pre = Sub(cfg.PreCommand);
-                _log.Info("Running job '" + cfg.Name + "' pre-command: " + pre);
-                var (preExit, _, preErr, preTimedOut) = await ProcessRunner.RunAsync(
-                    pre, wd, redirect: true, ct, timeoutMs, low).ConfigureAwait(false);
-                if (preTimedOut || preExit != 0)
-                {
-                    _log.Error(preTimedOut
-                        ? TimeoutMessage(cfg.Name + " pre-command", job.TimeoutMinutes)
-                        : "Job '" + cfg.Name + "' pre-command exited " + preExit + ": " + preErr);
-                    await RunFailureHookAsync(job, wd, Sub, timeoutMs, low, ct).ConfigureAwait(false);
-                    return; // gated: main never ran, no stamp, post skipped
-                }
+                if (!await RunPreCommandAsync(job, wd, Sub, timeoutMs, low, ct).ConfigureAwait(false)) return;
             }
 
             var cmd = Sub(cfg.Command!);
@@ -659,13 +701,7 @@ namespace TicTack
             // logged only — it neither unstamps a success nor pages failure.
             if (!string.IsNullOrWhiteSpace(cfg.PostCommand))
             {
-                var post = Sub(cfg.PostCommand);
-                _log.Info("Running job '" + cfg.Name + "' post-command: " + post);
-                var (postExit, _, postErr, postTimedOut) = await ProcessRunner.RunAsync(
-                    post, wd, redirect: true, ct, timeoutMs, low).ConfigureAwait(false);
-                if (postTimedOut) _log.Error(TimeoutMessage(cfg.Name + " post-command", job.TimeoutMinutes));
-                else if (postExit != 0) _log.Error("Job '" + cfg.Name + "' post-command exited " + postExit + ": " + postErr);
-                else _log.Info("Job '" + cfg.Name + "' post-command completed");
+                await RunPostCommandAsync(job, wd, Sub, timeoutMs, low, ct).ConfigureAwait(false);
             }
         }
 
@@ -784,7 +820,7 @@ namespace TicTack
                         psi.ArgumentList.Add("--why=scheduled job " + (jobName ?? "unnamed"));
                         psi.ArgumentList.Add("--mode=block");
                         psi.ArgumentList.Add("sleep");
-                        psi.ArgumentList.Add(secs.ToString());
+                        psi.ArgumentList.Add(secs.ToString(CultureInfo.InvariantCulture));
                         h._companion = Process.Start(psi);
                     }
                 }
@@ -939,6 +975,40 @@ namespace TicTack
             public Task? Running { get; set; }
             public bool Queued { get; set; }
             public object RunLock { get; } = new object();
+        }
+
+        private async Task<bool> RunPreCommandAsync(JobEntry job, string wd, Func<string, string> sub, int timeoutMs, bool low, CancellationToken ct)
+        {
+            var cfg = job.Config;
+            if (cfg.PreCommand == null)
+                return true;
+            var pre = sub(cfg.PreCommand);
+            _log.Info("Running job '" + cfg.Name + "' pre-command: " + pre);
+            var (preExit, _, preErr, preTimedOut) = await ProcessRunner.RunAsync(
+                pre, wd, redirect: true, ct, timeoutMs, low).ConfigureAwait(false);
+            if (preTimedOut || preExit != 0)
+            {
+                _log.Error(preTimedOut
+                    ? TimeoutMessage(cfg.Name + " pre-command", job.TimeoutMinutes)
+                    : "Job '" + cfg.Name + "' pre-command exited " + preExit + ": " + preErr);
+                await RunFailureHookAsync(job, wd, sub, timeoutMs, low, ct).ConfigureAwait(false);
+                return false; // gated: main never ran, no stamp, post skipped
+            }
+            return true;
+        }
+
+        private async Task RunPostCommandAsync(JobEntry job, string wd, Func<string, string> sub, int timeoutMs, bool low, CancellationToken ct)
+        {
+            var cfg = job.Config;
+            if (cfg.PostCommand == null)
+                return;
+            var post = sub(cfg.PostCommand);
+            _log.Info("Running job '" + cfg.Name + "' post-command: " + post);
+            var (postExit, _, postErr, postTimedOut) = await ProcessRunner.RunAsync(
+                post, wd, redirect: true, ct, timeoutMs, low).ConfigureAwait(false);
+            if (postTimedOut) _log.Error(TimeoutMessage(cfg.Name + " post-command", job.TimeoutMinutes));
+            else if (postExit != 0) _log.Error("Job '" + cfg.Name + "' post-command exited " + postExit + ": " + postErr);
+            else _log.Info("Job '" + cfg.Name + "' post-command completed");
         }
     }
 }

@@ -23,7 +23,7 @@ namespace TicTack
 
     // Validation mirrors comparison; the validators wrap the comparers instead
     // of duplicating their bodies (the two had drifted as copy-paste twins).
-    public class SizeValidator : IValidator
+    public sealed class SizeValidator : IValidator
     {
         private readonly SizeComparer _comparer = new SizeComparer();
 
@@ -31,7 +31,7 @@ namespace TicTack
             Task.FromResult(_comparer.AreEqual(sourcePath, destPath, sourceSnapshot));
     }
 
-    public class HashValidator : IValidator
+    public sealed class HashValidator : IValidator
     {
         private readonly HashComparer _comparer;
 

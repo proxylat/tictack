@@ -86,7 +86,7 @@ namespace TicTack
         }
     }
 
-    public class SizeComparer : IFileComparer
+    public sealed class SizeComparer : IFileComparer
     {
         // Metadata-only: never reads file contents.
         public bool RequiresContentRead => false;
@@ -108,7 +108,7 @@ namespace TicTack
         }
     }
 
-    public class DateSizeComparer : IFileComparer
+    public sealed class DateSizeComparer : IFileComparer
     {
         // Metadata-only: never reads file contents.
         public bool RequiresContentRead => false;
@@ -132,7 +132,7 @@ namespace TicTack
         }
     }
 
-    public class HashComparer : IFileComparer
+    public sealed class HashComparer : IFileComparer
     {
         private readonly IFileAccessor? _accessor;
         public HashComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
@@ -162,7 +162,7 @@ namespace TicTack
         }
     }
 
-    public class FullComparer : IFileComparer
+    public sealed class FullComparer : IFileComparer
     {
         private readonly HashComparer _hash;
         public FullComparer(IFileAccessor? accessor = null) { _hash = new HashComparer(accessor); }

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
@@ -9,10 +10,10 @@ namespace TicTack
 {
     public class TicTackConfig
     {
-        public List<SourceConfig> Sources { get; set; }
+        public IList<SourceConfig> Sources { get; set; }
         public MonitorConfig Monitor { get; set; }
         public LoggingConfig Logging { get; set; }
-        public List<JobConfig> Jobs { get; set; }
+        public IList<JobConfig> Jobs { get; set; }
         public JobsDefaultsConfig JobsDefaults { get; set; }
         public WatchdogConfig Watchdog { get; set; }
         public ExternalDrivesConfig ExternalDrives { get; set; }
@@ -27,7 +28,7 @@ namespace TicTack
         // Populated by ExpandPathsList for problems that are only visible
         // during expansion; Validate reports them.
         [YamlIgnore]
-        public List<string> Errors { get; set; }
+        public IList<string> Errors { get; set; }
 
         public TicTackConfig()
         {
@@ -46,7 +47,7 @@ namespace TicTack
     public class SourceConfig
     {
         public string Path { get; set; }
-        public List<string> Paths { get; set; }
+        public IList<string> Paths { get; set; } = new List<string>();
         public string Destination { get; set; }
         public string StateDbPath { get; set; }
         public double DebounceSeconds { get; set; }
@@ -68,7 +69,7 @@ namespace TicTack
     public class FilterConfig
     {
         public object? MaxFileSizeMb { get; set; }
-        public List<string> Exclude { get; set; } = new List<string>();
+        public IList<string> Exclude { get; set; } = new List<string>();
 
         public FilterConfig()
         {
@@ -149,7 +150,7 @@ namespace TicTack
             Retry = new RetryConfig();
             LockHandling = "retry";
             FileAccess = "direct";
-            LockWaitSeconds = 600;
+            LockWaitSeconds = 60;
             DeleteThresholdCount = 1000;
             DeleteThresholdSizeGb = 50;
             DeleteThresholdPercent = 50;
@@ -304,7 +305,7 @@ namespace TicTack
         public string? Every { get; set; }
         // Weekly mask ("days: [mon, wed, fri]"): fires on each listed weekday.
         // Only valid with schedule weekly; mutually exclusive with day.
-        public List<string> Days { get; set; }
+        public IList<string> Days { get; set; } = new List<string>();
         // Missed-run policy: catch_up | skip. Falls back to
         // jobs_defaults.missed_run, else catch_up (today's behavior).
         public string? MissedRun { get; set; }
@@ -358,7 +359,7 @@ namespace TicTack
     {
         public string? Command { get; set; }
         public string? WorkingDir { get; set; }
-        public List<string> ExcludeDrives { get; set; }
+        public IList<string> ExcludeDrives { get; set; } = new List<string>();
         public bool RequireMarkerFile { get; set; }
         public string? MarkerFileName { get; set; }
 
@@ -435,104 +436,135 @@ namespace TicTack
             var destinations = new Dictionary<string, string>(PathComparer);
             foreach (var src in cfg.Sources)
             {
-                if (string.IsNullOrEmpty(src.Path))
+                if (!ValidateSource(src, destinations, log)) valid = false;
+            }
+            return valid;
+        }
+        // One source stanza: paths, monitor, destinations, numeric knobs.
+        // False = logged the reason, keep checking the rest.
+        private static bool ValidateSource(SourceConfig src, Dictionary<string, string> destinations, ILogger log)
+        {
+            bool valid = true;
+            if (string.IsNullOrEmpty(src.Path))
+            {
+                log.Error("Source path is required");
+                valid = false;
+            }
+            if (string.IsNullOrEmpty(src.Destination))
+            {
+                log.Error("Destination is required for source: " + src.Path);
+                valid = false;
+            }
+            valid = ValidatePathsNotOverlapping(src, log) && valid;
+            if (src.Sync != null && !string.Equals(src.Sync.Durability, "full", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Error("Durability must be 'full', 'fdatasync', or 'rename-only' for source: " + src.Path);
+                valid = false;
+            }
+            if (src.Sync != null && !string.Equals(src.Sync.DrainStrategy, "scan", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(src.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Error("DrainStrategy must be 'scan' or 'ready_queue' for source: " + src.Path);
+                valid = false;
+            }
+            if (src.Sync != null && !string.Equals(src.Sync.DirSync, "per-file", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(src.Sync.DirSync, "per-batch", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Error("DirSync must be 'per-file' or 'per-batch' for source: " + src.Path);
+                valid = false;
+            }
+            if (src.Sync != null && !string.Equals(src.Sync.CompleteMode, "inline", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(src.Sync.CompleteMode, "pipelined", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Error("CompleteMode must be 'inline' or 'pipelined' for source: " + src.Path);
+                valid = false;
+            }
+            if (src.Sync != null && !IsValidVerification(src.Sync.Verification))
+            {
+                log.Error("Verification must be 'size', 'date_and_size', 'hash', or 'full' for source: " + src.Path);
+                valid = false;
+            }
+            if (src.Sync != null && !string.Equals(src.Sync.FileAccess, "direct", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(src.Sync.FileAccess, "vss", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Error("FileAccess must be 'direct' or 'vss' for source: " + src.Path);
+                valid = false;
+            }
+            if (src.Filter != null && !IsValidFileSizeLimit(src.Filter.MaxFileSizeMb))
+            {
+                log.Error("max_file_size_mb must be a number, 'no-limit', or 'none' for source: " + src.Path);
+                valid = false;
+            }
+            valid = ValidateDestinations(src, destinations, log) && valid;
+                    return valid;
+        }
+
+        // Source and destination must not overlap in either direction.
+        // False = logged. Unresolvable paths fail closed.
+        private static bool ValidatePathsNotOverlapping(SourceConfig src, ILogger log)
+        {
+            bool valid = true;
+
+            if (!string.IsNullOrEmpty(src.Path) && !string.IsNullOrEmpty(src.Destination))
+            {
+                try
                 {
-                    log.Error("Source path is required");
-                    valid = false;
-                }
-                if (string.IsNullOrEmpty(src.Destination))
-                {
-                    log.Error("Destination is required for source: " + src.Path);
-                    valid = false;
-                }
-                if (!string.IsNullOrEmpty(src.Path) && !string.IsNullOrEmpty(src.Destination))
-                {
-                    try
+                    var source = Path.GetFullPath(src.Path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    var destination = Path.GetFullPath(src.Destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    // Case-sensitive on Linux, where two paths differing only
+                    // in case are genuinely different directories.
+                    var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                    if (source.Equals(destination, cmp)
+                        || destination.StartsWith(source + Path.DirectorySeparatorChar, cmp)
+                        || source.StartsWith(destination + Path.DirectorySeparatorChar, cmp))
                     {
-                        var source = Path.GetFullPath(src.Path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                        var destination = Path.GetFullPath(src.Destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                        // Case-sensitive on Linux, where two paths differing only
-                        // in case are genuinely different directories.
-                        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-                        if (source.Equals(destination, cmp)
-                            || destination.StartsWith(source + Path.DirectorySeparatorChar, cmp)
-                            || source.StartsWith(destination + Path.DirectorySeparatorChar, cmp))
-                        {
-                            log.Error("Source and destination overlap: " + src.Path + " -> " + src.Destination);
-                            valid = false;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        log.Error("Invalid source or destination path: " + ex.Message);
+                        log.Error("Source and destination overlap: " + src.Path + " -> " + src.Destination);
                         valid = false;
                     }
                 }
-                if (src.Sync != null && !string.Equals(src.Sync.Durability, "full", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase))
+                catch (Exception ex)
                 {
-                    log.Error("Durability must be 'full', 'fdatasync', or 'rename-only' for source: " + src.Path);
+                    log.Error("Invalid source or destination path: " + ex.Message);
                     valid = false;
-                }
-                if (src.Sync != null && !string.Equals(src.Sync.DrainStrategy, "scan", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(src.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase))
-                {
-                    log.Error("DrainStrategy must be 'scan' or 'ready_queue' for source: " + src.Path);
-                    valid = false;
-                }
-                if (src.Sync != null && !string.Equals(src.Sync.DirSync, "per-file", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(src.Sync.DirSync, "per-batch", StringComparison.OrdinalIgnoreCase))
-                {
-                    log.Error("DirSync must be 'per-file' or 'per-batch' for source: " + src.Path);
-                    valid = false;
-                }
-                if (src.Sync != null && !string.Equals(src.Sync.CompleteMode, "inline", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(src.Sync.CompleteMode, "pipelined", StringComparison.OrdinalIgnoreCase))
-                {
-                    log.Error("CompleteMode must be 'inline' or 'pipelined' for source: " + src.Path);
-                    valid = false;
-                }
-                if (src.Sync != null && !IsValidVerification(src.Sync.Verification))
-                {
-                    log.Error("Verification must be 'size', 'date_and_size', 'hash', or 'full' for source: " + src.Path);
-                    valid = false;
-                }
-                if (src.Sync != null && !string.Equals(src.Sync.FileAccess, "direct", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(src.Sync.FileAccess, "vss", StringComparison.OrdinalIgnoreCase))
-                {
-                    log.Error("FileAccess must be 'direct' or 'vss' for source: " + src.Path);
-                    valid = false;
-                }
-                if (src.Filter != null && !IsValidFileSizeLimit(src.Filter.MaxFileSizeMb))
-                {
-                    log.Error("max_file_size_mb must be a number, 'no-limit', or 'none' for source: " + src.Path);
-                    valid = false;
-                }
-                if (!string.IsNullOrEmpty(src.Destination))
-                {
-                    try
-                    {
-                        var dest = Path.GetFullPath(src.Destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                        if (destinations.TryGetValue(dest, out var other))
-                        {
-                            log.Error("Two sources map to the same destination: " + other + " and " + src.Path + " -> " + src.Destination);
-                            valid = false;
-                        }
-                        else
-                        {
-                            destinations[dest] = src.Path;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        log.Error("Invalid destination path: " + ex.Message);
-                        valid = false;
-                    }
                 }
             }
             return valid;
         }
+
+
+        // Destination paths: no drive roots, no source-inside-source,
+        // no duplicates, all absolute. False = logged, keeps checking.
+        private static bool ValidateDestinations(SourceConfig src, Dictionary<string, string> destinations, ILogger log)
+        {
+            bool valid = true;
+
+            if (!string.IsNullOrEmpty(src.Destination))
+            {
+                try
+                {
+                    var dest = Path.GetFullPath(src.Destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (destinations.TryGetValue(dest, out var other))
+                    {
+                        log.Error("Two sources map to the same destination: " + other + " and " + src.Path + " -> " + src.Destination);
+                        valid = false;
+                    }
+                    else
+                    {
+                        destinations[dest] = src.Path;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log.Error("Invalid destination path: " + ex.Message);
+                    valid = false;
+                }
+            }
+            return valid;
+        }
+
+
 
         private static readonly StringComparer PathComparer =
             OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
@@ -559,7 +591,7 @@ namespace TicTack
                 case int i when i >= 0: limit = i; return true;
                 case long l when l >= 0: limit = l; return true;
                 case string s when s == "no-limit" || s == "none": return true;
-                case string s when long.TryParse(s, out var n) && n >= 0: limit = n; return true;
+                case string s when long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) && n >= 0: limit = n; return true;
                 default: return false;
             }
         }
@@ -659,7 +691,7 @@ namespace TicTack
                 int numStart = i;
                 while (i < s.Length && char.IsDigit(s[i])) i++;
                 if (i == numStart) return false;
-                if (!long.TryParse(s.Substring(numStart, i - numStart), out var num)) return false;
+                if (!long.TryParse(s.Substring(numStart, i - numStart), NumberStyles.Integer, CultureInfo.InvariantCulture, out var num)) return false;
                 while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
                 int unitStart = i;
                 while (i < s.Length && char.IsLetter(s[i])) i++;

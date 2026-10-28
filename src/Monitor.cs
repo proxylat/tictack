@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -8,7 +9,7 @@ using System.Threading;
 
 namespace TicTack
 {
-    public class FileWatcherMonitor : IFileMonitor, IGapSource
+    public sealed class FileWatcherMonitor : IFileMonitor, IGapSource
     {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess,
@@ -108,27 +109,7 @@ namespace TicTack
                     // buffering directory changes only once this call is issued.
                     _armed.Set();
                     var buf = new byte[_bufferSize];
-                    while (!_stopping)
-                    {
-                        uint ret;
-                        if (!ReadDirectoryChangesW(_dirHandle, buf, (uint)buf.Length, true,
-                                NotifyFileName | NotifyDirName | NotifySize | NotifyLastWrite,
-                                out ret, IntPtr.Zero, IntPtr.Zero))
-                        {
-                            var err = Marshal.GetLastWin32Error();
-                            if (err == 6 || err == 995) break;
-                            FireError(new IOException("ReadDirectoryChangesW error " + err));
-                            break;
-                        }
-                        if (ret == 0)
-                        {
-                            FireError(new IOException("ReadDirectoryChangesW buffer overflow; rescanning"));
-                            Rescan();
-                            SignalGap();
-                            break;
-                        }
-                        ParseEvents(buf, ret);
-                    }
+            PumpMessages(buf);
                 }
                 catch (Exception ex) when (!_stopping)
                 {
@@ -147,6 +128,31 @@ namespace TicTack
                 }
                 SleepOrStop(_restartDelaySec * 1000);
             }
+        }
+
+        private void PumpMessages(byte[] buf)
+        {
+                while (!_stopping)
+                {
+                    uint ret;
+                    if (!ReadDirectoryChangesW(_dirHandle, buf, (uint)buf.Length, true,
+                            NotifyFileName | NotifyDirName | NotifySize | NotifyLastWrite,
+                            out ret, IntPtr.Zero, IntPtr.Zero))
+                    {
+                        var err = Marshal.GetLastWin32Error();
+                        if (err == 6 || err == 995) break;
+                        FireError(new IOException("ReadDirectoryChangesW error " + err));
+                        break;
+                    }
+                    if (ret == 0)
+                    {
+                        FireError(new IOException("ReadDirectoryChangesW buffer overflow; rescanning"));
+                        Rescan();
+                        SignalGap();
+                        break;
+                    }
+                    ParseEvents(buf, ret);
+                }
         }
 
         private void ParseEvents(byte[] buf, uint len)
@@ -282,7 +288,7 @@ namespace TicTack
         }
     }
 
-    public class PollingMonitor : IFileMonitor
+    public sealed class PollingMonitor : IFileMonitor
     {
         private readonly string _path;
         private readonly int _intervalSec;
@@ -405,7 +411,7 @@ namespace TicTack
 
     }
 
-    public class CompositeMonitor : IFileMonitor
+    public sealed class CompositeMonitor : IFileMonitor
     {
         private readonly IFileMonitor[] _monitors;
         private readonly List<(IFileMonitor Monitor, EventHandler<FileChangedEventArgs> Changed, EventHandler<MonitorErrorEventArgs> Error)> _wired = new();
@@ -723,7 +729,7 @@ namespace TicTack
             throw new IOException("FSCTL_QUERY_USN_JOURNAL failed on " + device +
                 " [" + ProbeMarker + "] (Win32 " + err +
                 ", ok=" + ok + ", bytes=" + ret +
-                ", handle=0x" + volume.ToString("X") +
+                ", handle=0x" + volume.ToString("X", CultureInfo.InvariantCulture) +
                 ", mounted-control=" + (mountedOk ? "ok" : "fail/Win32 " + mountedErr) +
                 ", sample-shape=" + sample +
                 ", priv=" + priv + "); " +
@@ -992,116 +998,15 @@ namespace TicTack
                     // Same documented sample shape as ProbeVolume (see note
                     // there): minimal-access opens fail FSCTL delivery on
                     // some stacks with Win32 1.
-                    _volumeHandle = CreateFile(_volumeDevice, GenericRead | GenericWrite, FileShareAll,
-                        IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
-                    if (_volumeHandle == InvalidHandle)
-                    {
-                        _armed.Set();
-                        FireError(new IOException("Failed to open volume: " + _volumeDevice));
-                        SleepOrStop(_restartDelaySec * 1000);
-                        continue;
-                    }
+            if (!TryOpenVolume()) continue;
                     if (_stopping) break;
 
                     // Seed before the head is captured: dirs created in
                     // between still deliver CREATE records at/after it.
                     var buf = new byte[64 * 1024];
-                    SeedWatchDirs();
-                    ulong journalId;
-                    long lastUsn;
-                    ulong journalMaxSize;
-                    try { (journalId, lastUsn, journalMaxSize, _) = QueryJournal(_volumeHandle, _volumeDevice, priv); }
-                    catch (Exception ex)
-                    {
-                        _armed.Set();
-                        FireError(ex);
-                        SleepOrStop(_restartDelaySec * 1000);
-                        continue;
-                    }
-                    // First run only: replay the offline window from the
-                    // persisted checkpoint. Re-baselines go straight to head
-                    // (the error path already fired its gap); replaying there
-                    // would only re-deliver already-processed records.
-                    if (!_caughtUpOnce)
-                    {
-                        _caughtUpOnce = true;
-                        lastUsn = TryCatchUpOffline(_volumeHandle, journalId, lastUsn, buf);
-                    }
-
-                    // Seed receipt: dir count proves the tree was covered,
-                    // journal+head are the baseline the re-baseline line
-                    // compares against when the journal changes. Mask, poll
-                    // interval and prefilter flag are config/constants —
-                    // never logged, read them in the config file.
-                    var leaf = Path.GetFileName(_path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-                    if (string.IsNullOrEmpty(leaf)) leaf = _path;
-                    if (_prefilterActive)
-                        _log?.Debug("USN seeded: " + leaf + ": " + _watchDirFrns.Count + " dirs, journal=" + journalId + ", from=" + lastUsn);
-                    else
-                        _log?.Debug("USN seeded: " + leaf + ": journal=" + journalId + ", from=" + lastUsn + " (prefilter off)");
-                    // A small journal wraps in minutes on a busy volume,
-                    // turning every poll into a re-baseline loop. One
-                    // actionable line per seed, exact command included.
-                    // _volumeDevice is \\.\X: so the last 2 chars are the
-                    // drive fsutil wants.
-                    if (journalMaxSize > 0 && journalMaxSize < 128UL * 1024 * 1024)
-                    {
-                        var drive = _volumeDevice.Length >= 2 ? _volumeDevice.Substring(_volumeDevice.Length - 2) : _volumeDevice;
-                        _log?.Warn("USN journal is " + (journalMaxSize / 1024 / 1024) + "MB on " + _volumeDevice
-                            + "; consider: fsutil usn createjournal m=134217728 a=8388608 " + drive);
-                    }
+            if (!TrySeedJournal(priv, buf, out var journalId, out var lastUsn)) continue;
                     _armed.Set();
-                    while (!_stopping)
-                    {
-                        List<UsnRecord>? records = null;
-                        try
-                        {
-                            records = ReadJournal(_volumeHandle, journalId, ref lastUsn, buf, out var headJumped);
-                            // A head jump skipped events the cursor can never
-                            // revisit: same covering scan as a recreation.
-                            if (headJumped) SignalGap();
-                        }
-                        catch (UsnJournalReadException jex)
-                        {
-                            // Same recovery for every read failure; the Win32
-                            // code in the error line is the diagnosis (wrap
-                            // vs deletion vs access denied), never a guess.
-                            FireError(jex);
-                            _log?.Info("USN journal unreadable (Win32 " + jex.Win32Code + ") on " + _volumeDevice
-                                + ", re-baselining at new head (gap covered by on-demand rescan).");
-                            SignalGap();
-                            break;
-                        }
-                        catch (Exception ex)
-                        {
-                            FireError(ex);
-                            _log?.Info("USN journal read failed on " + _volumeDevice
-                                + ", re-baselining at new head (gap covered by on-demand rescan).");
-                            SignalGap();
-                            break;
-                        }
-                        if (records != null)
-                        {
-                            if (records.Count == 0)
-                            {
-                                // The read should block up to Timeout seconds,
-                                // but some stacks return instantly when caught
-                                // up — without this the loop busy-spins on an
-                                // ioctl per iteration (proven by ProcMon: solid
-                                // QUERY+READ with no sleeps, ~40% CPU idle).
-                                SleepOrStop(_pollIntervalMs);
-                            }
-                            else
-                            {
-                                foreach (var rec in records)
-                                {
-                                    if (_stopping) break;
-                                    Dispatch(rec);
-                                }
-                            }
-                            WriteCheckpointIfDue(journalId, lastUsn);
-                        }
-                    }
+            PollJournal(journalId, ref lastUsn, buf);
                 }
                 finally
                 {
@@ -1114,6 +1019,124 @@ namespace TicTack
                 }
                 if (!_stopping) SleepOrStop(_restartDelaySec * 1000);
             }
+        }
+
+        private bool TryOpenVolume()
+        {
+                _volumeHandle = CreateFile(_volumeDevice, GenericRead | GenericWrite, FileShareAll,
+                    IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+                if (_volumeHandle == InvalidHandle)
+                {
+                    _armed.Set();
+                    FireError(new IOException("Failed to open volume: " + _volumeDevice));
+                    SleepOrStop(_restartDelaySec * 1000);
+                    return false;
+                }
+            return true;
+        }
+
+        private bool TrySeedJournal(string priv, byte[] buf, out ulong journalId, out long lastUsn)
+        {
+                SeedWatchDirs();
+                journalId = 0;
+                lastUsn = 0;
+                ulong journalMaxSize;
+                try { (journalId, lastUsn, journalMaxSize, _) = QueryJournal(_volumeHandle, _volumeDevice, priv); }
+                catch (Exception ex)
+                {
+                    _armed.Set();
+                    FireError(ex);
+                    SleepOrStop(_restartDelaySec * 1000);
+            return false;
+                }
+                // First run only: replay the offline window from the
+                // persisted checkpoint. Re-baselines go straight to head
+                // (the error path already fired its gap); replaying there
+                // would only re-deliver already-processed records.
+                if (!_caughtUpOnce)
+                {
+                    _caughtUpOnce = true;
+                    lastUsn = TryCatchUpOffline(_volumeHandle, journalId, lastUsn, buf);
+                }
+
+                // Seed receipt: dir count proves the tree was covered,
+                // journal+head are the baseline the re-baseline line
+                // compares against when the journal changes. Mask, poll
+                // interval and prefilter flag are config/constants —
+                // never logged, read them in the config file.
+                var leaf = Path.GetFileName(_path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (string.IsNullOrEmpty(leaf)) leaf = _path;
+                if (_prefilterActive)
+                    _log?.Debug("USN seeded: " + leaf + ": " + _watchDirFrns.Count + " dirs, journal=" + journalId + ", from=" + lastUsn);
+                else
+                    _log?.Debug("USN seeded: " + leaf + ": journal=" + journalId + ", from=" + lastUsn + " (prefilter off)");
+                // A small journal wraps in minutes on a busy volume,
+                // turning every poll into a re-baseline loop. One
+                // actionable line per seed, exact command included.
+                // _volumeDevice is \\.\X: so the last 2 chars are the
+                // drive fsutil wants.
+                if (journalMaxSize > 0 && journalMaxSize < 128UL * 1024 * 1024)
+                {
+                    var drive = _volumeDevice.Length >= 2 ? _volumeDevice.Substring(_volumeDevice.Length - 2) : _volumeDevice;
+                    _log?.Warn("USN journal is " + (journalMaxSize / 1024 / 1024) + "MB on " + _volumeDevice
+                        + "; consider: fsutil usn createjournal m=134217728 a=8388608 " + drive);
+                }
+            return true;
+        }
+
+        private void PollJournal(ulong journalId, ref long lastUsn, byte[] buf)
+        {
+                while (!_stopping)
+                {
+                    List<UsnRecord>? records = null;
+                    try
+                    {
+                        records = ReadJournal(_volumeHandle, journalId, ref lastUsn, buf, out var headJumped);
+                        // A head jump skipped events the cursor can never
+                        // revisit: same covering scan as a recreation.
+                        if (headJumped) SignalGap();
+                    }
+                    catch (UsnJournalReadException jex)
+                    {
+                        // Same recovery for every read failure; the Win32
+                        // code in the error line is the diagnosis (wrap
+                        // vs deletion vs access denied), never a guess.
+                        FireError(jex);
+                        _log?.Info("USN journal unreadable (Win32 " + jex.Win32Code + ") on " + _volumeDevice
+                            + ", re-baselining at new head (gap covered by on-demand rescan).");
+                        SignalGap();
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        FireError(ex);
+                        _log?.Info("USN journal read failed on " + _volumeDevice
+                            + ", re-baselining at new head (gap covered by on-demand rescan).");
+                        SignalGap();
+                        break;
+                    }
+                    if (records != null)
+                    {
+                        if (records.Count == 0)
+                        {
+                            // The read should block up to Timeout seconds,
+                            // but some stacks return instantly when caught
+                            // up — without this the loop busy-spins on an
+                            // ioctl per iteration (proven by ProcMon: solid
+                            // QUERY+READ with no sleeps, ~40% CPU idle).
+                            SleepOrStop(_pollIntervalMs);
+                        }
+                        else
+                        {
+                            foreach (var rec in records)
+                            {
+                                if (_stopping) break;
+                                Dispatch(rec);
+                            }
+                        }
+                        WriteCheckpointIfDue(journalId, lastUsn);
+                    }
+                }
         }
 
         internal void Dispatch(UsnRecord rec)
@@ -1155,99 +1178,128 @@ namespace TicTack
             }
             else if ((rec.Reason & ReasonRenameOldName) != 0)
             {
-                // By the time the journal is read the file has already
-                // moved, so opening it by id returns the NEW path. The
-                // record's parent ref + old name are the authoritative
-                // old location.
-                var oldFull = UnderWatch(CombineParent(rec, resolvePath));
-                if (oldFull != null)
-                {
-                    // FIFO at the cap: stale queue stubs (already paired or
-                    // deleted FRNs) drain without effect until one live
-                    // entry evicts. Every add enqueues exactly once, so the
-                    // queue can never run dry while the map is over the cap.
-                    while (_pendingOldNames.Count >= RenameStashCap && _pendingOldOrder.Count > 0)
-                        _pendingOldNames.Remove(_pendingOldOrder.Dequeue());
-                    _pendingOldNames[rec.FileRef] = oldFull;
-                    _pendingOldOrder.Enqueue(rec.FileRef);
-                }
+                StashRenameOldName(rec, resolvePath);
                 return null;
             }
             else if ((rec.Reason & ReasonRenameNewName) != 0)
             {
-                type = ChangeType.Renamed;
-                if (!_pendingOldNames.Remove(rec.FileRef, out oldPath))
-                {
-                    // Duplicate delivery of an already-paired rename (same
-                    // FRN): the rename event covered it, stay silent.
-                    if (_renameTargets.Contains(rec.FileRef)) return null;
-                    // Rename into the watched tree (or a missed old-name):
-                    // report as creation of the new name.
-                    type = ChangeType.Created;
-                }
-                else
-                {
-                    while (_renameTargets.Count >= RenameStashCap && _renameTargetOrder.Count > 0)
-                        _renameTargets.Remove(_renameTargetOrder.Dequeue());
-                    _renameTargets.Add(rec.FileRef);
-                    _renameTargetOrder.Enqueue(rec.FileRef);
-                }
-                if (isDir && _parentPrefilter && _watchDirFrns.Contains(rec.ParentRef))
-                {
-                    // Directory moved (or created) into the tree: track it
-                    // plus its subtree, closing the move-in gap. A move out
-                    // leaves a stale entry — harmless, UnderWatch drops it.
-                    _watchDirFrns.Add(rec.FileRef);
-                    AddSubtreeFrns(CombineParent(rec, resolvePath));
-                }
-            }
-            else if ((rec.Reason & ReasonFileCreate) != 0)
-            {
-                // Create record for an already-paired rename target (same
-                // FRN): duplicate delivery of the new link, stay silent.
-                if (_renameTargets.Contains(rec.FileRef)) return null;
-                if (isDir && _parentPrefilter && _watchDirFrns.Contains(rec.ParentRef))
-                    _watchDirFrns.Add(rec.FileRef);
-                type = ChangeType.Created;
-            }
-            else if ((rec.Reason & ReasonModifyMask) != 0)
-            {
-                // Directory mtime churns on every child change; the watcher
-                // has the same noise, but USN parity only needs dir
-                // create/delete, so skip dir-Modified here.
-                if (isDir) return null;
-                type = ChangeType.Modified;
+                var paired = TryPairRenameNewName(rec, resolvePath, isDir, out oldPath);
+                if (paired == null) return null;
+                type = paired.Value;
             }
             else
             {
-                return null;
+                var classified = ClassifyCreateOrModify(rec, isDir);
+                if (classified == null) return null;
+                type = classified.Value;
             }
 
-            string? full;
-            if (type == ChangeType.Deleted)
-            {
-                // Deleted files cannot be opened by id; resolve through the
-                // (usually surviving) parent directory instead.
-                var combined = CombineParent(rec, resolvePath);
-                if (combined == null)
-                    NoteUnresolvedDelete(rec.ParentRef);
-                full = UnderWatch(combined);
-            }
-            else
-            {
-                // Event-time path first: by the time the journal is read
-                // the file may have moved (by-id then reports the NEW
-                // name) or been deleted (by-id fails outright). The
-                // record's parent ref + name are where the event happened;
-                // by-id stays as the fallback for a deleted parent.
-                full = UnderWatch(CombineParent(rec, resolvePath) ?? resolvePath(rec.FileRef));
-            }
+            string? full = ResolveEventPath(rec, resolvePath, type);
             if (full == null) return null;
             // A rename whose old path resolved outside the watched tree is a
             // creation as far as the destination is concerned.
             if (type == ChangeType.Renamed && (oldPath == null || UnderWatch(oldPath) == null))
                 return new FileChangedEventArgs(ChangeType.Created, full);
             return new FileChangedEventArgs(type, full, oldPath);
+        }
+
+        private void StashRenameOldName(UsnRecord rec, Func<ulong, string?> resolvePath)
+        {
+            // By the time the journal is read the file has already
+            // moved, so opening it by id returns the NEW path. The
+            // record's parent ref + old name are the authoritative
+            // old location.
+            var oldFull = UnderWatch(CombineParent(rec, resolvePath));
+            if (oldFull != null)
+            {
+                // FIFO at the cap: stale queue stubs (already paired or
+                // deleted FRNs) drain without effect until one live
+                // entry evicts. Every add enqueues exactly once, so the
+                // queue can never run dry while the map is over the cap.
+                while (_pendingOldNames.Count >= RenameStashCap && _pendingOldOrder.Count > 0)
+                    _pendingOldNames.Remove(_pendingOldOrder.Dequeue());
+                _pendingOldNames[rec.FileRef] = oldFull;
+                _pendingOldOrder.Enqueue(rec.FileRef);
+            }
+        }
+
+        private ChangeType? TryPairRenameNewName(UsnRecord rec, Func<ulong, string?> resolvePath, bool isDir, out string? oldPath)
+        {
+            ChangeType type = ChangeType.Renamed;
+            if (!_pendingOldNames.Remove(rec.FileRef, out oldPath))
+            {
+                // Duplicate delivery of an already-paired rename (same
+                // FRN): the rename event covered it, stay silent.
+                if (_renameTargets.Contains(rec.FileRef)) return null;
+                // Rename into the watched tree (or a missed old-name):
+                // report as creation of the new name.
+                type = ChangeType.Created;
+            }
+            else
+            {
+                while (_renameTargets.Count >= RenameStashCap && _renameTargetOrder.Count > 0)
+                    _renameTargets.Remove(_renameTargetOrder.Dequeue());
+                _renameTargets.Add(rec.FileRef);
+                _renameTargetOrder.Enqueue(rec.FileRef);
+            }
+            if (isDir && _parentPrefilter && _watchDirFrns.Contains(rec.ParentRef))
+            {
+                // Directory moved (or created) into the tree: track it
+                // plus its subtree, closing the move-in gap. A move out
+                // leaves a stale entry — harmless, UnderWatch drops it.
+                _watchDirFrns.Add(rec.FileRef);
+                AddSubtreeFrns(CombineParent(rec, resolvePath));
+            }
+            return type;
+        }
+
+        private ChangeType? ClassifyCreateOrModify(UsnRecord rec, bool isDir)
+        {
+        if ((rec.Reason & ReasonFileCreate) != 0)
+        {
+            // Create record for an already-paired rename target (same
+            // FRN): duplicate delivery of the new link, stay silent.
+            if (_renameTargets.Contains(rec.FileRef)) return null;
+            if (isDir && _parentPrefilter && _watchDirFrns.Contains(rec.ParentRef))
+                _watchDirFrns.Add(rec.FileRef);
+            return ChangeType.Created;
+        }
+        else if ((rec.Reason & ReasonModifyMask) != 0)
+        {
+            // Directory mtime churns on every child change; the watcher
+            // has the same noise, but USN parity only needs dir
+            // create/delete, so skip dir-Modified here.
+            if (isDir) return null;
+            return ChangeType.Modified;
+        }
+        else
+        {
+            return null;
+        }
+        }
+
+        private string? ResolveEventPath(UsnRecord rec, Func<ulong, string?> resolvePath, ChangeType type)
+        {
+        string? full;
+        if (type == ChangeType.Deleted)
+        {
+            // Deleted files cannot be opened by id; resolve through the
+            // (usually surviving) parent directory instead.
+            var combined = CombineParent(rec, resolvePath);
+            if (combined == null)
+                NoteUnresolvedDelete(rec.ParentRef);
+            full = UnderWatch(combined);
+        }
+        else
+        {
+            // Event-time path first: by the time the journal is read
+            // the file may have moved (by-id then reports the NEW
+            // name) or been deleted (by-id fails outright). The
+            // record's parent ref + name are where the event happened;
+            // by-id stays as the fallback for a deleted parent.
+            full = UnderWatch(CombineParent(rec, resolvePath) ?? resolvePath(rec.FileRef));
+        }
+            return full;
         }
 
         // Tree-delete signal: a delete whose parent was a TRACKED dir but

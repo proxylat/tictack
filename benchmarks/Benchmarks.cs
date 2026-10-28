@@ -119,7 +119,7 @@ public class StateDbBenchmarks
     private List<(string path, long size, long mtime)> _batch = null!;
 
     [GlobalSetup]
-    public void Setup()
+    public async Task Setup()
     {
         _dir = Path.Combine(Path.GetTempPath(), "tictack-bench-" + Guid.NewGuid().ToString("N"));
         _db = new StateDb(Path.Combine(_dir, "state.db"));
@@ -129,7 +129,7 @@ public class StateDbBenchmarks
         {
             seed.Add(($"/data/file{i:D6}.txt", i * 1024L, 637000000000000000L + i));
         }
-        _db.UpsertBatch(seed);
+        await _db.UpsertBatchAsync(seed);
 
         _batch = new List<(string path, long size, long mtime)>(1000);
         for (var i = 0; i < 1000; i++)
@@ -146,7 +146,7 @@ public class StateDbBenchmarks
     }
 
     [Benchmark]
-    public void UpsertBatch1000() => _db.UpsertBatch(_batch);
+    public async Task UpsertBatch1000() => await _db.UpsertBatchAsync(_batch);
 
     // Production initial-sync path: indexed point lookup per file,
     // 90% hits + 10% misses like a warm restart scan.
@@ -178,7 +178,7 @@ public class WarmPathBenchmarks
     private List<(string Src, string Dst, FileSnapshot Snap)> _files = null!;
 
     [GlobalSetup]
-    public void Setup()
+    public async Task Setup()
     {
         _dir = Path.Combine(Path.GetTempPath(), "tictack-warm-" + Guid.NewGuid().ToString("N"));
         var src = Path.Combine(_dir, "src");
@@ -199,7 +199,7 @@ public class WarmPathBenchmarks
             _files.Add((s, d, snap));
         }
         _db = new StateDb(Path.Combine(_dir, "state.db"));
-        _db.UpsertBatch(batch);
+        await _db.UpsertBatchAsync(batch);
     }
 
     [GlobalCleanup]

@@ -8,7 +8,6 @@
     <AssemblyName>Corpus</AssemblyName>
     <RootNamespace>Corpus</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <NoWarn>$(NoWarn);NU1903</NoWarn>
   </PropertyGroup>
   <!-- Segment-reader unit tests exercise VssReadStream over MemoryStream. -->
   <ItemGroup>

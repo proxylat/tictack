@@ -6,7 +6,7 @@ namespace TicTack
 {
     public static class DriveDiscoverer
     {
-        public static List<string> GetEligibleDrives(ExternalDrivesConfig cfg, HashSet<string> excludeDrives, ILogger log)
+        public static IReadOnlyList<string> GetEligibleDrives(ExternalDrivesConfig cfg, ISet<string> excludeDrives, ILogger log)
         {
             var drives = new List<DriveCandidate>();
             foreach (var di in DriveInfo.GetDrives())
@@ -14,7 +14,7 @@ namespace TicTack
             return GetEligibleDrives(cfg, excludeDrives, log, drives);
         }
 
-        internal static List<string> GetEligibleDrives(ExternalDrivesConfig cfg, HashSet<string> excludeDrives,
+        internal static IReadOnlyList<string> GetEligibleDrives(ExternalDrivesConfig cfg, ISet<string> excludeDrives,
             ILogger log, IEnumerable<DriveCandidate> drives)
         {
             var results = new List<string>();

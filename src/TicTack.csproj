@@ -5,13 +5,13 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AssemblyName>TicTackSv</AssemblyName>
     <RootNamespace>TicTack</RootNamespace>
-    <NoWarn>$(NoWarn);NU1903</NoWarn>
     <!-- IL2104/IL3053 are assembly-level advisories from YamlDotNet (no source
          generator upstream). Benign here: TicTackSv+YAML are rooted via
-         TrimmerRootAssembly in the Aot publish profile, and the analyzer
-         spike verified YamlDotNet emits no runtime codegen. -->
+         TrimmerRootAssembly in src/Properties/PublishProfiles/Aot.pubxml, and
+         the analyzer spike verified YamlDotNet emits no runtime codegen. -->
     <NoWarn>$(NoWarn);IL2104;IL3053</NoWarn>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <TieredCompilation>false</TieredCompilation>

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.IO;
 
@@ -32,11 +33,11 @@ namespace TicTack
                 if (!Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
 
-                var ts = now.ToString("yyyyMMdd-HHmmss");
+                var ts = now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
                 var path = Path.Combine(dir, "TicTack-" + level + "-" + ts + ".txt");
                 using (var w = new StreamWriter(path))
                 {
-                    w.WriteLine("TicTack " + level + " — " + now.ToString("yyyy-MM-dd HH:mm:ss"));
+                    w.WriteLine("TicTack " + level + " — " + now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
                     w.WriteLine(new string('-', 50));
                     w.WriteLine(message);
                     if (ex != null)

@@ -55,63 +55,77 @@ namespace TicTack
 
                 _log.Info("TicTack Service starting");
 
-                _pipelines = new List<SyncPipeline>();
-                foreach (var src in cfg.Sources)
-                {
-                    var pipeline = Program.BuildPipeline(src, cfg, _log, logMonitorStartup: true);
-                    pipeline.Start();
-                    _pipelines.Add(pipeline);
-                }
-
-                _scheduler = new TimerScheduler(cfg, _log);
-                _scheduler.Start();
-
-                if (cfg.Watchdog != null && cfg.Watchdog.Enabled)
-                {
-                    var ms = Math.Max(60000, cfg.Watchdog.IntervalMinutes * 60000);
-                    var stallAfter = TimeSpan.FromMilliseconds(ms);
-                    _heartbeat = new Timer(_ =>
-                    {
-                        _log!.Debug("[HEARTBEAT] Service running");
-                        // Stall-while-alive: a faulted processor or a
-                        // non-empty queue with no progress for a full
-                        // interval means sync is wedged. Error fans out to
-                        // tictack.log, the alert_path .txt, and EventLog
-                        // via the MultiLogger — no new plumbing.
-                        if (_pipelines != null)
-                            foreach (var pipeline in _pipelines)
-                            {
-                                var fault = pipeline.CheckHealth(stallAfter);
-                                if (fault != null)
-                                    _log.Error("[WATCHDOG] Source '" + pipeline.SourcePath + "': " + fault);
-                            }
-                    }, null, ms, ms);
-                }
-
-                _log.Info("TicTack Service started");
+                StartSyncEngine(cfg, _log);
             }
             catch (Exception ex)
             {
-                try
-                {
-                    EventLog.WriteEntry("TicTackSv", "OnStart failed: " + ex.ToString(),
-                        EventLogEntryType.Error);
-                }
-                catch { }
-                try
-                {
-                    var crashLog = Path.Combine(Path.GetTempPath(), "TicTackSv-crash.log");
-                    File.WriteAllText(crashLog, DateTime.Now + " OnStart failed:\r\n" + ex);
-                }
-                catch { }
-                try
-                {
-                    if (_pipelines != null) foreach (var pipeline in _pipelines) pipeline.Dispose();
-                }
-                catch { }
-                if (_log is IDisposable disposable) disposable.Dispose();
+                FailStart(ex);
                 throw;
             }
+        }
+
+        // Pipelines + scheduler + watchdog stall timer. Deferred: none here —
+        // TimerScheduler owns job timing; pipelines own their own deferreds.
+        private void StartSyncEngine(TicTackConfig cfg, ILogger log)
+        {
+            _pipelines = new List<SyncPipeline>();
+            foreach (var src in cfg.Sources)
+            {
+                var pipeline = Program.BuildPipeline(src, cfg, log, logMonitorStartup: true);
+                pipeline.Start();
+                _pipelines.Add(pipeline);
+            }
+
+            _scheduler = new TimerScheduler(cfg, log);
+            _scheduler.Start();
+
+            if (cfg.Watchdog != null && cfg.Watchdog.Enabled)
+            {
+                var ms = Math.Max(60000, cfg.Watchdog.IntervalMinutes * 60000);
+                var stallAfter = TimeSpan.FromMilliseconds(ms);
+                _heartbeat = new Timer(_ =>
+                {
+                    log.Debug("[HEARTBEAT] Service running");
+                    // Stall-while-alive: a faulted processor or a
+                    // non-empty queue with no progress for a full
+                    // interval means sync is wedged. Error fans out to
+                    // tictack.log, the alert_path .txt, and EventLog
+                    // via the MultiLogger — no new plumbing.
+                    if (_pipelines != null)
+                        foreach (var pipeline in _pipelines)
+                        {
+                            var fault = pipeline.CheckHealth(stallAfter);
+                            if (fault != null)
+                                log.Error("[WATCHDOG] Source '" + pipeline.SourcePath + "': " + fault);
+                        }
+                }, null, ms, ms);
+            }
+
+            log.Info("TicTack Service started");
+        }
+
+        // Best-effort crash trail: EventLog + temp crash log, then release
+        // anything OnStart opened before the throw propagates.
+        private void FailStart(Exception ex)
+        {
+            try
+            {
+                EventLog.WriteEntry("TicTackSv", "OnStart failed: " + ex.ToString(),
+                    EventLogEntryType.Error);
+            }
+            catch { }
+            try
+            {
+                var crashLog = Path.Combine(Path.GetTempPath(), "TicTackSv-crash.log");
+                File.WriteAllText(crashLog, DateTime.Now + " OnStart failed:\r\n" + ex);
+            }
+            catch { }
+            try
+            {
+                if (_pipelines != null) foreach (var pipeline in _pipelines) pipeline.Dispose();
+            }
+            catch { }
+            if (_log is IDisposable disposable) disposable.Dispose();
         }
 
         protected override void OnStop()

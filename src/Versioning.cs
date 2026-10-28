@@ -96,7 +96,7 @@ namespace TicTack
         public bool IsEmpty =>
             KeepLast == null && KeepWithin == null && KeepDaily == null && KeepWeekly == null && KeepMonthly == null;
 
-        public List<Decision> Evaluate(IEnumerable<VersionFile> versions, DateTime now)
+        public IReadOnlyList<Decision> Evaluate(IEnumerable<VersionFile> versions, DateTime now)
         {
             var ordered = versions.OrderByDescending(v => v.HasTimestamp ? v.Timestamp : DateTime.MaxValue).ToList();
             var keep = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -221,7 +221,7 @@ namespace TicTack
             try
             {
                 ct.ThrowIfCancellationRequested();
-                var ts = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+                var ts = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
                 var name = Path.GetFileNameWithoutExtension(destPath);
                 var ext = Path.GetExtension(destPath);
                 var dir = Path.GetDirectoryName(destPath);

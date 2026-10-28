@@ -8,7 +8,6 @@
     <AssemblyName>TicTack.Benchmarks</AssemblyName>
     <RootNamespace>TicTack.Benchmarks</RootNamespace>
     <StartupObject>TicTack.Benchmarks.Program</StartupObject>
-    <NoWarn>$(NoWarn);NU1903</NoWarn>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <InvariantGlobalization>true</InvariantGlobalization>
     <ServerGarbageCollection>false</ServerGarbageCollection>

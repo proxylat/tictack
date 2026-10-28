@@ -97,57 +97,17 @@ namespace TicTack
                     // Abandoned: the funnel already left (canceled). The tmp
                     // stays orphaned for PowerGuard; never touch it here.
                     if (item.Done.Task.IsCompleted) continue;
-                    FileSnapshot? fresh = null;
+                    FileSnapshot? fresh;
                     try
                     {
-                        var src = item.Args.ChangeEvent.FullPath;
-                        var dst = item.Args.DestPath;
-                        var result = _copy.CompleteTemp(item.Tmp, ct);
-                        if (!result.Success)
-                        {
-                            _log.Error(item.FailLabel + ": " + src + ": " + result.ErrorMessage);
-                            TicTackEventSource.Log.CopyFailed();
-                        }
-                        else if (!FileSnapshot.TryRead(src, out var snap))
-                        {
-                            _log.Error(item.ValidationLabel + ": source disappeared: " + src);
-                            TicTackEventSource.Log.CopyFailed();
-                        }
-                        else
-                        {
-                            bool valid;
-                            if (item.Tmp.SourceHash != null && item.Args.SourceSnapshot.HasValue
-                                && snap.Equals(item.Args.SourceSnapshot.Value)
-                                && _validator is HashValidator hashValidator)
-                            {
-                                valid = await hashValidator.ValidateWithSourceHashAsync(dst, item.Tmp.SourceHash, snap);
-                            }
-                            else
-                            {
-                                valid = await _validator.ValidateAsync(src, dst, snap);
-                            }
-                            if (!valid)
-                            {
-                                _log.Error(item.ValidationLabel + ": " + src + " -> " + dst);
-                                TicTackEventSource.Log.CopyFailed();
-                            }
-                            else if (await TryUpsertAsync(item, snap, src, ct))
-                            {
-                                fresh = snap;
-                            }
-                        }
+                        fresh = await CompleteOneAsync(item, ct);
                     }
                     catch (OperationCanceledException)
                     {
-                        // Shutdown mid-item: the rename may already be durable
-                        // without an upsert — safe (next run re-copies).
+                        // Shutdown mid-item: the rename may already be
+                        // durable without an upsert — safe (re-copies).
                         item.Done.TrySetCanceled();
                         continue;
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.Error("Completion failed: " + item.Args.ChangeEvent.FullPath, ex);
-                        TicTackEventSource.Log.CopyFailed();
                     }
                     item.Done.TrySetResult(fresh);
                 }
@@ -159,6 +119,58 @@ namespace TicTack
                 // waits forever on a loop that is gone.
                 while (_queue.Reader.TryRead(out var pending)) pending.Done.TrySetCanceled();
             }
+        }
+
+        // One queued completion: rename, validate, upsert. Null = a stage
+        // failed and already logged; the next run re-copies, never diverges.
+        private async Task<FileSnapshot?> CompleteOneAsync(PendingCompletion item, CancellationToken ct)
+        {
+            FileSnapshot? fresh = null;
+            try
+            {
+                var src = item.Args.ChangeEvent.FullPath;
+                var dst = item.Args.DestPath;
+                var result = _copy.CompleteTemp(item.Tmp, ct);
+                if (!result.Success)
+                {
+                    _log.Error(item.FailLabel + ": " + src + ": " + result.ErrorMessage);
+                    TicTackEventSource.Log.CopyFailed();
+                }
+                else if (!FileSnapshot.TryRead(src, out var snap))
+                {
+                    _log.Error(item.ValidationLabel + ": source disappeared: " + src);
+                    TicTackEventSource.Log.CopyFailed();
+                }
+                else
+                {
+                    bool valid;
+                    if (item.Tmp.SourceHash != null && item.Args.SourceSnapshot.HasValue
+                        && snap.Equals(item.Args.SourceSnapshot.Value)
+                        && _validator is HashValidator hashValidator)
+                    {
+                        valid = await hashValidator.ValidateWithSourceHashAsync(dst, item.Tmp.SourceHash, snap);
+                    }
+                    else
+                    {
+                        valid = await _validator.ValidateAsync(src, dst, snap);
+                    }
+                    if (!valid)
+                    {
+                        _log.Error(item.ValidationLabel + ": " + src + " -> " + dst);
+                        TicTackEventSource.Log.CopyFailed();
+                    }
+                    else if (await TryUpsertAsync(item, snap, src, ct))
+                    {
+                        fresh = snap;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error("Completion failed: " + item.Args.ChangeEvent.FullPath, ex);
+                TicTackEventSource.Log.CopyFailed();
+            }
+            return fresh;
         }
 
         // True when the snapshot is claimed in state. False (logged): durable

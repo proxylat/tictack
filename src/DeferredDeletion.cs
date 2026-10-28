@@ -104,52 +104,7 @@ namespace TicTack
                 try
                 {
                     EnsureConn();
-                    var existing = new HashSet<string>(StringComparer.Ordinal);
-                    foreach (var chunk in Chunk(incoming.Keys))
-                    {
-                        using var cmd = _conn!.CreateCommand();
-                        var names = new string[chunk.Count];
-                        for (int i = 0; i < chunk.Count; i++)
-                        {
-                            names[i] = "@p" + i;
-                            cmd.Parameters.AddWithValue(names[i], chunk[i]);
-                        }
-                        // Only generated @pN placeholder names are concatenated;
-                        // every value is bound, so no user input reaches SQL.
-                        // nosemgrep: csharp-sqli
-                        cmd.CommandText = "SELECT path_key FROM pending WHERE path_key IN (" + string.Join(",", names) + ")";
-                        using var reader = cmd.ExecuteReader();
-                        while (reader.Read()) existing.Add(reader.GetString(0));
-                    }
-                    var added = new List<KeyValuePair<string, string>>();
-                    foreach (var kv in incoming)
-                        if (!existing.Contains(kv.Key))
-                            added.Add(kv);
-                    // Two-phase drain: a fresh block during a slow drain must
-                    // restart that path's hold clock, not inherit
-                    // sweep-deletion. Claimed rows re-blocked here move to
-                    // the new batch with claimed reset. Unclaimed dupes keep
-                    // the old behavior (ignored, original clock stands).
-                    var reblocked = new List<string>();
-                    if (existing.Count > 0)
-                    {
-                        foreach (var chunk in Chunk(incoming.Keys.Where(k => existing.Contains(k))))
-                        {
-                            using var cmd = _conn!.CreateCommand();
-                            var names = new string[chunk.Count];
-                            for (int i = 0; i < chunk.Count; i++)
-                            {
-                                names[i] = "@p" + i;
-                                cmd.Parameters.AddWithValue(names[i], chunk[i]);
-                            }
-                            // Only generated @pN placeholder names are concatenated;
-                            // every value is bound, so no user input reaches SQL.
-                            // nosemgrep: csharp-sqli
-                            cmd.CommandText = "SELECT path_key FROM pending WHERE claimed = 1 AND path_key IN (" + string.Join(",", names) + ")";
-                            using var reader = cmd.ExecuteReader();
-                            while (reader.Read()) reblocked.Add(reader.GetString(0));
-                        }
-                    }
+                    var (added, reblocked) = ClassifyIncoming(incoming);
                     if (added.Count == 0 && reblocked.Count == 0)
                     {
                         _log.Debug("Deferred deletion: all files already pending, no new batch");
@@ -158,84 +113,153 @@ namespace TicTack
 
                     var now = DateTime.UtcNow;
                     var batchId = UniqueBatchId(now);
-                    using (var tx = _conn!.BeginTransaction())
-                    {
-                        using (var cmd = _conn.CreateCommand())
-                        {
-                            cmd.Transaction = tx;
-                            cmd.CommandText = "INSERT INTO batches (batch_id, blocked_at, last_warning_at, source_root) VALUES (@b, @t, 0, @s)";
-                            cmd.Parameters.AddWithValue("@b", batchId);
-                            cmd.Parameters.AddWithValue("@t", now.Ticks);
-                            cmd.Parameters.AddWithValue("@s", (object?)sourceRoot ?? DBNull.Value);
-                            cmd.ExecuteNonQuery();
-                        }
-                        using (var cmd = _conn.CreateCommand())
-                        {
-                            cmd.Transaction = tx;
-                            cmd.CommandText = "INSERT OR IGNORE INTO pending (path_key, batch_id, path) VALUES (@k, @b, @p)";
-                            var k = cmd.Parameters.Add("@k", SqliteType.Text);
-                            var b = cmd.Parameters.Add("@b", SqliteType.Text);
-                            var p = cmd.Parameters.Add("@p", SqliteType.Text);
-                            b.Value = batchId;
-                            foreach (var kv in added)
-                            {
-                                k.Value = kv.Key;
-                                p.Value = kv.Value;
-                                cmd.ExecuteNonQuery();
-                            }
-                        }
-                        if (reblocked.Count > 0)
-                        {
-                            foreach (var chunk in Chunk(reblocked))
-                            {
-                                using var cmd = _conn.CreateCommand();
-                                cmd.Transaction = tx;
-                                var names = new string[chunk.Count];
-                                for (int i = 0; i < chunk.Count; i++)
-                                {
-                                    names[i] = "@p" + i;
-                                    cmd.Parameters.AddWithValue(names[i], chunk[i]);
-                                }
-                                cmd.Parameters.AddWithValue("@b", batchId);
-                                // Only generated @pN placeholder names are concatenated;
-                                // every value is bound, so no user input reaches SQL.
-                                // nosemgrep: csharp-sqli
-                                cmd.CommandText = "UPDATE pending SET batch_id = @b, claimed = 0 WHERE path_key IN (" + string.Join(",", names) + ")";
-                                cmd.ExecuteNonQuery();
-                            }
-                        }
-                        tx.Commit();
-                    }
+                    WriteBatch(batchId, now, sourceRoot, added, reblocked);
                     _hasPending = true;
-                    var total = CountInternal();
-                    var fresh = added.Count + reblocked.Count;
-                    _log.Warn("Deferred deletion: batch " + BatchTimestamp(now) + ": " + fresh
-                        + " new files (" + total + " total held), hold for " + _holdDays + " days");
-                    var sample = added.Select(kv => kv.Value).ToList();
-                    if (reblocked.Count > 0)
-                    {
-                        foreach (var chunk in Chunk(reblocked))
-                        {
-                            using var cmd = _conn!.CreateCommand();
-                            var names = new string[chunk.Count];
-                            for (int i = 0; i < chunk.Count; i++)
-                            {
-                                names[i] = "@p" + i;
-                                cmd.Parameters.AddWithValue(names[i], chunk[i]);
-                            }
-                            // Only generated @pN placeholder names are concatenated;
-                            // every value is bound, so no user input reaches SQL.
-                            // nosemgrep: csharp-sqli
-                            cmd.CommandText = "SELECT path FROM pending WHERE path_key IN (" + string.Join(",", names) + ")";
-                            using var reader = cmd.ExecuteReader();
-                            while (reader.Read()) sample.Add(reader.GetString(0));
-                        }
-                    }
-                    LogSample(sample, batchId);
+                    LogBatch(batchId, now, added, reblocked);
+
                 }
                 catch (Exception ex) { _log.Warn("Deferred deletion state could not be saved: " + _dbPath + " (" + ex.Message + ")"); }
             }
         }
+        // Partition into brand-new rows vs already-held rows reblocked
+        // into a fresh batch. Chunked (SQLite variable cap).
+        private (List<KeyValuePair<string, string>> Added, List<string> Reblocked) ClassifyIncoming(Dictionary<string, string> incoming)
+        {
+            var existing = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var chunk in Chunk(incoming.Keys))
+            {
+                using var cmd = _conn!.CreateCommand();
+                var names = new string[chunk.Count];
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    names[i] = "@p" + i;
+                    cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                }
+                // Only generated @pN placeholder names are concatenated;
+                // every value is bound, so no user input reaches SQL.
+                // nosemgrep: csharp-sqli
+                cmd.CommandText = "SELECT path_key FROM pending WHERE path_key IN (" + string.Join(",", names) + ")";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read()) existing.Add(reader.GetString(0));
+            }
+            var added = new List<KeyValuePair<string, string>>();
+            foreach (var kv in incoming)
+                if (!existing.Contains(kv.Key))
+                    added.Add(kv);
+            // Two-phase drain: a fresh block during a slow drain must
+            // restart that path's hold clock, not inherit
+            // sweep-deletion. Claimed rows re-blocked here move to
+            // the new batch with claimed reset. Unclaimed dupes keep
+            // the old behavior (ignored, original clock stands).
+            var reblocked = new List<string>();
+            if (existing.Count > 0)
+            {
+                foreach (var chunk in Chunk(incoming.Keys.Where(k => existing.Contains(k))))
+                {
+                    using var cmd = _conn!.CreateCommand();
+                    var names = new string[chunk.Count];
+                    for (int i = 0; i < chunk.Count; i++)
+                    {
+                        names[i] = "@p" + i;
+                        cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                    }
+                    // Only generated @pN placeholder names are concatenated;
+                    // every value is bound, so no user input reaches SQL.
+                    // nosemgrep: csharp-sqli
+                    cmd.CommandText = "SELECT path_key FROM pending WHERE claimed = 1 AND path_key IN (" + string.Join(",", names) + ")";
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read()) reblocked.Add(reader.GetString(0));
+                }
+            }
+            return (added, reblocked);
+        }
+
+        // One transaction: batch row, inserts for new rows, batch roll
+        // for reblocked rows.
+        private void WriteBatch(string batchId, DateTime now, string? sourceRoot, List<KeyValuePair<string, string>> added, List<string> reblocked)
+        {
+            using (var tx = _conn!.BeginTransaction())
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "INSERT INTO batches (batch_id, blocked_at, last_warning_at, source_root) VALUES (@b, @t, 0, @s)";
+                    cmd.Parameters.AddWithValue("@b", batchId);
+                    cmd.Parameters.AddWithValue("@t", now.Ticks);
+                    cmd.Parameters.AddWithValue("@s", (object?)sourceRoot ?? DBNull.Value);
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "INSERT OR IGNORE INTO pending (path_key, batch_id, path) VALUES (@k, @b, @p)";
+                    var k = cmd.Parameters.Add("@k", SqliteType.Text);
+                    var b = cmd.Parameters.Add("@b", SqliteType.Text);
+                    var p = cmd.Parameters.Add("@p", SqliteType.Text);
+                    b.Value = batchId;
+                    foreach (var kv in added)
+                    {
+                        k.Value = kv.Key;
+                        p.Value = kv.Value;
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+                if (reblocked.Count > 0)
+                {
+                    foreach (var chunk in Chunk(reblocked))
+                    {
+                        using var cmd = _conn.CreateCommand();
+                        cmd.Transaction = tx;
+                        var names = new string[chunk.Count];
+                        for (int i = 0; i < chunk.Count; i++)
+                        {
+                            names[i] = "@p" + i;
+                            cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                        }
+                        cmd.Parameters.AddWithValue("@b", batchId);
+                        // Only generated @pN placeholder names are concatenated;
+                        // every value is bound, so no user input reaches SQL.
+                        // nosemgrep: csharp-sqli
+                        cmd.CommandText = "UPDATE pending SET batch_id = @b, claimed = 0 WHERE path_key IN (" + string.Join(",", names) + ")";
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+                tx.Commit();
+            }
+
+
+        }
+
+        // Warn line + path sample after the commit; LogSample caps output.
+        private void LogBatch(string batchId, DateTime now, List<KeyValuePair<string, string>> added, List<string> reblocked)
+        {
+            var total = CountInternal();
+            var fresh = added.Count + reblocked.Count;
+            _log.Warn("Deferred deletion: batch " + BatchTimestamp(now) + ": " + fresh
+                + " new files (" + total + " total held), hold for " + _holdDays + " days");
+            var sample = added.Select(kv => kv.Value).ToList();
+            if (reblocked.Count > 0)
+            {
+                foreach (var chunk in Chunk(reblocked))
+                {
+                    using var cmd = _conn!.CreateCommand();
+                    var names = new string[chunk.Count];
+                    for (int i = 0; i < chunk.Count; i++)
+                    {
+                        names[i] = "@p" + i;
+                        cmd.Parameters.AddWithValue(names[i], chunk[i]);
+                    }
+                    // Only generated @pN placeholder names are concatenated;
+                    // every value is bound, so no user input reaches SQL.
+                    // nosemgrep: csharp-sqli
+                    cmd.CommandText = "SELECT path FROM pending WHERE path_key IN (" + string.Join(",", names) + ")";
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read()) sample.Add(reader.GetString(0));
+                }
+            }
+            LogSample(sample, batchId);
+        }
+
 
         // Watcher fast path: a restored file fires Created, dropping its hold
         // row by indexed key. No I/O at all unless something is held.
@@ -407,8 +431,8 @@ namespace TicTack
                             if (File.Exists(e.Path)) gone.Add(e.Path);
                             else still.Add(e.Path);
                         }
-                        result.Files.AddRange(still);
-                        result.CancelledPaths.AddRange(gone);
+                        foreach (var f in still) result.Files.Add(f);
+                        foreach (var g in gone) result.CancelledPaths.Add(g);
                         result.Cancelled += gone.Count;
                         var tag = BatchTimestamp(b.BlockedAt);
                         if (still.Count > 0)
@@ -482,7 +506,7 @@ namespace TicTack
 
         // Metadata-only snapshot for --deferred-list: one row per batch.
         // Never touches pending paths, never mutates.
-        public List<BatchSummary> GetBatchSummaries()
+        public IReadOnlyList<BatchSummary> GetBatchSummaries()
         {
             var rows = new List<BatchSummary>();
             lock (_lock)
@@ -880,13 +904,13 @@ namespace TicTack
 
     public sealed class ExpiredChunk
     {
-        public List<string> Files { get; } = new List<string>();
+        public IList<string> Files { get; } = new List<string>();
         public int Cancelled { get; set; }
         // Reappeared paths claimed in this chunk (File.Exists at claim).
         // Needed so the sweeper can confirm them: their dest delete is a
         // no-op, but the hold row must still go. Kept in sync with
         // Cancelled by TakeExpiredChunk.
-        public List<string> CancelledPaths { get; } = new List<string>();
+        public IList<string> CancelledPaths { get; } = new List<string>();
     }
 
     public sealed class BatchSummary
