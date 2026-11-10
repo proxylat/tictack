@@ -80,11 +80,11 @@ namespace TicTack
                 }
                 _verifyStore.SetCounter(ShardKey, shard + 1);
                 if (verified > 0)
-                    _log.Info("Scrub: shard " + shard + "/" + ShardCount + ": " + verified + " verified, " + mismatched + " mismatched, " + skipped + " skipped");
+                    _log.Info("Scrub [" + _config.Path + "]: shard " + shard + "/" + ShardCount + ": " + verified + " verified, " + mismatched + " mismatched, " + skipped + " skipped");
                 else
                     _log.Debug("Scrub: shard " + shard + "/" + ShardCount + ": nothing to verify");
             }
-            catch (Exception ex) { _log.Warn("Scrub failed: " + ex.Message); }
+            catch (Exception ex) { _log.Warn("Scrub failed [" + _config.Path + "]: " + ex.Message); }
         }
 
         // -1 skipped (missing source, unknown file, unreadable), 0 match,
@@ -116,7 +116,7 @@ namespace TicTack
                 var dstHash = FileHasher.ComputeHex(dstFull, null);
                 if (string.Equals(srcHash, dstHash, StringComparison.Ordinal)) return 0;
                 // Routine (file changed mid-copy): file log only, never the desktop.
-                _log.Info("Scrub mismatch, re-queueing from source: " + rel);
+                _log.Info("Scrub mismatch, re-queueing from source [" + _config.Path + "]: " + rel);
                 await _deleteAsync(null, destPath, rel, "Scrub mismatch", ct);
                 return 1;
             }

@@ -27,6 +27,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "TicTackSv.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "on-failure.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "config.yaml"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 Source: "*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "*.deps.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
@@ -36,7 +37,12 @@ Source: "*.runtimeconfig.json"; DestDir: "{app}"; Flags: ignoreversion skipifsou
 ; Install and start the service
 Filename: "{sys}\sc.exe"; Parameters: "create TicTackSv binPath= ""{app}\TicTackSv.exe"" start= auto obj= LocalSystem DisplayName= ""TicTack File Sync"""; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "description TicTackSv ""Watches folders and syncs files to destinations.""";
-Filename: "{sys}\sc.exe"; Parameters: "failure TicTackSv reset= 60 actions= restart/5000/restart/10000/restart/30000"; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "sidtype TicTackSv unrestricted"; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "failureflag TicTackSv 1"; Flags: runhidden
+Filename: "{sys}\reg.exe"; Parameters: "add HKLM\SYSTEM\CurrentControlSet\Services\TicTackSv /v PreshutdownTimeout /t REG_DWORD /d 180000 /f"; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "sdset TicTackSv ""D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)"""; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "failure TicTackSv reset= 60 actions= restart/5000/restart/10000/restart/30000 command= ""{app}\on-failure.cmd"""; Flags: runhidden
+Filename: "{sys}\reg.exe"; Parameters: "add HKLM\SYSTEM\CurrentControlSet\Services\TicTackSv /v ServicesPipeTimeout /t REG_DWORD /d 120000 /f"; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "start TicTackSv"; Flags: runhidden
 
 [UninstallRun]

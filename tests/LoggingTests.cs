@@ -200,6 +200,56 @@ public class LoggingTests
     }
 
     [Fact]
+    public async Task BufferedLogger_DeliversWhileAlive()
+    {
+        // Regression test for the dead-primary incident: entries must
+        // reach the inner logger mid-run, with no Dispose involved.
+        // Poll (pump is async); fail only after a generous deadline.
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var logger = new BufferedLogger(new FileLogger(path, LogLevel.Debug)))
+            {
+                logger.Info("alive-one");
+                logger.Warn("alive-two");
+                var deadline = DateTime.UtcNow.AddSeconds(15);
+                string content;
+                do
+                {
+                    await Task.Delay(50);
+                    content = File.ReadAllText(path);
+                    if (content.Contains("alive-two")) break;
+                } while (DateTime.UtcNow < deadline);
+                Assert.Contains("alive-one", content);
+                Assert.Contains("alive-two", content);
+            }
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public async Task FileLogger_ExternalDeleteWhileIdle_Recreates()
+    {
+        // Idle-service gap: no emits after the delete, so only the idle
+        // timer can bring the primary back. Deadline = ~2 intervals.
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var logger = new FileLogger(path, LogLevel.Debug))
+            {
+                logger.Info("before-delete");
+                Assert.Contains("before-delete", File.ReadAllText(path));
+                File.Delete(path);
+                var deadline = DateTime.UtcNow.AddSeconds(12);
+                while (!File.Exists(path) && DateTime.UtcNow < deadline)
+                    await Task.Delay(200);
+                Assert.True(File.Exists(path), "primary not recreated while idle");
+            }
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
     public void FileLogger_CollapsesConsecutiveRepeats()
     {
         var path = Path.GetTempFileName();
@@ -332,5 +382,24 @@ public class LoggingTests
             Assert.Contains("after dispose", content);
         }
         finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void FileLogger_ExternalDelete_RecreatesFile()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            var logger = new FileLogger(path, LogLevel.Debug);
+            logger.Info("before delete");
+            File.Delete(path);
+            // Orphan check rides the flush cadence, so wait it out.
+            Thread.Sleep(4100);
+            logger.Info("after delete");
+            logger.Dispose();
+            var content = File.ReadAllText(path);
+            Assert.Contains("after delete", content);
+        }
+        finally { try { File.Delete(path); } catch { } }
     }
 }

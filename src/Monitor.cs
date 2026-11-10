@@ -1316,7 +1316,7 @@ namespace TicTack
             var now = DateTime.UtcNow;
             if (now - _lastResolveGapUtc < ResolveGapCooldown) return;
             _lastResolveGapUtc = now;
-            _log?.Info("USN delete with unresolvable tracked parent, covering scan picks up the deletes.");
+            _log?.Info("USN delete with unresolvable tracked parent, covering scan picks up the deletes. [" + _path + "]");
             SignalGap();
         }
 
@@ -1656,12 +1656,12 @@ namespace TicTack
             try { cp = _checkpointStore.GetUsnCheckpoint(); }
             catch (Exception ex)
             {
-                _log?.Info("USN checkpoint unreadable, starting at head (journal=" + journalId + " head=" + headUsn + "): " + ex.Message);
+                _log?.Info("USN checkpoint unreadable [" + _path + "], starting at head (journal=" + journalId + " head=" + headUsn + "): " + ex.Message);
                 return headUsn;
             }
             if (cp == null)
             {
-                _log?.Info("USN no checkpoint stored, starting at head (journal=" + journalId + " head=" + headUsn + "); initial walk covers the window.");
+                _log?.Info("USN no checkpoint stored [" + _path + "], starting at head (journal=" + journalId + " head=" + headUsn + "); initial walk covers the window.");
                 return headUsn;
             }
             // Normal clean stop: the final write landed exactly on head, so
@@ -1669,13 +1669,13 @@ namespace TicTack
             // one below): nothing is wrong.
             if (cp.Value.journalId == journalId && cp.Value.lastUsn == headUsn)
             {
-                _log?.Info("USN cursor current (journal=" + journalId + " usn=" + headUsn + "), nothing to replay.");
+                _log?.Debug("USN cursor current [" + _path + "] (journal=" + journalId + " usn=" + headUsn + "), nothing to replay.");
                 return headUsn;
             }
             var gapReason = CheckpointGapReason(cp.Value.journalId, cp.Value.lastUsn, journalId, headUsn);
             if (gapReason != null)
             {
-                _log?.Info("USN checkpoint unusable (" + gapReason + "), starting at head (journal=" + journalId + " head=" + headUsn + "); initial walk covers the window.");
+                _log?.Info("USN checkpoint unusable [" + _path + "] (" + gapReason + "), starting at head (journal=" + journalId + " head=" + headUsn + "); initial walk covers the window.");
                 return headUsn;
             }
             var lastUsn = cp.Value.lastUsn;
@@ -1697,13 +1697,13 @@ namespace TicTack
             }
             catch (UsnJournalReadException ex)
             {
-                _log?.Info("USN offline catch-up abandoned (Win32 " + ex.Win32Code + "), starting at head (journal=" + journalId + " head=" + headUsn + ").");
+                _log?.Info("USN offline catch-up abandoned [" + _path + "] (Win32 " + ex.Win32Code + "), starting at head (journal=" + journalId + " head=" + headUsn + ").");
                 return headUsn;
             }
             if (lastUsn < headUsn)
-                _log?.Info("USN offline catch-up hit its bounds after " + replayed + " record(s) (journal=" + journalId + " stored=" + cp.Value.lastUsn + " head=" + headUsn + "), resuming at head; initial walk covers the rest.");
+                _log?.Debug("USN offline catch-up [" + _path + "] hit its bounds after " + replayed + " record(s) (journal=" + journalId + " stored=" + cp.Value.lastUsn + " head=" + headUsn + "), resuming at head; initial walk covers the rest.");
             else if (replayed > 0)
-                _log?.Info("USN offline catch-up replayed " + replayed + " record(s) (journal=" + journalId + " " + cp.Value.lastUsn + " -> " + headUsn + ").");
+                _log?.Debug("USN offline catch-up [" + _path + "] replayed " + replayed + " record(s) (journal=" + journalId + " " + cp.Value.lastUsn + " -> " + headUsn + ").");
             return lastUsn;
         }
 

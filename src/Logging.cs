@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
@@ -61,9 +62,17 @@ namespace TicTack
         private StreamWriter? _writer;
         private long _baseLength; // on-disk length when the handle was opened
         private long _unflushedBytes; // buffered since open; logical len = base + this
+        private int _emitFails; // consecutive Emit failures; first one alerts via Event Log
         private DateTime _lastFlush = DateTime.UtcNow;
+        private DateTime _lastOrphanCheck = DateTime.UtcNow;
         private const int FlushIntervalSeconds = 4;
         private const long FlushThresholdBytes = 128 * 1024;
+        // Idle watchdog: the orphan check in EnsureOpenLocked only runs on
+        // Emit, so a quiet service would never recreate a deleted primary.
+        // One timer per logger at the flush cadence closes orphans and
+        // reopens eagerly even with zero emits.
+        private Timer? _idleTimer;
+        private bool _disposed;
 
         public FileLogger(string path, LogLevel minLevel = LogLevel.Info, long maxSizeMb = 10, int maxFiles = 5)
         {
@@ -78,6 +87,8 @@ namespace TicTack
                     Directory.CreateDirectory(dir);
             }
             catch { }
+            _idleTimer = new Timer(_ => IdleTick(), null,
+                TimeSpan.FromSeconds(FlushIntervalSeconds), TimeSpan.FromSeconds(FlushIntervalSeconds));
         }
 
         public void Debug(string msg) { if (_minLevel <= LogLevel.Debug) Write("DBG", msg); }
@@ -133,8 +144,7 @@ namespace TicTack
         private void EmitLocked(string level, string msg)
         {
             try
-            {
-                EnsureOpenLocked();
+            {                EnsureOpenLocked();
                 // Rotation trigger identical to before (on-disk length > max),
                 // tracked in memory so no stat/flush syscall per line. Only
                 // this class rotates, so base + buffered is the true length.
@@ -151,31 +161,58 @@ namespace TicTack
                 if (_unflushedBytes >= FlushThresholdBytes
                     || (DateTime.UtcNow - _lastFlush).TotalSeconds >= FlushIntervalSeconds)
                     FlushStreamLocked();
+                _emitFails = 0;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // A dead primary must scream through another channel: the
+                // file channel itself can't report it. Once per outage
+                // (counter resets on success) via the Event Log; the backup
+                // logger keeps history in the meantime.
+                if (_emitFails == 0)
+                {
+                    try { EventLog.WriteEntry("TicTackSv", "Primary log unwritable: " + _logPath + " (" + ex.Message + "). Backup log continues.", EventLogEntryType.Warning); }
+                    catch { }
+                }
+                _emitFails++;
+            }
         }
 
         // Caller holds the lock. Opens the append handle lazily so a
         // never-written logger creates no file, and reopens after
-        // rotation/Dispose. FileShare.ReadWrite|Delete keeps tail/readers working.
+        // rotation/Dispose/external delete. FileShare.ReadWrite|Delete
+        // keeps tail/readers working, but means a deleted path leaves the
+        // handle orphaned — so a throttled existence check (flush cadence,
+        // no per-line stat) closes the orphan and the open below recreates
+        // the file. Worst case one interval of lines goes to the orphan.
         private void EnsureOpenLocked()
         {
-            if (_writer != null) return;
+            if (_writer != null)
+            {
+                if ((DateTime.UtcNow - _lastOrphanCheck).TotalSeconds < FlushIntervalSeconds) return;
+                _lastOrphanCheck = DateTime.UtcNow;
+                try { if (File.Exists(_logPath)) return; } catch { return; }
+                CloseStreamLocked();
+            }
             long len = 0;
             try { if (File.Exists(_logPath)) len = new FileInfo(_logPath).Length; } catch { }
-            _stream = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-            _writer = new StreamWriter(_stream, Encoding.UTF8);
+            _stream = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, bufferSize: 1);
+            _writer = new StreamWriter(_stream, Encoding.UTF8) { AutoFlush = true };
             _baseLength = len;
             _unflushedBytes = 0;
             _lastFlush = DateTime.UtcNow;
         }
 
-        // Caller holds the lock.
+        // Caller holds the lock. Flush BOTH writers: StreamWriter.Flush
+        // alone only moves bytes into the FileStream's own (4KB) buffer,
+        // where small log volumes sat until Dispose — the primary looked
+        // dead while the per-line open/close backup stayed complete.
         private void FlushStreamLocked()
         {
             try
             {
                 _writer?.Flush();
+                _stream?.Flush();
                 _unflushedBytes = 0;
                 _lastFlush = DateTime.UtcNow;
             }
@@ -210,13 +247,43 @@ namespace TicTack
 
         public void Dispose()
         {
+            Timer? t;
             lock (_lock)
             {
+                _disposed = true;
+                t = _idleTimer;
+                _idleTimer = null;
                 FlushStreakLocked();
                 FlushStreamLocked();
                 CloseStreamLocked();
             }
-            // No disposed flag: a Write after Dispose reopens lazily.
+            // Outside the lock: a tick blocked on _lock proceeds after us
+            // and returns early on _disposed. Timer.Dispose never waits.
+            try { t?.Dispose(); } catch { }
+            // No disposed flag for writes: a Write after Dispose reopens lazily.
+        }
+
+        // Idle-timer tick: flush + orphan recovery with zero emits. Eagerly
+        // reopens a deleted primary (empty file) so operators watching the
+        // path see it back within one interval instead of at the next line.
+        private void IdleTick()
+        {
+            lock (_lock)
+            {
+                if (_disposed) return;
+                try
+                {
+                    FlushStreamLocked();
+                    if (_writer == null) return;
+                    bool missing;
+                    try { missing = !File.Exists(_logPath); } catch { return; }
+                    if (!missing) return;
+                    CloseStreamLocked();
+                    _lastOrphanCheck = DateTime.UtcNow;
+                    EnsureOpenLocked();
+                }
+                catch { }
+            }
         }
     }
 
@@ -345,8 +412,9 @@ namespace TicTack
         public DesktopAlertLogger(LogLevel minLevel = LogLevel.Warn, string? alertPath = null)
         {
             _minLevel = minLevel;
-            if (!string.IsNullOrEmpty(alertPath))
-                DesktopAlert.Configure(alertPath);
+            // Always configure (null resets): otherwise a stale static path
+            // from an earlier init would keep alerting after disable.
+            DesktopAlert.Configure(alertPath);
         }
         public void Debug(string msg) { }
         public void Info(string msg) { }
@@ -415,7 +483,7 @@ namespace TicTack
     internal static class LoggerFactory
     {
         public static ILogger Create(string? levelName, string logPath, int maxSizeMb, int maxFiles,
-            string? alertPath, bool console, bool eventLog, string? backupPath = null)
+            string? alertPath, bool console, bool eventLog, string? backupPath = null, bool? alertEnabled = null)
         {
             var level = LogLevelParser.Parse(levelName);
             var loggers = new List<ILogger>
@@ -429,7 +497,9 @@ namespace TicTack
                 loggers.Add(new DailyBackupLogger(backupPath, level));
             if (console) loggers.Add(new ConsoleLogger(level));
             // Alerts are a Warn/Error channel per the documented contract.
-            loggers.Add(new DesktopAlertLogger(LogLevel.Warn, alertPath));
+            // alert_enabled: false is a hard off even if alert_path is set.
+            var effectiveAlertPath = alertEnabled == false ? null : alertPath;
+            loggers.Add(new DesktopAlertLogger(LogLevel.Warn, effectiveAlertPath));
             if (eventLog) loggers.Add(new EventLogLogger());
             var log = new MultiLogger(loggers);
             if (!string.IsNullOrEmpty(levelName) && !LogLevelParser.IsValid(levelName))

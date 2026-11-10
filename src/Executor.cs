@@ -353,7 +353,7 @@ namespace TicTack
                 TicTackEventSource.Log.FileCopied(tmp.BytesCopied);
                 // The hash covers the bytes the copy loop wrote; rename and
                 // dir sync don't touch content, so it stays valid here.
-                return new ActionResult { Success = true, SourceHash = tmp.SourceHash };
+                return new ActionResult { Success = true, SourceHash = tmp.SourceHash, BytesCopied = tmp.BytesCopied };
             }
             catch (UnauthorizedAccessException ex) { return ActionResult.Fail(ex.Message); }
             catch (DirectoryNotFoundException ex) { return ActionResult.Fail(ex.Message); }

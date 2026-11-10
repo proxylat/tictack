@@ -19,11 +19,13 @@ namespace TicTack
     {
         private readonly string _path;
         private readonly string _identity;
+        private readonly int _ownPid;
         private readonly ILogger _log;
         private readonly Timer? _refreshTimer;
         private readonly string? _heldPath;
         private FileStream? _handle;
         private bool _disposed;
+        private int _refreshFailures;
 
         public bool IsHeld { get; private set; }
 
@@ -40,7 +42,8 @@ namespace TicTack
             _path = path;
             _log = log;
             _quietFailure = quietFailure;
-            _identity = Environment.MachineName + ":" + Process.GetCurrentProcess().Id;
+            _ownPid = Process.GetCurrentProcess().Id;
+            _identity = Environment.MachineName + ":" + _ownPid;
             var deadline = retryTimeout.HasValue ? DateTime.UtcNow + retryTimeout.Value : DateTime.MinValue;
             var refresh = refreshInterval ?? TimeSpan.FromSeconds(30);
             // Stale threshold must exceed the refresh cadence, or a live holder
@@ -72,8 +75,17 @@ namespace TicTack
                                 File.SetLastWriteTimeUtc(handle.SafeFileHandle, DateTime.UtcNow);
                             else
                                 File.SetLastWriteTimeUtc(touch, DateTime.UtcNow);
+                            Interlocked.Exchange(ref _refreshFailures, 0);
                         }
-                        catch (Exception ex) { _log.Debug("Lock refresh failed: " + ex.Message); }
+                        catch (Exception ex)
+                        {
+                            if (Interlocked.Increment(ref _refreshFailures) == 2)
+                            {
+                                IsHeld = false;
+                                _log.Warn("Lock refresh failed twice, running unprotected: " + touch + " (holder " + _identity + "): " + ex.Message);
+                            }
+                            else _log.Debug("Lock refresh failed: " + ex.Message);
+                        }
                     }, null, refresh, refresh);
                 }
             }
@@ -114,13 +126,22 @@ namespace TicTack
                     if (!File.Exists(_path)) throw;
                     var content = ReadIdentitySafe(_path);
                     var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(_path);
+                    // Self-ghost fast path: only our own STALE orphan. A live
+                    // same-process holder (undisposed SrcLock in this process)
+                    // is a real blocker, not an orphan.
+                    if (IsSelf(content) && age >= staleAfter)
+                    {
+                        try { File.Delete(_path); _log.Debug("Self orphan lock deleted: " + _path + " (" + content + ")"); continue; }
+                        catch (Exception ex) { _log.Debug("Self orphan delete failed: " + _path + ": " + ex.Message); }
+                    }
+                    string? deleteError = null;
                     if (age >= staleAfter)
                     {
                         try { File.Delete(_path); continue; }
-                        catch (Exception ex) { _log.Debug("Stale lock delete failed: " + ex.Message); }
+                        catch (Exception ex) { _log.Warn("Stale lock delete failed: " + _path + " (held by " + content + ", deleter " + _identity + "): " + ex.Message); deleteError = ex.Message; }
                     }
-                    BlockerSummary = content;
-                    if (!WaitOne("lock held by " + content, deadline, retryTimeout, ref waited, ref attempt))
+                    BlockerSummary = DescribeBlocker(content, age, staleAfter, deleteError);
+                    if (!WaitOne("lock held by " + BlockerSummary, deadline, retryTimeout, ref waited, ref attempt))
                         return null;
                 }
             }
@@ -130,7 +151,6 @@ namespace TicTack
         {
             var waited = false;
             var attempt = 0;
-                var liveNow = LiveExclusive(staleAfter, out var liveHolder);
             while (true)
             {
                 if (LiveExclusive(staleAfter, out var holder))
@@ -155,8 +175,9 @@ namespace TicTack
                 }
                 // Lost the race: an exclusive holder appeared between the
                 // check and our create. Yield and retry.
-                if (LiveExclusive(staleAfter, out _))
+                if (LiveExclusive(staleAfter, out var raceHolder))
                 {
+                    BlockerSummary = raceHolder;
                     try { File.Delete(roster); } catch { }
                     if (!WaitOne("exclusive lock", deadline, retryTimeout, ref waited, ref attempt))
                         return null;
@@ -175,11 +196,21 @@ namespace TicTack
                 if (!File.Exists(_path)) return false;
                 holder = ReadIdentitySafe(_path);
                 var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(_path);
-                if (age >= staleAfter)
+                // Self-ghost fast path: only our own STALE orphan. A live
+                // same-process holder is a real blocker — report it.
+                if (IsSelf(holder) && age >= staleAfter)
                 {
-                    try { File.Delete(_path); } catch (Exception ex) { _log.Debug("Stale lock delete failed: " + ex.Message); }
+                    try { File.Delete(_path); }
+                    catch (Exception ex) { _log.Debug("Self orphan delete failed: " + _path + ": " + ex.Message); return true; }
+                    _log.Debug("Self orphan lock deleted: " + _path + " (" + holder + ")");
                     return false;
                 }
+                if (age >= staleAfter)
+                {
+                    try { File.Delete(_path); } catch (Exception ex) { _log.Warn("Stale lock delete failed: " + _path + " (held by " + holder + ", deleter " + _identity + "): " + ex.Message); }
+                    return false;
+                }
+                holder = DescribeBlocker(holder, age, staleAfter);
                 return true;
             }
             catch { return false; }
@@ -197,13 +228,22 @@ namespace TicTack
                 {
                     try
                     {
+                        var id = ReadIdentitySafe(f);
                         var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(f);
-                        if (age >= staleAfter)
+                        // Self-ghost fast path: only our own STALE orphan
+                        // roster. A live same-process roster is a real blocker.
+                        if (IsSelf(id) && age >= staleAfter)
                         {
-                            try { File.Delete(f); } catch { }
+                            try { File.Delete(f); _log.Debug("Self orphan roster deleted: " + f + " (" + id + ")"); }
+                            catch (Exception ex) { _log.Debug("Self orphan roster delete failed: " + f + ": " + ex.Message); holders.Add(DescribeBlocker(id, age, staleAfter, ex.Message)); count++; }
                             continue;
                         }
-                        holders.Add(ReadIdentitySafe(f));
+                        if (age >= staleAfter)
+                        {
+                            try { File.Delete(f); continue; }
+                            catch (Exception ex) { _log.Warn("Stale roster delete failed: " + f + " (deleter " + _identity + "): " + ex.Message); holders.Add(DescribeBlocker(id, age, staleAfter, ex.Message)); count++; continue; }
+                        }
+                        holders.Add(DescribeBlocker(id, age, staleAfter));
                         count++;
                     }
                     catch { }
@@ -229,6 +269,162 @@ namespace TicTack
                 _log.Debug("Lock identity read failed: " + ex.Message);
                 return "unknown";
             }
+        }
+
+        // Self-ghost test: blocker PID == our PID means our own orphan
+        // (same process, earlier pipeline in this run). Strips any
+        // " (age/verdict)" suffix BlockerSummary formatting appends.
+        internal static bool IsSelfIdentity(string identity, int ownPid)
+        {
+            var pid = identity;
+            var paren = pid.IndexOf(" (", StringComparison.Ordinal);
+            if (paren >= 0) pid = pid.Substring(0, paren);
+            var colon = pid.LastIndexOf(':');
+            if (colon >= 0) pid = pid.Substring(colon + 1);
+            return int.TryParse(pid.Trim(), System.Globalization.CultureInfo.InvariantCulture, out var n) && n == ownPid;
+        }
+
+        private bool IsSelf(string identity) => IsSelfIdentity(identity, _ownPid);
+
+        // Sibling test: every named blocker is our own PID. Empty or
+        // unparseable ("unknown") summaries are NOT siblings — Warn.
+        internal bool AllBlockersSelf() => AllSelfIdentities(BlockerSummary, _ownPid);
+
+        internal static bool AllSelfIdentities(string summary, int ownPid)
+        {
+            if (string.IsNullOrWhiteSpace(summary)) return false;
+            var any = false;
+            foreach (var part in summary.Split(','))
+            {
+                var entry = part.Trim();
+                if (entry.Length == 0) continue;
+                if (!IsSelfIdentity(entry, ownPid)) return false;
+                any = true;
+            }
+            return any;
+        }
+
+        // Actionable blocker line: identity + file age + live/dead/stale
+        // verdict + delete error if any. One line per blocker; entries
+        // stay comma-joined in BlockerSummary (no commas emitted here).
+        internal static string DescribeBlocker(string identity, TimeSpan age, TimeSpan staleAfter, string? deleteError = null)
+        {
+            string verdict;
+            string? procName = null;
+            if (age >= staleAfter)
+            {
+                verdict = "stale";
+                procName = TryGetLocalProcessName(identity);
+            }
+            else if (TryGetLocalPid(identity, out var pid))
+            {
+                verdict = "live";
+                try
+                {
+                    using var proc = Process.GetProcessById(pid);
+                    try { procName = proc.ProcessName; } catch { procName = null; }
+                    DateTime startUtc;
+                    try { startUtc = proc.StartTime.ToUniversalTime(); }
+                    catch { startUtc = DateTime.MinValue; }
+                    if (startUtc != DateTime.MinValue && startUtc > (DateTime.UtcNow - age).AddSeconds(2))
+                        verdict = "recycled";
+                }
+                catch { verdict = "dead"; procName = null; }
+            }
+            else verdict = IsPidDead(identity) ? "dead" : "live";
+            var desc = identity + " (age " + FormatAge(age) + ", " + verdict + ")";
+            if (procName != null) desc += " [" + procName.Replace(',', '_') + "]";
+            if (!string.IsNullOrEmpty(deleteError)) desc += " [delete failed: " + deleteError + "]";
+            return desc;
+        }
+
+        // Local-PID parse: strips any " (...)" display suffix, requires the
+        // machine prefix (when present) to match this machine. Remote,
+        // unparseable, or missing PIDs return false.
+        private static bool TryGetLocalPid(string identity, out int pid)
+        {
+            pid = 0;
+            try
+            {
+                var s = identity;
+                var paren = s.IndexOf(" (", StringComparison.Ordinal);
+                if (paren >= 0) s = s.Substring(0, paren);
+                var colon = s.LastIndexOf(':');
+                string pidPart;
+                if (colon >= 0)
+                {
+                    var machine = s.Substring(0, colon).Trim();
+                    if (!string.Equals(machine, Environment.MachineName, StringComparison.OrdinalIgnoreCase)) return false;
+                    pidPart = s.Substring(colon + 1);
+                }
+                else pidPart = s;
+                return int.TryParse(pidPart.Trim(), System.Globalization.CultureInfo.InvariantCulture, out pid);
+            }
+            catch { return false; }
+        }
+
+        private static string? TryGetLocalProcessName(string identity)
+        {
+            if (!TryGetLocalPid(identity, out var pid)) return null;
+            try { using var proc = Process.GetProcessById(pid); return proc.ProcessName; }
+            catch { return null; }
+        }
+
+        internal static string FormatAge(TimeSpan age)
+        {
+            if (age.TotalMinutes < 1) return ((int)age.TotalSeconds) + "s";
+            if (age.TotalHours < 1) return ((int)age.TotalMinutes) + "m";
+            if (age.TotalDays < 1) return ((int)age.TotalHours) + "h" + ((int)age.Minutes) + "m";
+            return ((int)age.TotalDays) + "d" + ((int)age.Hours) + "h";
+        }
+
+        // Provably-dead test: the PID parses and GetProcessById throws (no
+        // such process). Unparseable identities count as live (conservative).
+        internal static bool IsPidDead(string identity)
+        {
+            var pid = identity;
+            var paren = pid.IndexOf(" (", StringComparison.Ordinal);
+            if (paren >= 0) pid = pid.Substring(0, paren);
+            var colon = pid.LastIndexOf(':');
+            if (colon >= 0) pid = pid.Substring(colon + 1);
+            if (!int.TryParse(pid.Trim(), System.Globalization.CultureInfo.InvariantCulture, out var n)) return false;
+            try { Process.GetProcessById(n).Dispose(); return false; }
+            catch { return true; }
+        }
+
+        // Boot takeover: delete lock/roster files whose holder PID is
+        // provably dead, so the caller skips the wait budget. Live or
+        // unparseable holders are left alone.
+        internal static void TakeOverDead(string lockPath, ILogger log)
+        {
+            try
+            {
+                if (File.Exists(lockPath))
+                {
+                    string holder;
+                    try { holder = ReadIdentity(lockPath); }
+                    catch { holder = "unknown"; }
+                    if (IsPidDead(holder))
+                    {
+                        try { File.Delete(lockPath); log.Debug("Boot takeover deleted dead holder lock: " + lockPath + " (" + holder + ")"); }
+                        catch (Exception ex) { log.Debug("Boot takeover delete failed: " + lockPath + ": " + ex.Message); }
+                    }
+                }
+                var dir = Path.GetDirectoryName(lockPath);
+                if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+                {
+                    foreach (var f in Directory.EnumerateFiles(dir, Path.GetFileName(lockPath) + ".shared.*"))
+                    {
+                        string holder;
+                        try { holder = ReadIdentity(f); }
+                        catch { continue; }
+                        if (!IsPidDead(holder)) continue;
+                        try { File.Delete(f); log.Debug("Boot takeover deleted dead holder roster: " + f + " (" + holder + ")"); }
+                        catch (Exception ex) { log.Debug("Boot takeover delete failed: " + f + ": " + ex.Message); }
+                    }
+                }
+            }
+            catch (Exception ex) { log.Debug("Boot takeover sweep failed: " + ex.Message); }
         }
 
         // Shared wait body: false means the deadline passed (warned, give up).
@@ -296,7 +492,7 @@ namespace TicTack
                     _handle = null;
                     if (_heldPath != null && File.Exists(_heldPath)) { File.Delete(_heldPath); }
                 }
-                catch (Exception ex) { _log.Debug("Lock release failed: " + ex.Message); }
+                catch (Exception ex) { _log.Warn("Lock release failed: " + _heldPath + " (holder " + _identity + "): " + ex.Message); }
             }
         }
     }

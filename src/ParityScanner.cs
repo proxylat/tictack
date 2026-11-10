@@ -57,7 +57,7 @@ namespace TicTack
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException || ex is DirectoryNotFoundException)
             {
-                _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message);
+                _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message + " [" + _config.Path + "]");
                 return;
             }
             await EnforceAsync(sourcePaths, ct);
@@ -106,7 +106,7 @@ namespace TicTack
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException || ex is DirectoryNotFoundException)
             {
-                _log.Warn("Destination scan incomplete, parity cleanup blocked: " + ex.Message);
+                _log.Warn("Destination scan incomplete, parity cleanup blocked: " + ex.Message + " [" + _config.Path + "]");
                 return null;
             }
             return staleFiles;
@@ -119,7 +119,7 @@ namespace TicTack
             {
                 await _deleter.DeleteAsync(null, sf.path, sf.rel, "Parity deletion failed", ct);
             }
-            _log.Info("Cleanup: archived " + staleFiles.Count + " stale files");
+            _log.Info("Cleanup: archived " + staleFiles.Count + " stale files [" + _config.Path + "]");
         }
 
         // Every ancestor dir of every source file.
@@ -148,7 +148,7 @@ namespace TicTack
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException || ex is DirectoryNotFoundException)
             {
-                _log.Warn("Destination directory scan incomplete, parity cleanup blocked: " + ex.Message);
+                _log.Warn("Destination directory scan incomplete, parity cleanup blocked: " + ex.Message + " [" + _config.Path + "]");
                 return;
             }
             foreach (var dir in destinationDirectories)

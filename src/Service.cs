@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using System.Threading;
 
@@ -18,7 +19,18 @@ namespace TicTack
         public TicTackService(string configPath)
         {
             _configPath = configPath;
-            ServiceName = "TicTackSv";
+            // Optional side-by-side installs (test services): the SCM name
+            // must match before Run registers us, so read it here. Failures
+            // fall through to the default; OnStart validates fully.
+            var name = "TicTackSv";
+            try
+            {
+                var early = Config.Load(configPath);
+                if (early != null && !string.IsNullOrWhiteSpace(early.ServiceName))
+                    name = early.ServiceName.Trim();
+            }
+            catch { }
+            ServiceName = name;
             CanStop = true;
             CanShutdown = true;
             AutoLog = false;
@@ -43,7 +55,8 @@ namespace TicTack
                     : cfg.Logging.Path;
                 _log = LoggerFactory.Create(cfg.Logging.Level, logPath, cfg.Logging.MaxSizeMb,
                     cfg.Logging.MaxFiles, cfg.Logging.AlertPath, console: cfg.Logging.Console, eventLog: true,
-                    backupPath: Path.Combine(Program.StateDbRoot(cfg), "tictack.log.bak"));
+                    backupPath: Path.Combine(Program.StateDbRoot(cfg), "tictack.log.bak"),
+                    alertEnabled: cfg.Logging.AlertEnabled);
 
                 if (!VolumeResolver.EnsureResolved(cfg, cfg.VolumeWaitMinutes, _log))
                     throw new InvalidOperationException("Volume(s) not available; see log for labels.");
@@ -52,6 +65,9 @@ namespace TicTack
 
                 if (!Config.Validate(cfg, _log))
                     throw new InvalidOperationException("Invalid configuration");
+
+                ApplyDelayedAutostart(cfg, _log);
+                ServiceTuning.Apply(cfg, _log, ServiceName);
 
                 _log.Info("TicTack Service starting");
 
@@ -102,6 +118,53 @@ namespace TicTack
             }
 
             log.Info("TicTack Service started");
+        }
+
+        // Applies the config.yaml delayed_autostart toggle to our own SCM
+        // record (DelayedAutostart value). Idempotent one-RPC write per
+        // start, effective on the next boot; never fails startup.
+        private void ApplyDelayedAutostart(TicTackConfig cfg, ILogger log)
+        {
+            if (!OperatingSystem.IsWindows()) return;
+            try
+            {
+                var scm = NativeServiceConfig.OpenSCManager(null, null, 0x0001);
+                if (scm == IntPtr.Zero) { log.Debug("DelayedAutostart apply skipped: OpenSCManager failed"); return; }
+                try
+                {
+                    var svc = NativeServiceConfig.OpenService(scm, ServiceName, 0x0002);
+                    if (svc == IntPtr.Zero) { log.Debug("DelayedAutostart apply skipped: OpenService failed"); return; }
+                    try
+                    {
+                        var info = new NativeServiceConfig.DelayedAutoStartInfo
+                            { Delayed = cfg.DelayedAutostart ? 1 : 0 };
+                        if (!NativeServiceConfig.ChangeServiceConfig2(svc, 3, ref info))
+                            log.Warn("DelayedAutostart apply failed (win32 " + Marshal.GetLastWin32Error() + ")");
+                        else log.Debug("DelayedAutostart set to " + (cfg.DelayedAutostart ? "1 (delayed-auto)" : "0 (auto)"));
+                    }
+                    finally { NativeServiceConfig.CloseServiceHandle(svc); }
+                }
+                finally { NativeServiceConfig.CloseServiceHandle(scm); }
+            }
+            catch (Exception ex) { log.Warn("DelayedAutostart apply failed: " + ex.Message); }
+        }
+
+        private static class NativeServiceConfig
+        {
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct DelayedAutoStartInfo { public int Delayed; }
+
+            [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+            internal static extern IntPtr OpenSCManager(string? machine, string? database, int access);
+
+            [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+            internal static extern IntPtr OpenService(IntPtr scm, string name, int access);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            internal static extern bool ChangeServiceConfig2(IntPtr service, int infoLevel, ref DelayedAutoStartInfo info);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            internal static extern bool CloseServiceHandle(IntPtr handle);
         }
 
         // Best-effort crash trail: EventLog + temp crash log, then release

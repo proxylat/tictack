@@ -156,8 +156,17 @@ namespace TicTack
                     }
                     if (!valid)
                     {
-                        _log.Error(item.ValidationLabel + ": " + src + " -> " + dst);
-                        TicTackEventSource.Log.CopyFailed();
+                        // Mid-copy source race, not corruption: truncation /
+                        // append converges on the next cycle, so no Error
+                        // and no alert.
+                        var benign = ValidationAppendProof.Classify(src, dst, item.Tmp.BytesCopied, snap.Length);
+                        if (benign != null)
+                            _log.Debug(item.ValidationLabel + " skipped (" + benign + ", will converge next cycle): " + src + " -> " + dst);
+                        else
+                        {
+                            _log.Error(item.ValidationLabel + ": " + src + " -> " + dst);
+                            TicTackEventSource.Log.CopyFailed();
+                        }
                     }
                     else if (await TryUpsertAsync(item, snap, src, ct))
                     {

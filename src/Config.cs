@@ -25,6 +25,31 @@ namespace TicTack
         // multiply worst-case waits and leave the log path homeless.
         public double VolumeWaitMinutes { get; set; }
 
+        // SCM delayed-auto-start toggle (DelayedAutostart registry value).
+        // false = normal auto start (default); true = delayed-auto, boot
+        // after disks/network settle. Applied to our own service record at
+        // startup; takes effect on the next boot.
+        public bool DelayedAutostart { get; set; }
+
+        // SCM service name override for side-by-side installs (test
+        // services). Must match the `sc create` name. Default TicTackSv.
+        public string? ServiceName { get; set; }
+
+        // Optional Windows service/process tuning (all null = don't touch).
+        // Applied at startup by ServiceTuning; see config_win.yaml.example.
+        public int? PreshutdownTimeoutMs { get; set; }
+        public int? ServicesPipeTimeoutMs { get; set; }
+        public int? CpuPriorityClass { get; set; }
+        public int? IoPriority { get; set; }
+        public int? PagePriority { get; set; }
+
+        // Service token restriction (REG_MULTI_SZ RequiredPrivileges via
+        // ChangeServiceConfig2 level 6). Default (key absent): least-privilege
+        // 4 (ChangeNotify/Backup/Restore/ManageVolume). Empty list = opt out,
+        // leave the full token alone. Custom list = applied verbatim.
+        // Applied at startup; takes effect on next start.
+        public string[]? RequiredPrivileges { get; set; }
+
         // Populated by ExpandPathsList for problems that are only visible
         // during expansion; Validate reports them.
         [YamlIgnore]
@@ -41,6 +66,7 @@ namespace TicTack
             Watchdog = new WatchdogConfig();
             ExternalDrives = new ExternalDrivesConfig();
             VolumeWaitMinutes = 2;
+            DelayedAutostart = false;
         }
     }
 
@@ -270,6 +296,11 @@ namespace TicTack
         public string? Level { get; set; }
         public string? Path { get; set; }
         public string? AlertPath { get; set; }
+        // Optional hard off for the Desktop .txt alerts. Null (omitted) =
+        // current behavior (alerts on iff alert_path is set); false = never
+        // write .txt even if alert_path is set. Warn/Error still reach
+        // tictack.log via the primary logger.
+        public bool? AlertEnabled { get; set; }
         public int MaxSizeMb { get; set; }
         public int MaxFiles { get; set; }
         public bool Console { get; set; }
@@ -419,18 +450,28 @@ namespace TicTack
             }
             if (cfg.Monitor != null && !IsValidMonitorType(cfg.Monitor.Type))
             {
-                log.Error("monitor.type must be 'watcher', 'usn', 'polling', or 'composite' (got: " + (cfg.Monitor.Type ?? "null") + ")");
+                log.Error("monitor.type must be 'watcher', 'usn', 'polling', or 'composite' (got: " + (cfg.Monitor.Type ?? "null") + ") [default monitor]");
                 valid = false;
             }
             if (cfg.Monitor != null && cfg.Monitor.Usn
                 && !string.Equals(cfg.Monitor.Type, "composite", StringComparison.OrdinalIgnoreCase))
-                log.Warn("monitor.usn only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'.");
+                log.Warn("monitor.usn only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'. [default monitor]");
             if (cfg.Monitor != null && !cfg.Monitor.PollingBackstop
                 && !string.Equals(cfg.Monitor.Type, "composite", StringComparison.OrdinalIgnoreCase))
-                log.Warn("monitor.polling_backstop only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'.");
+                log.Warn("monitor.polling_backstop only applies to type 'composite'; ignored for type '" + cfg.Monitor.Type + "'. [default monitor]");
             if (double.IsNaN(cfg.VolumeWaitMinutes) || cfg.VolumeWaitMinutes < 0)
             {
                 log.Error("volume_wait_minutes must be >= 0 (got: " + cfg.VolumeWaitMinutes + ")");
+                valid = false;
+            }
+            if (cfg.PreshutdownTimeoutMs.HasValue && cfg.PreshutdownTimeoutMs.Value <= 0)
+            {
+                log.Error("preshutdown_timeout_ms must be > 0 (got: " + cfg.PreshutdownTimeoutMs.Value + ")");
+                valid = false;
+            }
+            if (cfg.ServicesPipeTimeoutMs.HasValue && cfg.ServicesPipeTimeoutMs.Value <= 0)
+            {
+                log.Error("services_pipe_timeout_ms must be > 0 (got: " + cfg.ServicesPipeTimeoutMs.Value + ")");
                 valid = false;
             }
             var destinations = new Dictionary<string, string>(PathComparer);

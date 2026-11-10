@@ -56,6 +56,36 @@ namespace TicTack
             return Convert.ToHexStringLower(sha256.GetHashAndReset());
         }
 
+        // Lowercase hex SHA-256 of the first prefixLength bytes. Null when
+        // the file is shorter than the prefix or unreadable; the caller
+        // then treats the mismatch as a true failure.
+        internal static string? ComputeHexPrefix(string path, long prefixLength, IFileAccessor? accessor)
+        {
+            if (prefixLength < 0) return null;
+            try
+            {
+                path = PathUtil.EnsureExtended(path);
+                using var stream = accessor != null ? accessor.OpenRead(path) : File.OpenRead(path);
+                using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+                try
+                {
+                    long remaining = prefixLength;
+                    while (remaining > 0)
+                    {
+                        int want = remaining > BufferSize ? BufferSize : (int)remaining;
+                        int read = stream.Read(buffer, 0, want);
+                        if (read <= 0) return null;
+                        sha256.AppendData(buffer, 0, read);
+                        remaining -= read;
+                    }
+                }
+                finally { ArrayPool<byte>.Shared.Return(buffer); }
+                return Convert.ToHexStringLower(sha256.GetHashAndReset());
+            }
+            catch { return null; }
+        }
+
         // Length pre-check + full-content compare, for the archive/recovery
         // paths that used to reimplement SHA-256 (and uppercase hex) locally.
         internal static bool SameContent(string left, string right)

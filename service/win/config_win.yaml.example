@@ -82,10 +82,52 @@ logging:
   max_files: 5
   console: false
   alert_path: 'C:\Users\User\Desktop'
+  # alert_enabled: false # hard off for the Desktop .txt alerts (log-only mode); omitted = on iff alert_path is set
 
 watchdog:
   enabled: true
   interval_minutes: 30
+
+# SCM delayed-auto-start (DelayedAutostart registry value); false = normal
+# auto start (default), true = delayed-auto, boot after disks/network settle.
+# Applied to our own service record at startup; takes effect on next boot.
+# delayed_autostart: false
+
+# SCM service name override for side-by-side installs (test services).
+# Must match the `sc create` name. Default TicTackSv.
+# service_name: TicTackSv
+
+# Service token restriction (REG_MULTI_SZ RequiredPrivileges via
+# ChangeServiceConfig2 level 6). Default when this key is ABSENT:
+# SeChangeNotifyPrivilege, SeBackupPrivilege, SeRestorePrivilege,
+# SeManageVolumePrivilege. Opt out (full token): `required_privileges: []`.
+# Custom list example:
+# required_privileges:
+#   - SeChangeNotifyPrivilege
+#   - SeBackupPrivilege
+#   - SeRestorePrivilege
+#   - SeManageVolumePrivilege
+
+# Optional Windows service/process tuning (all absent = don't touch).
+# preshutdown_timeout_ms: SCM PreshutdownTimeout via ChangeServiceConfig2
+#   level 7; time to flush on system shutdown (safe: 180000-300000).
+# services_pipe_timeout_ms: REG_DWORD ServicesPipeTimeout under our own
+#   service key; extra time to answer start/stop under I/O load, only raises
+#   above the global (safe: 120000).
+# cpu_priority_class: IFEO PerfOptions DWORD (low byte, 1-6, NOT Win32
+#   constants): 1 IDLE, 2 NORMAL, 3 HIGH, 4 REALTIME (needs priv), 5
+#   BELOW_NORMAL, 6 ABOVE_NORMAL; 0 reserved, >6 ignored. Default absent.
+# io_priority: IFEO PerfOptions DWORD 1-3 (else ignored):
+#   1 IoPriorityNotSet (inherit), 2 IoPriorityVeryLow (recommended),
+#   3 IoPriorityLow (needs priv). 4+ (Normal/High/Critical) rejected:
+#   IFEO can only lower.
+# page_priority: IFEO PerfOptions DWORD, lower-only: 1 VERY_LOW,
+#   2 LOW, 3 MEDIUM, 4 BELOW_NORMAL; >=NORMAL(5) = no-op. 0 avoid.
+# preshutdown_timeout_ms: 180000
+# services_pipe_timeout_ms: 120000
+# cpu_priority_class: 5
+# io_priority: 2
+# page_priority: 2
 
 # Minutes to wait at startup for [VolumeLabel] volumes to appear (slow USB); 0 = resolve once, then fail fast
 volume_wait_minutes: 2

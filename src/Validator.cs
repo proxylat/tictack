@@ -23,6 +23,47 @@ namespace TicTack
 
     // Validation mirrors comparison; the validators wrap the comparers instead
     // of duplicating their bodies (the two had drifted as copy-paste twins).
+    // Content-only append proof for the post-copy validation mismatch
+    // path. Bytes are truth: no stat/mtime flux detection. Returns a
+    // benign reason when the mismatch is a mid-copy source race (the
+    // next cycle re-copies and converges), null for a true failure.
+    // (a) current source shorter than the bytes written -> truncation /
+    // rotation; (b) source grew past the bytes written -> pure append
+    // (dest == first-N prefix) OR middle-edit / rotation / torn write
+    // (prefix differs). Both converge by re-copying next cycle, so both
+    // are benign, never Error. Same-size drift (no growth evidence) and
+    // short dest (our own write incomplete) stay validation failures.
+    internal static class ValidationAppendProof
+    {
+        internal static string? Classify(string sourcePath, string destPath, long bytesWritten, long currentLength)
+        {
+            if (currentLength < bytesWritten)
+                return "source truncated during copy";
+            string? destHash;
+            try
+            {
+                var destInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
+                if (!destInfo.Exists || destInfo.Length != bytesWritten) return null;
+                destHash = FileHasher.ComputeHex(destPath, null);
+            }
+            catch { return null; }
+            if (currentLength == bytesWritten)
+            {
+                // The snapshot can predate a post-snapshot append (source
+                // grew after the validation re-read): re-stat, grown ->
+                // race, benign. Still same-size -> true drift, failure.
+                try { currentLength = new FileInfo(PathUtil.EnsureExtended(sourcePath)).Length; }
+                catch { return null; }
+                if (currentLength == bytesWritten) return null;
+            }
+            var prefixHash = FileHasher.ComputeHexPrefix(sourcePath, bytesWritten, null);
+            if (prefixHash == null) return null;
+            return string.Equals(destHash, prefixHash, StringComparison.Ordinal)
+                ? "source appended during copy"
+                : "source changed during copy";
+        }
+    }
+
     public sealed class SizeValidator : IValidator
     {
         private readonly SizeComparer _comparer = new SizeComparer();

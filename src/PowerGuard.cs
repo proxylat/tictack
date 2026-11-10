@@ -54,7 +54,7 @@ namespace TicTack
                         // re-cleans), so a failed sync never fails the clean.
                         if (!CopyAction.FlushDirectory(Path.GetDirectoryName(tmp)))
                             log.Debug("PowerGuard: directory sync failed after cleaning " + Path.GetFileName(tmp));
-                        log.Warn(string.Format(CultureInfo.InvariantCulture, "Cleaned stale temp {0}", Path.GetFileName(tmp)));
+                        log.Info(string.Format(CultureInfo.InvariantCulture, "Cleaned stale temp {0}", Path.GetFileName(tmp)));
                     }
                     catch (Exception ex) { log.Warn(string.Format(CultureInfo.InvariantCulture, "Could not clean {0}: {1}", Path.GetFileName(tmp), ex.Message)); }
                 }
@@ -80,7 +80,7 @@ namespace TicTack
                     File.Move(tmp, dest);
                     // Same barrier for the crash-recovery commit itself.
                     CopyAction.FlushDirectory(Path.GetDirectoryName(dest));
-                    log.Warn(string.Format(CultureInfo.InvariantCulture, "Recovered {0} from validated temp", Path.GetFileName(dest)));
+                    log.Info(string.Format(CultureInfo.InvariantCulture, "Recovered {0} from validated temp", Path.GetFileName(dest)));
                     return;
                 }
                 catch (Exception ex)

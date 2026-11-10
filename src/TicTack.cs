@@ -280,7 +280,8 @@ namespace TicTack
                 cfg.Logging.AlertPath,
                 console: o.isCli || o.isOnce || o.isValidate || o.isRebuild || o.isDeferredList || o.deferredVerb != null || o.isForget || o.isVersionsList || o.pinVerb != null || o.isOsCapture || o.isOsRestore || cfg.Logging.Console,
                 eventLog: OperatingSystem.IsWindows() && (o.isService || !Environment.UserInteractive),
-                backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"));
+                backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"),
+                alertEnabled: cfg.Logging.AlertEnabled);
             return (log, logPath);
         }
 
@@ -1514,24 +1515,29 @@ namespace TicTack
                     case "watcher":
                         monitor = CreateWatcher(src.Path, monitorConfig);
                         if (logMonitorStartup)
-                            log.Info("Syncing: " + SourceName(src) + " (watcher).");
+                            log.Debug("Syncing: " + SourceName(src) + " (watcher).");
                         break;
                     case "usn":
                         monitor = CreateUsnOrFallback(src.Path, monitorConfig, stateDb, log);
                         if (logMonitorStartup)
-                            log.Info("Syncing: " + SourceName(src) + (monitor is UsnJournalMonitor ? " (usn)." : " (watcher, USN unavailable)."));
+                        {
+                            // Degradation notice stays Info; the happy path is Debug.
+                            if (monitor is UsnJournalMonitor)
+                                log.Debug("Syncing: " + SourceName(src) + " (usn).");
+                            else log.Info("Syncing: " + SourceName(src) + " (watcher, USN unavailable).");
+                        }
                         break;
                     case "polling":
                         monitor = new PollingMonitor(src.Path, monitorConfig.PollingIntervalSeconds);
                         if (logMonitorStartup)
-                            log.Info("Syncing: " + SourceName(src) + " (polling every " + monitorConfig.PollingIntervalSeconds + "s).");
+                            log.Debug("Syncing: " + SourceName(src) + " (polling every " + monitorConfig.PollingIntervalSeconds + "s).");
                         break;
                     default:
                         compositeMembers = BuildCompositeMembers(
                             monitorConfig, src.Path, () => CreateWatcher(src.Path, monitorConfig), () => TryCreateUsn(src.Path, monitorConfig, stateDb, log, "skipping USN member"));
                         monitor = new CompositeMonitor(compositeMembers.ToArray());
                         if (logMonitorStartup)
-                            log.Info("Syncing: " + SourceName(src) + " (composite: " + string.Join(" + ", compositeMembers.Select(MemberShortName)) + ").");
+                            log.Debug("Syncing: " + SourceName(src) + " (composite: " + string.Join(" + ", compositeMembers.Select(MemberShortName)) + ").");
                         break;
                 }
             return (monitor, compositeMembers);

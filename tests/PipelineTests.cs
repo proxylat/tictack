@@ -150,6 +150,27 @@ public class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void ScanSummary_NamesFailedFiles()
+    {
+        // Seed before Start so the initial scan (not the event path)
+        // trips over it: the summary must name the failed rel.
+        File.WriteAllText(Path.Combine(_srcDir, "bad.txt"), "x");
+        var before = _log.Messages.Count(m => m.Contains("Sync complete"));
+        using var failingPipeline = new SyncPipeline(
+            new SourceConfig { Path = _srcDir, Destination = _dstDir, DebounceSeconds = 0 },
+            _monitor, new SizeComparer(), new FaultingAction("boom"), _rename,
+            new ExponentialBackoffRetry(1, 0, 1), _validator, new NoVersioning(), _deletion, _log,
+            new StateDb(Path.Combine(_root, "summary-state.db")));
+        _pipeline.Dispose();
+        failingPipeline.Start();
+
+        WaitFor(() => _log.Messages.Count(m => m.Contains("Sync complete")) > before, "scan summary");
+
+        Assert.Contains(_log.Messages,
+            m => m.Contains("1 failed, first failures: bad.txt"));
+    }
+
+    [Fact]
     public async Task RequestRescan_SyncsNewFileAndRemovesStaleDestFile()
     {
         // Seed through the live event path so state and dest agree first.
@@ -192,7 +213,7 @@ public class PipelineTests : IDisposable
         File.Delete(srcFile);
         monitor.FireGap();
         WaitFor(() => !File.Exists(dstFile), "gap covering delete");
-        Assert.Contains(log.Messages, m => m.StartsWith("WRN:Gap-triggered rescan starting: "));
+        Assert.Contains(log.Messages, m => m.StartsWith("INF:Gap-triggered rescan starting: "));
     }
 
     [Fact]

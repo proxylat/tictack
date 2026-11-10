@@ -46,4 +46,40 @@ public class AlertTests : IDisposable
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
+
+    [Fact]
+    public void AlertEnabledFalse_NeverConfiguresPath()
+    {
+        // Cooldown-safe: no Write call (the 30s global cooldown arms even
+        // on the early-return path), just inspect the configured path.
+        static string? ConfiguredPath() => (string?)typeof(DesktopAlert)
+            .GetField("_alertPath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
+            .GetValue(null);
+        var dir = Path.Combine(Path.GetTempPath(), "tictack-alertoff-" + Guid.NewGuid().ToString("N"));
+        var logPath = Path.GetTempFileName();
+        try
+        {
+            // Stale-path reset: constructing with null clears an earlier path.
+            DesktopAlert.Configure(dir);
+            var resetter = new DesktopAlertLogger(LogLevel.Warn, null);
+            Assert.Null(ConfiguredPath());
+
+            // Factory hard-off: alert_path set + alert_enabled false => null.
+            DesktopAlert.Configure(dir);
+            ((IDisposable)LoggerFactory.Create("info", logPath, 10, 5, dir,
+                console: false, eventLog: false, alertEnabled: false)).Dispose();
+            Assert.Null(ConfiguredPath());
+
+            // Omitted flag preserves current behavior: path configured.
+            ((IDisposable)LoggerFactory.Create("info", logPath, 10, 5, dir,
+                console: false, eventLog: false)).Dispose();
+            Assert.Equal(dir, ConfiguredPath());
+        }
+        finally
+        {
+            DesktopAlert.Configure(null);
+            try { File.Delete(logPath); } catch { }
+            try { Directory.Delete(dir, true); } catch { }
+        }
+    }
 }

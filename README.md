@@ -320,6 +320,7 @@ Fields live at three levels: top-level source keys (`path`/`paths`, `destination
 | `max_files` | `5` | Keep N rotated logs (`tictack.log`, `.1`, `.2`...) |
 | `console` | `false` | Also write to stdout (auto-enabled in `--cli`/`--once`) |
 | `alert_path` | unset (alerts off) | Where `TicTack-WARN/ERROR-*.txt` alert files are written — no code default, so leave it set (the examples use the Desktop). On Windows, Desktop is `C:\Users\User\Desktop`; on Linux, `/home/user/Desktop` |
+| `alert_enabled` | unset (on iff `alert_path` set) | `false` = hard off for the Desktop `.txt` alerts even if `alert_path` is set (log-only mode; Warn/Error still reach `tictack.log`) |
 
 ### watchdog
 

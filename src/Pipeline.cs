@@ -40,6 +40,11 @@ namespace TicTack
         private Task<bool>? _initialSync;
         // Coalesces concurrent on-demand covering scans to one run.
         private int _scanRunning;
+        // Gap-storm gate: single gaps are routine self-heal (Info only);
+        // 3+ within 10 min means the event stream keeps losing coverage
+        // (journal wrapping?) and earns one Warn per window.
+        private readonly List<DateTime> _gapStarts = new List<DateTime>();
+        private DateTime _gapStormWarnedUtc = DateTime.MinValue;
         private readonly List<Task> _deferredTasks = new List<Task>();
         private readonly object _taskLock = new object();
         // Re-arm floor when a deferred-check attempt made no progress: without
@@ -49,6 +54,14 @@ namespace TicTack
         private Timer? _deferredCheckTimer;
         private SrcLock? _lock;
         private TimeSpan? _lockTimeout;
+        private Timer? _lockReacquireTimer;
+        private int _welRunning;
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _sweepGates = new(PathComparer);
+        private static string SweepGateKey(string dest)
+        {
+            try { return Path.GetFullPath(dest).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar); }
+            catch { return dest; }
+        }
         private ChurnMonitor _churn = null!; // assigned in InitSyncState before use
         private bool _churnArmed;
         private readonly StateDb? _stateDb;
@@ -175,7 +188,11 @@ namespace TicTack
             try { Directory.CreateDirectory(_config.Destination); }
             catch (Exception ex) { _log.Debug("Destination create failed: " + ex.Message); }
             _lockTimeout = lockTimeout;
-            _lock = new SrcLock(Path.Combine(_config.Destination, ".tictack.lock"), _log, lockTimeout, mode: LockMode.Shared);
+            var lockPath = Path.Combine(_config.Destination, ".tictack.lock");
+            // Boot takeover: a provably-dead holder's files go now, so a
+            // fresh boot never sits out the 60s budget behind a corpse.
+            SrcLock.TakeOverDead(lockPath, _log);
+            _lock = new SrcLock(lockPath, _log, lockTimeout, mode: LockMode.Shared);
             if (!_lock.IsHeld)
             {
                 _log.Error("Could not acquire sync lock; pipeline will not start: " + _config.Destination);
@@ -185,7 +202,7 @@ namespace TicTack
                 return;
             }
             _monitor.Changed += OnChanged;
-            _monitorErrorHandler = (s, e) => _log.Error("Monitor error", e.Exception);
+            _monitorErrorHandler = (s, e) => _log.Error("Monitor error [" + _config.Path + "]", e.Exception);
             _monitor.Error += _monitorErrorHandler;
             // Standalone gap cover: watcher overflows and USN re-baselines
             // fire GapDetected; the covering scan picks up deletes the
@@ -378,11 +395,27 @@ namespace TicTack
         {
             try
             {
-                // Warn, not Info: a gap means the event stream lost coverage
-                // (overflow, re-baseline) — the operator should see it even
-                // though the covering scan below heals it. The logger
-                // prefixes every line with a timestamp.
-                _log.Warn("Gap-triggered rescan starting: " + _config.Path);
+                // Routine self-heal, not an incident: a gap means the event
+                // stream lost coverage (overflow, re-baseline) and the
+                // covering scan below restores it. Info only — the "Sync
+                // complete" line is the proof of work. Warn + desktop alert
+                // only on storms (repeated gaps = journal wrapping faster
+                // than we keep up; consider larger watcher_buffer_kb).
+                var now = DateTime.UtcNow;
+                var recent = 0;
+                lock (_gapStarts)
+                {
+                    _gapStarts.Add(now);
+                    _gapStarts.RemoveAll(t => (now - t).TotalMinutes >= 10);
+                    recent = _gapStarts.Count;
+                }
+                _log.Info("Gap-triggered rescan starting: " + _config.Path);
+                if (recent >= 3 && (now - _gapStormWarnedUtc).TotalMinutes >= 10)
+                {
+                    _gapStormWarnedUtc = now;
+                    _log.Warn(recent + " gap-rescans in 10 min for " + _config.Path
+                        + " — event stream keeps losing coverage (journal wrapping?); consider larger watcher_buffer_kb");
+                }
                 return await ScanAndSyncAsync("Gap rescan");
             }
             finally { ReleaseScan(); }
@@ -423,7 +456,15 @@ namespace TicTack
             catch (OperationCanceledException) { return false; }
             catch (Exception ex) { _log.Warn("Source scan incomplete, parity cleanup blocked: " + ex.Message); return false; }
             finally { if (_copyAction is CopyAction doneCopy) doneCopy.DirBatch = null; }
-            _log.Info($"Sync complete: {_config.Path} ({st.Scanned} scanned, {st.Copied} copied, {st.Moved} moved, {st.Skipped} skipped, {st.Scanned - st.Copied - st.Skipped - st.Moved} failed, {(DateTime.UtcNow - st.ScanStart).TotalSeconds:F0}s)");
+            // Sub-10s scans keep one decimal (a no-op scan rounds to "0s"
+            // at F0, which reads as broken); longer ones stay integral.
+            var elapsedSecs = (DateTime.UtcNow - st.ScanStart).TotalSeconds;
+            var dur = elapsedSecs < 10
+                ? elapsedSecs.ToString("F1", CultureInfo.InvariantCulture)
+                : elapsedSecs.ToString("F0", CultureInfo.InvariantCulture);
+            string failList;
+            lock (st.StateLock) { failList = st.FailedRels.Count > 0 ? ", first failures: " + string.Join("; ", st.FailedRels) : ""; }
+            _log.Info($"Sync complete: {_config.Path} ({st.Scanned} scanned, {st.Copied} copied, {st.Moved} moved, {st.Skipped} skipped, {st.Scanned - st.Copied - st.Skipped - st.Moved} failed{failList}, {dur}s)");
             return true;
         }
 
@@ -487,10 +528,10 @@ namespace TicTack
             if (failed > 0)
             {
                 // No stamp: re-alerts on the next run until fixed.
-                _log.Error("Routine check: " + failed + " of " + sample.Count + " sampled files differ — reruns next scan until clean");
+                _log.Error("Routine check: " + failed + " of " + sample.Count + " sampled files differ — reruns next scan until clean [" + _config.Path + "]");
                 return;
             }
-            _log.Info("Routine check: " + ok + "/" + sample.Count + " sampled files match (" + skipped + " skipped)");
+            _log.Info("Routine check: " + ok + "/" + sample.Count + " sampled files match (" + skipped + " skipped) [" + _config.Path + "]");
             try { _verifyStore.SetLastRun(_restoreKey, DateTime.UtcNow); }
             catch (Exception ex) { _log.Debug("Routine-check stamp failed, rechecking next scan: " + ex.Message); }
         }
@@ -512,7 +553,7 @@ namespace TicTack
             if (!srcInfo.Exists || !dstInfo.Exists) { return 2; }
             if (srcInfo.Length != dstInfo.Length)
             {
-                _log.Error("Routine check FAILED (destination differs from source): " + rel);
+                _log.Error("Routine check FAILED (destination differs from source): " + rel + " [" + _config.Path + "]");
                 return 1;
             }
             string hs, hd;
@@ -521,7 +562,7 @@ namespace TicTack
             try { hd = FileHasher.ComputeHex(PathUtil.EnsureExtended(Path.Combine(_config.Destination, rel)), null); }
             catch { return 2; }
             if (hs == hd) return 0;
-            _log.Error("Routine check FAILED (destination differs from source): " + rel); return 1;
+            _log.Error("Routine check FAILED (destination differs from source): " + rel + " [" + _config.Path + "]"); return 1;
         }
 
         // Full routine-check cadence: due when enabled and never stamped, or
@@ -624,7 +665,7 @@ namespace TicTack
         }
         catch (Exception ex) { _log.Debug("Move replay state update failed: " + rel + " (" + ex.Message + ")"); }
         _churn.ReportRename();
-        _log.Info("Replayed move: " + donorRel + " -> " + rel);
+        _log.Info("Replayed move: " + donorRel + " -> " + rel + " [" + _config.Path + "]");
         return true;
         }
 
@@ -755,6 +796,14 @@ namespace TicTack
         }
         if (!valid)
         {
+            // Mid-copy source race, not corruption: truncation/append
+            // converges on the next cycle, so no Error and no alert.
+            var benign = ValidationAppendProof.Classify(src, dst, result.BytesCopied, freshSnapshot.Length);
+            if (benign != null)
+            {
+                _log.Debug(validationLabel + " skipped (" + benign + ", will converge next cycle): " + src + " -> " + dst);
+                return (null, false);
+            }
             _log.Error(validationLabel + ": " + src + " -> " + dst);
             TicTackEventSource.Log.CopyFailed();
             return (null, false);
@@ -1035,6 +1084,7 @@ namespace TicTack
             }
             _monitor.Stop();
             _startRetryTimer?.Dispose();
+            DisarmLockReacquireTimer();
             _deferredCheckTimer?.Dispose();
             _parityTimer?.Dispose();
 
@@ -1049,7 +1099,7 @@ namespace TicTack
             lock (_taskLock) tasks.AddRange(_deferredTasks);
             try { await Task.WhenAll(tasks); }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { _log.Error("Pipeline shutdown worker failed", ex); }
+            catch (Exception ex) { _log.Error("Pipeline shutdown worker failed [" + _config.Path + "]", ex); }
         }
 
         public void Stop()
@@ -1092,6 +1142,7 @@ namespace TicTack
             Stop();
             _disposed = true;
             if (_startRetryTimer != null) _startRetryTimer.Dispose();
+            DisarmLockReacquireTimer();
             if (_deferredCheckTimer != null) _deferredCheckTimer.Dispose();
             if (_parityTimer != null) _parityTimer.Dispose();
             if (_cts != null) _cts.Dispose();
@@ -1158,7 +1209,7 @@ namespace TicTack
                 {
                     var progressed = true;
                     try { progressed = await CheckDeferredDeletionsAsync(); }
-                    catch (Exception ex) { _log.Error("Deferred deletion check failed", ex); }
+                    catch (Exception ex) { _log.Error("Deferred deletion check failed [" + _config.Path + "]", ex); }
                     // No progress (lock held elsewhere / churn hold) must not
                     // re-arm at zero: the due deadline is still in the past and
                     // would fire again immediately, spinning this timer.
@@ -1174,6 +1225,33 @@ namespace TicTack
         // back to shared. Skips the sweep when exclusivity is unavailable.
         private async Task WithExclusiveLockAsync(Func<Task> work)
         {
+            // Re-entrancy guard: the 3 sweep call sites share one _lock
+            // field, so a second entry would crossed-dispose the in-flight
+            // exclusive. Best-effort skip; the next cycle retries.
+            if (Interlocked.Exchange(ref _welRunning, 1) != 0)
+            {
+                _log.Debug("Exclusive sweep already running, skipping re-entrant entry");
+                return;
+            }
+            try
+            {
+                var gate = _sweepGates.GetOrAdd(SweepGateKey(_config.Destination), _ => new SemaphoreSlim(1, 1));
+                if (!await gate.WaitAsync(0).ConfigureAwait(false))
+                {
+                    _log.Debug("Exclusive sweep already running for destination, skipping: " + _config.Destination);
+                    return;
+                }
+                try { await WithExclusiveLockCoreAsync(work); }
+                finally { try { gate.Release(); } catch { } }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _welRunning, 0);
+            }
+        }
+
+        private async Task WithExclusiveLockCoreAsync(Func<Task> work)
+        {
             var path = Path.Combine(_config.Destination, ".tictack.lock");
             try
             {
@@ -1183,7 +1261,10 @@ namespace TicTack
                 if (!_lock.IsHeld)
                 {
                     var who = _lock.BlockerSummary.Length > 0 ? _lock.BlockerSummary : "unknown";
-                    _log.Warn("Exclusive lock unavailable (held by: " + who + "), skipping destructive sweep");
+                    if (_lock.AllBlockersSelf())
+                        _log.Debug("Exclusive lock held by sibling pipeline (same process), skipping destructive sweep: " + who);
+                    else
+                        _log.Warn("Exclusive lock unavailable (held by: " + who + "), skipping destructive sweep");
                     return;
                 }
                 await work();
@@ -1198,7 +1279,53 @@ namespace TicTack
                     _log.Error("Shared lock re-acquire failed after exclusive sweep");
                     _lock.Dispose();
                     _lock = null;
+                    ArmLockReacquireTimer();
                 }
+                else DisarmLockReacquireTimer();
+            }
+        }
+
+        // Degraded mode: the exclusive sweep dropped our shared roster and
+        // could not get it back. Retry on a timer with a standing Warn
+        // until held, instead of running silent lockless after one Error.
+        private void ArmLockReacquireTimer()
+        {
+            lock (_taskLock)
+            {
+                if (_disposed || _cts == null || _cts.IsCancellationRequested) return;
+                if (_lockReacquireTimer != null) return;
+                _lockReacquireTimer = new Timer(_ => TryReacquireSharedLock(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+            }
+        }
+
+        private void TryReacquireSharedLock()
+        {
+            if (_disposed || _cts == null || _cts.IsCancellationRequested) return;
+            if (_lock != null) { DisarmLockReacquireTimer(); return; }
+            var path = Path.Combine(_config.Destination, ".tictack.lock");
+            SrcLock? candidate = null;
+            try { candidate = new SrcLock(path, _log, _lockTimeout, mode: LockMode.Shared); }
+            catch (Exception ex) { _log.Debug("Shared lock re-acquire attempt failed: " + ex.Message); return; }
+            if (candidate.IsHeld)
+            {
+                _lock = candidate;
+                DisarmLockReacquireTimer();
+                _log.Warn("Shared lock re-acquired after exclusive sweep");
+            }
+            else
+            {
+                var who = candidate.BlockerSummary.Length > 0 ? candidate.BlockerSummary : "unknown";
+                candidate.Dispose();
+                _log.Warn("Shared lock still unavailable (held by: " + who + "), running unprotected; will retry");
+            }
+        }
+
+        private void DisarmLockReacquireTimer()
+        {
+            lock (_taskLock)
+            {
+                try { _lockReacquireTimer?.Dispose(); } catch { }
+                _lockReacquireTimer = null;
             }
         }
 
@@ -1283,6 +1410,15 @@ namespace TicTack
             internal readonly List<(string path, long size, long mtime, string? fileId, long ctime, string? hash)> Pending = new();
             internal long Scanned, Copied, Moved, Skipped;
             internal int ScanFailed;
+            // Bounded: first few failed rels for the summary line. The
+            // full paths already sit on the per-file Error lines above
+            // it; this is the at-a-glance list. Reuses StateLock (same
+            // contention domain as Pending, no new lock object).
+            internal readonly List<string> FailedRels = new();
+            internal void RecordFailed(string rel)
+            {
+                lock (StateLock) { if (FailedRels.Count < 5) FailedRels.Add(rel); }
+            }
             internal ScanScope(SyncPipeline p, string reason, DateTime scanStart) { _p = p; Reason = reason; ScanStart = scanStart; }
 
             internal async Task FlushStateAsync()
@@ -1325,6 +1461,7 @@ namespace TicTack
                 if (!FileSnapshot.TryRead(f, out var s))
                 {
                     Interlocked.Exchange(ref ScanFailed, 1);
+                    RecordFailed(rel);
                     snap = default;
                     dst = "";
                     return false;
@@ -1334,6 +1471,7 @@ namespace TicTack
                 if (!_p._driveReady(_p._config.Destination))
                 {
                     _p._log.Warn("Destination drive is not ready, initial copy blocked: " + f);
+                    RecordFailed(rel);
                     snap = default;
                     dst = "";
                     return false;
@@ -1403,7 +1541,7 @@ namespace TicTack
                 var fresh = await _p.ExecuteCopyAsync(args,
                     _p.CopyWithRetryAsync,
                     Reason + " failed", Reason + " validation FAILED", token, batchUpsert);
-                if (fresh == null) return;
+                if (fresh == null) { RecordFailed(rel); return; }
                 _p._churn.ReportCopy(fresh.Value.Length);
                 if (!_p.UsePipelined(batchUpsert) && _p._stateDb != null)
                 {
@@ -1460,6 +1598,7 @@ namespace TicTack
                 catch (Exception ex)
                 {
                     Interlocked.Exchange(ref ScanFailed, 1);
+                    RecordFailed(rel);
                     _p._log.Error(Reason + " failed: " + f, ex);
                 }
             }

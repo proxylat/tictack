@@ -126,6 +126,9 @@ namespace TicTack
         // set only when CopyAction.ComputeSourceHash is on. Null means no
         // copy-time hash is available; validators must do full reads.
         public string? SourceHash { get; set; }
+        // Bytes the copy loop actually wrote (dst length after commit).
+        // The append proof compares the current source against this prefix.
+        public long BytesCopied { get; set; }
         public static ActionResult Ok() { return new ActionResult { Success = true }; }
         public static ActionResult Fail(string msg, bool retryable = false) =>
             new ActionResult { Success = false, ErrorMessage = msg, Retryable = retryable };
