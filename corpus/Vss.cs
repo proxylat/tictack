@@ -59,6 +59,26 @@ namespace Corpus
         Postcommitted = 15
     }
 
+    internal enum VssWriterState
+    {
+        Unknown = 0,
+        Stable = 1,
+        WaitingForFreeze = 2,
+        WaitingForThaw = 3,
+        WaitingForPostSnapshot = 4,
+        WaitingForBackupComplete = 5,
+        FailedAtIdentify = 6,
+        FailedAtPrepareBackup = 7,
+        FailedAtPrepareSnapshot = 8,
+        FailedAtFreeze = 9,
+        FailedAtThaw = 10,
+        FailedAtPostSnapshot = 11,
+        FailedAtBackupComplete = 12,
+        FailedAtPreRestore = 13,
+        FailedAtPostRestore = 14,
+        FailedAtBackupShutdown = 15
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct VssSnapshotProp
     {
@@ -119,10 +139,10 @@ namespace Corpus
         [PreserveSig] int AddComponent(Guid instance, Guid writer, int type, [MarshalAs(UnmanagedType.LPWStr)] string? path, [MarshalAs(UnmanagedType.LPWStr)] string name);
         [PreserveSig] int PrepareForBackup(out IVssAsync async);
         [PreserveSig] int AbortBackup();
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GatherWriterStatus(out IVssAsync async);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetWriterStatusCount(out uint count);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int FreeWriterStatus();
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetWriterStatus(uint i, out Guid instance, out Guid writer, out IntPtr name, out int state, out int failure);
+        [PreserveSig] int GatherWriterStatus(out IVssAsync async);
+        [PreserveSig] int GetWriterStatusCount(out uint count);
+        [PreserveSig] int FreeWriterStatus();
+        [PreserveSig] int GetWriterStatus(uint i, out Guid instance, out Guid writer, [MarshalAs(UnmanagedType.BStr)] out string name, out int state, out int failure);
         [PreserveSig] int SetBackupSucceeded(Guid instance, Guid writer, int type, [MarshalAs(UnmanagedType.LPWStr)] string? path, [MarshalAs(UnmanagedType.LPWStr)] string name, [MarshalAs(UnmanagedType.U1)] bool succeeded);
         [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetBackupOptions(Guid writer, int type, IntPtr path, IntPtr name, IntPtr options);
         [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetSelectedForRestore(Guid writer, int type, IntPtr path, IntPtr name, byte selected);
@@ -203,7 +223,7 @@ namespace Corpus
         // AOT: the VSS COM entry point above; same justification (built-in COM
         // interop on NativeAOT Windows, proven by smoke test).
         [UnconditionalSuppressMessage("Trimming", "IL2050", Justification = "Built-in COM interop on NativeAOT Windows; VSS API surface rooted, proven by smoke test.")]
-        public static VssSnapshot Create(string drive, ILogger log)
+        public static VssSnapshot Create(string drive, ILogger log, bool strictWriters = true, Action? preFreeze = null, Action? postThaw = null)
         {
             ArgumentNullException.ThrowIfNull(drive);
             ArgumentNullException.ThrowIfNull(log);
@@ -275,8 +295,18 @@ namespace Corpus
                 // Prepare validates set existence).
                 Hr(com.PrepareForBackup(out var pf), "PrepareForBackup");
                 RunAsync(pf, "PrepareForBackup");
-                Hr(com.DoSnapshotSet(out var ds), "DoSnapshotSet");
-                RunAsync(ds, "DoSnapshotSet");
+                VssWriterVerifier.Verify(com, log, strictWriters);
+                preFreeze?.Invoke();
+                try
+                {
+                    Hr(com.DoSnapshotSet(out var ds), "DoSnapshotSet");
+                    RunAsync(ds, "DoSnapshotSet");
+                }
+                finally
+                {
+                    postThaw?.Invoke();
+                }
+                VssWriterVerifier.Verify(com, log, strictWriters);
                 Hr(com.GetSnapshotProperties(snapId, out var prop), "GetSnapshotProperties");
                 string device;
                 try
@@ -348,7 +378,7 @@ namespace Corpus
             }
         }
 
-        private static void RunAsync(IVssAsync async, string op)
+        internal static void RunAsync(IVssAsync async, string op)
         {
             try
             {
@@ -399,6 +429,46 @@ namespace Corpus
         {
             using var id = WindowsIdentity.GetCurrent();
             return new WindowsPrincipal(id).IsInRole(WindowsBuiltInRole.Administrator);
+        }
+    }
+
+    internal static class VssWriterVerifier
+    {
+        public static bool IsFailureState(int state) => state >= (int)VssWriterState.FailedAtIdentify;
+
+        public static void Verify(IVssBackupComponents com, ILogger log, bool strict)
+        {
+            var ghr = com.GatherWriterStatus(out var async);
+            if (ghr < 0)
+                throw new IOException($"GatherWriterStatus failed (0x{ghr:X8})", Marshal.GetExceptionForHR(ghr));
+            VssSnapshot.RunAsync(async, "GatherWriterStatus");
+            try
+            {
+                var chr = com.GetWriterStatusCount(out var count);
+                if (chr < 0)
+                    throw new IOException($"GetWriterStatusCount failed (0x{chr:X8})", Marshal.GetExceptionForHR(chr));
+                var failures = new List<string>();
+                for (uint i = 0; i < count; i++)
+                {
+                    var shr = com.GetWriterStatus(i, out _, out _, out var name, out var state, out var failure);
+                    if (shr < 0) continue;
+                    EvaluateWriter(name, state, failure, log, failures);
+                }
+                if (failures.Count > 0 && strict)
+                    throw new IOException("VSS writer failure(s): " + string.Join("; ", failures));
+            }
+            finally
+            {
+                try { com.FreeWriterStatus(); } catch { }
+            }
+        }
+
+        internal static void EvaluateWriter(string name, int state, int failure, ILogger log, List<string> failures)
+        {
+            if (!IsFailureState(state) && failure >= 0) return;
+            var msg = $"{name} state={(VssWriterState)state}({state}) hr=0x{failure:X8}";
+            log.Warn("VSS writer error: " + msg);
+            failures.Add(msg);
         }
     }
 }

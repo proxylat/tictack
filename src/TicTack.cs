@@ -138,8 +138,8 @@ namespace TicTack
             public bool isService = false, isCli = false, isOnce = false, isValidate = false, isExternalDrives = false, isRebuild = false, isRemoteAgent = false;
             public bool isDeferredList = false;
             public string? deferredVerb = null, deferredTarget = null;
-            public bool isForget = false, forgetDryRun = false, versionsJson = false;
-            public string? forgetKeepLast = null, forgetKeepWithin = null, forgetKeepDaily = null, forgetKeepWeekly = null, forgetKeepMonthly = null;
+            public bool isForget = false, isArchiveForget = false, forgetDryRun = false, forgetCleanAll = false, versionsJson = false;
+            public string? forgetKeepLast = null, forgetKeepWithin = null, forgetKeepDaily = null, forgetKeepWeekly = null, forgetKeepMonthly = null, forgetKeepYearly = null;
             public bool isVersionsList = false;
             public string? versionsGlob = null, versionsLatest = null;
             public string? pinVerb = null, pinTarget = null;
@@ -160,12 +160,27 @@ namespace TicTack
                 case "--external-drives": o.isExternalDrives = true; return true;
                 case "--rebuild": o.isRebuild = true; return true;
                 case "--forget": o.isForget = true; return true;
+                case "--archive-forget": o.isArchiveForget = true; return true;
+                case "--clean-all": o.forgetCleanAll = true; return true;
                 case "--dry-run": o.forgetDryRun = true; return true;
                 case "--json": o.versionsJson = true; return true;
                 case "--deferred-list": o.isDeferredList = true; return true;
                 case "--os-capture": o.isOsCapture = true; return true;
                 case "--os-restore": o.isOsRestore = true; return true;
                 default: return false;
+            }
+        }
+
+        private static void ApplyKeepArg(MainOptions o, string flag, string val)
+        {
+            switch (flag)
+            {
+                case "--keep-last": o.forgetKeepLast = val; break;
+                case "--keep-within": o.forgetKeepWithin = val; break;
+                case "--keep-daily": o.forgetKeepDaily = val; break;
+                case "--keep-weekly": o.forgetKeepWeekly = val; break;
+                case "--keep-monthly": o.forgetKeepMonthly = val; break;
+                case "--keep-yearly": o.forgetKeepYearly = val; break;
             }
         }
 
@@ -177,19 +192,12 @@ namespace TicTack
                     if (i + 1 < args.Length) o.CfgPath = args[++i];
                     return true;
                 case "--keep-last":
-                    if (i + 1 < args.Length) o.forgetKeepLast = args[++i];
-                    return true;
                 case "--keep-within":
-                    if (i + 1 < args.Length) o.forgetKeepWithin = args[++i];
-                    return true;
                 case "--keep-daily":
-                    if (i + 1 < args.Length) o.forgetKeepDaily = args[++i];
-                    return true;
                 case "--keep-weekly":
-                    if (i + 1 < args.Length) o.forgetKeepWeekly = args[++i];
-                    return true;
                 case "--keep-monthly":
-                    if (i + 1 < args.Length) o.forgetKeepMonthly = args[++i];
+                case "--keep-yearly":
+                    if (i + 1 < args.Length) ApplyKeepArg(o, args[i].ToLowerInvariant(), args[++i]);
                     return true;
                 case "--versions-list":
                     o.isVersionsList = true;
@@ -292,7 +300,7 @@ namespace TicTack
                 cfg.Logging.MaxSizeMb,
                 cfg.Logging.MaxFiles,
                 cfg.Logging.AlertPath,
-                console: o.isCli || o.isOnce || o.isValidate || o.isRebuild || o.isDeferredList || o.deferredVerb != null || o.isForget || o.isVersionsList || o.pinVerb != null || o.isOsCapture || o.isOsRestore || cfg.Logging.Console,
+                console: o.isCli || o.isOnce || o.isValidate || o.isRebuild || o.isDeferredList || o.deferredVerb != null || o.isForget || o.isArchiveForget || o.isVersionsList || o.pinVerb != null || o.isOsCapture || o.isOsRestore || cfg.Logging.Console,
                 eventLog: OperatingSystem.IsWindows() && (o.isService || !Environment.UserInteractive),
                 backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"),
                 alertEnabled: cfg.Logging.AlertEnabled);
@@ -320,7 +328,11 @@ namespace TicTack
 
             if (o.isForget)
             {
-                return RunForget(cfg, log, o.forgetDryRun, o.forgetKeepLast, o.forgetKeepWithin, o.forgetKeepDaily, o.forgetKeepWeekly, o.forgetKeepMonthly);
+                return RunForget(cfg, log, o.forgetDryRun, o.forgetKeepLast, o.forgetKeepWithin, o.forgetKeepDaily, o.forgetKeepWeekly, o.forgetKeepMonthly, o.forgetKeepYearly, o.forgetCleanAll);
+            }
+            if (o.isArchiveForget)
+            {
+                return RunArchiveForget(cfg, log, o.forgetDryRun, o.forgetKeepLast, o.forgetKeepWithin, o.forgetKeepDaily, o.forgetKeepWeekly, o.forgetKeepMonthly, o.forgetKeepYearly, o.forgetCleanAll);
             }
 
             if (o.isVersionsList)
@@ -812,12 +824,15 @@ namespace TicTack
             Console.WriteLine("  --rebuild              Clear state and re-sync every source from scratch");
             Console.WriteLine("  --validate             Check config.yaml and exit");
             Console.WriteLine("  --external-drives      Back up to eligible external drives (interactive)");
+            Console.WriteLine("  --remote-agent         Run the authenticated TCP remote sync agent");
             Console.WriteLine("  --config <path>        Use this config file (default: config.yaml next to the exe)");
             Console.WriteLine();
-            Console.WriteLine("Retention (versions are per-file; forget IS prune):");
-            Console.WriteLine("  --forget [--dry-run]   Apply each source's keep_* policies to its versions dir");
-            Console.WriteLine("  --keep-last N --keep-within 30d --keep-daily N --keep-weekly N --keep-monthly N");
-            Console.WriteLine("                           Override the config policies for one forget run");
+            Console.WriteLine("Retention (versions and archive are independent; forget IS prune):");
+            Console.WriteLine("  --forget [--dry-run]   Apply each source's versioning.keep_* policies to .versions");
+            Console.WriteLine("  --archive-forget [--dry-run]");
+            Console.WriteLine("                         Apply each source's deletion.keep_* policies to .archive");
+            Console.WriteLine("  --keep-last N --keep-within 30d --keep-daily N --keep-weekly N --keep-monthly N --keep-yearly N --clean-all");
+            Console.WriteLine("                         Override the config policies for one forget / archive-forget run");
             Console.WriteLine("  --versions-list [glob] [--latest N] [--json]");
             Console.WriteLine("                           List stored versions, newest first");
             Console.WriteLine("  --versions-pin <spec>  Never auto-delete these versions (spec: path or file@ts)");
@@ -846,9 +861,10 @@ namespace TicTack
         // policies by default; any --keep-* flag switches the whole run to
         // flag-only policies (explicit beats configured, never merges).
         internal static int RunForget(TicTackConfig cfg, ILogger log, bool dryRun,
-            string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly)
+            string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly,
+            string? keepYearly = null, bool cleanAll = false)
         {
-            var (overrides, orc) = ParseForgetOverrides(keepLast, keepWithin, keepDaily, keepWeekly, keepMonthly, log);
+            var (overrides, orc) = ParseForgetOverrides(keepLast, keepWithin, keepDaily, keepWeekly, keepMonthly, keepYearly, cleanAll, log);
             if (orc != 0) return orc;
             var removedTotal = 0;
             var keptTotal = 0;
@@ -862,13 +878,54 @@ namespace TicTack
             return 0;
         }
 
+        internal static int RunArchiveForget(TicTackConfig cfg, ILogger log, bool dryRun,
+            string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly,
+            string? keepYearly = null, bool cleanAll = false)
+        {
+            var (overrides, orc) = ParseForgetOverrides(keepLast, keepWithin, keepDaily, keepWeekly, keepMonthly, keepYearly, cleanAll, log);
+            if (orc != 0) return orc;
+            var removedTotal = 0;
+            var keptTotal = 0;
+            var allSources = new List<SourceConfig>(cfg.Sources ?? new List<SourceConfig>());
+            allSources.AddRange(Config.ResolveRemoteSources(cfg));
+            foreach (var src in allSources)
+            {
+                var archiveDir = src.Sync?.Deletion?.Path ?? Path.Combine(src.Destination, ".archive");
+                var policy = overrides ?? ArchivePolicyFromConfig(src.Sync?.Deletion, log);
+                var (kept, pruned, _) = ArchivePruner.Forget(archiveDir, policy, dryRun, log);
+                keptTotal += kept;
+                removedTotal += pruned;
+            }
+            log.Info(dryRun ? "archive-forget --dry-run: change nothing" : "archive-forget: removed " + removedTotal + ", kept " + keptTotal);
+            return 0;
+        }
+
+        private static RetentionPolicy ArchivePolicyFromConfig(DeletionConfig? dcfg, ILogger log)
+        {
+            if (dcfg == null) return new RetentionPolicy();
+            return RetentionPolicy.FromConfig(new VersioningConfig
+            {
+                KeepLast = dcfg.KeepLast,
+                KeepWithin = dcfg.KeepWithin,
+                KeepDaily = dcfg.KeepDaily,
+                KeepWeekly = dcfg.KeepWeekly,
+                KeepMonthly = dcfg.KeepMonthly,
+                KeepYearly = dcfg.KeepYearly,
+            }, log);
+        }
+
         internal static (RetentionPolicy? Overrides, int Rc) ParseForgetOverrides(
-            string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly, ILogger log)
+            string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly, ILogger log) =>
+            ParseForgetOverrides(keepLast, keepWithin, keepDaily, keepWeekly, keepMonthly, null, false, log);
+
+        internal static (RetentionPolicy? Overrides, int Rc) ParseForgetOverrides(
+            string? keepLast, string? keepWithin, string? keepDaily, string? keepWeekly, string? keepMonthly,
+            string? keepYearly, bool cleanAll, ILogger log)
         {
                 RetentionPolicy? overrides = null;
-                if (keepLast != null || keepWithin != null || keepDaily != null || keepWeekly != null || keepMonthly != null)
+                if (cleanAll || keepLast != null || keepWithin != null || keepDaily != null || keepWeekly != null || keepMonthly != null || keepYearly != null)
                 {
-                    overrides = new RetentionPolicy();
+                    overrides = new RetentionPolicy { CleanAll = cleanAll };
                     int? Num(string? raw, string flag)
                     {
                         if (raw == null) return null;
@@ -882,6 +939,7 @@ namespace TicTack
                         overrides.KeepDaily = Num(keepDaily, "--keep-daily");
                         overrides.KeepWeekly = Num(keepWeekly, "--keep-weekly");
                         overrides.KeepMonthly = Num(keepMonthly, "--keep-monthly");
+                        overrides.KeepYearly = Num(keepYearly, "--keep-yearly");
                         if (keepWithin != null)
                         {
                             if (!Config.TryParseDuration(keepWithin, out var within))
@@ -1395,7 +1453,7 @@ namespace TicTack
             if (rs == null || !rs.HasAgent)
                 throw new InvalidOperationException("remote_system.listen and remote_system.root must be configured for --remote-agent.");
             if (rs.Sandbox)
-                RemoteSandbox.Apply(log, rs.Root);
+                RemoteSandbox.Apply(log, rs.Root, rs.SandboxLevel);
 
             using var agent = StartRemoteAgentIfConfigured(cfg, log);
             log.Info("Remote agent running. Press Ctrl+C or Enter to stop.");

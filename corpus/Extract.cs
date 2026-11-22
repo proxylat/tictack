@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -422,11 +424,24 @@ namespace Corpus
                 var stream = new MftRunStream(parsed.DataRuns!, _vol, _geo.BytesPerCluster, _generation, src);
                 if (parsed.DataSize > (stream.EndVcn - stream.StartVcn + 1) * _geo.BytesPerCluster)
                     throw new ExtractCorruptException(_generation, $"file '{src}' runs shorter than its size");
+                var isSparse = stream.HasSparseRuns;
+                if (isSparse && OperatingSystem.IsWindows())
+                    TrySetSparse(output);
                 var buf = new byte[(int)Math.Min(parsed.DataSize, 1024 * 1024)];
                 var pos = 0L;
                 var nextPrefetch = 0L;
                 while (pos < parsed.DataSize)
                 {
+                    if (isSparse)
+                    {
+                        var hole = stream.SparseHoleBytesAt(pos, parsed.DataSize - pos);
+                        if (hole > 0)
+                        {
+                            output.Seek(hole, SeekOrigin.Current);
+                            pos += hole;
+                            continue;
+                        }
+                    }
                     if (pos >= nextPrefetch)
                     {
                         // Bounded readahead: the next segment's chunks are
@@ -446,6 +461,12 @@ namespace Corpus
                         nextPrefetch = pos + PrefetchSegmentBytes;
                     }
                     var take = (int)Math.Min(buf.Length, parsed.DataSize - pos);
+                    if (isSparse)
+                    {
+                        var nextHoleOffset = stream.NextSparseOffsetIn(pos, take);
+                        if (nextHoleOffset >= 0 && nextHoleOffset < take)
+                            take = (int)nextHoleOffset;
+                    }
                     stream.Read(pos, buf, 0, take, zeroUnmapped: false);
                     // Valid-data-length tail: NTFS reads [initSize, realSize) as zeros.
                     if (parsed.DataInitSize < pos + take)
@@ -457,6 +478,20 @@ namespace Corpus
                     output.Write(buf, 0, take);
                     pos += take;
                 }
+                if (isSparse)
+                    output.SetLength(parsed.DataSize);
+            }
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            private static extern bool DeviceIoControl(IntPtr hDevice, uint dwIoControlCode,
+                IntPtr lpInBuffer, uint nInBufferSize, IntPtr lpOutBuffer, uint nOutBufferSize,
+                out uint lpBytesReturned, IntPtr lpOverlapped);
+
+            private static void TrySetSparse(FileStream output)
+            {
+                const uint FSCTL_SET_SPARSE = 0x000900C4;
+                DeviceIoControl(output.SafeFileHandle.DangerousGetHandle(), FSCTL_SET_SPARSE,
+                    IntPtr.Zero, 0, IntPtr.Zero, 0, out _, IntPtr.Zero);
             }
 
             private void SetTimes(string outPath, ParsedFile parsed, string src)
@@ -1011,6 +1046,26 @@ namespace Corpus
             }
             if (extStart >= 0)
                 _vol.PrefetchRange(extStart, extLen);
+        }
+
+        internal bool HasSparseRuns => _runs.Any(r => r.Lcn < 0);
+
+        internal long SparseHoleBytesAt(long fileOffset, long maxBytes)
+        {
+            var vcn = fileOffset / _bpc;
+            if (!TryMap(vcn, out var lcn, out var runEnd) || lcn >= 0)
+                return 0;
+            var holeEnd = (runEnd + 1) * _bpc;
+            return Math.Min(maxBytes, holeEnd - fileOffset);
+        }
+
+        internal long NextSparseOffsetIn(long fileOffset, long spanBytes)
+        {
+            var vcn = fileOffset / _bpc;
+            if (!TryMap(vcn, out var lcn, out var runEnd) || lcn < 0)
+                return -1;
+            var runEndByte = (runEnd + 1) * _bpc - fileOffset;
+            return runEndByte < spanBytes ? runEndByte : -1;
         }
 
         private bool TryMap(long vcn, out long lcn, out long runEnd)

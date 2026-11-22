@@ -235,6 +235,7 @@ namespace TicTack
         public int? KeepDaily { get; set; }
         public int? KeepWeekly { get; set; }
         public int? KeepMonthly { get; set; }
+        public int? KeepYearly { get; set; }
 
         public VersioningConfig()
         {
@@ -246,6 +247,12 @@ namespace TicTack
     {
         public string? Mode { get; set; }
         public string? Path { get; set; }
+        public int? KeepLast { get; set; }
+        public string? KeepWithin { get; set; }
+        public int? KeepDaily { get; set; }
+        public int? KeepWeekly { get; set; }
+        public int? KeepMonthly { get; set; }
+        public int? KeepYearly { get; set; }
 
         public DeletionConfig()
         {
@@ -373,6 +380,7 @@ namespace TicTack
         public bool PreventSleep { get; set; }
         // Null = inherit jobs_defaults.show_terminal (default false).
         public bool? ShowTerminal { get; set; }
+        public bool? Sandbox { get; set; }
         // Optional cloud/network stability gate before launching the job.
         public bool? NetCheck { get; set; }
         public string? NetCheckHost { get; set; }
@@ -395,6 +403,7 @@ namespace TicTack
         public string? MissedRun { get; set; }
         public int? TimeoutMinutes { get; set; }
         public bool? ShowTerminal { get; set; }
+        public bool? Sandbox { get; set; }
         public bool? NetCheck { get; set; }
         public string? NetCheckHost { get; set; }
         public int? NetCheckSamples { get; set; }
@@ -892,6 +901,7 @@ namespace TicTack
         public string? AllowIp { get; set; }
         public int MaxClients { get; set; } = 8;
         public bool Sandbox { get; set; } = true;
+        public string SandboxLevel { get; set; } = "low";
 
         public string? Host { get; set; }
         public IList<string> Hosts { get; set; } = new List<string>();

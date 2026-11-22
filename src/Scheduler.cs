@@ -68,6 +68,7 @@ namespace TicTack
                     Config = job,
                     TimeoutMinutes = EffectiveTimeout(job, defaults),
                     ShowTerminal = EffectiveShowTerminal(job, defaults),
+                    Sandbox = job.Sandbox ?? defaults?.Sandbox ?? false,
                     NetCheckHost = EffectiveNetCheckHost(job, defaults),
                     NetCheckEnabled = EffectiveNetCheckEnabled(job, defaults),
                     NetCheckSamples = job.NetCheckSamples ?? defaults?.NetCheckSamples ?? 3,
@@ -693,7 +694,7 @@ namespace TicTack
             var cmd = Sub(cfg.Command!);
             _log.Info("Running job '" + cfg.Name + "': " + cmd);
             var (exitCode, _, err, timedOut) = await ProcessRunner.RunAsync(
-                cmd, wd, redirect: !job.ShowTerminal, ct, timeoutMs, low).ConfigureAwait(false);
+                cmd, wd, redirect: !job.ShowTerminal, ct, timeoutMs, low, job.Sandbox).ConfigureAwait(false);
 
             if (timedOut)
             {
@@ -999,6 +1000,7 @@ namespace TicTack
             public TimeSpan Jitter { get; set; }
             public int TimeoutMinutes { get; set; }
             public bool ShowTerminal { get; set; }
+            public bool Sandbox { get; set; }
             public string? NetCheckHost { get; set; }
             public bool NetCheckEnabled { get; set; }
             public int NetCheckSamples { get; set; }

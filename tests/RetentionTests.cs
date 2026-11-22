@@ -249,4 +249,71 @@ public class RetentionTests : IDisposable
         }
         Assert.Equal(10, Directory.GetFiles(Path.Combine(_verDir, "Desktop"), "a_*").Length);
     }
+
+    [Fact]
+    public void KeepYearly_And_CleanAll_WorkOnVersions()
+    {
+        var files = new[]
+        {
+            new VersionFile("2024a", new DateTime(2024, 3, 1), true, false),
+            new VersionFile("2024b", new DateTime(2024, 11, 1), true, false),
+            new VersionFile("2025a", new DateTime(2025, 6, 1), true, false),
+            new VersionFile("pinned", new DateTime(2023, 1, 1), true, true),
+        };
+
+        var yearly = new RetentionPolicy { KeepYearly = 1 }.Evaluate(files, new DateTime(2026, 1, 1));
+        Assert.True(yearly.Single(d => d.Path == "2025a").Keep);
+        Assert.True(yearly.Single(d => d.Path == "pinned").Keep);
+        Assert.False(yearly.Single(d => d.Path == "2024b").Keep);
+
+        var cleanAll = new RetentionPolicy { CleanAll = true }.Evaluate(files, new DateTime(2026, 1, 1));
+        Assert.True(cleanAll.Single(d => d.Path == "pinned").Keep);
+        Assert.False(cleanAll.Single(d => d.Path == "2025a").Keep);
+        Assert.False(cleanAll.Single(d => d.Path == "2024b").Keep);
+    }
+
+    [Fact]
+    public void ArchivePruner_EvaluatesGfsAndCleanAll_IndependentlyFromVersions()
+    {
+        var archiveDir = Path.Combine(_dstDir, ".archive");
+        Directory.CreateDirectory(Path.Combine(archiveDir, "sub"));
+        var f1 = Path.Combine(archiveDir, "old.txt");
+        var f2 = Path.Combine(archiveDir, "sub", "new.txt");
+        File.WriteAllText(f1, "old");
+        File.WriteAllText(f2, "new");
+        File.SetLastWriteTime(f1, new DateTime(2024, 1, 10));
+        File.SetLastWriteTime(f2, new DateTime(2025, 11, 1));
+
+        // Seed a file in .versions to prove ArchivePruner never touches it.
+        var verFile = Path.Combine(_verDir, "keepme.txt");
+        File.WriteAllText(verFile, "keep");
+
+        var log = new NullLogger();
+        var (kept, pruned, failed) = ArchivePruner.Forget(
+            archiveDir,
+            new RetentionPolicy { KeepYearly = 1 },
+            dryRun: false,
+            log,
+            now: new DateTime(2026, 1, 1));
+
+        Assert.Equal(1, kept);
+        Assert.Equal(1, pruned);
+        Assert.Equal(0, failed);
+        Assert.False(File.Exists(f1));
+        Assert.True(File.Exists(f2));
+        Assert.True(File.Exists(verFile));
+
+        var (_, prunedAll, _) = ArchivePruner.Forget(archiveDir, new RetentionPolicy { CleanAll = true }, dryRun: false, log);
+        Assert.Equal(1, prunedAll);
+        Assert.False(File.Exists(f2));
+        Assert.True(File.Exists(verFile));
+    }
+
+    private sealed class NullLogger : ILogger
+    {
+        public void Debug(string msg) { }
+        public void Info(string msg) { }
+        public void Warn(string msg) { }
+        public void Error(string msg, Exception? ex = null) { }
+    }
 }

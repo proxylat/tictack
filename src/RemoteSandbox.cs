@@ -6,9 +6,14 @@ namespace TicTack
     internal static class RemoteSandbox
     {
         private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+        private const uint TOKEN_ADJUST_DEFAULT = 0x0080;
+        private const int TokenIntegrityLevel = 25;
+        private const uint SE_GROUP_INTEGRITY = 0x00000020;
+        private const uint SECURITY_MANDATORY_LOW_RID = 0x00001000;
         private const int JobObjectBasicUIRestrictions = 4;
         private const int JobObjectExtendedLimitInformation = 9;
         private const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
         private const uint JOB_OBJECT_UILIMIT_ALL = 0x000000FF;
 
         private const int PR_SET_NO_NEW_PRIVS = 38;
@@ -95,6 +100,41 @@ namespace TicTack
             public ulong RlimMax;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SID_IDENTIFIER_AUTHORITY
+        {
+            public byte b0, b1, b2, b3, b4, b5;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SID_AND_ATTRIBUTES
+        {
+            public IntPtr Sid;
+            public uint Attributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TOKEN_MANDATORY_LABEL
+        {
+            public SID_AND_ATTRIBUTES Label;
+        }
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AllocateAndInitializeSid(
+            ref SID_IDENTIFIER_AUTHORITY pIdentifierAuthority, byte nSubAuthorityCount,
+            uint dwSubAuthority0, uint dwSubAuthority1, uint dwSubAuthority2, uint dwSubAuthority3,
+            uint dwSubAuthority4, uint dwSubAuthority5, uint dwSubAuthority6, uint dwSubAuthority7,
+            out IntPtr pSid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern IntPtr FreeSid(IntPtr pSid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern int GetLengthSid(IntPtr pSid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool SetTokenInformation(IntPtr tokenHandle, int tokenInformationClass, ref TOKEN_MANDATORY_LABEL tokenInformation, int tokenInformationLength);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
 
@@ -137,47 +177,107 @@ namespace TicTack
         [DllImport("libc", SetLastError = true)]
         private static extern int close(int fd);
 
-        public static void Apply(ILogger log, string? rootPath = null)
+        public static void Apply(ILogger log, string? rootPath = null, string sandboxLevel = "low")
         {
             ProcessHardening.Apply(log, blockChildProcesses: true);
             if (OperatingSystem.IsWindows())
             {
-                ApplyWindows(log);
+                ApplyWindows(log, sandboxLevel);
                 return;
             }
             if (OperatingSystem.IsLinux())
                 ApplyLinux(log, rootPath);
         }
 
-        private static void ApplyWindows(ILogger log)
+        private static void ApplyWindows(ILogger log, string sandboxLevel)
         {
             try
             {
-                if (OpenProcessToken(Environment.ProcessId == 0 ? IntPtr.Zero : System.Diagnostics.Process.GetCurrentProcess().Handle, TOKEN_ADJUST_PRIVILEGES, out var tok))
+                bool useLow = !string.Equals(sandboxLevel, "restricted", StringComparison.OrdinalIgnoreCase);
+                uint access = TOKEN_ADJUST_PRIVILEGES | (useLow ? TOKEN_ADJUST_DEFAULT : 0);
+                if (OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, access, out var tok))
                 {
-                    AdjustTokenPrivileges(tok, true, IntPtr.Zero, 0, IntPtr.Zero, IntPtr.Zero);
-                    CloseHandle(tok);
+                    try
+                    {
+                        AdjustTokenPrivileges(tok, true, IntPtr.Zero, 0, IntPtr.Zero, IntPtr.Zero);
+                        if (useLow)
+                            ApplyLowIntegrity(tok, log);
+                    }
+                    finally
+                    {
+                        CloseHandle(tok);
+                    }
                 }
 
                 var job = CreateJobObjectW(IntPtr.Zero, null);
-                if (job != IntPtr.Zero)
+                if (job == IntPtr.Zero)
+                    throw new InvalidOperationException("CreateJobObjectW failed (win32 " + Marshal.GetLastWin32Error() + ")");
+
+                var ex = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+                ex.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                ex.BasicLimitInformation.ActiveProcessLimit = 1;
+                if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref ex, Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()))
                 {
-                    var ex = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
-                    ex.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-                    ex.BasicLimitInformation.ActiveProcessLimit = 1;
-                    SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref ex, Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>());
-
-                    var ui = new JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass = JOB_OBJECT_UILIMIT_ALL };
-                    SetInformationJobObject(job, JobObjectBasicUIRestrictions, ref ui, Marshal.SizeOf<JOBOBJECT_BASIC_UI_RESTRICTIONS>());
-
-                    AssignProcessToJobObject(job, System.Diagnostics.Process.GetCurrentProcess().Handle);
+                    CloseHandle(job);
+                    throw new InvalidOperationException("SetInformationJobObject(ExtendedLimit) failed.");
                 }
-                log.Info("Remote agent Windows sandbox applied (privileges stripped, JobObject active-process=1).");
+
+                var ui = new JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass = JOB_OBJECT_UILIMIT_ALL };
+                if (!SetInformationJobObject(job, JobObjectBasicUIRestrictions, ref ui, Marshal.SizeOf<JOBOBJECT_BASIC_UI_RESTRICTIONS>()))
+                {
+                    CloseHandle(job);
+                    throw new InvalidOperationException("SetInformationJobObject(UIRestrictions) failed.");
+                }
+
+                AssignProcessToJobObject(job, System.Diagnostics.Process.GetCurrentProcess().Handle);
+                log.Info($"Remote agent Windows sandbox applied (level={(useLow ? "low" : "restricted")}, privileges stripped, JobObject active-process=1).");
             }
             catch (Exception ex)
             {
                 log.Warn("Remote agent Windows sandbox partial: " + ex.Message);
             }
+        }
+
+        private static void ApplyLowIntegrity(IntPtr token, ILogger log)
+        {
+            var auth = new SID_IDENTIFIER_AUTHORITY { b5 = 16 }; // SECURITY_MANDATORY_LABEL_AUTHORITY
+            if (!AllocateAndInitializeSid(ref auth, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, out var sid))
+                return;
+            try
+            {
+                var tml = new TOKEN_MANDATORY_LABEL
+                {
+                    Label = new SID_AND_ATTRIBUTES { Sid = sid, Attributes = SE_GROUP_INTEGRITY }
+                };
+                int len = Marshal.SizeOf<TOKEN_MANDATORY_LABEL>() + GetLengthSid(sid);
+                if (!SetTokenInformation(token, TokenIntegrityLevel, ref tml, len))
+                    log.Warn("Low integrity level apply skipped (win32 " + Marshal.GetLastWin32Error() + ")");
+            }
+            finally
+            {
+                _ = FreeSid(sid);
+            }
+        }
+
+        // Per-child sandbox JobObject for scheduled jobs (sandbox: true).
+        public static IntPtr CreateChildJob(System.Diagnostics.Process proc)
+        {
+            if (!OperatingSystem.IsWindows()) return IntPtr.Zero;
+            var job = CreateJobObjectW(IntPtr.Zero, null);
+            if (job == IntPtr.Zero) return IntPtr.Zero;
+            var ex = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            ex.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            _ = SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref ex, Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>());
+            var ui = new JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass = JOB_OBJECT_UILIMIT_ALL };
+            _ = SetInformationJobObject(job, JobObjectBasicUIRestrictions, ref ui, Marshal.SizeOf<JOBOBJECT_BASIC_UI_RESTRICTIONS>());
+            _ = AssignProcessToJobObject(job, proc.Handle);
+            return job;
+        }
+
+        public static void CloseChildJob(IntPtr job)
+        {
+            if (job != IntPtr.Zero && OperatingSystem.IsWindows())
+                _ = CloseHandle(job);
         }
 
         private static void ApplyLinux(ILogger log, string? rootPath)

@@ -25,22 +25,24 @@ namespace Corpus
         // (no live volume there) → the record pass uses the shadow view.
         private readonly string? _liveDrive;
 
-        public VssBlockSource(string drive, ILogger log, bool useUnbuffered = true)
-            : this(drive, log, ManageBdeBitLocker.Instance, useUnbuffered)
+        public VssBlockSource(string drive, ILogger log, bool useUnbuffered = true,
+            bool strictWriters = true, Action? preFreeze = null, Action? postThaw = null)
+            : this(drive, log, ManageBdeBitLocker.Instance, useUnbuffered, strictWriters, preFreeze, postThaw)
         {
         }
 
         // Item 12b: the scope arms BEFORE the snapshot freezes the volume
         // (suspend-then-capture) and resumes AFTER teardown; the catch
         // re-enables even when snapshot creation itself throws.
-        internal VssBlockSource(string drive, ILogger log, IBitLockerController bitlocker, bool useUnbuffered = true)
+        internal VssBlockSource(string drive, ILogger log, IBitLockerController bitlocker, bool useUnbuffered = true,
+            bool strictWriters = true, Action? preFreeze = null, Action? postThaw = null)
         {
             _bitlocker = BitLockerCaptureScope.Arm(drive, bitlocker, log);
             _useUnbuffered = useUnbuffered;
             _liveDrive = drive;
             try
             {
-                _snap = VssSnapshot.Create(drive, log);
+                _snap = VssSnapshot.Create(drive, log, strictWriters, preFreeze, postThaw);
                 _device = _snap.DeviceObject.TrimEnd('\\');
                 Length = DeviceLength(drive, _device);
                 BytesPerCluster = VolumeBitmap.BytesPerCluster(drive + "\\");

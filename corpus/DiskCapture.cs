@@ -469,7 +469,13 @@ namespace Corpus
 
         // AOT: same VSS COM entry point as VssSnapshot.Create (see Vss.cs).
         [UnconditionalSuppressMessage("Trimming", "IL2050", Justification = "Built-in COM interop on NativeAOT Windows; VSS API surface rooted, proven by smoke test.")]
-        public static VssSnapshotSet Create(IReadOnlyList<string> volumes, ILogger log, IReadOnlySet<string>? knownStaticVolumes = null)
+        public static VssSnapshotSet Create(
+            IReadOnlyList<string> volumes,
+            ILogger log,
+            IReadOnlySet<string>? knownStaticVolumes = null,
+            bool strictWriters = true,
+            Action? preFreeze = null,
+            Action? postThaw = null)
         {
             ArgumentNullException.ThrowIfNull(volumes);
             ArgumentNullException.ThrowIfNull(log);
@@ -563,8 +569,18 @@ namespace Corpus
                 // constraint as VssSnapshot — Prepare validates set existence).
                 Hr(com.PrepareForBackup(out var pf), "PrepareForBackup");
                 RunAsync(pf, "PrepareForBackup");
-                Hr(com.DoSnapshotSet(out var ds), "DoSnapshotSet");
-                RunAsync(ds, "DoSnapshotSet");
+                VssWriterVerifier.Verify(com, log, strictWriters);
+                preFreeze?.Invoke();
+                try
+                {
+                    Hr(com.DoSnapshotSet(out var ds), "DoSnapshotSet");
+                    RunAsync(ds, "DoSnapshotSet");
+                }
+                finally
+                {
+                    postThaw?.Invoke();
+                }
+                VssWriterVerifier.Verify(com, log, strictWriters);
                 var devices = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 for (var i = 0; i < snapIds.Count; i++)
                 {

@@ -115,6 +115,15 @@ namespace TicTack
             out uint lpBytesReturned, IntPtr lpOverlapped);
 
         const uint FSCTL_SET_SPARSE = 0x000900C4;
+        const uint FSCTL_QUERY_ALLOCATED_RANGES = 0x000940CF;
+        const int ERROR_MORE_DATA = 234;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct FILE_ALLOCATED_RANGE_BUFFER
+        {
+            public long FileOffset;
+            public long Length;
+        }
 
         // Directory fsync on Windows: open the directory with backup
         // semantics and flush it, so the rename entry itself is durable.
@@ -279,9 +288,11 @@ namespace TicTack
                 }
                 else if (isSparse)
                 {
-                    uint dummy;
-                    DeviceIoControl(dstStream.SafeFileHandle.DangerousGetHandle(),
-                        FSCTL_SET_SPARSE, IntPtr.Zero, 0, IntPtr.Zero, 0, out dummy, IntPtr.Zero);
+                    if (OperatingSystem.IsWindows())
+                    {
+                        DeviceIoControl(dstStream.SafeFileHandle.DangerousGetHandle(),
+                            FSCTL_SET_SPARSE, IntPtr.Zero, 0, IntPtr.Zero, 0, out _, IntPtr.Zero);
+                    }
                 }
                 else
                 {
@@ -290,7 +301,9 @@ namespace TicTack
 
                 try
                 {
-                    if (ComputeSourceHash && !resumed)
+                    if (isSparse && !resumed)
+                        sourceHash = await CopySparseAsync(srcStream, dstStream, ComputeSourceHash, ct).ConfigureAwait(false);
+                    else if (ComputeSourceHash && !resumed)
                         sourceHash = await CopyHashedAsync(srcStream, dstStream, ct).ConfigureAwait(false);
                     else
                         await srcStream.CopyToAsync(dstStream, 81920, ct);
@@ -321,6 +334,115 @@ namespace TicTack
             }
             finally { ArrayPool<byte>.Shared.Return(buffer); }
             return Convert.ToHexStringLower(hasher.GetHashAndReset());
+        }
+
+        private static async Task<string?> CopySparseAsync(Stream srcStream, FileStream dstStream, bool computeHash, CancellationToken ct)
+        {
+            if (OperatingSystem.IsWindows() && srcStream is FileStream srcFs
+                && TryGetAllocatedRanges(srcFs.SafeFileHandle, srcStream.Length, out var ranges))
+            {
+                return await CopyAllocatedRangesAsync(srcStream, dstStream, ranges, computeHash, ct).ConfigureAwait(false);
+            }
+            using var hasher = computeHash ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;
+            var buffer = ArrayPool<byte>.Shared.Rent(FileHasher.BufferSize);
+            try
+            {
+                int read;
+                while ((read = await srcStream.ReadAsync(buffer, 0, FileHasher.BufferSize, ct).ConfigureAwait(false)) > 0)
+                {
+                    hasher?.AppendData(buffer, 0, read);
+                    if (buffer.AsSpan(0, read).IndexOfAnyExcept((byte)0) < 0)
+                        dstStream.Seek(read, SeekOrigin.Current);
+                    else
+                        await dstStream.WriteAsync(buffer, 0, read, ct).ConfigureAwait(false);
+                }
+                dstStream.SetLength(srcStream.Length);
+                dstStream.Seek(srcStream.Length, SeekOrigin.Begin);
+            }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
+            return hasher != null ? Convert.ToHexStringLower(hasher.GetHashAndReset()) : null;
+        }
+
+        private static async Task<string?> CopyAllocatedRangesAsync(
+            Stream srcStream, FileStream dstStream, List<FILE_ALLOCATED_RANGE_BUFFER> ranges, bool computeHash, CancellationToken ct)
+        {
+            using var hasher = computeHash ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;
+            var buffer = ArrayPool<byte>.Shared.Rent(FileHasher.BufferSize);
+            try
+            {
+                long cursor = 0;
+                foreach (var range in ranges)
+                {
+                    if (range.FileOffset > cursor && hasher != null)
+                        HashZeros(hasher, buffer, range.FileOffset - cursor);
+                    srcStream.Seek(range.FileOffset, SeekOrigin.Begin);
+                    dstStream.Seek(range.FileOffset, SeekOrigin.Begin);
+                    long rem = range.Length;
+                    while (rem > 0)
+                    {
+                        var take = (int)Math.Min(FileHasher.BufferSize, rem);
+                        var read = await srcStream.ReadAsync(buffer, 0, take, ct).ConfigureAwait(false);
+                        if (read == 0) break;
+                        hasher?.AppendData(buffer, 0, read);
+                        await dstStream.WriteAsync(buffer, 0, read, ct).ConfigureAwait(false);
+                        rem -= read;
+                    }
+                    cursor = range.FileOffset + range.Length;
+                }
+                if (srcStream.Length > cursor && hasher != null)
+                    HashZeros(hasher, buffer, srcStream.Length - cursor);
+                dstStream.SetLength(srcStream.Length);
+                dstStream.Seek(srcStream.Length, SeekOrigin.Begin);
+            }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
+            return hasher != null ? Convert.ToHexStringLower(hasher.GetHashAndReset()) : null;
+        }
+
+        private static void HashZeros(IncrementalHash hasher, byte[] buffer, long count)
+        {
+            Array.Clear(buffer, 0, Math.Min(buffer.Length, (int)Math.Min(count, buffer.Length)));
+            while (count > 0)
+            {
+                var step = (int)Math.Min(buffer.Length, count);
+                hasher.AppendData(buffer, 0, step);
+                count -= step;
+            }
+        }
+
+        private static unsafe bool TryGetAllocatedRanges(
+            Microsoft.Win32.SafeHandles.SafeFileHandle handle, long fileLength, out List<FILE_ALLOCATED_RANGE_BUFFER> ranges)
+        {
+            ranges = new List<FILE_ALLOCATED_RANGE_BUFFER>();
+            if (fileLength <= 0) return true;
+            var outBuf = new FILE_ALLOCATED_RANGE_BUFFER[256];
+            long offset = 0;
+            while (offset < fileLength)
+            {
+                var query = new FILE_ALLOCATED_RANGE_BUFFER { FileOffset = offset, Length = fileLength - offset };
+                fixed (FILE_ALLOCATED_RANGE_BUFFER* pOut = outBuf)
+                {
+                    bool ok = DeviceIoControl(
+                        handle.DangerousGetHandle(),
+                        FSCTL_QUERY_ALLOCATED_RANGES,
+                        new IntPtr(&query),
+                        (uint)sizeof(FILE_ALLOCATED_RANGE_BUFFER),
+                        new IntPtr(pOut),
+                        (uint)(outBuf.Length * sizeof(FILE_ALLOCATED_RANGE_BUFFER)),
+                        out uint bytesReturned,
+                        IntPtr.Zero);
+                    int err = ok ? 0 : Marshal.GetLastWin32Error();
+                    if (!ok && err != ERROR_MORE_DATA)
+                        return false;
+                    int count = (int)(bytesReturned / (uint)sizeof(FILE_ALLOCATED_RANGE_BUFFER));
+                    for (int i = 0; i < count; i++)
+                        ranges.Add(outBuf[i]);
+                    if (ok || count == 0)
+                        break;
+                    var last = outBuf[count - 1];
+                    offset = last.FileOffset + last.Length;
+                }
+            }
+            return true;
         }
 
         private static void SaveResumeSidecar(FileStream dstStream, string tmp, FileSnapshot snap)

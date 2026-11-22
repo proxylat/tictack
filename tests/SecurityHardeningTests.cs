@@ -80,6 +80,32 @@ namespace TicTack.Tests
             }
         }
 
+        [Fact]
+        public void RemoteAgent_TraversalAbuse_TriggersBan()
+        {
+            var root = Path.Combine(_tempDir, "root-trav");
+            Directory.CreateDirectory(root);
+            var log = new ListLogger();
+
+            using var agent = new RemoteAgentServer(root, "127.0.0.1:0", "127.0.0.1", 4, useTls: false, psk: Array.Empty<byte>(), log: log);
+            agent.Start();
+
+            for (int i = 0; i < 5; i++)
+            {
+                using var tcp = new TcpClient();
+                tcp.Connect("127.0.0.1", agent.LocalPort);
+                RemoteProto.SendFrame(tcp.GetStream(), tcp.Client, (uint)RemoteOp.Stat, System.Text.Encoding.UTF8.GetBytes("../escape.txt"));
+                Assert.ThrowsAny<Exception>(() => RemoteProto.ReadFrame(tcp.GetStream()));
+            }
+
+            using (var bannedTcp = new TcpClient())
+            {
+                bannedTcp.Connect("127.0.0.1", agent.LocalPort);
+                RemoteProto.SendFrame(bannedTcp.GetStream(), bannedTcp.Client, (uint)RemoteOp.List);
+                Assert.ThrowsAny<Exception>(() => RemoteProto.ReadFrame(bannedTcp.GetStream()));
+            }
+        }
+
         private sealed class ListLogger : ILogger
         {
             public List<string> Errors { get; } = new List<string>();

@@ -49,6 +49,8 @@ sources:
       # routine_check_days: 0  # periodic proof-by-restore sampling; 0 = off
       # routine_check_files: 10
       destination_protect: false  # service-only write ACLs on the backup drive; true = on, does not revert on false
+      # min_free_gb: 20
+      # strict_fit_check: true
       versioning:
         max_versions: 10
         path: '[TicTack]\Sync\.versions'
@@ -59,9 +61,17 @@ sources:
         # keep_daily: 7
         # keep_weekly: 4
         # keep_monthly: 6
+        # keep_yearly: 1
       deletion:
         mode: archive
         path: '[TicTack]\Sync\.archive'
+        # Independent GFS retention for .archive (pruned via --archive-forget):
+        # keep_last: 5
+        # keep_within: 30d
+        # keep_daily: 14
+        # keep_weekly: 4
+        # keep_monthly: 3
+        # keep_yearly: 1
 
 monitor:
   type: watcher # watcher | usn (NTFS journal, needs elevation, else falls back to watcher) | polling | composite

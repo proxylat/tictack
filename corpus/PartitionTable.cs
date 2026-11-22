@@ -36,19 +36,47 @@ namespace Corpus
             if (!IsElevated())
                 throw new InvalidOperationException("whole-disk capture needs elevation — run Corpus.exe elevated.");
             var device = $@"\\.\PhysicalDrive{diskNumber}";
-            byte[] header;
+            DiskLayout layout;
             using (var handle = NativeDisk.OpenHandle(device, read: true))
             using (var fs = new FileStream(handle, FileAccess.Read))
             {
-                var mbr = new byte[SectorSize];
-                fs.Seek(0, SeekOrigin.Begin);
-                fs.ReadExactly(mbr, 0, SectorSize);
-                CheckProtectiveMbr(mbr);
-                header = new byte[SectorSize];
-                fs.Seek(SectorSize, SeekOrigin.Begin);
-                fs.ReadExactly(header, 0, SectorSize);
+                layout = ReadFromStream(fs, diskNumber, NativeDisk.GetLengthBytes(device), log);
             }
+            SniffFilesystems(device, layout.Partitions, layout.SectorSizeBytes, log);
+            return layout;
+        }
+
+        internal static int DetectSectorSize(Stream fs)
+        {
+            var probe = new byte[8];
+            if (fs.Length >= 512 + 8)
+            {
+                fs.Seek(512, SeekOrigin.Begin);
+                if (fs.Read(probe, 0, 8) == 8 && Encoding.ASCII.GetString(probe) == "EFI PART")
+                    return 512;
+            }
+            if (fs.Length >= 4096 + 8)
+            {
+                fs.Seek(4096, SeekOrigin.Begin);
+                if (fs.Read(probe, 0, 8) == 8 && Encoding.ASCII.GetString(probe) == "EFI PART")
+                    return 4096;
+            }
+            return SectorSize;
+        }
+
+        internal static DiskLayout ReadFromStream(Stream fs, int diskNumber, long diskSizeBytes, ILogger log)
+        {
+            var sectorSize = DetectSectorSize(fs);
+            var mbr = new byte[sectorSize];
+            fs.Seek(0, SeekOrigin.Begin);
+            fs.ReadExactly(mbr, 0, sectorSize);
+            CheckProtectiveMbr(mbr);
+
+            var header = new byte[sectorSize];
+            fs.Seek(sectorSize, SeekOrigin.Begin);
+            fs.ReadExactly(header, 0, sectorSize);
             CheckHeader(header);
+
             var entriesLba = BitConverter.ToInt64(header, 72);
             var entryCount = BitConverter.ToInt32(header, 80);
             var entrySize = BitConverter.ToInt32(header, 84);
@@ -56,29 +84,26 @@ namespace Corpus
                 throw new InvalidDataException($"GPT entry size {entrySize}, want {EntrySize} (disk {diskNumber})");
             if (entryCount <= 0 || entriesLba <= 0)
                 throw new InvalidDataException($"GPT header names {entryCount} entries at LBA {entriesLba} (disk {diskNumber})");
+
             var entriesBytes = new byte[(long)entryCount * EntrySize];
-            using (var handle = NativeDisk.OpenHandle(device, read: true))
-            using (var fs = new FileStream(handle, FileAccess.Read))
-            {
-                fs.Seek(entriesLba * SectorSize, SeekOrigin.Begin);
-                fs.ReadExactly(entriesBytes, 0, entriesBytes.Length);
-            }
+            fs.Seek(entriesLba * sectorSize, SeekOrigin.Begin);
+            fs.ReadExactly(entriesBytes, 0, entriesBytes.Length);
             var storedEntriesCrc = BitConverter.ToUInt32(header, 88);
             if (Crc32(entriesBytes) != storedEntriesCrc)
-                throw new InvalidDataException("GPT entries CRC mismatch — 4Kn disks (4096-byte sectors) misparse as 512B and fail here; 4Kn is unsupported in v1");
-            var parts = ParseEntries(entriesBytes, entryCount);
+                throw new InvalidDataException($"GPT entries CRC mismatch (disk {diskNumber}, sectorSize {sectorSize})");
+
+            var parts = ParseEntries(entriesBytes, entryCount, sectorSize);
             foreach (var p in parts)
                 p.PartitionKey = $"disk{diskNumber}p{p.PartitionNumber}:{p.UniqueGuid}";
-            SniffFilesystems(device, parts, log);
             var diskGuid = new Guid(header.AsSpan(56, 16)).ToString("d");
-            log.Info($"disk {diskNumber} {diskGuid}: {parts.Count} partitions");
+            log.Info($"disk {diskNumber} {diskGuid}: {parts.Count} partitions ({sectorSize}B sectors)");
             return new DiskLayout
             {
                 Generation = 0,
                 DiskNumber = diskNumber,
                 DiskGuid = diskGuid,
-                DiskSizeBytes = NativeDisk.GetLengthBytes(device),
-                SectorSizeBytes = SectorSize,
+                DiskSizeBytes = diskSizeBytes,
+                SectorSizeBytes = sectorSize,
                 Partitions = parts,
             };
         }
@@ -125,7 +150,7 @@ namespace Corpus
         // slots are free space (omitted, not even skipped); MSR slots stay
         // in the layout as skipped-with-range; LDM refuses the whole disk
         // (block copy without LDM reassembly restores garbage).
-        public static List<PartitionRecord> ParseEntries(byte[] entriesBytes, int count)
+        public static List<PartitionRecord> ParseEntries(byte[] entriesBytes, int count, int sectorSize = SectorSize)
         {
             ArgumentNullException.ThrowIfNull(entriesBytes);
             if (count < 0 || entriesBytes.Length < count * EntrySize)
@@ -154,8 +179,8 @@ namespace Corpus
                     UniqueGuid = unique.ToString("d"),
                     FirstLba = first,
                     LastLba = last,
-                    OffsetBytes = first * SectorSize,
-                    LengthBytes = (last - first + 1) * SectorSize,
+                    OffsetBytes = first * sectorSize,
+                    LengthBytes = (last - first + 1) * sectorSize,
                     Filesystem = type == EspType ? "fat32" : type == MsrType ? "none" : "unknown",
                     Skipped = skipped,
                     SkipReason = skipped ? "msr-reserved" : null,
@@ -170,7 +195,7 @@ namespace Corpus
         // (basic-data spans NTFS/exFAT/BitLocker/raw), and CheckLayout + the
         // diskpart plan need the real answer. One 512B read per unknown
         // partition; unreadable stays "unknown", never throws.
-        private static void SniffFilesystems(string device, List<PartitionRecord> parts, ILogger log)
+        private static void SniffFilesystems(string device, List<PartitionRecord> parts, int sectorSize, ILogger log)
         {
             try
             {
@@ -182,9 +207,9 @@ namespace Corpus
                         continue;
                     try
                     {
-                        var sector = new byte[SectorSize];
+                        var sector = new byte[sectorSize];
                         fs.Seek(p.OffsetBytes, SeekOrigin.Begin);
-                        fs.ReadExactly(sector, 0, SectorSize);
+                        fs.ReadExactly(sector, 0, sectorSize);
                         var sniffed = SniffFilesystem(sector);
                         if (sniffed != "unknown")
                         {

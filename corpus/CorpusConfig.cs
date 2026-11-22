@@ -44,6 +44,10 @@ namespace Corpus
     {
         public int KeepLast { get; set; }
         public int KeepWithinDays { get; set; }
+        public int KeepDaily { get; set; }
+        public int KeepWeekly { get; set; }
+        public int KeepMonthly { get; set; }
+        public int KeepYearly { get; set; }
         public List<int> Pin { get; set; } = new();
 
         public CorpusRetentionConfig()
@@ -104,6 +108,11 @@ namespace Corpus
         public bool StrictFitCheck { get; set; }
         // Optional Windows 11 EcoQoS / Linux nice +10 background mode.
         public bool EcoQos { get; set; }
+        // Consistency group & VSS writer policy: fail-closed when any writer errors.
+        public bool StrictVssWriters { get; set; } = true;
+        // Optional pre-freeze / post-thaw commands bracketing DoSnapshotSet.
+        public string PreFreeze { get; set; } = string.Empty;
+        public string PostThaw { get; set; } = string.Empty;
 
         public CorpusConfig()
         {

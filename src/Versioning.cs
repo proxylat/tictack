@@ -46,6 +46,8 @@ namespace TicTack
         public int? KeepDaily { get; set; }
         public int? KeepWeekly { get; set; }
         public int? KeepMonthly { get; set; }
+        public int? KeepYearly { get; set; }
+        public bool CleanAll { get; set; }
 
         public readonly struct Decision
         {
@@ -90,15 +92,28 @@ namespace TicTack
             policy.KeepDaily = Clean(config.KeepDaily, "keep_daily");
             policy.KeepWeekly = Clean(config.KeepWeekly, "keep_weekly");
             policy.KeepMonthly = Clean(config.KeepMonthly, "keep_monthly");
+            policy.KeepYearly = Clean(config.KeepYearly, "keep_yearly");
             return policy;
         }
 
         public bool IsEmpty =>
-            KeepLast == null && KeepWithin == null && KeepDaily == null && KeepWeekly == null && KeepMonthly == null;
+            !CleanAll && KeepLast == null && KeepWithin == null && KeepDaily == null && KeepWeekly == null && KeepMonthly == null && KeepYearly == null;
 
         public IReadOnlyList<Decision> Evaluate(IEnumerable<VersionFile> versions, DateTime now)
         {
             var ordered = versions.OrderByDescending(v => v.HasTimestamp ? v.Timestamp : DateTime.MaxValue).ToList();
+            if (CleanAll)
+            {
+                var cleanAll = new List<Decision>(ordered.Count);
+                foreach (var v in ordered)
+                {
+                    cleanAll.Add(v.Pinned
+                        ? new Decision(v.Path, true, "pinned")
+                        : new Decision(v.Path, false, "clean-all"));
+                }
+                return cleanAll;
+            }
+
             var keep = new Dictionary<string, string>(StringComparer.Ordinal);
 
             foreach (var v in ordered)
@@ -132,6 +147,7 @@ namespace TicTack
             KeepBuckets(ordered, keep, KeepDaily, v => v.Timestamp.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), "keep-daily");
             KeepBuckets(ordered, keep, KeepWeekly, v => IsoWeekKey(v.Timestamp), "keep-weekly");
             KeepBuckets(ordered, keep, KeepMonthly, v => v.Timestamp.ToString("yyyy-MM", CultureInfo.InvariantCulture), "keep-monthly");
+            KeepBuckets(ordered, keep, KeepYearly, v => v.Timestamp.ToString("yyyy", CultureInfo.InvariantCulture), "keep-yearly");
 
             var result = new List<Decision>(ordered.Count);
             foreach (var v in ordered)

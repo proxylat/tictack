@@ -185,6 +185,15 @@ namespace TicTack
             if (addr != null) _authFailures.TryRemove(addr, out _);
         }
 
+        private static void ConfigureClientSocket(Socket sock)
+        {
+            sock.NoDelay = true;
+            sock.ReceiveBufferSize = RemoteProto.MaxChunkBytes;
+            sock.SendBufferSize = RemoteProto.MaxChunkBytes;
+            sock.ReceiveTimeout = 15000;
+            sock.SendTimeout = 30000;
+        }
+
         private void HandleClient(int id, Socket sock, CancellationToken ct)
         {
             Stream? stream = null;
@@ -193,11 +202,7 @@ namespace TicTack
             if (peerAddr != null && peerAddr.IsIPv4MappedToIPv6) peerAddr = peerAddr.MapToIPv4();
             try
             {
-                sock.NoDelay = true;
-                sock.ReceiveBufferSize = RemoteProto.MaxChunkBytes;
-                sock.SendBufferSize = RemoteProto.MaxChunkBytes;
-                sock.ReceiveTimeout = 15000;
-                sock.SendTimeout = 30000;
+                ConfigureClientSocket(sock);
 
                 var net = new NetworkStream(sock, ownsSocket: true);
                 if (_useTls && _cert != null)
@@ -226,6 +231,11 @@ namespace TicTack
 
                 sock.ReceiveTimeout = 60000;
                 ClientLoop(id, stream, rawSock, ct);
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException || ex is InvalidDataException)
+            {
+                RecordAuthFailure(peerAddr);
+                _log.Warn($"Remote client #{id} security/frame violation: {ex.Message}");
             }
             catch (Exception ex) when (ex is EndOfStreamException || ex is IOException || ex is OperationCanceledException)
             {

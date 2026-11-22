@@ -837,4 +837,45 @@ public sealed class DiskLayoutTests : IDisposable
             prev = v;
         }
     }
+
+    [Fact]
+    public void PartitionTable_4KnSectorSize_ParsesGptOffsetsCorrectly()
+    {
+        const int sec = 4096;
+        var disk = new byte[sec * 4]; // LBA 0: MBR, LBA 1: GPT Header, LBA 2..3: Entries
+
+        // Protective MBR at LBA 0
+        disk[446 + 4] = 0xEE;
+        disk[510] = 0x55;
+        disk[511] = 0xAA;
+
+        // 1 GPT partition entry at LBA 2 (offset 8192): Basic Data from LBA 10..29 (20 sectors = 81920 bytes)
+        var entries = new byte[128 * 4];
+        var basicData = new Guid("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7");
+        basicData.TryWriteBytes(entries.AsSpan(0, 16));
+        Guid.NewGuid().TryWriteBytes(entries.AsSpan(16, 16));
+        BitConverter.TryWriteBytes(entries.AsSpan(32, 8), 10L);
+        BitConverter.TryWriteBytes(entries.AsSpan(40, 8), 29L);
+        Buffer.BlockCopy(entries, 0, disk, sec * 2, entries.Length);
+        var entriesCrc = PartitionTable.Crc32(entries);
+
+        // GPT Header at LBA 1 (offset 4096)
+        var hdr = disk.AsSpan(sec, 92);
+        System.Text.Encoding.ASCII.GetBytes("EFI PART", hdr[..8]);
+        BitConverter.TryWriteBytes(hdr.Slice(12, 4), 92u);
+        Guid.NewGuid().TryWriteBytes(hdr.Slice(56, 16));
+        BitConverter.TryWriteBytes(hdr.Slice(72, 8), 2L);
+        BitConverter.TryWriteBytes(hdr.Slice(80, 4), 4);
+        BitConverter.TryWriteBytes(hdr.Slice(84, 4), 128);
+        BitConverter.TryWriteBytes(hdr.Slice(88, 4), entriesCrc);
+        BitConverter.TryWriteBytes(hdr.Slice(16, 4), PartitionTable.Crc32(hdr));
+
+        using var ms = new MemoryStream(disk);
+        var layout = PartitionTable.ReadFromStream(ms, 0, 100L * sec, new TestLogger());
+
+        Assert.Equal(4096, layout.SectorSizeBytes);
+        var p = Assert.Single(layout.Partitions);
+        Assert.Equal(10L * 4096, p.OffsetBytes);
+        Assert.Equal(20L * 4096, p.LengthBytes);
+    }
 }

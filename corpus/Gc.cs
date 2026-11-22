@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Threading;
 using TicTack;
@@ -206,7 +207,61 @@ namespace Corpus
                 else
                     notes.Add($"unknown pinned gen {pin} ignored");
             }
+            AddGfsRoots(manifests, gens, roots, notes);
             return roots;
+        }
+
+        private void AddGfsRoots(
+            Dictionary<int, (string Path, SnapshotManifest Manifest)> manifests,
+            List<int> gens,
+            HashSet<int> roots,
+            List<string> notes)
+        {
+            if (_retention.KeepDaily <= 0 && _retention.KeepWeekly <= 0
+                && _retention.KeepMonthly <= 0 && _retention.KeepYearly <= 0)
+                return;
+
+            var ordered = new List<(int Gen, DateTime Utc)>(gens.Count);
+            foreach (var gen in gens)
+            {
+                if (DateTime.TryParse(manifests[gen].Manifest.CreatedUtc, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var dt))
+                {
+                    ordered.Add((gen, dt));
+                }
+                else
+                {
+                    roots.Add(gen);
+                }
+            }
+            ordered.Sort((a, b) =>
+            {
+                var cmp = b.Utc.CompareTo(a.Utc);
+                return cmp != 0 ? cmp : b.Gen.CompareTo(a.Gen);
+            });
+
+            var gfsPinned = 0;
+            gfsPinned += KeepBuckets(ordered, _retention.KeepDaily, d => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), roots);
+            gfsPinned += KeepBuckets(ordered, _retention.KeepWeekly, d => $"{ISOWeek.GetYear(d)}-W{ISOWeek.GetWeekOfYear(d):D2}", roots);
+            gfsPinned += KeepBuckets(ordered, _retention.KeepMonthly, d => d.ToString("yyyy-MM", CultureInfo.InvariantCulture), roots);
+            gfsPinned += KeepBuckets(ordered, _retention.KeepYearly, d => d.ToString("yyyy", CultureInfo.InvariantCulture), roots);
+            if (gfsPinned > 0)
+                notes.Add($"GFS retention pinned {gfsPinned} generation(s)");
+        }
+
+        private static int KeepBuckets(List<(int Gen, DateTime Utc)> ordered, int limit, Func<DateTime, string> keyFn, HashSet<int> roots)
+        {
+            if (limit <= 0) return 0;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var added = 0;
+            foreach (var (gen, dt) in ordered)
+            {
+                var bucket = keyFn(dt);
+                if (!seen.Add(bucket)) continue;
+                if (roots.Add(gen)) added++;
+                if (seen.Count >= limit) break;
+            }
+            return added;
         }
 
         // Retained-manifest digest union WITHOUT touching index marks: the

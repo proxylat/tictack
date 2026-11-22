@@ -49,6 +49,8 @@ namespace Corpus
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? PartitionKey { get; set; }        // null = volume snapshot
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? ConsistencyGroupId { get; set; }  // shared id across atomic multi-volume set
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public int DiskNumber { get; set; }
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public int PartitionNumber { get; set; }
@@ -150,10 +152,11 @@ namespace Corpus
             };
         }
 
-        public static string Save(string manifestsDir, SnapshotManifest m, byte[] key, bool wormMode = false)
+        public static string Save(string manifestsDir, SnapshotManifest m, byte[] key, bool wormMode = false, bool preserveCreatedUtc = false)
         {
             Directory.CreateDirectory(manifestsDir);
-            m.CreatedUtc = DateTime.UtcNow.ToString("o");
+            if (!preserveCreatedUtc || string.IsNullOrEmpty(m.CreatedUtc))
+                m.CreatedUtc = DateTime.UtcNow.ToString("o");
             m.Hmac = "";
             m.Hmac = ComputeHmac(JsonSerializer.Serialize(m, CorpusJsonContext.Default.SnapshotManifest), key);
             var path = Path.Combine(manifestsDir, $"{m.Generation:D6}-{Sanitize(m.Name)}.json");

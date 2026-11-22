@@ -8,6 +8,8 @@ namespace TicTack
     // disables ptrace/core-dump memory inspection on Linux.
     internal static class ProcessHardening
     {
+        private const int ProcessASLRPolicy = 1;
+        private const int ProcessStrictHandleCheckPolicy = 3;
         private const int ProcessExtensionPointDisablePolicy = 6;
         private const int ProcessImageLoadPolicy = 10;
         private const int ProcessChildProcessPolicy = 13;
@@ -29,6 +31,12 @@ namespace TicTack
             public uint ControlMask;
             public uint StateMask;
         }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool SetDllDirectoryW(string lpPathName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool HeapSetInformation(IntPtr heapHandle, int heapInformationClass, IntPtr heapInformation, nuint heapInformationLength);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetProcessMitigationPolicy(int mitigationPolicy, ref uint lpBuffer, nuint dwLength);
@@ -94,6 +102,15 @@ namespace TicTack
         {
             try
             {
+                _ = SetDllDirectoryW("");
+                _ = HeapSetInformation(IntPtr.Zero, 1 /* HeapEnableTerminationOnCorruption */, IntPtr.Zero, 0);
+
+                uint aslrFlags = 0x1 | 0x2 | 0x4; // BottomUp | ForceRelocate | HighEntropy
+                _ = SetProcessMitigationPolicy(ProcessASLRPolicy, ref aslrFlags, sizeof(uint));
+
+                uint handleFlags = 0x1 | 0x2; // RaiseExceptionOnInvalidHandleReference | HandleExceptionsPermanentlyEnabled
+                _ = SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, ref handleFlags, sizeof(uint));
+
                 uint imageFlags = ImageLoadNoRemoteImages | ImageLoadNoLowMandatoryLabel | ImageLoadPreferSystem32;
                 _ = SetProcessMitigationPolicy(ProcessImageLoadPolicy, ref imageFlags, sizeof(uint));
 
@@ -105,7 +122,7 @@ namespace TicTack
                     uint childFlags = 1;
                     _ = SetProcessMitigationPolicy(ProcessChildProcessPolicy, ref childFlags, sizeof(uint));
                 }
-                log.Debug("Process mitigations applied (ImageLoad, ExtensionPoint" + (blockChildProcesses ? ", NoChildProcess" : "") + ").");
+                log.Debug("Process mitigations applied (DllDir, HeapTerminate, ASLR, StrictHandle, ImageLoad, ExtensionPoint" + (blockChildProcesses ? ", NoChildProcess" : "") + ").");
             }
             catch (Exception ex)
             {

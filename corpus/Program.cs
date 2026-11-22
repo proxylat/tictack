@@ -97,6 +97,8 @@ namespace Corpus
             string? regType = null;
             string? regData = null;
             var removeKbs = new List<string>();
+            string? volumesArg = null;
+            int? keepDaily = null, keepWeekly = null, keepMonthly = null, keepYearly = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -470,6 +472,21 @@ namespace Corpus
                     case "--dry-run":
                         dryRun = true;
                         break;
+                    case "--volumes":
+                        if (i + 1 < args.Length) volumesArg = args[++i];
+                        break;
+                    case "--keep-daily":
+                        if (i + 1 < args.Length && int.TryParse(args[++i], out var kd)) keepDaily = kd;
+                        break;
+                    case "--keep-weekly":
+                        if (i + 1 < args.Length && int.TryParse(args[++i], out var kw)) keepWeekly = kw;
+                        break;
+                    case "--keep-monthly":
+                        if (i + 1 < args.Length && int.TryParse(args[++i], out var km)) keepMonthly = km;
+                        break;
+                    case "--keep-yearly":
+                        if (i + 1 < args.Length && int.TryParse(args[++i], out var ky)) keepYearly = ky;
+                        break;
                     default:
                         Console.Error.WriteLine("Unknown argument: " + args[i]);
                         PrintHelp();
@@ -615,6 +632,8 @@ namespace Corpus
                         // the combo, never merges).
                         if (!string.IsNullOrEmpty(diskArg))
                             return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log, !bufferedIo, skipIfUnchanged);
+                        if (!string.IsNullOrEmpty(volumesArg))
+                            return RunConsistencyGroup(cfg, volumesArg, name ?? "cg", cliExcludes, log, !bufferedIo, skipIfUnchanged);
                         if (string.IsNullOrEmpty(volume) || string.IsNullOrEmpty(name))
                         {
                             log.Error("--image requires --volume <path> --name <snapshot> (or --disk <N> --name <snapshot>)");
@@ -630,7 +649,7 @@ namespace Corpus
                                 return 1;
                             }
                             using (var store = CreateStore(cfg, log))
-                            using (var source = OpenSource(volume, log, !bufferedIo))
+                            using (var source = OpenSource(volume, log, !bufferedIo, cfg))
                             {
                                 var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
                                 var m = excl == null
@@ -729,7 +748,7 @@ namespace Corpus
                         return RunRestoreDisk(cfg, baseDir, layoutArg, partitionsArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, repairBoot, log);
                     case "gc":
                         using (StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log))
-                            return RunGc(cfg, dryRun, confirm, log);
+                            return RunGc(cfg, dryRun, confirm, log, keepDaily, keepWeekly, keepMonthly, keepYearly);
                     case "service":
                         return RunService(cfg, log);
                     case "copy":
@@ -1410,17 +1429,23 @@ namespace Corpus
             return 0;
         }
 
-        private static int RunGc(CorpusConfig cfg, bool dryRun, bool confirm, ILogger log)
+        private static int RunGc(CorpusConfig cfg, bool dryRun, bool confirm, ILogger log,
+            int? keepDaily = null, int? keepWeekly = null, int? keepMonthly = null, int? keepYearly = null)
         {
             if (dryRun && confirm)
             {
                 log.Error("--dry-run and --confirm are mutually exclusive");
                 return 1;
             }
+            var ret = cfg.Retention ?? new CorpusRetentionConfig();
+            if (keepDaily.HasValue) ret.KeepDaily = keepDaily.Value;
+            if (keepWeekly.HasValue) ret.KeepWeekly = keepWeekly.Value;
+            if (keepMonthly.HasValue) ret.KeepMonthly = keepMonthly.Value;
+            if (keepYearly.HasValue) ret.KeepYearly = keepYearly.Value;
             var gc = new GarbageCollector(
                 cfg.StorePath,
                 Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"),
-                cfg.Retention ?? new CorpusRetentionConfig(), log,
+                ret, log,
                 wormMode: cfg.WormMode);
             var plan = gc.Plan();
             if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0 && plan.DropLayouts.Count == 0)
@@ -1809,10 +1834,80 @@ namespace Corpus
 
         // Drive-letter-colon ("T:") images the live volume through VSS;
         // anything else is a file path for FileBlockSource.
-        private static IBlockSource OpenSource(string volume, ILogger log, bool useUnbuffered = true) =>
+        private static IBlockSource OpenSource(string volume, ILogger log, bool useUnbuffered = true, CorpusConfig? cfg = null) =>
             volume.Length == 2 && volume[1] == ':' && char.IsAsciiLetter(volume[0])
-                ? new VssBlockSource(volume, log, useUnbuffered)
+                ? new VssBlockSource(
+                    volume,
+                    log,
+                    useUnbuffered,
+                    strictWriters: cfg?.StrictVssWriters ?? true,
+                    preFreeze: string.IsNullOrWhiteSpace(cfg?.PreFreeze) ? null : () => RunFreezeHook(cfg!.PreFreeze, "pre_freeze", log, throwOnFail: true),
+                    postThaw: string.IsNullOrWhiteSpace(cfg?.PostThaw) ? null : () => RunFreezeHook(cfg!.PostThaw, "post_thaw", log, throwOnFail: false))
                 : new FileBlockSource(volume, useUnbuffered);
+
+        private static void RunFreezeHook(string command, string phase, ILogger log, bool throwOnFail)
+        {
+            log.Info($"consistency hook ({phase}): {command}");
+            var psi = OperatingSystem.IsWindows()
+                ? new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c " + command)
+                : new System.Diagnostics.ProcessStartInfo("/bin/sh", "-c \"" + command.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            using var proc = System.Diagnostics.Process.Start(psi)
+                ?? throw new InvalidOperationException($"{phase} hook failed to start");
+            proc.WaitForExit();
+            if (proc.ExitCode != 0)
+            {
+                var msg = $"{phase} hook exited with code {proc.ExitCode}";
+                if (throwOnFail) throw new InvalidOperationException(msg);
+                log.Warn(msg);
+            }
+        }
+
+        private static int RunConsistencyGroup(
+            CorpusConfig cfg, string volumesArg, string name,
+            List<string> cliExcludes, ILogger log, bool useUnbuffered, bool skipIfUnchanged)
+        {
+            var volumes = volumesArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (volumes.Length == 0)
+            {
+                log.Error("--volumes requires at least one drive (e.g. C:,D:)");
+                return 1;
+            }
+            var groupId = Guid.NewGuid().ToString("N");
+            var scopes = new List<BitLockerCaptureScope>(volumes.Length);
+            try
+            {
+                foreach (var v in volumes)
+                    scopes.Add(BitLockerCaptureScope.Arm(v, ManageBdeBitLocker.Instance, log));
+                Action? pre = string.IsNullOrWhiteSpace(cfg.PreFreeze) ? null : () => RunFreezeHook(cfg.PreFreeze, "pre_freeze", log, throwOnFail: true);
+                Action? post = string.IsNullOrWhiteSpace(cfg.PostThaw) ? null : () => RunFreezeHook(cfg.PostThaw, "post_thaw", log, throwOnFail: false);
+                using var set = VssSnapshotSet.Create(volumes, log, null, cfg.StrictVssWriters, pre, post);
+                using var lifetime = new DiskCaptureLifetime(set, scopes, volumes);
+                var key = ChunkId.EnsureKey(cfg.StorePath);
+                using var store = CreateStore(cfg, log);
+                for (int i = 0; i < volumes.Length; i++)
+                {
+                    var vol = volumes[i];
+                    using var src = new DiskSnapshotSource(lifetime, vol, set.DeviceFor(vol), scopes[i], useUnbuffered);
+                    var excl = ResolveImageExclusions(cfg, src, vol, cliExcludes, log);
+                    var snapName = $"{name}-{vol.TrimEnd(':', '\\')}";
+                    var m = excl == null
+                        ? store.ImageFast(src, snapName, skipIfUnchanged: skipIfUnchanged)
+                        : store.ImageFast(src, snapName, new ImageOptions(Exclusions: excl), skipIfUnchanged);
+                    m.ConsistencyGroupId = groupId;
+                    ManifestStore.Save(Path.Combine(cfg.StorePath, "manifests"), m, key, preserveCreatedUtc: true);
+                    log.Info($"consistency-group {groupId}: {m.Generation:D6}-{m.Name} ({m.Chunks.Count} chunks)");
+                }
+                set.Complete();
+                return 0;
+            }
+            catch
+            {
+                foreach (var s in scopes) { try { s.Dispose(); } catch { } }
+                throw;
+            }
+        }
 
         private static string? ProbeVolume(string? volume, ILogger log)
         {
@@ -1979,6 +2074,7 @@ namespace Corpus
             Console.WriteLine();
             Console.WriteLine("  --image --volume <path|X:> --name <snap>   Fast landing capture (default, always full; run --gc/optimize to fold)");
             Console.WriteLine("      --inline [--incremental | --parent <gen>] [--full]   Classic packed capture instead of landing");
+            Console.WriteLine("  --image --volumes <C:,D:> --name <snap>   Atomic multi-volume VSS consistency group capture");
             Console.WriteLine("  --image --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)");
             Console.WriteLine("  --export --snapshot <gen> --out <path>  Export a snapshot to a file");
             Console.WriteLine("  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX");
@@ -2003,8 +2099,9 @@ namespace Corpus
             Console.WriteLine("  --deep-verify --snapshot <gen>                   Re-read deep_verify_percent of chunks from packs, hash-compare (exit 1 on mismatch; percent 0 = no-op)");
             Console.WriteLine("  --mount-snapshot --snapshot <gen>                Materialize a snapshot read-only under temp (Ctrl+C to unmount)");
             Console.WriteLine("  --list-snapshots                     List snapshots (\"gen name\" lines)");
-            Console.WriteLine("  --gc [--dry-run | --confirm]          Garbage-collect pruned snapshots (manual; --service runs this on schedule)");
-            Console.WriteLine("      retention: keep_last/keep_within_days/pin from config; exports outside the store are untouched");
+            Console.WriteLine("  --gc [--dry-run | --confirm] [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--keep-yearly N]");
+            Console.WriteLine("      Garbage-collect pruned snapshots (manual; --service runs this on schedule)");
+            Console.WriteLine("      retention: keep_last/keep_within_days/keep_daily/keep_weekly/keep_monthly/keep_yearly/pin from config; exports outside the store are untouched");
             Console.WriteLine("      retention pool is shared between volume and disk snapshots (use two stores for isolation)");
             Console.WriteLine("  --service                              Run scheduled GC (gc_daily_at) + landing optimize (optimize_every) until Ctrl+C");
             Console.WriteLine("  --locate-winre                         Print winre.wim source+path (reagentc/known-path/partition-scan; exit 1 when absent)");
