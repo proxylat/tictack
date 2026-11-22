@@ -73,6 +73,7 @@ namespace TicTack
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateFiles;
         private readonly Func<string, SearchOption, IEnumerable<string>> _enumerateDirectories;
         private readonly Func<string, bool> _driveReady;
+        private readonly ISourceStat? _sourceStat;
         private DeletionGuard _deletions = null!; // assigned in InitSyncState before use
         private FileCompleter? _completer;
         private Timer? _parityTimer;
@@ -106,7 +107,8 @@ namespace TicTack
             Func<string, bool>? directoryExists = null,
             Func<string, SearchOption, IEnumerable<string>>? enumerateFiles = null,
             Func<string, SearchOption, IEnumerable<string>>? enumerateDirectories = null,
-            Func<string, bool>? driveReady = null)
+            Func<string, bool>? driveReady = null,
+            ISourceStat? sourceStat = null)
         {
             _config = config;
             _monitor = monitor;
@@ -123,6 +125,7 @@ namespace TicTack
             _enumerateFiles = enumerateFiles ?? ((path, option) => Directory.EnumerateFiles(path, "*", option));
             _enumerateDirectories = enumerateDirectories ?? ((path, option) => Directory.EnumerateDirectories(path, "*", option));
             _driveReady = driveReady ?? (path => DriveGuard.IsReady(path));
+            _sourceStat = sourceStat;
             _drain = new ReadyDrain(_config.Sync != null
                 && string.Equals(_config.Sync.DrainStrategy, "ready_queue", StringComparison.OrdinalIgnoreCase));
             // Hash-during-copy: only the real CopyAction paired with a HashValidator
@@ -770,11 +773,14 @@ namespace TicTack
             return true;
         }
 
+        private bool TryStatSource(string path, out FileSnapshot snap) =>
+            _sourceStat != null ? _sourceStat.TryStat(path, out snap) : FileSnapshot.TryRead(path, out snap);
+
         // Re-read the source after copy and validate. Null snap = already logged.
         private async Task<(FileSnapshot? snap, bool valid)> ValidateFreshCopyAsync(
             string src, string dst, ActionResult result, FileSnapshot? sourceSnapshot, string validationLabel)
         {
-        if (!FileSnapshot.TryRead(src, out var freshSnapshot))
+        if (!TryStatSource(src, out var freshSnapshot))
         {
             _log.Error(validationLabel + ": source disappeared: " + src);
             TicTackEventSource.Log.CopyFailed();
@@ -959,15 +965,14 @@ namespace TicTack
                             await _stateDb.DeleteAsync(oldRel);
                             try
                             {
-                                if (File.Exists(e.FullPath))
+                                if (TryStatSource(e.FullPath, out var rSnap))
                                 {
-                                    var fi = new FileInfo(e.FullPath);
-                                    await _stateDb.UpsertAsync(newRel, fi.Length, fi.LastWriteTimeUtc.Ticks);
+                                    await _stateDb.UpsertAsync(newRel, rSnap.Length, rSnap.LastWriteTimeUtcTicks);
                                     // Identity follows the rename: capture
                                     // lazily, never fail the rename for it.
                                     try
                                     {
-                                        if (FileIdentity.TryGet(e.FullPath, out var rid, out var rctime) && rid != null)
+                                        if (_sourceStat == null && FileIdentity.TryGet(e.FullPath, out var rid, out var rctime) && rid != null)
                                             await _stateDb.UpdateIdentityAsync(newRel, rid, rctime);
                                     }
                                     catch (Exception ex) { _log.Debug("Rename identity capture skipped: " + ex.Message); }
@@ -1040,7 +1045,7 @@ namespace TicTack
                         }
                         return;
                     }
-                    if (!FileSnapshot.TryRead(e.FullPath, out var sourceSnapshot))
+                    if (!TryStatSource(e.FullPath, out var sourceSnapshot))
                     {
                         _log.Warn("Source unreadable, copy skipped: " + e.FullPath);
                         return;
@@ -1048,7 +1053,7 @@ namespace TicTack
                     args = new FileActionArgs(e, _config.Path, _config.Destination, sourceSnapshot);
                     // Event-time move replay: same create-time rule as the
                     // scan path, before the comparer burns two full reads.
-                    if (_stateDb != null && !File.Exists(args.DestPath)
+                    if (_sourceStat == null && _stateDb != null && !File.Exists(args.DestPath)
                         && FileIdentity.TryGet(e.FullPath, out var emoveId, out var emoveCtime) && emoveId != null
                         && await TryReplayMoveAsync(e.FullPath, PathUtil.Relative(e.FullPath, _config.Path), sourceSnapshot, emoveId, emoveCtime))
                         return;
@@ -1458,7 +1463,7 @@ namespace TicTack
                 var n = Interlocked.Increment(ref Scanned);
                 if (n % 1000 == 0)
                     _p._log.Debug($"{Reason} progress: {n} scanned, {Interlocked.Read(ref Copied)} copied, {Interlocked.Read(ref Skipped)} skipped ({(DateTime.UtcNow - ScanStart).TotalSeconds:F0}s): " + _p._config.Path);
-                if (!FileSnapshot.TryRead(f, out var s))
+                if (!_p.TryStatSource(f, out var s))
                 {
                     Interlocked.Exchange(ref ScanFailed, 1);
                     RecordFailed(rel);
@@ -1627,10 +1632,43 @@ namespace TicTack
             {
                 chunk.Add((path, PathUtil.Relative(path, _config.Path)));
                 if (chunk.Count < 2000) continue;
+                if (!CheckBatchFit(st, chunk)) return;
                 await st.ProcessChunkAsync(chunk, options);
                 chunk.Clear();
             }
-            if (chunk.Count > 0) await st.ProcessChunkAsync(chunk, options);
+            if (chunk.Count > 0 && CheckBatchFit(st, chunk))
+                await st.ProcessChunkAsync(chunk, options);
+        }
+
+        private bool CheckBatchFit(ScanScope st, List<(string f, string rel)> batch)
+        {
+            long minFree = DiskSpaceGuard.GbToBytes(_config.Sync?.MinFreeGb);
+            bool strict = _config.Sync?.StrictFitCheck ?? false;
+            if (minFree <= 0 && !strict) return true;
+            if (!DiskSpaceGuard.TryGetAvailableBytes(_config.Destination, out var avail)) return true;
+
+            long delta = 0;
+            foreach (var (f, rel) in batch)
+            {
+                if (_filter != null && !_filter.ShouldProcess(f)) continue;
+                if (!TryStatSource(f, out var snap)) continue;
+                var dst = Path.Combine(_config.Destination, rel);
+                long dstLen = 0;
+                try { if (File.Exists(dst)) dstLen = new FileInfo(dst).Length; } catch { }
+                if (snap.Length > dstLen)
+                    delta += snap.Length - dstLen;
+            }
+            if (avail >= delta + minFree) return true;
+
+            var msg = $"Destination '{_config.Destination}' has {avail / (1024.0 * 1024 * 1024):F2} GiB free, insufficient for {delta / (1024.0 * 1024 * 1024):F2} GiB batch delta.";
+            if (strict)
+            {
+                _log.Error(msg + " Aborting scan under strict_fit_check.");
+                Interlocked.Exchange(ref st.ScanFailed, 1);
+                return false;
+            }
+            _log.Warn(msg);
+            return true;
         }
 
         private async Task<bool> FinishScanAsync(ScanScope st)

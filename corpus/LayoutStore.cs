@@ -54,7 +54,7 @@ namespace Corpus
             layout.Hmac = "";
             layout.Hmac = ComputeHmac(JsonSerializer.Serialize(layout, CorpusJsonContext.Default.DiskLayout), key);
             var path = Path.Combine(layoutsDir, $"{layout.Generation:D6}-disk{layout.DiskNumber}.json");
-            File.WriteAllText(path, JsonSerializer.Serialize(layout, CorpusJsonContext.Default.DiskLayout));
+            AtomicFile.WriteAllText(path, JsonSerializer.Serialize(layout, CorpusJsonContext.Default.DiskLayout));
             return path;
         }
 

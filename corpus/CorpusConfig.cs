@@ -90,6 +90,20 @@ namespace Corpus
         // Change alarm: Error + alert when one generation changes more
         // than this percent of stored bytes. 0 = off.
         public double ChangeAlarmPercent { get; set; }
+        // Off-store HMAC key: path or env var so id.key can live outside
+        // the writable backup store.
+        public string? KeyPath { get; set; }
+        public string? KeyEnv { get; set; }
+        public bool StrictConfigPerms { get; set; }
+        public bool DestinationProtect { get; set; }
+        // Parallel hash/compress workers (0 = auto, clamped 2..16).
+        public int Workers { get; set; }
+        // Optional destination store free-space floor in GB (null/<=0 = disabled).
+        public double? MinFreeGb { get; set; }
+        // Optional strict whole-image fit pre-check (false = warn on marginal, true = refuse upfront).
+        public bool StrictFitCheck { get; set; }
+        // Optional Windows 11 EcoQoS / Linux nice +10 background mode.
+        public bool EcoQos { get; set; }
 
         public CorpusConfig()
         {
@@ -123,7 +137,23 @@ namespace Corpus
                 .Build();
 
             using (var reader = new StreamReader(path))
-                return deserializer.Deserialize<CorpusConfig>(reader);
+            {
+                var cfg = deserializer.Deserialize<CorpusConfig>(reader);
+                if (cfg != null) ResolveVolumes(cfg);
+                return cfg;
+            }
+        }
+
+        public static void ResolveVolumes(CorpusConfig cfg)
+        {
+            if (!string.IsNullOrEmpty(cfg.StorePath))
+                cfg.StorePath = VolumeResolver.Resolve(cfg.StorePath);
+            if (!string.IsNullOrEmpty(cfg.StateDbPath))
+                cfg.StateDbPath = VolumeResolver.Resolve(cfg.StateDbPath);
+            if (!string.IsNullOrEmpty(cfg.KeyPath))
+                cfg.KeyPath = VolumeResolver.Resolve(cfg.KeyPath);
+            if (cfg.Logging != null && !string.IsNullOrEmpty(cfg.Logging.Path))
+                cfg.Logging.Path = VolumeResolver.Resolve(cfg.Logging.Path);
         }
 
         public static bool Validate(CorpusConfig cfg, ILogger log)

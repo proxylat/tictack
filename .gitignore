@@ -4,7 +4,8 @@ obj/
 *.log
 TestResults/
 BenchmarkDotNet.Artifacts/
-benchmarks/baseline-*.json
+benchmarks/
+rules/
 service/win/TicTackSv.exe
 service/win/config.yaml
 service/win/*.dll

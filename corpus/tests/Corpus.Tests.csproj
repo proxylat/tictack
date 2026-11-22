@@ -28,11 +28,16 @@
 
   <ItemGroup>
     <Compile Include="../CorpusConfig.cs" Link="corpus/CorpusConfig.cs" />
+    <Compile Include="../../src/VolumeResolver.cs" Link="shared/VolumeResolver.cs" />
+    <Compile Include="../../src/DestinationGuard.cs" Link="shared/DestinationGuard.cs" />
+    <Compile Include="../../src/DiskSpaceGuard.cs" Link="shared/DiskSpaceGuard.cs" />
     <Compile Include="../DeepVerify.cs" Link="corpus/DeepVerify.cs" />
     <Compile Include="../DeltaCodec.cs" Link="corpus/DeltaCodec.cs" />
     <Compile Include="../ZstdDeltaCodec.cs" Link="corpus/ZstdDeltaCodec.cs" />
     <Compile Include="../Chunker.cs" Link="corpus/Chunker.cs" />
     <Compile Include="../ChunkId.cs" Link="corpus/ChunkId.cs" />
+    <Compile Include="../AtomicFile.cs" Link="corpus/AtomicFile.cs" />
+    <Compile Include="../ChunkPipeline.cs" Link="corpus/ChunkPipeline.cs" />
     <Compile Include="../Compression.cs" Link="corpus/Compression.cs" />
     <Compile Include="../IBlockSource.cs" Link="corpus/IBlockSource.cs" />
     <Compile Include="../IBlockTarget.cs" Link="corpus/IBlockTarget.cs" />

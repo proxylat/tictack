@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
 using TicTack;
 
 namespace Corpus
@@ -98,6 +100,41 @@ namespace Corpus
             }
             log.Error(msg);
             throw new ChangeAlarmException(msg + " (re-run with --force-full to override)");
+        }
+
+        private const ulong FS_IOC_SETFLAGS = 0x40086602;
+        private const int FS_IMMUTABLE_FL = 0x00000010;
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern uint geteuid();
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int ioctl(int fd, ulong request, ref int flags);
+
+        // OS-level WORM sealing on finalized packs/manifests: sets ReadOnly
+        // attribute on all platforms and best-effort FS_IMMUTABLE_FL on Linux
+        // when running as root.
+        public static void SealWormFile(string path, ILogger? log = null)
+        {
+            try
+            {
+                var attr = File.GetAttributes(path);
+                if ((attr & FileAttributes.ReadOnly) == FileAttributes.None)
+                    File.SetAttributes(path, attr | FileAttributes.ReadOnly);
+            }
+            catch (Exception ex) { log?.Debug("WORM ReadOnly attribute skipped for " + path + ": " + ex.Message); }
+
+            if (OperatingSystem.IsLinux())
+            {
+                try
+                {
+                    if (geteuid() != 0) return;
+                    using var fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    int flags = FS_IMMUTABLE_FL;
+                    _ = ioctl((int)fs.SafeFileHandle.DangerousGetHandle(), FS_IOC_SETFLAGS, ref flags);
+                }
+                catch { }
+            }
         }
     }
 }

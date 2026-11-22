@@ -178,6 +178,22 @@ namespace TicTack
         Stream OpenRead(string path);
     }
 
+    public interface ISourceStat
+    {
+        bool TryStat(string path, out FileSnapshot snapshot);
+        bool Exists(string path);
+    }
+
+    public interface IHashProvider
+    {
+        bool TryComputeHash(string path, out string hexHash);
+    }
+
+    public interface IPrefixHashProvider
+    {
+        bool TryComputePrefixHash(string path, long prefixLen, out string hexHash);
+    }
+
     public interface IValidator
     {
         Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null);

@@ -38,5 +38,10 @@
     <Compile Include="../src/Logging.cs" Link="shared/Logging.cs" />
     <Compile Include="../src/DesktopAlert.cs" Link="shared/DesktopAlert.cs" />
     <Compile Include="../src/ProcessRunner.cs" Link="shared/ProcessRunner.cs" />
+    <Compile Include="../src/ProcessHardening.cs" Link="shared/ProcessHardening.cs" />
+    <Compile Include="../src/ConfigGuard.cs" Link="shared/ConfigGuard.cs" />
+    <Compile Include="../src/VolumeResolver.cs" Link="shared/VolumeResolver.cs" />
+    <Compile Include="../src/DestinationGuard.cs" Link="shared/DestinationGuard.cs" />
+    <Compile Include="../src/DiskSpaceGuard.cs" Link="shared/DiskSpaceGuard.cs" />
   </ItemGroup>
 </Project>

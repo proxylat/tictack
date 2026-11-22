@@ -67,6 +67,13 @@ namespace TicTack
                 {
                     Config = job,
                     TimeoutMinutes = EffectiveTimeout(job, defaults),
+                    ShowTerminal = EffectiveShowTerminal(job, defaults),
+                    NetCheckHost = EffectiveNetCheckHost(job, defaults),
+                    NetCheckEnabled = EffectiveNetCheckEnabled(job, defaults),
+                    NetCheckSamples = job.NetCheckSamples ?? defaults?.NetCheckSamples ?? 3,
+                    NetCheckMaxMs = job.NetCheckMaxMs ?? defaults?.NetCheckMaxMs ?? 500,
+                    NetCheckWaitSeconds = job.NetCheckWaitSeconds ?? defaults?.NetCheckWaitSeconds ?? 0,
+                    NetCheckIcmp = job.NetCheckIcmp ?? defaults?.NetCheckIcmp ?? true,
                 };
                 if (!ParseSchedule(job, entry, defaultMissed, log)) continue;
                 SeedJobHistory(job, entry, log);
@@ -528,6 +535,17 @@ namespace TicTack
             job.TimeoutMinutes > 0 ? job.TimeoutMinutes
             : defaults?.TimeoutMinutes > 0 ? defaults.TimeoutMinutes.Value : 10;
 
+        internal static bool EffectiveShowTerminal(JobConfig job, JobsDefaultsConfig? defaults) =>
+            job.ShowTerminal ?? defaults?.ShowTerminal ?? false;
+
+        internal static string? EffectiveNetCheckHost(JobConfig job, JobsDefaultsConfig? defaults) =>
+            !string.IsNullOrWhiteSpace(job.NetCheckHost) ? job.NetCheckHost.Trim()
+            : !string.IsNullOrWhiteSpace(defaults?.NetCheckHost) ? defaults.NetCheckHost.Trim()
+            : null;
+
+        internal static bool EffectiveNetCheckEnabled(JobConfig job, JobsDefaultsConfig? defaults) =>
+            job.NetCheck ?? defaults?.NetCheck ?? !string.IsNullOrWhiteSpace(EffectiveNetCheckHost(job, defaults));
+
         private static bool EntryIsDue(DateTime now, JobEntry job)
         {
             var skip = job.Missed == MissedPolicy.Skip;
@@ -641,6 +659,14 @@ namespace TicTack
                     _log.Info("Job '" + job.Config.Name + "' skipped, running on battery power");
                     return;
                 }
+                if (job.NetCheckEnabled)
+                {
+                    var netResult = await NetCheck.EvaluateAsync(
+                        job.NetCheckHost, job.NetCheckSamples, job.NetCheckMaxMs,
+                        job.NetCheckWaitSeconds, job.NetCheckIcmp, _log, ct).ConfigureAwait(false);
+                    if (!NetCheck.DecideOnResult(netResult, job.Config.Name ?? "job", _log))
+                        return;
+                }
                 using (SleepInhibit.Hold(job.Config.PreventSleep, job.Config.Name, job.TimeoutMinutes, _log))
                     await RunJobBodyAsync(job, ct).ConfigureAwait(false);
             }
@@ -667,7 +693,7 @@ namespace TicTack
             var cmd = Sub(cfg.Command!);
             _log.Info("Running job '" + cfg.Name + "': " + cmd);
             var (exitCode, _, err, timedOut) = await ProcessRunner.RunAsync(
-                cmd, wd, redirect: true, ct, timeoutMs, low).ConfigureAwait(false);
+                cmd, wd, redirect: !job.ShowTerminal, ct, timeoutMs, low).ConfigureAwait(false);
 
             if (timedOut)
             {
@@ -972,6 +998,13 @@ namespace TicTack
             public OverlapPolicy Overlap { get; set; }
             public TimeSpan Jitter { get; set; }
             public int TimeoutMinutes { get; set; }
+            public bool ShowTerminal { get; set; }
+            public string? NetCheckHost { get; set; }
+            public bool NetCheckEnabled { get; set; }
+            public int NetCheckSamples { get; set; }
+            public int NetCheckMaxMs { get; set; }
+            public int NetCheckWaitSeconds { get; set; }
+            public bool NetCheckIcmp { get; set; }
             public Task? Running { get; set; }
             public bool Queued { get; set; }
             public object RunLock { get; } = new object();

@@ -170,9 +170,7 @@ namespace Corpus
         private static void WriteMarker(string mountDir, Marker marker)
         {
             var path = Path.Combine(mountDir, MarkerFileName);
-            var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(marker, CorpusJsonContext.Default.Marker));
-            File.Move(tmp, path, overwrite: true);
+            AtomicFile.WriteAllText(path, JsonSerializer.Serialize(marker, CorpusJsonContext.Default.Marker));
         }
     }
 }

@@ -9,10 +9,12 @@ namespace TicTack
     {
         public static void Cleanup(TicTackConfig cfg, ILogger log)
         {
-            foreach (var src in cfg.Sources)
+            var allSources = new System.Collections.Generic.List<SourceConfig>(cfg.Sources ?? new System.Collections.Generic.List<SourceConfig>());
+            allSources.AddRange(Config.ResolveRemoteSources(cfg));
+            foreach (var src in allSources)
             {
                 if (!string.IsNullOrEmpty(src.Destination) && Directory.Exists(src.Destination))
-                    CleanDir(src.Destination, src.Path, log);
+                    CleanDir(src.Destination, src.RemoteEndpoint == null ? src.Path : null, log);
                 if (src.Sync != null)
                 {
                     if (src.Sync.Versioning != null && !string.IsNullOrEmpty(src.Sync.Versioning.Path)
@@ -29,9 +31,22 @@ namespace TicTack
         {
             try
             {
+                foreach (var res in Directory.EnumerateFiles(dir, "*.tictack.tmp.resume", SearchOption.AllDirectories))
+                {
+                    var tmpPair = res.Substring(0, res.Length - ".resume".Length);
+                    if (!File.Exists(tmpPair))
+                    {
+                        try { File.Delete(res); } catch { }
+                    }
+                }
                 foreach (var tmp in Directory.EnumerateFiles(dir, "*.tictack.tmp",
                     SearchOption.AllDirectories))
                 {
+                    if (File.Exists(tmp + ".resume"))
+                    {
+                        log.Debug("Preserving resumable temp " + Path.GetFileName(tmp));
+                        continue;
+                    }
                     var dest = tmp.Substring(0, tmp.Length - ".tictack.tmp".Length);
                     if (!File.Exists(dest) && sourceBase != null)
                     {

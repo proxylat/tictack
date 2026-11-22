@@ -9,6 +9,15 @@ ExecStart=/opt/tictack/TicTackSv --cli
 KillSignal=SIGINT
 TimeoutStopSec=60
 UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
 Restart=on-failure
 RestartSec=10
 

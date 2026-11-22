@@ -211,9 +211,7 @@ namespace Corpus
             if (!File.Exists(dst))
             {
                 Directory.CreateDirectory(toRoot);
-                File.WriteAllBytes(dst, key);
-                if (OperatingSystem.IsLinux())
-                    File.SetUnixFileMode(dst, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                AtomicFile.WriteAllBytes(dst, key, overwrite: false, ownerOnlyOnLinux: true);
                 log.Info("seeded dest identity key from source (same key = same content addresses)");
                 return key;
             }

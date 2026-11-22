@@ -593,9 +593,7 @@ namespace Corpus
             var sidecar = SidecarPath(target);
             if (File.Exists(sidecar) || Directory.Exists(sidecar))
                 throw new SingleFileTargetExistsException(sidecar);
-            var partial = sidecar + ".tmp";
-            File.WriteAllText(partial, JsonSerializer.Serialize(record, CorpusJsonContext.Default.DifferencingParentRecord));
-            File.Move(partial, sidecar);
+            AtomicFile.WriteAllText(sidecar, JsonSerializer.Serialize(record, CorpusJsonContext.Default.DifferencingParentRecord), overwrite: false);
         }
 
         private static string ShaFile(string path)

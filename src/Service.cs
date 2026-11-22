@@ -13,6 +13,7 @@ namespace TicTack
         private readonly string _configPath;
         private ILogger? _log;
         private List<SyncPipeline>? _pipelines;
+        private RemoteAgentServer? _remoteAgent;
         private TimerScheduler? _scheduler;
         private Timer? _heartbeat;
 
@@ -65,7 +66,14 @@ namespace TicTack
 
                 if (!Config.Validate(cfg, _log))
                     throw new InvalidOperationException("Invalid configuration");
+                if (!ConfigGuard.CheckConfigFile(_configPath, _log, cfg.StrictConfigPerms))
+                    throw new InvalidOperationException("Insecure config permissions under strict_config_perms");
+                if (cfg.RemoteSystem != null && !ConfigGuard.CheckSecretFile(cfg.RemoteSystem.PskFile, _log, cfg.StrictConfigPerms))
+                    throw new InvalidOperationException("Insecure PSK file permissions under strict_config_perms");
 
+                ProcessHardening.Apply(_log);
+                if (cfg.EcoQos)
+                    ProcessHardening.ApplyEcoQos(_log);
                 ApplyDelayedAutostart(cfg, _log);
                 ServiceTuning.Apply(cfg, _log, ServiceName);
 
@@ -84,8 +92,11 @@ namespace TicTack
         // TimerScheduler owns job timing; pipelines own their own deferreds.
         private void StartSyncEngine(TicTackConfig cfg, ILogger log)
         {
+            _remoteAgent = Program.StartRemoteAgentIfConfigured(cfg, log);
             _pipelines = new List<SyncPipeline>();
-            foreach (var src in cfg.Sources)
+            var allSources = new List<SourceConfig>(cfg.Sources ?? new List<SourceConfig>());
+            allSources.AddRange(Config.ResolveRemoteSources(cfg));
+            foreach (var src in allSources)
             {
                 var pipeline = Program.BuildPipeline(src, cfg, log, logMonitorStartup: true);
                 pipeline.Start();
@@ -196,6 +207,7 @@ namespace TicTack
             if (_log != null) _log.Info("TicTack Service stopping");
             if (_heartbeat != null) _heartbeat.Dispose();
             if (_scheduler != null) _scheduler.Dispose();
+            if (_remoteAgent != null) _remoteAgent.Dispose();
             if (_pipelines != null) foreach (var p in _pipelines) p.Dispose();
             if (_log != null) _log.Info("TicTack Service stopped");
             if (_log is IDisposable disposable) disposable.Dispose();

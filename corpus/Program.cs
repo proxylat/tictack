@@ -497,6 +497,19 @@ namespace Corpus
             }
             var backupDir = CorpusConfig.ResolveLogBackupDir(cfg, toVhdx, toWim, toEsd, cfg != null ? CorpusConfig.StateRoot(cfg) : baseDir);
             var log = CreateLogger(cfg, baseDir, backupDir);
+            ProcessHardening.Apply(log);
+            if (!ConfigGuard.CheckConfigFile(cfgPath, log, cfg?.StrictConfigPerms ?? false))
+                return 1;
+            if (cfg != null)
+            {
+                if (cfg.EcoQos)
+                    ProcessHardening.ApplyEcoQos(log);
+                ChunkId.ConfigureOverride(cfg.KeyPath, cfg.KeyEnv);
+                if (!ConfigGuard.CheckSecretFile(cfg.KeyPath, log, cfg.StrictConfigPerms))
+                    return 1;
+                if (cfg.DestinationProtect && !string.IsNullOrEmpty(cfg.StorePath))
+                    DestinationGuard.Enforce(cfg.StorePath, log);
+            }
             var backupTarget = CorpusConfig.LogBackupTargetDir(cfg, toVhdx, toWim, toEsd);
             if (!string.IsNullOrEmpty(backupTarget) && !string.Equals(backupDir, backupTarget, StringComparison.OrdinalIgnoreCase))
                 log.Warn("Log backup dir " + backupTarget + " not writable; using " + backupDir + " instead.");
@@ -832,6 +845,10 @@ namespace Corpus
                 changeAlarmPercent: cfg.ChangeAlarmPercent,
                 chunker: cfg.Chunker,
                 eccOverheadPercent: cfg.EccOverheadPercent);
+            store.WormMode = cfg.WormMode;
+            store.Workers = cfg.Workers;
+            store.MinFreeBytes = DiskSpaceGuard.GbToBytes(cfg.MinFreeGb);
+            store.StrictFitCheck = cfg.StrictFitCheck;
             store.ProgressOpts = LiveProgressOptions.FromConfig(cfg.Logging);
             return store;
         }

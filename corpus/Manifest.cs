@@ -150,14 +150,16 @@ namespace Corpus
             };
         }
 
-        public static string Save(string manifestsDir, SnapshotManifest m, byte[] key)
+        public static string Save(string manifestsDir, SnapshotManifest m, byte[] key, bool wormMode = false)
         {
             Directory.CreateDirectory(manifestsDir);
             m.CreatedUtc = DateTime.UtcNow.ToString("o");
             m.Hmac = "";
             m.Hmac = ComputeHmac(JsonSerializer.Serialize(m, CorpusJsonContext.Default.SnapshotManifest), key);
             var path = Path.Combine(manifestsDir, $"{m.Generation:D6}-{Sanitize(m.Name)}.json");
-            File.WriteAllText(path, JsonSerializer.Serialize(m, CorpusJsonContext.Default.SnapshotManifest));
+            AtomicFile.WriteAllText(path, JsonSerializer.Serialize(m, CorpusJsonContext.Default.SnapshotManifest));
+            if (wormMode)
+                Hardening.SealWormFile(path);
             return path;
         }
 

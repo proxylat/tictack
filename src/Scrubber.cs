@@ -79,8 +79,10 @@ namespace TicTack
                     else { verified++; mismatched += r; }
                 }
                 _verifyStore.SetCounter(ShardKey, shard + 1);
+                // Debug: 20 shards x N sources of routine steady-state noise
+                // otherwise (mismatches/failures keep their own lines below).
                 if (verified > 0)
-                    _log.Info("Scrub [" + _config.Path + "]: shard " + shard + "/" + ShardCount + ": " + verified + " verified, " + mismatched + " mismatched, " + skipped + " skipped");
+                    _log.Debug("Scrub [" + _config.Path + "]: shard " + shard + "/" + ShardCount + ": " + verified + " verified, " + mismatched + " mismatched, " + skipped + " skipped");
                 else
                     _log.Debug("Scrub: shard " + shard + "/" + ShardCount + ": nothing to verify");
             }

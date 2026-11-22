@@ -599,4 +599,25 @@ public class SchedulerTests
             try { Directory.Delete(dir, true); } catch { }
         }
     }
+
+    [Fact]
+    public void ShowTerminal_DefaultsOff_AndPerJobOverridesGlobal()
+    {
+        var job = new JobConfig();
+        Assert.False(TimerScheduler.EffectiveShowTerminal(job, null));
+
+        var defaultsOn = new JobsDefaultsConfig { ShowTerminal = true };
+        Assert.True(TimerScheduler.EffectiveShowTerminal(job, defaultsOn));
+
+        var jobOff = new JobConfig { ShowTerminal = false };
+        Assert.False(TimerScheduler.EffectiveShowTerminal(jobOff, defaultsOn));
+
+        var psiShown = ProcessRunner.CreateStartInfo("echo hi", Directory.GetCurrentDirectory(), redirect: false);
+        Assert.False(psiShown.CreateNoWindow);
+        Assert.False(psiShown.RedirectStandardOutput);
+
+        var psiHidden = ProcessRunner.CreateStartInfo("echo hi", Directory.GetCurrentDirectory(), redirect: true);
+        Assert.True(psiHidden.CreateNoWindow);
+        Assert.True(psiHidden.RedirectStandardOutput);
+    }
 }

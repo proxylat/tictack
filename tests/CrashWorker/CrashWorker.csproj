@@ -17,8 +17,10 @@
   <ItemGroup>
     <Compile Include="../../src/Interfaces.cs" Link="src/Interfaces.cs" />
     <Compile Include="../../src/PathUtil.cs" Link="src/PathUtil.cs" />
+    <Compile Include="../../src/VolumeResolver.cs" Link="src/VolumeResolver.cs" />
     <Compile Include="../../src/Handler.cs" Link="src/Handler.cs" />
     <Compile Include="../../src/Executor.cs" Link="src/Executor.cs" />
+    <Compile Include="../../src/DiskSpaceGuard.cs" Link="src/DiskSpaceGuard.cs" />
     <Compile Include="../../src/SrcLock.cs" Link="src/SrcLock.cs" />
     <Compile Include="../../src/Config.cs" Link="src/Config.cs" />
     <Compile Include="../../src/Comparer.cs" Link="src/Comparer.cs" />

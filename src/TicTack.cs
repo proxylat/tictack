@@ -70,6 +70,13 @@ namespace TicTack
                 return 1;
                 if (!Config.Validate(cfg, log))
                 return 1;
+                if (!ConfigGuard.CheckConfigFile(o.CfgPath, log, cfg.StrictConfigPerms))
+                    return 1;
+                if (cfg.RemoteSystem != null && !ConfigGuard.CheckSecretFile(cfg.RemoteSystem.PskFile, log, cfg.StrictConfigPerms))
+                    return 1;
+                ProcessHardening.Apply(log);
+                if (cfg.EcoQos)
+                    ProcessHardening.ApplyEcoQos(log);
                 PowerGuard.Cleanup(cfg, log);
                 int? maint = await RunMaintenanceModesAsync(o, args, cfg, log);
                 if (maint.HasValue)
@@ -110,6 +117,12 @@ namespace TicTack
             return 0;
         }
 
+        if (o.isRemoteAgent)
+        {
+            RunRemoteAgent(cfg, log);
+            return 0;
+        }
+
         if (OperatingSystem.IsWindows() && (o.isService || !Environment.UserInteractive))
         {
             RunService(o.CfgPath);
@@ -122,7 +135,7 @@ namespace TicTack
 
         private sealed class MainOptions
         {
-            public bool isService = false, isCli = false, isOnce = false, isValidate = false, isExternalDrives = false, isRebuild = false;
+            public bool isService = false, isCli = false, isOnce = false, isValidate = false, isExternalDrives = false, isRebuild = false, isRemoteAgent = false;
             public bool isDeferredList = false;
             public string? deferredVerb = null, deferredTarget = null;
             public bool isForget = false, forgetDryRun = false, versionsJson = false;
@@ -141,6 +154,7 @@ namespace TicTack
             {
                 case "--service": o.isService = true; return true;
                 case "--cli": o.isCli = true; return true;
+                case "--remote-agent": o.isRemoteAgent = true; return true;
                 case "--once": o.isOnce = true; return true;
                 case "--validate": o.isValidate = true; return true;
                 case "--external-drives": o.isExternalDrives = true; return true;
@@ -428,9 +442,11 @@ namespace TicTack
         {
             log.Info("Once-off sync starting");
             var ran = false;
-            foreach (var src in cfg.Sources)
+            var allSources = new List<SourceConfig>(cfg.Sources ?? new List<SourceConfig>());
+            allSources.AddRange(Config.ResolveRemoteSources(cfg));
+            foreach (var src in allSources)
             {
-                if (!Directory.Exists(src.Path))
+                if (src.RemoteEndpoint == null && !Directory.Exists(src.Path))
                 {
                     log.Warn("Source folder missing, skipping once-off sync: " + src.Path);
                     continue;
@@ -1207,8 +1223,11 @@ namespace TicTack
         static void RunCli(TicTackConfig cfg, ILogger log)
         {
             var pipelines = new List<SyncPipeline>();
+            using var remoteAgent = StartRemoteAgentIfConfigured(cfg, log);
 
-            foreach (var src in cfg.Sources)
+            var allSources = new List<SourceConfig>(cfg.Sources ?? new List<SourceConfig>());
+            allSources.AddRange(Config.ResolveRemoteSources(cfg));
+            foreach (var src in allSources)
             {
                 var pipeline = BuildPipeline(src, cfg, log);
                 pipeline.Start();
@@ -1232,7 +1251,8 @@ namespace TicTack
                 };
                 if (!Console.IsInputRedirected)
                 {
-                    var thread = new Thread(() => { Console.ReadLine(); wait.Set(); });
+                    var thread = new Thread(() => { if (Console.ReadLine() != null) wait.Set(); });
+                    thread.IsBackground = true;
                     thread.Start();
                 }
                 wait.WaitOne();
@@ -1359,9 +1379,49 @@ namespace TicTack
             _ => "watcher",
         };
 
+        internal static RemoteAgentServer? StartRemoteAgentIfConfigured(TicTackConfig cfg, ILogger log)
+        {
+            var rs = cfg.RemoteSystem;
+            if (rs == null || !rs.HasAgent) return null;
+            var psk = RemoteProto.ResolvePsk(rs.Psk, rs.PskEnv, rs.PskFile);
+            var agent = new RemoteAgentServer(rs.Root!, rs.Listen!, rs.AllowIp, rs.MaxClients, rs.Tls, psk, log);
+            agent.Start();
+            return agent;
+        }
+
+        static void RunRemoteAgent(TicTackConfig cfg, ILogger log)
+        {
+            var rs = cfg.RemoteSystem;
+            if (rs == null || !rs.HasAgent)
+                throw new InvalidOperationException("remote_system.listen and remote_system.root must be configured for --remote-agent.");
+            if (rs.Sandbox)
+                RemoteSandbox.Apply(log, rs.Root);
+
+            using var agent = StartRemoteAgentIfConfigured(cfg, log);
+            log.Info("Remote agent running. Press Ctrl+C or Enter to stop.");
+            using (var wait = new ManualResetEvent(false))
+            {
+                Console.CancelKeyPress += (s, e) => { e.Cancel = true; wait.Set(); };
+                if (!Console.IsInputRedirected)
+                {
+                    var thread = new Thread(() => { if (Console.ReadLine() != null) wait.Set(); });
+                    thread.IsBackground = true;
+                    thread.Start();
+                }
+                wait.WaitOne();
+            }
+            log.Info("Remote agent stopped.");
+        }
+
         internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log, bool logMonitorStartup = false)
         {
-            var accessor = CreateAccessorOrFallback(src, log);
+            var remotePsk = src.RemotePsk ?? (cfg.RemoteSystem != null
+                ? RemoteProto.ResolvePsk(cfg.RemoteSystem.Psk, cfg.RemoteSystem.PskEnv, cfg.RemoteSystem.PskFile)
+                : Array.Empty<byte>());
+            var remoteAccessor = src.RemoteEndpoint != null
+                ? new RemoteFileAccessor(src.RemoteEndpoint, src.RemoteTls, remotePsk)
+                : null;
+            IFileAccessor accessor = remoteAccessor ?? CreateAccessorOrFallback(src, log);
             var level = Config.ParseVerification(src.Sync != null ? src.Sync.Verification : null);
             var comparer = ComparerFactory.Create(level, accessor);
             var validator = ValidatorFactory.Create(level, accessor);
@@ -1373,13 +1433,32 @@ namespace TicTack
 
             var durability = ParseDurability(src);
 
-            var copyAction = new CopyAction(accessor, durability, log);
+            var copyAction = new CopyAction(accessor, durability, log)
+            {
+                MinFreeBytes = DiskSpaceGuard.GbToBytes(src.Sync?.MinFreeGb),
+            };
             var renameAction = new RenameAction(deletion, log);
 
             var stateDb = OpenStateDbOrNull(src, log);
 
             var monitorConfig = cfg.Monitor ?? new MonitorConfig();
-            var (monitor, compositeMembers) = CreateMonitor(monitorConfig, src, stateDb, log, logMonitorStartup);
+            IFileMonitor monitor;
+            List<IFileMonitor>? compositeMembers = null;
+            if (remoteAccessor != null)
+            {
+                var remoteMonitor = new RemoteFileMonitor(
+                    src.RemoteEndpoint!,
+                    src.RemoteTls,
+                    remotePsk,
+                    monitorConfig.RestartDelaySeconds,
+                    log);
+                monitor = remoteMonitor;
+                compositeMembers = new List<IFileMonitor> { remoteMonitor };
+            }
+            else
+            {
+                (monitor, compositeMembers) = CreateMonitor(monitorConfig, src, stateDb, log, logMonitorStartup);
+            }
 
             var (excludes, deferredDir, deferredPrefix) = ResolveSourcePaths(src, cfg, log);
 
@@ -1387,7 +1466,11 @@ namespace TicTack
                 retry, validator, versioning, deletion, log, stateDb,
                 autoExcludePrefixes: excludes,
                 deferredDir: deferredDir,
-                deferredFilePrefix: deferredPrefix);
+                deferredFilePrefix: deferredPrefix,
+                directoryExists: remoteAccessor != null ? remoteAccessor.DirectoryExists : null,
+                enumerateFiles: remoteAccessor != null ? remoteAccessor.EnumerateFiles : null,
+                enumerateDirectories: remoteAccessor != null ? (_, _) => Array.Empty<string>() : null,
+                sourceStat: remoteAccessor);
             WireGapRescan(compositeMembers, pipeline);
             return pipeline;
         }

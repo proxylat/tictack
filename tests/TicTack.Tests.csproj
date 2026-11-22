@@ -63,6 +63,14 @@
     <Compile Include="../src/TicTack.cs" Link="src/TicTack.cs" />
     <Compile Include="../src/Monitor.cs" Link="src/Monitor.cs" />
     <Compile Include="../src/Pipeline.cs" Link="src/Pipeline.cs" />
+    <Compile Include="../src/RemoteProto.cs" Link="src/RemoteProto.cs" />
+    <Compile Include="../src/RemoteSandbox.cs" Link="src/RemoteSandbox.cs" />
+    <Compile Include="../src/RemoteAgent.cs" Link="src/RemoteAgent.cs" />
+    <Compile Include="../src/RemoteSource.cs" Link="src/RemoteSource.cs" />
+    <Compile Include="../src/ProcessHardening.cs" Link="src/ProcessHardening.cs" />
+    <Compile Include="../src/ConfigGuard.cs" Link="src/ConfigGuard.cs" />
+    <Compile Include="../src/DiskSpaceGuard.cs" Link="src/DiskSpaceGuard.cs" />
+    <Compile Include="../src/NetCheck.cs" Link="src/NetCheck.cs" />
     <Compile Include="../src/ReadyDrain.cs" Link="src/ReadyDrain.cs" />
     <Compile Include="../src/DeletionGuard.cs" Link="src/DeletionGuard.cs" />
     <Compile Include="../src/Completer.cs" Link="src/Completer.cs" />

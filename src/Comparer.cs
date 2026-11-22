@@ -15,6 +15,8 @@ namespace TicTack
 
         internal static string ComputeHex(string path, IFileAccessor? accessor)
         {
+            if (accessor is IHashProvider hp && hp.TryComputeHash(path, out var remoteHex))
+                return remoteHex;
             path = PathUtil.EnsureExtended(path);
             using (var stream = accessor != null ? accessor.OpenRead(path) : File.OpenRead(path))
                 return ComputeHex(stream);
@@ -105,10 +107,11 @@ namespace TicTack
     {
         public static IFileComparer Create(VerificationLevel level, IFileAccessor? accessor = null)
         {
+            var stat = accessor as ISourceStat;
             switch (level)
             {
-                case VerificationLevel.Size: return new SizeComparer();
-                case VerificationLevel.DateAndSize: return new DateSizeComparer();
+                case VerificationLevel.Size: return new SizeComparer(stat);
+                case VerificationLevel.DateAndSize: return new DateSizeComparer(stat);
                 case VerificationLevel.Hash: return new HashComparer(accessor);
                 case VerificationLevel.Full: return new FullComparer(accessor);
                 default: throw new ArgumentOutOfRangeException(nameof(level), level, "Unknown verification level");
@@ -118,6 +121,9 @@ namespace TicTack
 
     public sealed class SizeComparer : IFileComparer
     {
+        private readonly ISourceStat? _stat;
+        public SizeComparer(ISourceStat? stat = null) { _stat = stat; }
+
         // Metadata-only: never reads file contents.
         public bool RequiresContentRead => false;
 
@@ -128,7 +134,10 @@ namespace TicTack
                 var source = sourceSnapshot;
                 if (!source.HasValue)
                 {
-                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    var ok = _stat != null
+                        ? _stat.TryStat(sourcePath, out var current)
+                        : FileSnapshot.TryRead(sourcePath, out current);
+                    if (!ok) return false;
                     source = current;
                 }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
@@ -140,6 +149,9 @@ namespace TicTack
 
     public sealed class DateSizeComparer : IFileComparer
     {
+        private readonly ISourceStat? _stat;
+        public DateSizeComparer(ISourceStat? stat = null) { _stat = stat; }
+
         // Metadata-only: never reads file contents.
         public bool RequiresContentRead => false;
 
@@ -150,7 +162,10 @@ namespace TicTack
                 var source = sourceSnapshot;
                 if (!source.HasValue)
                 {
-                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    var ok = _stat != null
+                        ? _stat.TryStat(sourcePath, out var current)
+                        : FileSnapshot.TryRead(sourcePath, out current);
+                    if (!ok) return false;
                     source = current;
                 }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
@@ -165,10 +180,15 @@ namespace TicTack
     public sealed class HashComparer : IFileComparer
     {
         private readonly IFileAccessor? _accessor;
-        public HashComparer(IFileAccessor? accessor = null) { _accessor = accessor; }
+        private readonly ISourceStat? _stat;
+        public HashComparer(IFileAccessor? accessor = null)
+        {
+            _accessor = accessor;
+            _stat = accessor as ISourceStat;
+        }
 
         // Single-file hash for the copy-time validation fast path (hashes only this path).
-        internal string HashFile(string path) => FileHasher.ComputeHex(path, _accessor);
+        internal string HashFile(string path) => FileHasher.ComputeHex(path, _stat != null ? null : _accessor);
 
         // Reads both files end to end when metadata matches.
         public bool RequiresContentRead => true;
@@ -180,13 +200,16 @@ namespace TicTack
                 var source = sourceSnapshot;
                 if (!source.HasValue)
                 {
-                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    var ok = _stat != null
+                        ? _stat.TryStat(sourcePath, out var current)
+                        : FileSnapshot.TryRead(sourcePath, out current);
+                    if (!ok) return false;
                     source = current;
                 }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));
                 if (!dInfo.Exists) return false;
                 if (source.Value.Length != dInfo.Length) return false;
-                return FileHasher.ComputeHex(sourcePath, _accessor) == FileHasher.ComputeHex(destPath, _accessor);
+                return FileHasher.ComputeHex(sourcePath, _accessor) == FileHasher.ComputeHex(destPath, _stat != null ? null : _accessor);
             }
             catch { return false; }
         }
@@ -195,7 +218,12 @@ namespace TicTack
     public sealed class FullComparer : IFileComparer
     {
         private readonly HashComparer _hash;
-        public FullComparer(IFileAccessor? accessor = null) { _hash = new HashComparer(accessor); }
+        private readonly ISourceStat? _stat;
+        public FullComparer(IFileAccessor? accessor = null)
+        {
+            _hash = new HashComparer(accessor);
+            _stat = accessor as ISourceStat;
+        }
 
         // Delegates to HashComparer when metadata matches.
         public bool RequiresContentRead => true;
@@ -207,7 +235,10 @@ namespace TicTack
                 var source = sourceSnapshot;
                 if (!source.HasValue)
                 {
-                    if (!FileSnapshot.TryRead(sourcePath, out var current)) return false;
+                    var ok = _stat != null
+                        ? _stat.TryStat(sourcePath, out var current)
+                        : FileSnapshot.TryRead(sourcePath, out current);
+                    if (!ok) return false;
                     source = current;
                 }
                 var dInfo = new FileInfo(PathUtil.EnsureExtended(destPath));

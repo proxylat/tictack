@@ -12,7 +12,7 @@ namespace TicTack
             {
                 case VerificationLevel.Size:
                 case VerificationLevel.DateAndSize:
-                    return new SizeValidator();
+                    return new SizeValidator(accessor as ISourceStat);
                 case VerificationLevel.Hash:
                 case VerificationLevel.Full:
                     return new HashValidator(accessor);
@@ -66,7 +66,9 @@ namespace TicTack
 
     public sealed class SizeValidator : IValidator
     {
-        private readonly SizeComparer _comparer = new SizeComparer();
+        private readonly SizeComparer _comparer;
+
+        public SizeValidator(ISourceStat? stat = null) { _comparer = new SizeComparer(stat); }
 
         public Task<bool> ValidateAsync(string sourcePath, string destPath, FileSnapshot? sourceSnapshot = null) =>
             Task.FromResult(_comparer.AreEqual(sourcePath, destPath, sourceSnapshot));

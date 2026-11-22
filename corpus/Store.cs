@@ -67,13 +67,13 @@ namespace Corpus
             private readonly List<(byte[] Digest, byte[] Data, string? Path)> _work = new();
             private long _bytes;
 
-            public EncodeWindow(PackWriter pack, List<ChunkRow> pending, int level, List<string>? paths = null)
+            public EncodeWindow(PackWriter pack, List<ChunkRow> pending, int level, List<string>? paths = null, int workers = 0)
             {
                 _pack = pack;
                 _pending = pending;
                 _paths = paths;
                 _level = level;
-                _maxCount = Math.Clamp(Environment.ProcessorCount, 2, 16);
+                _maxCount = ChunkPipeline.ResolveWorkers(workers);
             }
 
             public void Add(byte[] digest, byte[] data, string? path = null)
@@ -182,6 +182,73 @@ namespace Corpus
         // The MFT view is borrowed for filename display, never disposed here.
         private static Func<IMftVolume?>? MftOf(IBlockSource source)
             => source is IMftVolume vol ? () => vol : null;
+
+        public bool WormMode { get; set; }
+        public int Workers { get; set; }
+        public long MinFreeBytes { get; set; }
+        public bool StrictFitCheck { get; set; }
+        internal Func<string, long>? FreeSpaceOverride { get; set; }
+
+        private void EnsureDestinationHeadroom(long requiredBytes = 0)
+        {
+            if (MinFreeBytes <= 0) return;
+            if (!DiskSpaceGuard.HasHeadroom(_packsDir, requiredBytes, MinFreeBytes, out var avail, FreeSpaceOverride))
+                throw new IOException($"Destination store '{_packsDir}' low on free space ({avail / (1024 * 1024)} MiB free, min_free_gb requires {MinFreeBytes / (1024 * 1024)} MiB headroom).");
+        }
+
+        private void CheckImageFit(long plannedBytes, bool hasParent)
+        {
+            if (hasParent || plannedBytes <= 0) return;
+            long avail;
+            if (FreeSpaceOverride != null)
+                avail = FreeSpaceOverride(_packsDir);
+            else if (!DiskSpaceGuard.TryGetAvailableBytes(_packsDir, out avail))
+                return;
+
+            long fullNeeded = plannedBytes + MinFreeBytes;
+            if (avail >= fullNeeded) return;
+
+            long minExpected = (plannedBytes / 2) + MinFreeBytes;
+            if (StrictFitCheck || avail < minExpected)
+                throw new IOException($"Destination store '{_packsDir}' has {avail / (1024.0 * 1024 * 1024):F2} GiB free, insufficient for planned {plannedBytes / (1024.0 * 1024 * 1024):F2} GiB image.");
+            _log.Warn($"Destination store '{_packsDir}' has {avail / (1024.0 * 1024 * 1024):F2} GiB free vs {plannedBytes / (1024.0 * 1024 * 1024):F2} GiB planned (relying on compression).");
+        }
+
+        // Re-indexes any sealed CPK1 packs whose chunks weren't committed to
+        // ChunkIndex before a crash, and sweeps orphaned packs/*.tmp files.
+        public int RecoverOrphanPacks()
+        {
+            if (!Directory.Exists(_packsDir)) return 0;
+            foreach (var tmp in Directory.EnumerateFiles(_packsDir, "*.tmp"))
+            {
+                try { File.Delete(tmp); _log.Warn("Cleaned orphaned pack temp: " + Path.GetFileName(tmp)); }
+                catch { }
+            }
+
+            int recovered = 0;
+            foreach (var packPath in Directory.EnumerateFiles(_packsDir, "pack-*.pack"))
+            {
+                List<(byte[] Digest, long Offset, int Stored, int Plain)> rows;
+                try { rows = PackReader.ReadIndex(packPath); }
+                catch { continue; }
+                if (rows.Count == 0) continue;
+
+                var missing = new List<ChunkRow>();
+                var packName = Path.GetFileName(packPath);
+                foreach (var r in rows)
+                {
+                    if (!_index.TryGet(r.Digest, out _))
+                        missing.Add(new ChunkRow(r.Digest, r.Plain, r.Stored, packName, r.Offset));
+                }
+                if (missing.Count > 0)
+                {
+                    _index.UpsertBatch(missing);
+                    recovered += missing.Count;
+                    _log.Warn($"Recovered {missing.Count} chunk(s) from orphan sealed pack {packName}.");
+                }
+            }
+            return recovered;
+        }
 
         public Store(string storeRoot, string dbPath, int chunkMib, int zstdLevel, ILogger log, string? encryptHook = null, IDeltaCodec? deltaCodec = null, double changeAlarmPercent = 0, string chunker = "fixed", int eccOverheadPercent = 0)
         {
@@ -469,10 +536,12 @@ namespace Corpus
             var totalBytes = 0L;
             var holes = 0;
             var chunkBytes = _chunkMib * 1024 * 1024;
+            EnsureDestinationHeadroom(chunkBytes);
+            RecoverOrphanPacks();
             var excl = ResolveExclusions(source, opts);
             var exclBpc = excl?.BytesPerCluster ?? 0;
             var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent))
+            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent, wormMode: WormMode))
             using (var stream = source.OpenRead())
             {
                 bool[]? holeMap = null;
@@ -498,11 +567,14 @@ namespace Corpus
                 // above). A caller-supplied progress (disk aggregate) owns
                 // the throttle; direct calls get their own reporter.
                 var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
+                CheckImageFit(planned, !string.IsNullOrEmpty(prevDigest));
                 var reporter = progress ?? LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source), progress) ?? new ImageProgress(_log, planned);
                 var done = 0L;
-                var window = new EncodeWindow(pack, pending, _zstdLevel);
-                foreach (var chunk in enumerable)
+                var window = new EncodeWindow(pack, pending, _zstdLevel, workers: Workers);
+                int lastSealed = pack.SealedPackCount;
+                foreach (var item in ChunkPipeline.HashBatched(enumerable, _key, exclRuns, exclBpc, Workers))
                 {
+                    var chunk = item.Chunk;
                     if (chunk.IsHole)
                     {
                         var holeSize = Math.Min((long)chunkBytes, source.Length - chunk.Offset);
@@ -511,10 +583,8 @@ namespace Corpus
                         holes++;
                         continue;
                     }
-                    if (exclRuns != null && exclRuns.Count > 0)
-                        CapturePolicy.ZeroExcludedRanges(chunk.Data, chunk.Offset, exclRuns, exclBpc);
-                    var digest = ChunkId.ComputeId(chunk.Data, _key);
-                    var hex = ChunkId.ToHex(digest);
+                    var digest = item.Digest;
+                    var hex = item.Hex;
                     entries.Add(new ManifestEntry(hex, chunk.Data.Length));
                     totalBytes += chunk.Data.Length;
                     done += chunk.Data.Length;
@@ -524,12 +594,15 @@ namespace Corpus
                     packedThisImage.Add(hex);
                     window.Add(digest, chunk.Data);
                     newChunks++;
-                    if (pending.Count >= 500)
+                    if ((newChunks & 15) == 0)
+                        EnsureDestinationHeadroom(chunkBytes);
+                    if (pack.SealedPackCount != lastSealed || pending.Count >= 64)
                     {
                         window.Drain();
                         _index.UpsertBatch(pending);
                         pending.Clear();
                         packedThisImage.Clear();
+                        lastSealed = pack.SealedPackCount;
                     }
                 }
                 window.Drain();
@@ -579,7 +652,7 @@ namespace Corpus
                 bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
                 bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds,
                 chunker: _chunker == "buzhash" ? "buzhash" : null);
-            ManifestStore.Save(_manifestsDir, manifest, _key);
+            ManifestStore.Save(_manifestsDir, manifest, _key, WormMode);
             if (manifest.SkippedExclusions != null)
                 _log.Warn($"excluded extents restored as zeros: {string.Join(", ", manifest.SkippedExclusions)}");
             _log.Info($"imaged '{name}' gen {generation}: {entries.Count} chunks ({holes} holes), {newChunks} new, {totalBytes} bytes");
@@ -604,7 +677,7 @@ namespace Corpus
             var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
             var reread = 0;
             var newChunks = 0;
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent))
+            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent, wormMode: WormMode))
             using (var stream = source.OpenRead())
             {
                 bool[]? holeMap = null;
@@ -705,7 +778,7 @@ namespace Corpus
                 mftRecordDigests: plan.NewMftRecordDigests,
                 bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
                 bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
-            ManifestStore.Save(_manifestsDir, manifest, _key);
+            ManifestStore.Save(_manifestsDir, manifest, _key, WormMode);
             _log.Info($"incremental gen {generation} from parent {parent.Generation}: {reread}/{grid} chunks re-read, {newChunks} new");
             return manifest;
         }
@@ -887,7 +960,7 @@ namespace Corpus
                 manifest.PartitionKey = key;
                 manifest.DiskNumber = diskNumber;
                 manifest.PartitionNumber = part.PartitionNumber;
-                ManifestStore.Save(_manifestsDir, manifest, _key);
+                ManifestStore.Save(_manifestsDir, manifest, _key, WormMode);
                 record.SnapshotGeneration = manifest.Generation;
                 if (manifest.Generation > maxGen)
                     maxGen = manifest.Generation;
@@ -1051,6 +1124,8 @@ namespace Corpus
                     SkipUnchanged(skipParent.Generation);
             }
             Directory.CreateDirectory(_landingDir);
+            EnsureDestinationHeadroom(chunkBytes);
+            RecoverOrphanPacks();
             // §12.13 automatic resume: a matching fingerprint reuses
             // hash-verified landed chunks; a mismatch discards them with
             // an INF line naming the cause — never a silent mix.
@@ -1076,10 +1151,12 @@ namespace Corpus
                 // sparse sources, plain length otherwise. Resumed chunks
                 // still stream through here, so they advance the series.
                 var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
+                CheckImageFit(planned, skipParent != null);
                 var reporter = LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source)) ?? new ImageProgress(_log, planned);
                 var done = 0L;
-                foreach (var chunk in enumerable)
+                foreach (var item in ChunkPipeline.HashBatched(enumerable, _key, exclRuns, exclBpc, Workers))
                 {
+                    var chunk = item.Chunk;
                     if (chunk.IsHole)
                     {
                         var holeSize = Math.Min((long)chunkBytes, source.Length - chunk.Offset);
@@ -1087,10 +1164,8 @@ namespace Corpus
                         holes++;
                         continue;
                     }
-                    if (exclRuns != null && exclRuns.Count > 0)
-                        CapturePolicy.ZeroExcludedRanges(chunk.Data, chunk.Offset, exclRuns, exclBpc);
-                    var digest = ChunkId.ComputeId(chunk.Data, _key);
-                    var hex = ChunkId.ToHex(digest);
+                    var digest = item.Digest;
+                    var hex = item.Hex;
                     entries.Add(new ManifestEntry(hex, chunk.Data.Length));
                     done += chunk.Data.Length;
                     reporter.Report(done);
@@ -1111,6 +1186,8 @@ namespace Corpus
                     {
                         landed++;
                         landedThisRun.Add(Path.Combine(_landingDir, hex + ".chunk"));
+                        if ((landed & 15) == 0)
+                            EnsureDestinationHeadroom(chunkBytes);
                     }
                 }
                 if (planned <= 0 || done < planned)
@@ -1144,7 +1221,7 @@ namespace Corpus
                 mftChunkDigests: mftDigests, mftRecordBytes: mftRecordBytes, mftRecordDigests: mftRecords,
                 bitLockerState: (source as IBitLockerVolume)?.BitLockerState,
                 bitLockerKeyIds: (source as IBitLockerVolume)?.BitLockerKeyIds);
-            ManifestStore.Save(_manifestsDir, manifest, _key);
+            ManifestStore.Save(_manifestsDir, manifest, _key, WormMode);
             if (manifest.SkippedExclusions != null)
                 _log.Warn($"excluded extents restored as zeros: {string.Join(", ", manifest.SkippedExclusions)}");
             _log.Info($"fast-imaged '{name}' gen {generation}: {entries.Count} chunks ({holes} holes), {landed} landed (optimize pending)");
@@ -1670,9 +1747,7 @@ namespace Corpus
         private void WriteLandingFingerprint(LandingFingerprint fingerprint)
         {
             var path = Path.Combine(_landingDir, LandingFingerprintName);
-            var tmp = path + "." + Guid.NewGuid().ToString("n") + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(fingerprint, CorpusJsonContext.Default.LandingFingerprint));
-            File.Move(tmp, path, true);
+            AtomicFile.WriteAllText(path, JsonSerializer.Serialize(fingerprint, CorpusJsonContext.Default.LandingFingerprint));
         }
 
         // Resume gate for ImageFast. Returns the verified already-landed
@@ -1758,7 +1833,7 @@ namespace Corpus
             var dropped = 0;
             var pending = new List<ChunkRow>();
             var pendingPaths = new List<string>();
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent))
+            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent, wormMode: WormMode))
             {
                 var window = new EncodeWindow(pack, pending, _zstdLevel, pendingPaths);
                 foreach (var path in paths)

@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -175,6 +176,9 @@ namespace TicTack
         // validator can skip re-reading the source. SyncPipeline enables it
         // only when the validator is a HashValidator.
         public bool ComputeSourceHash { get; set; }
+        public long MinFreeBytes { get; set; }
+        public long ResumeThresholdBytes { get; set; } = 16L * 1024 * 1024;
+        internal Func<string, long>? FreeSpaceOverride { get; set; }
 
         public async Task<ActionResult> ExecuteAsync(FileActionArgs args, CancellationToken ct)
         {
@@ -200,6 +204,14 @@ namespace TicTack
                 var dir = PathUtil.EnsureExtended(Path.GetDirectoryName(dst) ?? "");
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
+                if (MinFreeBytes > 0
+                    && !DiskSpaceGuard.HasHeadroom(args.DestPath, args.SourceSnapshot?.Length ?? 0, MinFreeBytes, out var avail, FreeSpaceOverride))
+                {
+                    return TempCopyResult.Fail(
+                        $"Destination low on free space ({avail / (1024 * 1024)} MiB available, need headroom for min_free_gb).",
+                        retryable: false);
+                }
+
                 using (var probe = _accessor.OpenRead(src))
                 {
                     probe.ReadByte();
@@ -214,7 +226,7 @@ namespace TicTack
                     srcAttributes = currentSnap.Attributes;
                 var isSparse = (srcAttributes.GetValueOrDefault() & FileAttributes.SparseFile) == FileAttributes.SparseFile;
 
-                var (bytesCopied, copyMs, sourceHash) = await StreamToTempAsync(src, tmp, isSparse, ct);
+                var (bytesCopied, copyMs, sourceHash) = await StreamToTempAsync(src, tmp, isSparse, args.SourceSnapshot, ct);
                 StampTempMtime(tmp, src, args, dst);
                 return new TempCopyResult
                 {
@@ -230,27 +242,42 @@ namespace TicTack
             catch (DirectoryNotFoundException ex) { return TempCopyResult.Fail(ex.Message); }
             catch (PathTooLongException ex) { return TempCopyResult.Fail(ex.Message); }
             catch (NotSupportedException ex) { return TempCopyResult.Fail(ex.Message); }
-            // Retryable: sharing violations and transient IO. Pipeline unwraps
-            // these into ExponentialBackoffRetry.
-            catch (IOException ex) { return TempCopyResult.Fail(ex.Message, retryable: true); }
+            // Retryable: sharing violations and transient IO. Disk-full (ENOSPC /
+            // ERROR_DISK_FULL) is never retryable so a full drive fails fast.
+            catch (IOException ex)
+            {
+                if (DiskSpaceGuard.IsDiskFull(ex))
+                {
+                    try { var t = PathUtil.EnsureExtended(args.DestPath) + ".tictack.tmp"; if (File.Exists(t)) File.Delete(t); } catch { }
+                    return TempCopyResult.Fail("Destination disk full: " + ex.Message, retryable: false);
+                }
+                return TempCopyResult.Fail(ex.Message, retryable: true);
+            }
             catch (Win32Exception ex) { return TempCopyResult.Fail(ex.Message, retryable: true); }
         }
         // Byte pump: sparse flag or preallocate, then hashed or plain
         // copy. Returns what the temp actually holds (bytes, hash, ms).
-        private async Task<(long BytesCopied, double CopyMs, string? SourceHash)> StreamToTempAsync(string src, string tmp, bool isSparse, CancellationToken ct)
+        private async Task<(long BytesCopied, double CopyMs, string? SourceHash)> StreamToTempAsync(string src, string tmp, bool isSparse, FileSnapshot? snap, CancellationToken ct)
         {
             long bytesCopied = 0;
             double copyMs = -1;
             string? sourceHash = null;
+            bool resumed = TryPrepareResume(src, tmp, snap, out long resumeOffset);
+
             using (var srcStream = _accessor.OpenRead(src))
-            using (var dstStream = File.Create(tmp))
+            using (var dstStream = resumed
+                ? new FileStream(tmp, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
+                : File.Create(tmp))
             {
                 _checkpoint?.Invoke(CopyCheckpoint.TempCreated);
-                // Timed only while a counters listener is attached — otherwise
-                // this path stays allocation-free apart from the copy itself.
                 var timed = TicTackEventSource.Log.IsEnabled();
                 var sw = timed ? Stopwatch.StartNew() : null;
-                if (isSparse)
+                if (resumed)
+                {
+                    srcStream.Seek(resumeOffset, SeekOrigin.Begin);
+                    dstStream.Seek(resumeOffset, SeekOrigin.Begin);
+                }
+                else if (isSparse)
                 {
                     uint dummy;
                     DeviceIoControl(dstStream.SafeFileHandle.DangerousGetHandle(),
@@ -260,37 +287,84 @@ namespace TicTack
                 {
                     dstStream.SetLength(srcStream.Length);
                 }
-                if (ComputeSourceHash)
+
+                try
                 {
-                    // Hash the bytes as streamed: one pass serves both
-                    // the copy and a hash validator. Same buffer size as
-                    // CopyToAsync's default so throughput is unchanged.
-                    using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                    var buffer = ArrayPool<byte>.Shared.Rent(FileHasher.BufferSize);
-                    try
-                    {
-                        int read;
-                        while ((read = await srcStream.ReadAsync(buffer, 0, FileHasher.BufferSize, ct)) > 0)
-                        {
-                            hasher.AppendData(buffer, 0, read);
-                            await dstStream.WriteAsync(buffer, 0, read, ct);
-                        }
-                    }
-                    finally { ArrayPool<byte>.Shared.Return(buffer); }
-                    sourceHash = Convert.ToHexStringLower(hasher.GetHashAndReset());
+                    if (ComputeSourceHash && !resumed)
+                        sourceHash = await CopyHashedAsync(srcStream, dstStream, ct).ConfigureAwait(false);
+                    else
+                        await srcStream.CopyToAsync(dstStream, 81920, ct);
                 }
-                else
+                catch (Exception ex) when (snap.HasValue && snap.Value.Length >= ResumeThresholdBytes && dstStream.Position > 0 && !DiskSpaceGuard.IsDiskFull(ex))
                 {
-                    await srcStream.CopyToAsync(dstStream, 81920, ct);
+                    SaveResumeSidecar(dstStream, tmp, snap.Value);
+                    throw;
                 }
-                // Prefer the bytes actually written: a source appended
-                // mid-copy makes Length a lie.
                 bytesCopied = dstStream.Position;
                 if (sw != null) copyMs = sw.Elapsed.TotalMilliseconds;
             }
-            // No flush here: durability is the complete phase's job.
-
             return (bytesCopied, copyMs, sourceHash);
+        }
+
+        private static async Task<string> CopyHashedAsync(Stream srcStream, FileStream dstStream, CancellationToken ct)
+        {
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = ArrayPool<byte>.Shared.Rent(FileHasher.BufferSize);
+            try
+            {
+                int read;
+                while ((read = await srcStream.ReadAsync(buffer, 0, FileHasher.BufferSize, ct).ConfigureAwait(false)) > 0)
+                {
+                    hasher.AppendData(buffer, 0, read);
+                    await dstStream.WriteAsync(buffer, 0, read, ct).ConfigureAwait(false);
+                }
+            }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
+            return Convert.ToHexStringLower(hasher.GetHashAndReset());
+        }
+
+        private static void SaveResumeSidecar(FileStream dstStream, string tmp, FileSnapshot snap)
+        {
+            try
+            {
+                dstStream.Flush(true);
+                File.WriteAllText(tmp + ".resume", $"{snap.Length}|{snap.LastWriteTimeUtcTicks}|{dstStream.Position}");
+            }
+            catch { }
+        }
+
+        private bool TryPrepareResume(string src, string tmp, FileSnapshot? snap, out long resumeOffset)
+        {
+            resumeOffset = 0;
+            if (!snap.HasValue || snap.Value.Length < ResumeThresholdBytes) return false;
+            var resumePath = tmp + ".resume";
+            if (!File.Exists(tmp) || !File.Exists(resumePath)) return false;
+
+            try
+            {
+                var parts = File.ReadAllText(resumePath).Trim().Split('|');
+                if (parts.Length != 3) return false;
+                if (!long.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out long len)
+                    || !long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out long mtime)
+                    || !long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out long written))
+                    return false;
+                if (len != snap.Value.Length || mtime != snap.Value.LastWriteTimeUtcTicks) return false;
+                if (written <= 0 || written >= len || new FileInfo(tmp).Length < written) return false;
+
+                var localPrefix = FileHasher.ComputeHexPrefix(tmp, written, null);
+                string? remotePrefix = _accessor is IPrefixHashProvider php
+                    ? (php.TryComputePrefixHash(src, written, out var h) ? h : null)
+                    : FileHasher.ComputeHexPrefix(src, written, _accessor);
+                if (localPrefix == null || !string.Equals(localPrefix, remotePrefix, StringComparison.Ordinal))
+                    return false;
+
+                resumeOffset = written;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         // Best-effort mtime stamp; never fails the copy when it cannot.
@@ -344,6 +418,7 @@ namespace TicTack
                     File.Move(tmp.Tmp, dst);
                 }
                 _checkpoint?.Invoke(CopyCheckpoint.AfterCommit);
+                try { var rp = tmp.Tmp + ".resume"; if (File.Exists(rp)) File.Delete(rp); } catch { }
 
                 if (!SyncDirectory(dst))
                     return ActionResult.Fail("Could not fsync destination directory" + DirSyncDetail(), retryable: true);
@@ -359,7 +434,7 @@ namespace TicTack
             catch (DirectoryNotFoundException ex) { return ActionResult.Fail(ex.Message); }
             catch (PathTooLongException ex) { return ActionResult.Fail(ex.Message); }
             catch (NotSupportedException ex) { return ActionResult.Fail(ex.Message); }
-            catch (IOException ex) { return ActionResult.Fail(ex.Message, retryable: true); }
+            catch (IOException ex) { return ActionResult.Fail(ex.Message, retryable: !DiskSpaceGuard.IsDiskFull(ex)); }
             catch (Win32Exception ex) { return ActionResult.Fail(ex.Message, retryable: true); }
         }
 

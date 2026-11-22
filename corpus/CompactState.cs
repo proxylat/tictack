@@ -133,9 +133,7 @@ namespace Corpus
                 QueriedUtc = DateTime.UtcNow.ToString("o"),
             };
             var path = Path.Combine(manifestsDir, $"{generation:D6}.compact.json");
-            var tmp = path + "." + Guid.NewGuid().ToString("n") + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(record, CorpusJsonContext.Default.CompactStateRecord));
-            File.Move(tmp, path, true);
+            AtomicFile.WriteAllText(path, JsonSerializer.Serialize(record, CorpusJsonContext.Default.CompactStateRecord));
             log.Info($"recorded CompactOS state for gen {generation}: {(state.Enabled ? "on" : "off")}");
             return path;
         }

@@ -5,7 +5,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
@@ -64,15 +63,12 @@ namespace TicTack
         private long _unflushedBytes; // buffered since open; logical len = base + this
         private int _emitFails; // consecutive Emit failures; first one alerts via Event Log
         private DateTime _lastFlush = DateTime.UtcNow;
-        private DateTime _lastOrphanCheck = DateTime.UtcNow;
         private const int FlushIntervalSeconds = 4;
         private const long FlushThresholdBytes = 128 * 1024;
-        // Idle watchdog: the orphan check in EnsureOpenLocked only runs on
-        // Emit, so a quiet service would never recreate a deleted primary.
-        // One timer per logger at the flush cadence closes orphans and
-        // reopens eagerly even with zero emits.
-        private Timer? _idleTimer;
-        private bool _disposed;
+        // No flush timer by design: delivery happens on the write path
+        // (threshold/interval flush in EmitLocked) or at Dispose. A burst
+        // followed by silence sits in buffers until the next line — stale
+        // tail, never lost lines. Zero background threads in logging.
 
         public FileLogger(string path, LogLevel minLevel = LogLevel.Info, long maxSizeMb = 10, int maxFiles = 5)
         {
@@ -87,8 +83,6 @@ namespace TicTack
                     Directory.CreateDirectory(dir);
             }
             catch { }
-            _idleTimer = new Timer(_ => IdleTick(), null,
-                TimeSpan.FromSeconds(FlushIntervalSeconds), TimeSpan.FromSeconds(FlushIntervalSeconds));
         }
 
         public void Debug(string msg) { if (_minLevel <= LogLevel.Debug) Write("DBG", msg); }
@@ -182,22 +176,28 @@ namespace TicTack
         // never-written logger creates no file, and reopens after
         // rotation/Dispose/external delete. FileShare.ReadWrite|Delete
         // keeps tail/readers working, but means a deleted path leaves the
-        // handle orphaned — so a throttled existence check (flush cadence,
-        // no per-line stat) closes the orphan and the open below recreates
-        // the file. Worst case one interval of lines goes to the orphan.
+        // handle orphaned (writes to it succeed silently — the OS reports
+        // no error). So EVERY Emit stats existence first (~100ns cached,
+        // no disk I/O): missing closes the orphan and the open below
+        // recreates the file before the bytes land. Idle + deleted simply
+        // stays absent until the next line, which then recreates it.
         private void EnsureOpenLocked()
         {
             if (_writer != null)
             {
-                if ((DateTime.UtcNow - _lastOrphanCheck).TotalSeconds < FlushIntervalSeconds) return;
-                _lastOrphanCheck = DateTime.UtcNow;
-                try { if (File.Exists(_logPath)) return; } catch { return; }
+                bool missing;
+                try { missing = !File.Exists(_logPath); } catch { return; }
+                if (!missing) return;
                 CloseStreamLocked();
             }
             long len = 0;
             try { if (File.Exists(_logPath)) len = new FileInfo(_logPath).Length; } catch { }
-            _stream = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, bufferSize: 1);
-            _writer = new StreamWriter(_stream, Encoding.UTF8) { AutoFlush = true };
+            // Default 4KB FileStream buffer, no AutoFlush: per-line cost is
+            // a memcpy, physical writes happen on buffer-full or flush
+            // (threshold/interval in EmitLocked). Visibility is bounded by
+            // the flush cadence, not by write-through.
+            _stream = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+            _writer = new StreamWriter(_stream, Encoding.UTF8);
             _baseLength = len;
             _unflushedBytes = 0;
             _lastFlush = DateTime.UtcNow;
@@ -247,43 +247,13 @@ namespace TicTack
 
         public void Dispose()
         {
-            Timer? t;
             lock (_lock)
             {
-                _disposed = true;
-                t = _idleTimer;
-                _idleTimer = null;
                 FlushStreakLocked();
                 FlushStreamLocked();
                 CloseStreamLocked();
             }
-            // Outside the lock: a tick blocked on _lock proceeds after us
-            // and returns early on _disposed. Timer.Dispose never waits.
-            try { t?.Dispose(); } catch { }
-            // No disposed flag for writes: a Write after Dispose reopens lazily.
-        }
-
-        // Idle-timer tick: flush + orphan recovery with zero emits. Eagerly
-        // reopens a deleted primary (empty file) so operators watching the
-        // path see it back within one interval instead of at the next line.
-        private void IdleTick()
-        {
-            lock (_lock)
-            {
-                if (_disposed) return;
-                try
-                {
-                    FlushStreamLocked();
-                    if (_writer == null) return;
-                    bool missing;
-                    try { missing = !File.Exists(_logPath); } catch { return; }
-                    if (!missing) return;
-                    CloseStreamLocked();
-                    _lastOrphanCheck = DateTime.UtcNow;
-                    EnsureOpenLocked();
-                }
-                catch { }
-            }
+            // No disposed flag: a Write after Dispose reopens lazily.
         }
     }
 

@@ -200,11 +200,11 @@ public class LoggingTests
     }
 
     [Fact]
-    public async Task BufferedLogger_DeliversWhileAlive()
+    public async Task BufferedLogger_DeliversOnNextEmit()
     {
-        // Regression test for the dead-primary incident: entries must
-        // reach the inner logger mid-run, with no Dispose involved.
-        // Poll (pump is async); fail only after a generous deadline.
+        // Contract: no background threads in logging, so delivery happens
+        // on the write path — the first emit past the flush interval lands
+        // everything buffered, including earlier lines. No Dispose involved.
         var path = Path.GetTempFileName();
         try
         {
@@ -212,39 +212,44 @@ public class LoggingTests
             {
                 logger.Info("alive-one");
                 logger.Warn("alive-two");
+                await Task.Delay(4500); // pass the 4s flush interval
+                logger.Info("alive-three");
                 var deadline = DateTime.UtcNow.AddSeconds(15);
                 string content;
                 do
                 {
                     await Task.Delay(50);
                     content = File.ReadAllText(path);
-                    if (content.Contains("alive-two")) break;
+                    if (content.Contains("alive-three")) break;
                 } while (DateTime.UtcNow < deadline);
                 Assert.Contains("alive-one", content);
                 Assert.Contains("alive-two", content);
+                Assert.Contains("alive-three", content);
             }
         }
         finally { File.Delete(path); }
     }
 
     [Fact]
-    public async Task FileLogger_ExternalDeleteWhileIdle_Recreates()
+    public void FileLogger_ExternalDelete_RecreatesOnNextEmit()
     {
-        // Idle-service gap: no emits after the delete, so only the idle
-        // timer can bring the primary back. Deadline = ~2 intervals.
+        // Emit-path recovery: no timer, no sleep — the write after the
+        // delete recreates the file deterministically. The pre-delete line
+        // went to the orphan handle (OS reports no error) and is gone;
+        // the post-delete line must land in the recreated file.
         var path = Path.GetTempFileName();
         try
         {
             using (var logger = new FileLogger(path, LogLevel.Debug))
             {
                 logger.Info("before-delete");
-                Assert.Contains("before-delete", File.ReadAllText(path));
                 File.Delete(path);
-                var deadline = DateTime.UtcNow.AddSeconds(12);
-                while (!File.Exists(path) && DateTime.UtcNow < deadline)
-                    await Task.Delay(200);
-                Assert.True(File.Exists(path), "primary not recreated while idle");
+                logger.Info("after-delete");
             }
+            Assert.True(File.Exists(path));
+            var content = File.ReadAllText(path);
+            Assert.Contains("after-delete", content);
+            Assert.DoesNotContain("before-delete", content);
         }
         finally { try { File.Delete(path); } catch { } }
     }
@@ -393,8 +398,6 @@ public class LoggingTests
             var logger = new FileLogger(path, LogLevel.Debug);
             logger.Info("before delete");
             File.Delete(path);
-            // Orphan check rides the flush cadence, so wait it out.
-            Thread.Sleep(4100);
             logger.Info("after delete");
             logger.Dispose();
             var content = File.ReadAllText(path);

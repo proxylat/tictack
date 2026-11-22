@@ -25,14 +25,16 @@ namespace Corpus
         private readonly long _maxPackBytes;
         private readonly string? _encryptHook;
         private readonly int _eccOverheadPercent;
+        private readonly bool _wormMode;
         private readonly List<(byte[] Digest, long Offset, uint Stored, uint Plain, byte Codec)> _index = new List<(byte[] Digest, long Offset, uint Stored, uint Plain, byte Codec)>();
         private FileStream? _stream;
         private string? _tmpPath;
         private string? _packName;
         private long _currentSize;
         private bool _disposed;
+        public int SealedPackCount { get; private set; }
 
-        public PackWriter(string packsDir, long maxPackBytes = DefaultMaxPackBytes, string? encryptHook = null, int eccOverheadPercent = 0)
+        public PackWriter(string packsDir, long maxPackBytes = DefaultMaxPackBytes, string? encryptHook = null, int eccOverheadPercent = 0, bool wormMode = false)
         {
             ArgumentNullException.ThrowIfNull(packsDir);
             if (maxPackBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxPackBytes));
@@ -41,6 +43,7 @@ namespace Corpus
             _maxPackBytes = maxPackBytes;
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
             _eccOverheadPercent = eccOverheadPercent;
+            _wormMode = wormMode;
             Directory.CreateDirectory(_packsDir);
         }
 
@@ -134,6 +137,7 @@ namespace Corpus
             _stream = null;
             var sealedPath = Path.Combine(_packsDir, _packName!);
             File.Move(_tmpPath!, sealedPath);
+            AtomicFile.SyncParentDir(sealedPath);
             // Reset BEFORE the hook: a hook failure must leave a clean writer,
             // never a half-sealed pack the next Add would corrupt.
             _tmpPath = null;
@@ -146,6 +150,9 @@ namespace Corpus
             // encrypted); a missing sidecar just reads like an old pack.
             if (_eccOverheadPercent > 0)
                 PackEcc.WriteSidecar(sealedPath, _eccOverheadPercent);
+            if (_wormMode)
+                Hardening.SealWormFile(sealedPath);
+            SealedPackCount++;
         }
     }
 
@@ -227,6 +234,39 @@ namespace Corpus
                 if (n == 0) throw new InvalidDataException("truncated pack blob header");
                 filled += n;
             }
+        }
+
+        // Reads the CPK1 trailing index of a sealed pack without touching blob payloads.
+        public static List<(byte[] Digest, long Offset, int Stored, int Plain)> ReadIndex(string packPath)
+        {
+            using var stream = new FileStream(packPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (stream.Length < 16)
+                throw new InvalidDataException("Pack too small for CPK1 trailer: " + packPath);
+            stream.Seek(-16, SeekOrigin.End);
+            Span<byte> trailer = stackalloc byte[16];
+            Fill(stream, trailer);
+            if (trailer[12] != (byte)'C' || trailer[13] != (byte)'P' || trailer[14] != (byte)'K' || trailer[15] != (byte)'1')
+                throw new InvalidDataException("Invalid CPK1 magic in pack: " + packPath);
+
+            long indexOffset = (long)BinaryPrimitives.ReadUInt64LittleEndian(trailer);
+            uint count = BinaryPrimitives.ReadUInt32LittleEndian(trailer.Slice(8));
+            if (indexOffset < 0 || indexOffset + (long)count * 49L > stream.Length - 16)
+                throw new InvalidDataException("Corrupt CPK1 index bounds in pack: " + packPath);
+
+            stream.Seek(indexOffset, SeekOrigin.Begin);
+            var rows = new List<(byte[] Digest, long Offset, int Stored, int Plain)>((int)count);
+            Span<byte> tail = stackalloc byte[17];
+            for (uint i = 0; i < count; i++)
+            {
+                var digest = new byte[32];
+                Fill(stream, digest);
+                Fill(stream, tail);
+                long offset = (long)BinaryPrimitives.ReadUInt64LittleEndian(tail);
+                int stored = (int)BinaryPrimitives.ReadUInt32LittleEndian(tail.Slice(8));
+                int plain = (int)BinaryPrimitives.ReadUInt32LittleEndian(tail.Slice(12));
+                rows.Add((digest, offset, stored, plain));
+            }
+            return rows;
         }
     }
 }

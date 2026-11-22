@@ -17,6 +17,9 @@ namespace TicTack
         public JobsDefaultsConfig JobsDefaults { get; set; }
         public WatchdogConfig Watchdog { get; set; }
         public ExternalDrivesConfig ExternalDrives { get; set; }
+        public RemoteSystemConfig? RemoteSystem { get; set; }
+        public bool StrictConfigPerms { get; set; }
+        public bool EcoQos { get; set; }
 
         // Minutes to wait for [VolumeLabel] volumes to appear (slow USB
         // spin-up) before failing fast on unresolved labels. Top-level on
@@ -80,6 +83,13 @@ namespace TicTack
         public FilterConfig Filter { get; set; }
         public SyncConfig Sync { get; set; }
 
+        [YamlIgnore]
+        public string? RemoteEndpoint { get; set; }
+        [YamlIgnore]
+        public bool RemoteTls { get; set; }
+        [YamlIgnore]
+        public byte[]? RemotePsk { get; set; }
+
         public SourceConfig()
         {
             Path = string.Empty;
@@ -117,6 +127,9 @@ namespace TicTack
         public string? LockHandling { get; set; }
         public string FileAccess { get; set; }
         public int LockWaitSeconds { get; set; }
+        // Optional destination free-space floor in GB (null/<=0 = disabled).
+        public double? MinFreeGb { get; set; }
+        public bool StrictFitCheck { get; set; }
         public int DeleteThresholdCount { get; set; }
         public long? DeleteThresholdSizeGb { get; set; }
         public double DeleteThresholdPercent { get; set; }
@@ -358,6 +371,15 @@ namespace TicTack
         public bool LowPriority { get; set; }
         public bool OnAcOnly { get; set; }
         public bool PreventSleep { get; set; }
+        // Null = inherit jobs_defaults.show_terminal (default false).
+        public bool? ShowTerminal { get; set; }
+        // Optional cloud/network stability gate before launching the job.
+        public bool? NetCheck { get; set; }
+        public string? NetCheckHost { get; set; }
+        public int? NetCheckSamples { get; set; }
+        public int? NetCheckMaxMs { get; set; }
+        public int? NetCheckWaitSeconds { get; set; }
+        public bool? NetCheckIcmp { get; set; }
 
         public JobConfig()
         {
@@ -372,6 +394,13 @@ namespace TicTack
     {
         public string? MissedRun { get; set; }
         public int? TimeoutMinutes { get; set; }
+        public bool? ShowTerminal { get; set; }
+        public bool? NetCheck { get; set; }
+        public string? NetCheckHost { get; set; }
+        public int? NetCheckSamples { get; set; }
+        public int? NetCheckMaxMs { get; set; }
+        public int? NetCheckWaitSeconds { get; set; }
+        public bool? NetCheckIcmp { get; set; }
     }
 
     public class WatchdogConfig
@@ -434,7 +463,8 @@ namespace TicTack
 
         public static bool Validate(TicTackConfig cfg, ILogger log)
         {
-            if (cfg.Sources == null || cfg.Sources.Count == 0)
+            bool hasRemote = cfg.RemoteSystem != null && (cfg.RemoteSystem.HasAgent || cfg.RemoteSystem.HasClient);
+            if ((cfg.Sources == null || cfg.Sources.Count == 0) && !hasRemote)
             {
                 log.Error("No sources configured");
                 return false;
@@ -475,10 +505,15 @@ namespace TicTack
                 valid = false;
             }
             var destinations = new Dictionary<string, string>(PathComparer);
-            foreach (var src in cfg.Sources)
+            if (cfg.Sources != null)
             {
-                if (!ValidateSource(src, destinations, log)) valid = false;
+                foreach (var src in cfg.Sources)
+                {
+                    if (!ValidateSource(src, destinations, log)) valid = false;
+                }
             }
+            if (cfg.RemoteSystem != null && !ValidateRemoteSystem(cfg, cfg.RemoteSystem, destinations, log))
+                valid = false;
             return valid;
         }
         // One source stanza: paths, monitor, destinations, numeric knobs.
@@ -754,6 +789,266 @@ namespace TicTack
             if (parsed == 0) return false;
             duration = TimeSpan.FromSeconds(totalSeconds);
             return true;
+        }
+
+        private static bool ValidateRemoteSystem(TicTackConfig cfg, RemoteSystemConfig rs, Dictionary<string, string> destinations, ILogger log)
+        {
+            bool valid = true;
+            if (rs.HasAgent)
+            {
+                if (string.IsNullOrWhiteSpace(rs.Listen))
+                {
+                    log.Error("remote_system.listen is required when configuring remote agent");
+                    valid = false;
+                }
+                else if (!TryParseEndpoint(rs.Listen, out _, out _))
+                {
+                    log.Error("remote_system.listen must be host:port with port 1..65535");
+                    valid = false;
+                }
+                if (string.IsNullOrWhiteSpace(rs.Root))
+                {
+                    log.Error("remote_system.root is required when configuring remote agent");
+                    valid = false;
+                }
+            }
+            if (rs.HasClient)
+            {
+                foreach (var ep in rs.GetEndpoints())
+                {
+                    if (!TryParseEndpoint(ep, out _, out _))
+                    {
+                        log.Error("remote_system.host must be host:port with port 1..65535: " + ep);
+                        valid = false;
+                    }
+                }
+                if (string.IsNullOrWhiteSpace(rs.Destination))
+                {
+                    log.Error("remote_system.destination is required when remote_system.host is set");
+                    valid = false;
+                }
+                foreach (var resolved in ResolveRemoteSources(cfg))
+                {
+                    if (!ValidateSource(resolved, destinations, log)) valid = false;
+                }
+            }
+            return valid;
+        }
+
+        public static IList<SourceConfig> ResolveRemoteSources(TicTackConfig cfg)
+        {
+            var result = new List<SourceConfig>();
+            var rs = cfg.RemoteSystem;
+            if (rs == null || !rs.HasClient) return result;
+
+            var baseSrc = cfg.Sources != null && cfg.Sources.Count > 0 ? cfg.Sources[0] : new SourceConfig();
+            var endpoints = rs.GetEndpoints();
+
+            foreach (var ep in endpoints)
+            {
+                var dest = endpoints.Count == 1
+                    ? rs.Destination
+                    : Path.Combine(rs.Destination, SanitizeEndpointDir(ep));
+                var basePath = TryParseEndpoint(ep, out var h, out var p)
+                    ? $"remote://{h}:{p}"
+                    : "remote://" + ep;
+
+                result.Add(new SourceConfig
+                {
+                    Path = basePath,
+                    Destination = dest,
+                    StateDbPath = rs.StateDbPath ?? baseSrc.StateDbPath,
+                    DebounceSeconds = rs.DebounceSeconds ?? baseSrc.DebounceSeconds,
+                    Filter = rs.Filter ?? baseSrc.Filter,
+                    Sync = rs.Sync ?? baseSrc.Sync,
+                    RemoteEndpoint = ep,
+                    RemoteTls = rs.Tls,
+                });
+            }
+            return result;
+        }
+
+        internal static bool TryParseEndpoint(string endpoint, out string host, out int port)
+        {
+            host = string.Empty;
+            port = 0;
+            if (string.IsNullOrWhiteSpace(endpoint)) return false;
+            int colon = endpoint.LastIndexOf(':');
+            if (colon <= 0 || colon == endpoint.Length - 1) return false;
+            host = endpoint.Substring(0, colon).Trim('[', ']');
+            return !string.IsNullOrEmpty(host)
+                && int.TryParse(endpoint.AsSpan(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out port)
+                && port >= 1 && port <= 65535;
+        }
+
+        private static string SanitizeEndpointDir(string ep) =>
+            ep.Replace(':', '_').Replace('[', '_').Replace(']', '_');
+    }
+
+    public class RemoteSystemConfig
+    {
+        public string? Listen { get; set; }
+        public string? Root { get; set; }
+        public string? AllowIp { get; set; }
+        public int MaxClients { get; set; } = 8;
+        public bool Sandbox { get; set; } = true;
+
+        public string? Host { get; set; }
+        public IList<string> Hosts { get; set; } = new List<string>();
+        public string Destination { get; set; } = string.Empty;
+
+        public bool Tls { get; set; } = true;
+        public string? Psk { get; set; }
+        public string? PskEnv { get; set; }
+        public string? PskFile { get; set; }
+
+        // Nullable overrides: null inherits from sources[0].
+        public double? DebounceSeconds { get; set; }
+        public string? StateDbPath { get; set; }
+        public FilterConfig? Filter { get; set; }
+        public SyncConfig? Sync { get; set; }
+
+        [YamlIgnore]
+        public bool HasAgent => !string.IsNullOrWhiteSpace(Listen) || !string.IsNullOrWhiteSpace(Root);
+
+        [YamlIgnore]
+        public bool HasClient => !string.IsNullOrWhiteSpace(Host) || (Hosts != null && Hosts.Count > 0);
+
+        public IList<string> GetEndpoints()
+        {
+            var list = new List<string>();
+            if (!string.IsNullOrWhiteSpace(Host)) list.Add(Host.Trim());
+            if (Hosts != null)
+            {
+                foreach (var h in Hosts)
+                {
+                    if (!string.IsNullOrWhiteSpace(h)) list.Add(h.Trim());
+                }
+            }
+            return list;
+        }
+    }
+
+    public static partial class VolumeResolver
+    {
+        public static void ResolveConfig(TicTackConfig cfg, ILogger? log = null) =>
+            ResolveConfig(cfg, GetVolumes(log));
+
+        internal static void ResolveConfig(TicTackConfig cfg, IEnumerable<(string label, string root)> volumes)
+        {
+            if (cfg == null || cfg.Sources == null) return;
+            var map = BuildVolumeMap(volumes);
+
+            foreach (var src in cfg.Sources)
+            {
+                src.Path = Resolve(src.Path, map);
+                for (var i = 0; i < src.Paths.Count; i++)
+                    src.Paths[i] = Resolve(src.Paths[i], map);
+                src.Destination = Resolve(src.Destination, map);
+                src.StateDbPath = Resolve(src.StateDbPath, map);
+                if (src.Sync?.Versioning?.Path != null)
+                    src.Sync.Versioning.Path = Resolve(src.Sync.Versioning.Path, map);
+                if (src.Sync?.Deletion?.Path != null)
+                    src.Sync.Deletion.Path = Resolve(src.Sync.Deletion.Path, map);
+            }
+
+            if (cfg.Logging?.Path != null) cfg.Logging.Path = Resolve(cfg.Logging.Path, map);
+            if (cfg.Logging?.AlertPath != null) cfg.Logging.AlertPath = Resolve(cfg.Logging.AlertPath, map);
+            if (cfg.RemoteSystem != null)
+            {
+                if (cfg.RemoteSystem.Root != null) cfg.RemoteSystem.Root = Resolve(cfg.RemoteSystem.Root, map);
+                if (!string.IsNullOrEmpty(cfg.RemoteSystem.Destination)) cfg.RemoteSystem.Destination = Resolve(cfg.RemoteSystem.Destination, map);
+                if (cfg.RemoteSystem.StateDbPath != null) cfg.RemoteSystem.StateDbPath = Resolve(cfg.RemoteSystem.StateDbPath, map);
+                if (cfg.RemoteSystem.PskFile != null) cfg.RemoteSystem.PskFile = Resolve(cfg.RemoteSystem.PskFile, map);
+            }
+
+            if (cfg.Jobs != null)
+            {
+                foreach (var job in cfg.Jobs)
+                {
+                    if (job.WorkingDir != null) job.WorkingDir = Resolve(job.WorkingDir, map);
+                    if (job.Command != null) job.Command = Resolve(job.Command, map);
+                }
+            }
+
+            if (cfg.ExternalDrives?.WorkingDir != null) cfg.ExternalDrives.WorkingDir = Resolve(cfg.ExternalDrives.WorkingDir, map);
+            if (cfg.ExternalDrives?.Command != null) cfg.ExternalDrives.Command = Resolve(cfg.ExternalDrives.Command, map);
+        }
+
+        internal static List<string> FindUnresolvedLabels(TicTackConfig cfg)
+        {
+            var fields = new List<string>();
+            if (cfg == null || cfg.Sources == null) return fields;
+            foreach (var src in cfg.Sources)
+            {
+                AddField(fields, src.Path);
+                if (src.Paths != null) fields.AddRange(src.Paths);
+                AddField(fields, src.Destination);
+                AddField(fields, src.StateDbPath);
+                if (src.Sync?.Versioning != null) AddField(fields, src.Sync.Versioning.Path);
+                if (src.Sync?.Deletion != null) AddField(fields, src.Sync.Deletion.Path);
+            }
+            if (cfg.Logging != null)
+            {
+                AddField(fields, cfg.Logging.Path);
+                AddField(fields, cfg.Logging.AlertPath);
+            }
+            if (cfg.RemoteSystem != null)
+            {
+                AddField(fields, cfg.RemoteSystem.Root);
+                AddField(fields, cfg.RemoteSystem.Destination);
+                AddField(fields, cfg.RemoteSystem.StateDbPath);
+                AddField(fields, cfg.RemoteSystem.PskFile);
+            }
+            if (cfg.Jobs != null)
+            {
+                foreach (var job in cfg.Jobs) AddField(fields, job.WorkingDir);
+            }
+            if (cfg.ExternalDrives != null) AddField(fields, cfg.ExternalDrives.WorkingDir);
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var labels = new List<string>();
+            foreach (var field in fields)
+            {
+                if (string.IsNullOrEmpty(field)) continue;
+                foreach (var label in MatchLabels(field))
+                    if (seen.Add(label)) labels.Add(label);
+            }
+            return labels;
+        }
+
+        private static void AddField(List<string> fields, string? value)
+        {
+            if (!string.IsNullOrEmpty(value)) fields.Add(value);
+        }
+
+        internal static bool EnsureResolved(TicTackConfig cfg, double waitMinutes, ILogger log)
+        {
+            if (double.IsNaN(waitMinutes) || waitMinutes < 0) waitMinutes = 0;
+            var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(waitMinutes);
+            bool warned = false;
+            while (true)
+            {
+                ResolveConfig(cfg, log);
+                var missing = FindUnresolvedLabels(cfg);
+                if (missing.Count == 0) return true;
+                if (DateTime.UtcNow >= deadline)
+                {
+                    log.Error("Volume(s) not available: " + string.Join(", ", missing)
+                        + ". Check the drive is plugged in and the label matches.");
+                    return false;
+                }
+                if (!warned)
+                {
+                    log.Warn("Waiting for volume(s): " + string.Join(", ", missing));
+                    warned = true;
+                }
+                else
+                {
+                    log.Debug("Still waiting for volume(s): " + string.Join(", ", missing));
+                }
+                System.Threading.Thread.Sleep(TimeSpan.FromSeconds(10));
+            }
         }
     }
 }

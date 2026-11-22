@@ -24,16 +24,37 @@ namespace Corpus
             return Convert.ToHexString(digest).ToLowerInvariant();
         }
 
-        public static byte[] EnsureKey(string storeRoot)
+        private static string? _overrideKeyPath;
+        private static string? _overrideKeyEnv;
+
+        public static void ConfigureOverride(string? keyPath, string? keyEnv)
         {
-            Directory.CreateDirectory(storeRoot);
-            var path = Path.Combine(storeRoot, "id.key");
+            _overrideKeyPath = string.IsNullOrWhiteSpace(keyPath) ? null : keyPath.Trim();
+            _overrideKeyEnv = string.IsNullOrWhiteSpace(keyEnv) ? null : keyEnv.Trim();
+        }
+
+        public static byte[] EnsureKey(string storeRoot, string? keyPath = null, string? keyEnv = null)
+        {
+            var effectiveEnv = keyEnv ?? _overrideKeyEnv;
+            if (!string.IsNullOrWhiteSpace(effectiveEnv))
+            {
+                var raw = Environment.GetEnvironmentVariable(effectiveEnv);
+                if (!string.IsNullOrWhiteSpace(raw))
+                    return SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(raw));
+            }
+
+            var effectivePath = keyPath ?? _overrideKeyPath;
+            var path = !string.IsNullOrWhiteSpace(effectivePath)
+                ? effectivePath
+                : Path.Combine(storeRoot, "id.key");
+
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
             if (!File.Exists(path))
             {
                 var key = RandomNumberGenerator.GetBytes(32);
-                File.WriteAllBytes(path, key);
-                if (OperatingSystem.IsLinux())
-                    File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                AtomicFile.WriteAllBytes(path, key, overwrite: false, ownerOnlyOnLinux: true);
                 return key;
             }
             return File.ReadAllBytes(path);
