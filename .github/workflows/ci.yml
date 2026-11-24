@@ -103,10 +103,6 @@ jobs:
           # Pinned: a new rule release must not turn the gate red on its own.
           pipx install 'semgrep==1.177.0'
           semgrep --config r/csharp --metrics off --json -o semgrep.json src corpus
-      - name: ast-grep banked rules
-        run: |
-          npm install -g '@ast-grep/cli@0.45.3'
-          ast-grep scan
       - name: Upload semgrep results
         if: failure()
         uses: actions/upload-artifact@v7

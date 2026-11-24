@@ -31,6 +31,7 @@ namespace TicTack
 
         private static void Write(string level, string msg, ConsoleColor color)
         {
+            msg = LogLevelParser.Clean(msg);
             var orig = Console.ForegroundColor;
             Console.ForegroundColor = color;
             Console.WriteLine("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] [" + level + "] " + msg);
@@ -99,6 +100,7 @@ namespace TicTack
 
         private void Write(string level, string msg)
         {
+            msg = LogLevelParser.Clean(msg);
             var now = DateTime.Now;
             lock (_lock)
             {
@@ -293,6 +295,7 @@ namespace TicTack
 
         private void Write(string level, string msg)
         {
+            msg = LogLevelParser.Clean(msg);
             var now = DateTime.Now;
             lock (_lock)
             {
@@ -388,8 +391,8 @@ namespace TicTack
         }
         public void Debug(string msg) { }
         public void Info(string msg) { }
-        public void Warn(string msg) { if (_minLevel <= LogLevel.Warn) DesktopAlert.Write("WARN", msg); }
-        public void Error(string msg, Exception? ex = null) { if (_minLevel <= LogLevel.Error) DesktopAlert.Write("ERROR", msg, ex); }
+        public void Warn(string msg) { if (_minLevel <= LogLevel.Warn) DesktopAlert.Write("WARN", LogLevelParser.Clean(msg)); }
+        public void Error(string msg, Exception? ex = null) { if (_minLevel <= LogLevel.Error) DesktopAlert.Write("ERROR", LogLevelParser.Clean(msg), ex); }
     }
 
     public class EventLogLogger : ILogger
@@ -406,13 +409,14 @@ namespace TicTack
         public void Warn(string msg)
         {
             if (_minLevel > LogLevel.Warn || !OperatingSystem.IsWindows()) return;
-            try { EventLog.WriteEntry(_source, msg, EventLogEntryType.Warning); }
+            try { EventLog.WriteEntry(_source, LogLevelParser.Clean(msg), EventLogEntryType.Warning); }
             catch { }
         }
         public void Error(string msg, Exception? ex = null)
         {
             if (_minLevel > LogLevel.Error || !OperatingSystem.IsWindows()) return;
-            try { EventLog.WriteEntry(_source, msg + (ex != null ? "\n" + ex : ""), EventLogEntryType.Error); }
+            var body = LogLevelParser.Clean(msg) + (ex != null ? " " + LogLevelParser.Clean(ex.ToString()) : "");
+            try { EventLog.WriteEntry(_source, body, EventLogEntryType.Error); }
             catch { }
         }
     }
@@ -425,10 +429,10 @@ namespace TicTack
             _loggers = loggers != null ? loggers.ToArray() : Array.Empty<ILogger>();
         }
 
-        public void Debug(string msg) { foreach (var l in _loggers) l.Debug(msg); }
-        public void Info(string msg) { foreach (var l in _loggers) l.Info(msg); }
-        public void Warn(string msg) { foreach (var l in _loggers) l.Warn(msg); }
-        public void Error(string msg, Exception? ex = null) { foreach (var l in _loggers) l.Error(msg, ex); }
+        public void Debug(string msg) { var c = LogLevelParser.Clean(msg); foreach (var l in _loggers) l.Debug(c); }
+        public void Info(string msg) { var c = LogLevelParser.Clean(msg); foreach (var l in _loggers) l.Info(c); }
+        public void Warn(string msg) { var c = LogLevelParser.Clean(msg); foreach (var l in _loggers) l.Warn(c); }
+        public void Error(string msg, Exception? ex = null) { var c = LogLevelParser.Clean(msg); foreach (var l in _loggers) l.Error(c, ex); }
         public void Dispose()
         {
             foreach (var logger in _loggers)
@@ -438,6 +442,9 @@ namespace TicTack
 
     public static class LogLevelParser
     {
+        internal static string Clean(string? msg) =>
+            string.IsNullOrEmpty(msg) ? string.Empty : msg.Replace('\r', ' ').Replace('\n', ' ');
+
         public static LogLevel Parse(string? level, LogLevel defaultLevel = LogLevel.Info) =>
             TryParse(level, out var parsed) ? parsed : defaultLevel;
 

@@ -26,7 +26,7 @@ namespace TicTack
             var result = await _deletion.HandleDeletionAsync(sourcePath, destPath, ct);
             if (!result.Success)
             {
-                _log.Error(label + ": " + destPath + ": " + result.ErrorMessage);
+                _log.Error(Clean(label + ": " + destPath + ": " + result.ErrorMessage));
                 return false;
             }
             // Barrier symmetry with the copy path (file fsync → rename →
@@ -34,7 +34,7 @@ namespace TicTack
             // entry. Benign when it fails — next parity re-deletes — so a
             // failed sync never fails the delete, it just gets logged.
             if (!CopyAction.FlushDirectory(Path.GetDirectoryName(destPath)))
-                _log.Debug(label + ": directory sync failed after delete: " + destPath);
+                _log.Debug(Clean(label + ": directory sync failed after delete: " + destPath));
             if (_stateDb != null)
             {
                 try { await _stateDb.DeleteAsync(rel); }
@@ -42,5 +42,8 @@ namespace TicTack
             }
             return true;
         }
+
+        private static string Clean(string? s) =>
+            string.IsNullOrEmpty(s) ? string.Empty : s.Replace('\r', ' ').Replace('\n', ' ');
     }
 }

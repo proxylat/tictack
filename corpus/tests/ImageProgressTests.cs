@@ -35,7 +35,7 @@ public sealed class ImageProgressTests : IDisposable
     {
         private readonly object _gate = new();
         public readonly List<string> Lines = new();
-        private void Add(string line) { lock (_gate) Lines.Add(line); }
+        private void Add(string line) { lock (_gate) Lines.Add((line ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ')); }
         public void Debug(string msg) => Add("DBG:" + msg);
         public void Info(string msg) => Add("INF:" + msg);
         public void Warn(string msg) => Add("WRN:" + msg);

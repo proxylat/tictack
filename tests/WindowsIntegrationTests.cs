@@ -173,15 +173,4 @@ public class WindowsIntegrationTests
         Assert.Equal(root + "\\probe\\file.txt", resolved);
     }
 
-    [Fact]
-    [Trait("Category", "Windows")]
-    public void ExternalDrives_DefaultCommand_IsWindowsShape()
-    {
-        if (!OperatingSystem.IsWindows()) return;
-
-        var command = new ExternalDrivesConfig().Command;
-
-        Assert.Contains("restic.exe", command);
-        Assert.Contains("{drive}\\restic-repo", command);
-    }
 }

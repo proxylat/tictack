@@ -118,7 +118,7 @@ namespace TicTack
                 var dstHash = FileHasher.ComputeHex(dstFull, null);
                 if (string.Equals(srcHash, dstHash, StringComparison.Ordinal)) return 0;
                 // Routine (file changed mid-copy): file log only, never the desktop.
-                _log.Info("Scrub mismatch, re-queueing from source [" + _config.Path + "]: " + rel);
+                _log.Info(Clean("Scrub mismatch, re-queueing from source [" + _config.Path + "]: " + rel));
                 await _deleteAsync(null, destPath, rel, "Scrub mismatch", ct);
                 return 1;
             }
@@ -126,9 +126,12 @@ namespace TicTack
             {
                 // Locked or vanished mid-read is a skip, never a mismatch:
                 // deleting on a read failure would destroy good data.
-                _log.Debug("Scrub skipped: " + rel + " (" + ex.Message + ")");
+                _log.Debug(Clean("Scrub skipped: " + rel + " (" + ex.Message + ")"));
                 return -1;
             }
         }
+
+        private static string Clean(string? s) =>
+            string.IsNullOrEmpty(s) ? string.Empty : s.Replace('\r', ' ').Replace('\n', ' ');
     }
 }

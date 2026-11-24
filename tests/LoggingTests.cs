@@ -219,7 +219,9 @@ public class LoggingTests
                 do
                 {
                     await Task.Delay(50);
-                    content = File.ReadAllText(path);
+                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    using (var sr = new StreamReader(fs))
+                        content = sr.ReadToEnd();
                     if (content.Contains("alive-three")) break;
                 } while (DateTime.UtcNow < deadline);
                 Assert.Contains("alive-one", content);
@@ -414,5 +416,38 @@ public class LoggingTests
         logger.Info("ignored");
         logger.Warn("warn test");
         logger.Error("error test", new InvalidOperationException("boom"));
+    }
+
+    [Fact]
+    public void BufferedLogger_SanitizesNewlines_PreventsLogForging()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var logger = new BufferedLogger(new FileLogger(path, LogLevel.Info)))
+                logger.Info("hello\r\nFAKE_ENTRY");
+
+            var lines = File.ReadAllLines(path);
+            Assert.Single(lines);
+            Assert.Contains("hello  FAKE_ENTRY", lines[0]);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public void FileLogger_SanitizesExceptionNewlines()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var logger = new FileLogger(path, LogLevel.Info))
+                logger.Error("err\r\nline", new InvalidOperationException("bad\r\nmsg"));
+
+            var lines = File.ReadAllLines(path);
+            Assert.Equal(2, lines.Length);
+            Assert.Contains("err  line", lines[0]);
+            Assert.Contains("bad  msg", lines[1]);
+        }
+        finally { try { File.Delete(path); } catch { } }
     }
 }
