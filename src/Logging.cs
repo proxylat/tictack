@@ -394,15 +394,25 @@ namespace TicTack
 
     public class EventLogLogger : ILogger
     {
+        private readonly string _source;
         private readonly LogLevel _minLevel;
-        public EventLogLogger(LogLevel minLevel = LogLevel.Error) { _minLevel = minLevel; }
+        public EventLogLogger(string source = "TicTackSv", LogLevel minLevel = LogLevel.Warn)
+        {
+            _source = string.IsNullOrEmpty(source) ? "TicTackSv" : source;
+            _minLevel = minLevel;
+        }
         public void Debug(string msg) { }
         public void Info(string msg) { }
-        public void Warn(string msg) { }
+        public void Warn(string msg)
+        {
+            if (_minLevel > LogLevel.Warn || !OperatingSystem.IsWindows()) return;
+            try { EventLog.WriteEntry(_source, msg, EventLogEntryType.Warning); }
+            catch { }
+        }
         public void Error(string msg, Exception? ex = null)
         {
-            if (_minLevel > LogLevel.Error) return;
-            try { EventLog.WriteEntry("TicTackSv", msg + (ex != null ? "\n" + ex : ""), EventLogEntryType.Error); }
+            if (_minLevel > LogLevel.Error || !OperatingSystem.IsWindows()) return;
+            try { EventLog.WriteEntry(_source, msg + (ex != null ? "\n" + ex : ""), EventLogEntryType.Error); }
             catch { }
         }
     }
@@ -453,7 +463,8 @@ namespace TicTack
     internal static class LoggerFactory
     {
         public static ILogger Create(string? levelName, string logPath, int maxSizeMb, int maxFiles,
-            string? alertPath, bool console, bool eventLog, string? backupPath = null, bool? alertEnabled = null)
+            string? alertPath, bool console, bool eventLog, string? backupPath = null, bool? alertEnabled = null,
+            string eventLogSource = "TicTackSv")
         {
             var level = LogLevelParser.Parse(levelName);
             var loggers = new List<ILogger>
@@ -470,7 +481,7 @@ namespace TicTack
             // alert_enabled: false is a hard off even if alert_path is set.
             var effectiveAlertPath = alertEnabled == false ? null : alertPath;
             loggers.Add(new DesktopAlertLogger(LogLevel.Warn, effectiveAlertPath));
-            if (eventLog) loggers.Add(new EventLogLogger());
+            if (eventLog) loggers.Add(new EventLogLogger(eventLogSource));
             var log = new MultiLogger(loggers);
             if (!string.IsNullOrEmpty(levelName) && !LogLevelParser.IsValid(levelName))
                 log.Warn("Unknown logging.level '" + levelName + "', using " + level);

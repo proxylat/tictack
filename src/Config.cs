@@ -17,7 +17,7 @@ namespace TicTack
         public JobsDefaultsConfig JobsDefaults { get; set; }
         public WatchdogConfig Watchdog { get; set; }
         public ExternalDrivesConfig ExternalDrives { get; set; }
-        public RemoteSystemConfig? RemoteSystem { get; set; }
+        public RemoteSystemConfig? RemoteSync { get; set; }
         public bool StrictConfigPerms { get; set; }
         public bool EcoQos { get; set; }
 
@@ -434,9 +434,6 @@ namespace TicTack
 
         public ExternalDrivesConfig()
         {
-            Command = OperatingSystem.IsWindows()
-                ? "restic.exe backup --compression auto \"{source}\" -r \"{drive}\\restic-repo\""
-                : "restic backup --compression auto \"{source}\" -r \"{drive}/restic-repo\"";
             ExcludeDrives = new List<string>();
             RequireMarkerFile = true;
             MarkerFileName = ".tictack-target";
@@ -472,7 +469,7 @@ namespace TicTack
 
         public static bool Validate(TicTackConfig cfg, ILogger log)
         {
-            bool hasRemote = cfg.RemoteSystem != null && (cfg.RemoteSystem.HasAgent || cfg.RemoteSystem.HasClient);
+            bool hasRemote = cfg.RemoteSync != null && (cfg.RemoteSync.HasAgent || cfg.RemoteSync.HasClient);
             if ((cfg.Sources == null || cfg.Sources.Count == 0) && !hasRemote)
             {
                 log.Error("No sources configured");
@@ -521,7 +518,7 @@ namespace TicTack
                     if (!ValidateSource(src, destinations, log)) valid = false;
                 }
             }
-            if (cfg.RemoteSystem != null && !ValidateRemoteSystem(cfg, cfg.RemoteSystem, destinations, log))
+            if (cfg.RemoteSync != null && !ValidateRemoteSystem(cfg, cfg.RemoteSync, destinations, log))
                 valid = false;
             return valid;
         }
@@ -542,10 +539,11 @@ namespace TicTack
             }
             valid = ValidatePathsNotOverlapping(src, log) && valid;
             if (src.Sync != null && !string.Equals(src.Sync.Durability, "full", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(src.Sync.Durability, "write-through", StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase))
             {
-                log.Error("Durability must be 'full', 'fdatasync', or 'rename-only' for source: " + src.Path);
+                log.Error("Durability must be 'full', 'write-through', 'fdatasync', or 'rename-only' for source: " + src.Path);
                 valid = false;
             }
             if (src.Sync != null && !string.Equals(src.Sync.DrainStrategy, "scan", StringComparison.OrdinalIgnoreCase)
@@ -807,17 +805,17 @@ namespace TicTack
             {
                 if (string.IsNullOrWhiteSpace(rs.Listen))
                 {
-                    log.Error("remote_system.listen is required when configuring remote agent");
+                    log.Error("remote_sync.listen is required when configuring remote agent");
                     valid = false;
                 }
                 else if (!TryParseEndpoint(rs.Listen, out _, out _))
                 {
-                    log.Error("remote_system.listen must be host:port with port 1..65535");
+                    log.Error("remote_sync.listen must be host:port with port 1..65535");
                     valid = false;
                 }
                 if (string.IsNullOrWhiteSpace(rs.Root))
                 {
-                    log.Error("remote_system.root is required when configuring remote agent");
+                    log.Error("remote_sync.root is required when configuring remote agent");
                     valid = false;
                 }
             }
@@ -827,13 +825,13 @@ namespace TicTack
                 {
                     if (!TryParseEndpoint(ep, out _, out _))
                     {
-                        log.Error("remote_system.host must be host:port with port 1..65535: " + ep);
+                        log.Error("remote_sync.host must be host:port with port 1..65535: " + ep);
                         valid = false;
                     }
                 }
                 if (string.IsNullOrWhiteSpace(rs.Destination))
                 {
-                    log.Error("remote_system.destination is required when remote_system.host is set");
+                    log.Error("remote_sync.destination is required when remote_sync.host is set");
                     valid = false;
                 }
                 foreach (var resolved in ResolveRemoteSources(cfg))
@@ -847,7 +845,7 @@ namespace TicTack
         public static IList<SourceConfig> ResolveRemoteSources(TicTackConfig cfg)
         {
             var result = new List<SourceConfig>();
-            var rs = cfg.RemoteSystem;
+            var rs = cfg.RemoteSync;
             if (rs == null || !rs.HasClient) return result;
 
             var baseSrc = cfg.Sources != null && cfg.Sources.Count > 0 ? cfg.Sources[0] : new SourceConfig();
@@ -964,12 +962,12 @@ namespace TicTack
 
             if (cfg.Logging?.Path != null) cfg.Logging.Path = Resolve(cfg.Logging.Path, map);
             if (cfg.Logging?.AlertPath != null) cfg.Logging.AlertPath = Resolve(cfg.Logging.AlertPath, map);
-            if (cfg.RemoteSystem != null)
+            if (cfg.RemoteSync != null)
             {
-                if (cfg.RemoteSystem.Root != null) cfg.RemoteSystem.Root = Resolve(cfg.RemoteSystem.Root, map);
-                if (!string.IsNullOrEmpty(cfg.RemoteSystem.Destination)) cfg.RemoteSystem.Destination = Resolve(cfg.RemoteSystem.Destination, map);
-                if (cfg.RemoteSystem.StateDbPath != null) cfg.RemoteSystem.StateDbPath = Resolve(cfg.RemoteSystem.StateDbPath, map);
-                if (cfg.RemoteSystem.PskFile != null) cfg.RemoteSystem.PskFile = Resolve(cfg.RemoteSystem.PskFile, map);
+                if (cfg.RemoteSync.Root != null) cfg.RemoteSync.Root = Resolve(cfg.RemoteSync.Root, map);
+                if (!string.IsNullOrEmpty(cfg.RemoteSync.Destination)) cfg.RemoteSync.Destination = Resolve(cfg.RemoteSync.Destination, map);
+                if (cfg.RemoteSync.StateDbPath != null) cfg.RemoteSync.StateDbPath = Resolve(cfg.RemoteSync.StateDbPath, map);
+                if (cfg.RemoteSync.PskFile != null) cfg.RemoteSync.PskFile = Resolve(cfg.RemoteSync.PskFile, map);
             }
 
             if (cfg.Jobs != null)
@@ -1003,12 +1001,12 @@ namespace TicTack
                 AddField(fields, cfg.Logging.Path);
                 AddField(fields, cfg.Logging.AlertPath);
             }
-            if (cfg.RemoteSystem != null)
+            if (cfg.RemoteSync != null)
             {
-                AddField(fields, cfg.RemoteSystem.Root);
-                AddField(fields, cfg.RemoteSystem.Destination);
-                AddField(fields, cfg.RemoteSystem.StateDbPath);
-                AddField(fields, cfg.RemoteSystem.PskFile);
+                AddField(fields, cfg.RemoteSync.Root);
+                AddField(fields, cfg.RemoteSync.Destination);
+                AddField(fields, cfg.RemoteSync.StateDbPath);
+                AddField(fields, cfg.RemoteSync.PskFile);
             }
             if (cfg.Jobs != null)
             {

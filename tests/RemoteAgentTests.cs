@@ -72,7 +72,7 @@ namespace TicTack.Tests
                         - "*.tmp"
                     sync:
                       verification: date_and_size
-                remote_system:
+                remote_sync:
                   host: "192.168.122.50:27200"
                   destination: /tmp/vm-dst
                   debounce_seconds: 10
@@ -121,7 +121,7 @@ namespace TicTack.Tests
                         Sync = new SyncConfig { Verification = "hash" },
                     }
                 },
-                RemoteSystem = new RemoteSystemConfig
+                RemoteSync = new RemoteSystemConfig
                 {
                     Host = $"127.0.0.1:{agent.LocalPort}",
                     Destination = _destDir,

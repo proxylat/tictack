@@ -1,0 +1,1515 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TicTack Documentation</title>
+<link rel="stylesheet" href="style.css?v=13" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400&display=swap" />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400&display=swap" media="print" onload="this.media='all'" />
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400&display=swap" /></noscript>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="topbar">
+    <div class="brand-cluster">
+      <a class="brand-title" href="#page-overview">
+        <span>TicTack</span>
+        <span class="brand-meta">Documentation</span>
+      </a>
+    </div>
+
+    <button type="button" class="search-btn" data-search-open aria-label="Search documentation">
+      <span>Search documentation...</span>
+      <kbd>Ctrl K</kbd>
+    </button>
+
+    <div class="header-controls">
+      <button type="button" id="theme-btn" class="util-btn" aria-label="Switch theme">Theme: Dark</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout-grid">
+
+<aside class="sidebar" aria-label="Documentation navigation">
+    <ul class="nav-list">
+        <li><a class="nav-item" href="#page-overview">Overview</a></li>
+        <li><a class="nav-item" href="#page-requirements">Requirements & constraints</a></li>
+        <li><a class="nav-item" href="#page-setup">Quickstart</a></li>
+        <li><a class="nav-item" href="#page-cli">CLI (TicTack)</a></li>
+        <li><a class="nav-item" href="#page-configuration">YAML (TicTack)</a></li>
+        <li><a class="nav-item" href="#page-remote">Remote sync</a></li>
+        <li><a class="nav-item" href="#page-jobs">Jobs &amp; scheduler</a></li>
+        <li><a class="nav-item" href="#page-corpus">Corpus (Architecture)</a></li>
+        <li><a class="nav-item" href="#page-corpus-cli">CLI (Corpus)</a></li>
+        <li><a class="nav-item" href="#page-corpus-yaml">YAML (Corpus)</a></li>
+        <li><a class="nav-item" href="#page-diagnostics">Diagnostics &amp; profiling</a></li>
+    </ul>
+  </aside>
+
+<main class="article">
+  <section class="doc-page" id="page-overview">
+<header class="article-header">
+    <h1 id="overview">Overview</h1>
+    <p class="article-lede">One-way file synchronization, system image backup, and third-party software scheduler for Windows 10/11 and Linux.</p>
+  </header>
+
+<h2 id="three-roles">Two paired binaries</h2>
+    <p>TicTack was built to stay at zero CPU when nothing is changing while matching the safety guards and feature set of closed-source backup suites. The repository ships two dependency-light binaries &mdash; <code>TicTackSv</code> (file sync, low-latency remote sync, and job scheduler) and <code>Corpus.exe</code> (Windows 10/11 block and volume imager):</p>
+
+    <div class="entry-ledger">
+      <a class="entry-row" href="#page-setup">
+        <span class="entry-name">1. File synchronization (<code>TicTackSv</code>)</span>
+        <span class="entry-summary">Runs as a Windows service, a Linux systemd unit, or from the CLI. Watches user folders and mirrors changes in real time or after a configured delay with version history and deletion archiving.</span>
+        <span class="entry-arrow">&rarr;</span>
+      </a>
+      <a class="entry-row" href="#page-remote">
+        <span class="entry-name">2. Low-latency remote sync (<code>TicTackSv</code>)</span>
+        <span class="entry-summary">Pulls live changes from remote machines or VMs over encrypted <code>TTRM</code> v1 TCP (TLS 1.2/1.3 + mutual PSK) with an OS-sandboxed <code>--remote-agent</code> and push change stream.</span>
+        <span class="entry-arrow">&rarr;</span>
+      </a>
+      <a class="entry-row" href="#page-jobs">
+        <span class="entry-name">3. Software scheduler (<code>TicTackSv</code> <code>jobs:</code>)</span>
+        <span class="entry-summary">Schedules and sandboxes external backup tools like <code>Corpus.exe</code>, <code>restic</code>, and <code>rclone</code> inside Windows JobObjects, gated by pre-flight disk-fit and local network stability checks.</span>
+        <span class="entry-arrow">&rarr;</span>
+      </a>
+      <a class="entry-row" href="#page-corpus">
+        <span class="entry-name">4. System image backup (<code>Corpus.exe</code>)</span>
+        <span class="entry-summary">Standalone Windows 10/11 block-level imager (invoked directly or scheduled by <code>TicTackSv</code>). Captures live NTFS volumes and 512e/4Kn physical disks via VSS into a deduplicated chunk store or dynamic VHDX and WIM images.</span>
+        <span class="entry-arrow">&rarr;</span>
+      </a>
+    </div>
+
+<h2 id="design-goals">Design goals</h2>
+    <ul>
+      <li><strong>Do one thing well and obey least astonishment:</strong> TicTack handles one-way file synchronization, block-level volume imaging, and scheduled job execution. If a setting in your configuration file is misspelled or duplicated, startup fails immediately and names the bad key instead of running with silent defaults.</li>
+      <li><strong>Zero-CPU idle, flexible sync timing, and EcoQoS scheduling:</strong> You can mirror changes in real time, after a configurable debounce delay, on a periodic polling interval, or as a one-shot CLI pass. Between file events, the service sleeps on OS kernel notifications at 0% CPU. When a sync or backup runs, optional EcoQoS efficiency mode and low I/O priority keep background transfers off foreground CPU cores so active work or games do not stutter.</li>
+      <li><strong>Continuous Data Protection (near-zero RPO) and GFS retention:</strong> Live file changes mirror after your configured delay, keeping your Recovery Point Objective (RPO, the amount of recent work you could lose if a drive fails) near zero. Overwritten and deleted files rotate into separate history (<code>.versions</code>) and deleted-items (<code>.archive</code>) folders with independent Grandfather-Father-Son (GFS) retention (<code>keep_daily</code>, <code>keep_weekly</code>, <code>keep_monthly</code>, <code>keep_yearly</code>, <code>keep_last</code>, <code>keep_within</code>, <code>--clean-all</code>) and <code>.pin</code> locks.</li>
+      <li><strong>Crash consistency, sparse preservation, and power-loss recovery:</strong> Existing backup files are never overwritten in place. New data streams to a temporary file beside the target, flushes to physical disk along with the parent directory entry, and swaps in atomically. Thin-provisioned virtual machine disks (sparse files) copy only their allocated data blocks without inflating to their full virtual size, and interrupted large transfers resume from where they stopped.</li>
+      <li><strong>Fail fast, fail loud, and circuit-break anomalies:</strong> A pre-read check catches file lock and permission failures before copying begins. Pre-flight disk fit checks verify the entire backup fits on the destination drive, and passive local network checks verify routing, link health, packet error deltas, and local gateway latency before cloud jobs start. Mass-deletion holds and sliding-window churn circuit-breakers pause ransomware-like spikes during a cooling-off period and write warning files to your Desktop.</li>
+      <li><strong>Sandboxed job orchestration and low-latency remote sync:</strong> Scheduled third-party tools (<code>restic</code>, <code>rclone</code>, <code>Corpus</code>) run inside OS process sandboxes (Windows JobObjects that block UI popups and terminate orphan child processes on timeout). Built-in remote LAN and VM transfers run over authenticated TCP inside a Low-Integrity or restricted OS token locked to the destination folder.</li>
+    </ul>
+
+<h2 id="architecture">Architecture</h2>
+    <p>Execution order across both binaries:</p>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">TicTackSv &amp; Corpus.exe pipeline specification</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre>  BINARY 1: TicTack (TicTackSv - Windows 10/11 &amp; Linux)
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ A. File Sync (Local &amp; Service)                                          │
+  │    1. Startup: SrcLock (.tictack.lock) ──► PowerGuard (.tmp / .resume)  │
+  │       ──► Parallel Walk + Filter + Comparer + StateDb ──► DiskSpaceGuard│
+  │    2. Pipeline: OS Monitor (Watcher / USN / Polling / Composite)        │
+  │       ──► Debounce &amp; ReadyDrain ──► ChurnMonitor &amp; DeletionGuard        │
+  │       ──► Versioning (.versions) ──► CopyAction (1B probe ──► .tmp      │
+  │           with Sparse &amp; Resume) ──► Completer (fsync + atomic rename)   │
+  │       ──► Validator (size | hash) ──► StateDb (SQLite WAL)              │
+  │    3. Maintenance: ParityScanner (6h) · Scrubber · Watchdog             │
+  │       Independent GFS Pruners: --forget (.versions) &amp; --archive-forget  │
+  │                                                                         │
+  │ B. Low-Latency Remote Sync (TTRM v1 over TLS 1.2/1.3 + Mutual PSK)      │
+  │    RemoteSource (Client) ◄──► TicTackSv --remote-agent (Server)         │
+  │    • Ephemeral ECDSA P-256 TLS + 3-way HMAC-SHA256 PSK + 5-err/60s ban  │
+  │    • Control Pool (List/Stat/Hash/ReadChunk) + Subscribe Push Stream    │
+  │    • RemoteSandbox: Win Low-Integrity + JobObject / Linux Landlock LSM  │
+  │                                                                         │
+  │ C. Software Scheduler (jobs: &amp; external_drives:)                        │
+  │    Triggers: Calendar (daily/weekly/monthly/once) · Interval (every:)   │
+  │              External Drive Marker Discovery (.tictack-target)          │
+  │    ──► Pre-flight: NetCheck (route + NIC delta + gateway RTT) + Power   │
+  │    ──► Execution:  ProcessRunner inside Windows JobObject Sandbox       │
+  │    ──► Targets:    Corpus.exe · restic · rclone · rsync · custom hooks  │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  BINARY 2: Corpus (Corpus.exe - Windows 10/11 Block &amp; Volume Imager)
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ pre_freeze hook ──► VSS Snapshot / Multi-Volume Consistency Group       │
+  │ (VSS + EventSystem + swprv + volsnap/volmgrx + GatherWriterStatus)      │
+  │ ──► finally: post_thaw hook                                             │
+  │ ──► NTFS $Bitmap (skip free space) + USN / MFT Digest Incremental Diff  │
+  │ ──► Parallel Chunker (4 MiB fixed | Buzhash CDC + zstd + depth-1 delta) │
+  │ ──► 16 MiB CPK1 Packs (+ optional Encrypt &amp; RS .ecc) + SQLite Index     │
+  │ ──► Outputs: Dedup Store (GFS --gc) · Dynamic VHDX · WIM/ESD · --extract│
+  └─────────────────────────────────────────────────────────────────────────┘</pre>
+      </div>
+    </div>
+
+<h2 id="features">Feature matrix</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Feature</th><th>Implementation</th></tr>
+        <tr><td>Change monitoring &amp; timing</td><td><code>FileWatcherMonitor</code> (Windows <code>ReadDirectoryChangesW</code>) / <code>FsWatchMonitor</code> (Linux <code>inotify</code>), <code>UsnJournalMonitor</code> (Windows NTFS cursor), <code>PollingMonitor</code>, <code>CompositeMonitor</code>. Supports real-time mirroring, configurable debounce delays, periodic polling, or one-shot CLI passes</td></tr>
+        <tr><td>Comparison &amp; verification</td><td><code>SizeComparer</code>, <code>DateSizeComparer</code>, <code>HashComparer</code>, <code>FullComparer</code> paired with post-copy <code>SizeValidator</code> or <code>HashValidator</code></td></tr>
+        <tr><td>Sparse file preservation</td><td>Detects <code>FILE_ATTRIBUTE_SPARSE_FILE</code>; queries allocated extents via <code>FSCTL_QUERY_ALLOCATED_RANGES</code> on Windows (or skips zero blocks on Linux) and seeks over holes without inflating VM disk images</td></tr>
+        <tr><td>Resumable large-file copy</td><td>Interrupted copies (&ge; 16 MiB) write a <code>.tictack.tmp.resume</code> checkpoint (<code>size|mtime|offset</code>) and resume from the last flushed offset on retry or startup</td></tr>
+        <tr><td>Pre-flight disk fit &amp; headroom</td><td><code>DiskSpaceGuard</code> calculates total planned net bytes before initial sync (<code>strict_fit_check</code>) and enforces optional <code>min_free_gb</code> floors before and during copies</td></tr>
+        <tr><td>Local network stability check</td><td><code>NetCheck</code> verifies routing table, NIC operational state, packet error/drop deltas, and local gateway RTT before cloud/network jobs without contacting external third-party hosts</td></tr>
+        <tr><td>Separate GFS retention</td><td>Independent <code>keep_last</code>, <code>keep_within</code>, <code>keep_daily</code>, <code>keep_weekly</code>, <code>keep_monthly</code>, <code>keep_yearly</code>, and <code>--clean-all</code> policies for <code>.versions</code> (<code>--forget</code>) and <code>.archive</code> (<code>--archive-forget</code>)</td></tr>
+        <tr><td>Ransomware &amp; mass-delete guards</td><td><code>DeletionGuard</code> / <code>DeferredDeletion</code> holds deletion bursts (&ge; count, GB, or % of baseline) in SQLite for <code>delete_hold_days</code>; <code>ChurnMonitor</code> trips a <code>.tictack-churn-hold</code> brake on copy/delete/rename spikes</td></tr>
+        <tr><td>Sandboxed jobs &amp; RemoteAgent</td><td>Windows self-hardening (<code>SetDllDirectoryW("")</code>, <code>HeapEnableTerminationOnCorruption</code>, ASLR, strict handles), per-job <code>ChildJobSandbox</code> (<code>KILL_ON_JOB_CLOSE</code> + <code>UILIMIT_ALL</code>), and Low-Integrity (<code>S-1-16-4096</code>) / restricted token sandboxing for TCP <code>RemoteAgent</code></td></tr>
+      </table>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-diagnostics">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">Corpus (Windows)</span>
+      </a>
+      <a class="pager-link next" href="#page-requirements">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">Requirements & constraints</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-requirements">
+<header class="article-header">
+    <h1>Requirements &amp; constraints</h1>
+    <p class="article-lede">Core requirements, feature-specific OS services and drivers, and constraints for Windows 10/11 and Linux.</p>
+  </header>
+
+<h2 id="requirements">Core requirements</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Component</th><th>Requirement</th></tr>
+        <tr><td><strong>Operating system</strong></td><td><strong>Windows 10/11</strong> (<code>TicTackSv</code> service running as <code>LocalSystem</code>, or CLI) or <strong>Linux</strong> (<code>systemd</code> for service mode, <code>inotify</code> for default file monitoring, or CLI)</td></tr>
+        <tr><td><strong>SDK / Runtime</strong></td><td>.NET 10 SDK to build from source. Published builds support framework-dependent, self-contained JIT single-file, or NativeAOT (Windows MSVC / Linux clang + zlib)</td></tr>
+        <tr><td><strong>Runtime packages</strong></td><td>Four runtime dependencies fetched automatically via NuGet: <code>YamlDotNet 16.3.0</code>, <code>Microsoft.Data.Sqlite 10.0.12</code>, <code>System.ServiceProcess.ServiceController</code>, and <code>System.Diagnostics.EventLog</code>. Static analyzers (<code>Meziantou.Analyzer</code>) and <code>BenchmarkDotNet</code> are dev-only</td></tr>
+      </table>
+    </div>
+
+<h2 id="feature-deps">Feature-specific OS dependencies</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Feature</th><th>Platform</th><th>Underlying OS Services, Drivers &amp; Binaries</th></tr>
+        <tr><td><strong>Live Volume / Disk Imaging (<code>Corpus</code>) &amp; Locked-File VSS (<code>sync.file_access: vss</code>)</strong></td><td>Windows 10/11 (Admin / <code>LocalSystem</code>)</td><td><strong>Services:</strong> <code>VSS</code> (Volume Shadow Copy), <code>EventSystem</code> (COM+ Event System), <code>swprv</code> (Microsoft Software Shadow Copy Provider, must not be disabled).<br /><strong>Kernel drivers:</strong> <code>volsnap</code> (Volume Shadow Copy driver), <code>volmgr</code> / <code>volmgrx</code> (Volume Manager / Dynamic Volume Manager).<br /><strong>Inbox DLL / CLI:</strong> <code>vssapi.dll</code> (requires JIT/framework build for COM interop), <code>vssadmin.exe</code> (writer diagnostics on failure). Verified automatically by <code>Corpus.exe --validate</code>.</td></tr>
+        <tr><td><strong>NTFS USN Journal Monitoring (<code>monitor.type: usn</code> &amp; Corpus incremental USN)</strong></td><td>Windows 10/11 (Admin / <code>LocalSystem</code>)</td><td>NTFS volume + Administrator / <code>LocalSystem</code> privileges (<code>FSCTL_READ_USN_JOURNAL</code>). Falls back to standard folder watcher when unprivileged.</td></tr>
+        <tr><td><strong>BitLocker Volume Imaging (<code>Corpus</code> on encrypted drives)</strong></td><td>Windows 10/11 (Admin)</td><td><strong>Service &amp; driver:</strong> <code>BDESVC</code> (BitLocker Drive Encryption Service) and <code>fvevol</code> (BitLocker Filter Driver).<br /><strong>Inbox CLI:</strong> <code>manage-bde.exe</code> (suspends protection across the VSS freeze window and resumes immediately after).</td></tr>
+        <tr><td><strong>WIM / ESD / Bare-Metal Restore &amp; Recovery Media (<code>Corpus</code> optional verbs)</strong></td><td>Windows 10/11 (or Linux with <code>wimlib</code>)</td><td><code>dism.exe</code> (Windows inbox) or <code>wimlib-imagex</code> (for <code>--to-wim</code>, <code>--to-esd</code>, <code>--mount-wim</code>, offline servicing); <code>diskpart.exe</code> and <code>bcdboot.exe</code> (inbox, for <code>--restore-disk</code> and <code>--repair-boot</code>); Windows ADK <code>oscdimg.exe</code> (only for <code>--build-media</code>); Hyper-V PowerShell module (only for <code>--optimize-vhd</code> and <code>--boot-verify</code>).</td></tr>
+        <tr><td><strong>Local Network Stability Check (<code>net_check: true</code> on <code>jobs:</code>)</strong></td><td>Windows 10/11 &amp; Linux</td><td>Windows: in-box <code>.NET NetworkInformation</code> APIs (zero external binaries).<br />Linux: <code>/proc/net/route</code>, <code>/proc/net/dev</code>, <code>/sys/class/net</code>, and <code>ping</code> (only when <code>net_check_icmp: true</code>).</td></tr>
+        <tr><td><strong>Third-Party Scheduled Jobs (<code>jobs:</code> &amp; <code>external_drives:</code>)</strong></td><td>Windows 10/11 &amp; Linux</td><td>Whichever external CLI binaries your jobs invoke (<code>restic</code>, <code>rclone</code>, <code>rsync</code>, <code>age</code>, <code>Corpus.exe</code>).</td></tr>
+        <tr><td><strong>Windows Event Log (<code>TicTackSv</code> &amp; <code>Corpus</code> alerts)</strong></td><td>Windows 10/11</td><td><strong>Service:</strong> <code>EventLog</code> (Windows Event Log). Recommended so <code>Warn</code> and <code>Error</code> entries appear in Event Viewer under sources <code>TicTackSv</code> and <code>Corpus</code>; degrades gracefully to <code>tictack.log</code> / <code>corpus.log</code> if stopped.</td></tr>
+      </table>
+    </div>
+
+    <div class="note-box">
+      <p><span class="note-label">Service PATH</span>Services run as <code>LocalSystem</code> on Windows 10/11 and root or service-user under <code>systemd</code>, so they do not inherit your interactive user <code>PATH</code>. Register a CLI tool once with <code>service\win\add-tool-env.bat restic</code> (Windows Admin) or <code>sudo service/linux/add-tool-env.sh restic</code> (Linux), then restart the service.</p>
+    </div>
+
+<h2 id="aot-matrix">JIT vs. NativeAOT (<code>--aot</code>)</h2>
+    <p>TicTack supports framework-dependent, self-contained JIT (<code>--jit</code>), and NativeAOT (<code>--aot</code>) publishes. NativeAOT produces a smaller native binary with fast startup, with the following differences:</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Capability</th><th>JIT (<code>--jit</code>)</th><th>NativeAOT (<code>--aot</code>)</th><th>Notes</th></tr>
+        <tr><td><strong>TicTack file sync, USN, GFS, Remote sync, Jobs, EventLog</strong></td><td>Supported</td><td>Supported</td><td>JSON uses source-gen contexts; YAML is trim-rooted via <code>Aot.pubxml</code></td></tr>
+        <tr><td><strong>TicTack locked-file VSS (<code>file_access: vss</code>)</strong></td><td>Supported</td><td>Supported</td><td>Uses <code>[GeneratedComInterface]</code> + <code>[LibraryImport]</code> + <code>StrategyBasedComWrappers</code></td></tr>
+        <tr><td><strong>Corpus VSS volume/disk imaging (<code>Corpus.exe</code>)</strong></td><td>Supported</td><td>Supported</td><td>Uses <code>[GeneratedComInterface]</code> + <code>[LibraryImport]</code> + <code>StrategyBasedComWrappers</code></td></tr>
+        <tr><td><strong>SQLite native DLL (<code>e_sqlite3.dll</code>)</strong></td><td>Sidecar</td><td>Sidecar</td><td><code>e_sqlite3.dll</code> must remain next to the executable (not embedded in AOT single-file)</td></tr>
+        <tr><td><strong><code>dotnet-counters</code> / <code>dotnet-trace</code> / <code>dotnet-gcdump</code></strong></td><td>Supported</td><td>Unsupported</td><td>NativeAOT has no EventPipe IPC server; profile AOT binaries with ETW/PerfView (Windows) or <code>perf</code>/<code>bpftrace</code> (Linux)</td></tr>
+        <tr><td><strong>Cross-OS publish</strong></td><td>Supported</td><td>Unsupported</td><td>Must compile on the target OS (Windows MSVC Build Tools or Linux <code>clang</code> + <code>zlib</code>)</td></tr>
+      </table>
+    </div>
+
+<h2 id="limitations">Limitations and constraints</h2>
+    <div class="details-list">
+      <details class="spec-item">
+        <summary>
+          <span>No macOS support and Corpus Windows-only scope</span>
+          <span class="spec-marker"></span>
+        </summary>
+        <div class="spec-body">
+          TicTack targets <strong>Windows 10/11 and Linux</strong>; there is no macOS service, watcher, or snapshot integration. <strong>Corpus</strong> is currently Windows-only because it relies on Windows VSS (<code>vssapi.dll</code>), NTFS raw <code>$MFT</code>, <code>$Bitmap</code>, and USN parsing, and VHDX/WIM APIs.
+        </div>
+      </details>
+
+      <details class="spec-item">
+        <summary>
+          <span>One-way authority (Source to Destination)</span>
+          <span class="spec-marker"></span>
+        </summary>
+        <div class="spec-body">
+          TicTack treats your source folder as the single source of truth and mirrors changes in one direction (<code>Source &rarr; Destination</code>). It does not perform bidirectional multi-master sync or two-way merge conflict resolution, ensuring a modified or corrupted backup drive never overwrites your live working files.
+        </div>
+      </details>
+
+      <details class="spec-item">
+        <summary>
+          <span>No %VAR% or ~ expansion in configuration paths</span>
+          <span class="spec-marker"></span>
+        </summary>
+        <div class="spec-body">
+          Never write <code>%USERPROFILE%</code>, <code>%HOME%</code>, or <code>~</code> in <code>config.yaml</code>. Services run under <code>LocalSystem</code> or <code>root</code>, so expanded variables would point at the wrong profile. Always write full paths (<code>C:\Users\Alice\Documents</code>, <code>/home/alice/Pictures</code>) or use Windows <code>[VolumeLabel]\path</code> syntax.
+        </div>
+      </details>
+
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-overview">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">Overview</span>
+      </a>
+      <a class="pager-link next" href="#page-setup">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">Quickstart</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-setup">
+<header class="article-header">
+    <h1 id="setup">Quickstart</h1>
+    <p class="article-lede">Get running fast: install the Windows 10/11 service or Linux systemd unit, or run from the CLI.</p>
+  </header>
+
+<h2 id="quickstart">TicTack quickstart (File sync &amp; scheduler)</h2>
+    <p>Switch tabs below to inspect service setup on Windows 10/11 or Linux, interactive CLI commands, or a unified <code>config.yaml</code> combining file sync, Corpus volume imaging, <code>restic</code>, and <code>rclone</code>:</p>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <div class="tab-list" role="tablist">
+          <button type="button" class="tab-btn active" role="tab">Windows 10/11</button>
+          <button type="button" class="tab-btn" role="tab">Linux (systemd)</button>
+          <button type="button" class="tab-btn" role="tab">CLI Mode</button>
+          <button type="button" class="tab-btn" role="tab">config.yaml</button>
+        </div>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+
+      <div class="tab-pane active">
+        <pre><span class="comment">REM Run cmd.exe as Administrator (supports default, --jit, or --aot)</span>
+<span class="cmd">copy</span> service\win\config_win.yaml.example service\win\config.yaml
+<span class="cmd">service\win\build-service.bat</span> --jit
+
+<span class="comment">REM Restart service after config edits</span>
+<span class="cmd">sc stop</span> TicTackSv &amp;&amp; <span class="cmd">sc start</span> TicTackSv</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment"># Copy config and publish to /opt/tictack with systemd unit enabled</span>
+<span class="cmd">cp</span> service/linux/config_linux.yaml.example service/linux/config.yaml
+<span class="cmd">cd</span> service/linux &amp;&amp; <span class="cmd">./build-service.sh</span>
+
+<span class="comment"># Check status and follow live logs</span>
+<span class="cmd">sudo systemctl status</span> tictack
+<span class="cmd">journalctl</span> -u tictack -f</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment"># Interactive foreground watch + scheduled jobs</span>
+<span class="cmd">TicTackSv</span> --cli
+
+<span class="comment"># Single sync pass over all sources, then exit</span>
+<span class="cmd">TicTackSv</span> --once
+
+<span class="comment"># Independent GFS pruning for .versions and .archive</span>
+<span class="cmd">TicTackSv</span> --forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 1
+<span class="cmd">TicTackSv</span> --archive-forget --keep-daily 14 --keep-monthly 3</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="key">sources:</span>
+  - <span class="key">paths:</span>
+      - <span class="str">"C:\\Users\\Alice\\Documents"</span>
+      - <span class="str">"C:\\Users\\Alice\\Projects"</span>
+    <span class="key">destination:</span> <span class="str">"[Backup-Disk]\\Mirror"</span>
+    <span class="key">debounce_seconds:</span> 10
+    <span class="key">sync:</span>
+      <span class="key">verification:</span> date_and_size
+      <span class="key">durability:</span> full
+      <span class="key">min_free_gb:</span> 20
+      <span class="key">strict_fit_check:</span> true
+      <span class="key">versioning:</span>
+        <span class="key">path:</span> <span class="str">"[Backup-Disk]\\Mirror\\.versions"</span>
+        <span class="key">keep_daily:</span> 7
+        <span class="key">keep_weekly:</span> 4
+        <span class="key">keep_monthly:</span> 6
+        <span class="key">keep_yearly:</span> 1
+      <span class="key">deletion:</span>
+        <span class="key">mode:</span> archive
+        <span class="key">path:</span> <span class="str">"[Backup-Disk]\\Mirror\\.archive"</span>
+        <span class="key">keep_daily:</span> 14
+        <span class="key">keep_monthly:</span> 3
+
+<span class="key">jobs_defaults:</span>
+  <span class="key">sandbox:</span> true
+  <span class="key">timeout_minutes:</span> 60
+
+<span class="key">jobs:</span>
+  - <span class="key">name:</span> corpus-system-image
+    <span class="key">time:</span> <span class="str">"02:00"</span>
+    <span class="key">command:</span> <span class="str">"Corpus.exe --config C:\\ProgramData\\TicTack\\config_corpus.yaml --image --volumes C:,D: --name nightly"</span>
+  - <span class="key">name:</span> restic-repo
+    <span class="key">time:</span> <span class="str">"03:00"</span>
+    <span class="key">command:</span> <span class="str">"restic -r [Backup-Disk]\\Restic backup {source}"</span>
+  - <span class="key">name:</span> rclone-cloud
+    <span class="key">time:</span> <span class="str">"04:00"</span>
+    <span class="key">net_check:</span> true
+    <span class="key">command:</span> <span class="str">"rclone sync [Backup-Disk]\\Restic s3:my-offsite-bucket/restic"</span></pre>
+      </div>
+    </div>
+
+<h2 id="corpus-quickstart">Corpus quickstart (Windows 10/11 volume imaging)</h2>
+    <p><code>Corpus.exe</code> runs elevated on Windows 10/11 as a standalone CLI or scheduled via TicTack's <code>jobs:</code> block:</p>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <div class="tab-list" role="tablist">
+          <button type="button" class="tab-btn active" role="tab">Build &amp; validate (Admin)</button>
+          <button type="button" class="tab-btn" role="tab">Capture &amp; restore</button>
+          <button type="button" class="tab-btn" role="tab">config_corpus.yaml</button>
+        </div>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+
+      <div class="tab-pane active">
+        <pre><span class="comment">REM 1. Copy example config and build Corpus.exe</span>
+<span class="cmd">copy</span> corpus\win\config_corpus.yaml.example corpus\win\config_corpus.yaml
+<span class="cmd">corpus\win\build-corpus.bat</span>
+
+<span class="comment">REM 2. Verify Administrator token, VSS services (VSS/EventSystem/swprv), and drivers</span>
+<span class="cmd">corpus\win\Corpus.exe</span> --config corpus\win\config_corpus.yaml --validate</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment">REM Capture live C: volume into the deduplicated chunk store</span>
+<span class="cmd">Corpus.exe</span> --image --volume C: --name daily-os --inline --incremental
+
+<span class="comment">REM Atomic multi-volume consistency group across C: and D:</span>
+<span class="cmd">Corpus.exe</span> --image --volumes C:,D: --name app-db-nightly
+
+<span class="comment">REM Storeless single-file dynamic VHDX backup</span>
+<span class="cmd">Corpus.exe</span> --image --volume C: --to-vhdx D:\Backups\system.vhdx
+
+<span class="comment">REM Selective file/folder extraction from snapshot generation 1</span>
+<span class="cmd">Corpus.exe</span> --extract --snapshot 1 --paths <span class="str">"Users\Alice\Documents"</span> --out D:\Restore</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="key">store_path:</span> <span class="str">"E:\\CorpusStore"</span>
+<span class="key">chunk_mib:</span> 4
+<span class="key">eco_qos:</span> true
+<span class="key">min_free_gb:</span> 25
+<span class="key">strict_fit_check:</span> true
+<span class="key">strict_vss_writers:</span> true
+
+<span class="key">retention:</span>
+  <span class="key">keep_last:</span> 4
+  <span class="key">keep_daily:</span> 7
+  <span class="key">keep_weekly:</span> 4
+  <span class="key">keep_monthly:</span> 6
+  <span class="key">keep_yearly:</span> 1</pre>
+      </div>
+    </div>
+
+<h2 id="windows">Windows 10/11 setup</h2>
+    <div class="code-block">
+      <div class="code-bar">
+        <div class="tab-list" role="tablist">
+          <button type="button" class="tab-btn active" role="tab">Service install (cmd Admin)</button>
+          <button type="button" class="tab-btn" role="tab">CLI &amp; one-shot</button>
+          <button type="button" class="tab-btn" role="tab">Register tool PATH</button>
+        </div>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+
+      <div class="tab-pane active">
+        <pre><span class="comment">REM 1. Copy example config and edit your source/destination paths</span>
+<span class="cmd">copy</span> service\win\config_win.yaml.example service\win\config.yaml
+
+<span class="comment">REM 2. Build, register, and start the TicTackSv Windows service</span>
+<span class="comment">REM    Lanes: default, --jit (bundled runtime), --aot (native ~8 MB exe, requires VS C++ Build Tools)</span>
+<span class="cmd">service\win\build-service.bat</span> --jit
+
+<span class="comment">REM 3. Restart after config edits</span>
+<span class="cmd">sc stop</span> TicTackSv &amp;&amp; <span class="cmd">sc start</span> TicTackSv</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment">REM Run interactively in console with live watcher + scheduled jobs</span>
+<span class="cmd">service\win\TicTackSv.exe</span> --cli
+
+<span class="comment">REM Run a single synchronization pass and exit</span>
+<span class="cmd">service\win\TicTackSv.exe</span> --once
+
+<span class="comment">REM Validate config.yaml syntax and paths</span>
+<span class="cmd">service\win\TicTackSv.exe</span> --validate</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment">REM Add restic / rclone / Corpus to the machine PATH visible to LocalSystem</span>
+<span class="cmd">service\win\add-tool-env.bat</span> restic
+<span class="cmd">service\win\add-tool-env.bat</span> C:\tools\rclone\rclone.exe
+<span class="cmd">sc stop</span> TicTackSv &amp;&amp; <span class="cmd">sc start</span> TicTackSv</pre>
+      </div>
+    </div>
+
+<h2 id="linux">Linux setup (systemd or CLI)</h2>
+    <div class="code-block">
+      <div class="code-bar">
+        <div class="tab-list" role="tablist">
+          <button type="button" class="tab-btn active" role="tab">systemd install</button>
+          <button type="button" class="tab-btn" role="tab">Service management</button>
+          <button type="button" class="tab-btn" role="tab">CLI mode</button>
+        </div>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+
+      <div class="tab-pane active">
+        <pre><span class="comment"># 1. Copy example config and edit your paths</span>
+<span class="cmd">cp</span> service/linux/config_linux.yaml.example service/linux/config.yaml
+
+<span class="comment"># 2. Publish to /opt/tictack and enable the systemd unit</span>
+<span class="cmd">cd</span> service/linux &amp;&amp; <span class="cmd">./build-service.sh</span></pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="cmd">sudo systemctl status</span> tictack
+<span class="cmd">sudo systemctl restart</span> tictack
+<span class="cmd">journalctl</span> -u tictack -f
+
+<span class="comment"># Stop and remove unit (preserves /opt/tictack/config.yaml)</span>
+<span class="cmd">./uninstall-service.sh</span></pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment"># Run directly from the terminal without systemd</span>
+<span class="cmd">/opt/tictack/TicTackSv</span> --cli
+<span class="cmd">/opt/tictack/TicTackSv</span> --once</pre>
+      </div>
+    </div>
+
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-requirements">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">Requirements & constraints</span>
+      </a>
+      <a class="pager-link next" href="#page-cli">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">CLI (TicTack)</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-cli">
+<header class="article-header">
+    <h1 id="cli">CLI (TicTack)</h1>
+    <p class="article-lede">Every TicTackSv command-line flag: sync passes, GFS pruning, pins, holds, and remote agent.</p>
+  </header>
+
+<h2 id="cli-modes">Service &amp; sync modes</h2>
+    <p>Start the Windows service, interactive CLI watcher, one-shot sync, or config validator.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--cli</code></td><td>Interactive console mode: live monitoring with per-event logging plus scheduled jobs (also used by <code>systemd</code>)</td></tr>
+        <tr><td><code>--service</code></td><td>Run as a Windows service (auto-detected when non-interactive; Windows 10/11 only)</td></tr>
+        <tr><td><code>--once</code></td><td>Single sync pass over all sources, then exit (always exits 0 even on per-file failures; parity cleanup runs, scheduled jobs do not)</td></tr>
+        <tr><td><code>--validate</code></td><td>Load and validate <code>config.yaml</code>, exit with code <code>0</code> or <code>1</code></td></tr>
+        <tr><td><code>--rebuild</code></td><td>Clear state DBs and re-sync from scratch (archives stale destination files under <code>archive</code> mode, deletes them under <code>mirror</code>; stop the service first)</td></tr>
+      </table>
+    </div>
+
+<h2 id="cli-retention">Version &amp; archive retention</h2>
+    <p>Prune <code>.versions</code> and <code>.archive</code> with GFS rules, list stored versions, or lock snapshots with <code>.pin</code> sidecars.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--forget [--dry-run]</code></td><td>Prune <code>.versions</code> using each source's <code>versioning:</code> <code>keep_*</code> rules. One-shot overrides: <code>--keep-last N</code>, <code>--keep-within 30d</code>, <code>--keep-daily N</code>, <code>--keep-weekly N</code>, <code>--keep-monthly N</code>, <code>--keep-yearly N</code>, <code>--clean-all</code> (removes all unpinned versions, preserves <code>.pin</code>)</td></tr>
+        <tr><td><code>--archive-forget [--dry-run]</code></td><td>Prune <code>.archive</code> independently of <code>.versions</code> using <code>deletion:</code> <code>keep_*</code> rules or the same <code>--keep-last</code> / <code>--keep-within</code> / <code>--keep-daily</code> / <code>--keep-weekly</code> / <code>--keep-monthly</code> / <code>--keep-yearly</code> / <code>--clean-all</code> CLI overrides</td></tr>
+        <tr><td><code>--versions-list [glob] [--latest N] [--json]</code></td><td>List stored versions newest-first (<code>--latest N</code> caps per file, <code>--json</code> outputs a scriptable JSON array)</td></tr>
+        <tr><td><code>--versions-pin &lt;spec&gt;</code></td><td>Pin versions matching a path or <code>file@timestamp</code> (writes a <code>.pin</code> sidecar so retention and <code>--clean-all</code> never delete them)</td></tr>
+        <tr><td><code>--versions-unpin &lt;spec&gt;</code> / <code>--unpin &lt;spec&gt;</code></td><td>Remove the <code>.pin</code> lock from versions matching a path or <code>file@timestamp</code></td></tr>
+      </table>
+    </div>
+
+<h2 id="cli-holds">Deferred deletions &amp; external drives</h2>
+    <p>Inspect, approve, or cancel mass-deletion holds and trigger on-demand external drive backups.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--deferred-list</code></td><td>Show pending mass-deletion holds (source stem, path, batches, files, oldest, next due)</td></tr>
+        <tr><td><code>--deferred-approve &lt;stem&gt;</code></td><td>Drain expired deletion holds now through the normal delete path (unexpired batches wait; stop the service first)</td></tr>
+        <tr><td><code>--deferred-check &lt;stem&gt;</code></td><td>Run daily warnings and hold expiry evaluation once without draining (stamps the daily-warning clock)</td></tr>
+        <tr><td><code>--reprove &lt;stem&gt;</code> / <code>--deferred-cancel &lt;stem&gt;</code></td><td>Cancel a deletion hold, delete the hold <code>.db</code>, and keep all destination files (stop the service first)</td></tr>
+        <tr><td><code>--external-drives</code></td><td>Discover external drives with marker file, prompt <code>Proceed? (y/n)</code> per drive, and run the configured backup command (10-minute timeout)</td></tr>
+      </table>
+    </div>
+
+<h2 id="cli-capture">OS capture, remote agent &amp; utility</h2>
+    <p>Run file-level OS captures/restores, launch the TCP remote agent, or print version and help.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--os-capture --os-source &lt;dir&gt; --os-dest &lt;dir&gt;</code></td><td>Capture a live OS file tree through the configured file accessor (direct or VSS) using atomic <code>.tictack.tmp</code> writes</td></tr>
+        <tr><td><code>--os-restore --os-source &lt;cap&gt; --os-dest &lt;dir&gt;</code></td><td>Restore a file-level OS capture tree to its target path and print bootloader repair instructions</td></tr>
+        <tr><td><code>--remote-agent</code></td><td>Run the authenticated TCP remote sync agent inside the configured root jail and token sandbox</td></tr>
+        <tr><td><code>--config &lt;path&gt;</code></td><td>Path to config file (default: <code>config.yaml</code> next to the executable)</td></tr>
+        <tr><td><code>--help</code> / <code>-h</code> / <code>-?</code></td><td>Print CLI usage help and exit (no config needed)</td></tr>
+        <tr><td><code>--version</code> / <code>-v</code></td><td>Print version and exit (no config needed)</td></tr>
+      </table>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-setup">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">Quickstart</span>
+      </a>
+      <a class="pager-link next" href="#page-configuration">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">YAML (TicTack)</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-configuration">
+<header class="article-header">
+    <h1 id="configuration">YAML (TicTack)</h1>
+    <p class="article-lede">Complete config.yaml schema: sources, monitor, logging, remote system, jobs, and external drives. All Windows paths support <code>[VolumeLabel]\path</code> syntax; unknown or duplicate keys fail startup immediately.</p>
+  </header>
+
+<h2 id="cfg-sources"><code>sources:</code></h2>
+    <p>List of source folders to watch and mirror one-way to their configured destination directories.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>paths:</code> / <code>path:</code></td><td>none</td><td>List of source folders to watch (or singular <code>path:</code>). Each entry becomes its own source at <code>destination + foldername</code></td></tr>
+        <tr><td><code>destination:</code></td><td>none</td><td>Target directory (supports Windows <code>[VolumeLabel]</code> syntax)</td></tr>
+        <tr><td><code>state_db_path:</code></td><td><code>C:\ProgramData\TicTack</code> / <code>/var/lib/tictack</code></td><td>Directory for per-source SQLite WAL state DBs (<code>&lt;folder&gt;-&lt;hash&gt;.db</code>) used to skip unchanged files</td></tr>
+        <tr><td><code>debounce_seconds:</code></td><td><code>10</code></td><td>Quiet period (seconds) after the last file event before syncing that file</td></tr>
+      </table>
+    </div>
+
+<h3 id="cfg-filter"><code>filter:</code> <span class="cfg-badge">Under sources:</span></h3>
+    <p>Per-source file size caps and glob exclusion patterns.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>max_file_size_mb:</code></td><td><code>no-limit</code></td><td>Skip files larger than N MB (<code>no-limit</code> copies all files, <code>none</code> skips all files)</td></tr>
+        <tr><td><code>exclude:</code></td><td><code>[]</code></td><td>Glob patterns to skip (<code>*.tmp</code>, <code>*.iso</code>, <code>.git/*</code>; case-insensitive on Windows)</td></tr>
+      </table>
+    </div>
+
+<h3 id="cfg-sync"><code>sync:</code> <span class="cfg-badge">Under sources:</span></h3>
+    <p>Copy verification, disk durability, locked-file fallback, disk-space guards, and ransomware/deletion circuit breakers.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>verification:</code></td><td><code>date_and_size</code></td><td>Pre-copy compare and post-copy check (<code>size</code> | <code>date_and_size</code> | <code>hash</code> | <code>full</code>)</td></tr>
+        <tr><td><code>durability:</code></td><td><code>full</code></td><td><code>full</code> (fsync temp file + parent dir) | <code>write-through</code> (FUA <code>FileOptions.WriteThrough</code> + fsync for USB/write-cache safety) | <code>fdatasync</code> (Linux data+size flush) | <code>rename-only</code> (atomic rename + dir sync; skips file flush, risks 0-byte targets on power loss)</td></tr>
+        <tr><td><code>drain_strategy:</code></td><td><code>scan</code></td><td>Backlog drain order (<code>scan</code> unordered zero-overhead scan | <code>ready_queue</code> earliest-expiry heap)</td></tr>
+        <tr><td><code>dir_sync:</code></td><td><code>per-file</code></td><td>Parent directory fsync cadence on initial sync (<code>per-file</code> | <code>per-batch</code>; <code>per-batch</code> is faster on initial sync but can lag behind <code>StateDb</code> on sudden power loss)</td></tr>
+        <tr><td><code>complete_mode:</code></td><td><code>inline</code></td><td>Copy completion pipeline (<code>inline</code> on worker thread | <code>pipelined</code> dedicated completer thread)</td></tr>
+        <tr><td><code>file_access:</code></td><td><code>direct</code></td><td><code>direct</code> | <code>vss</code> (Windows on-demand shadow copy fallback when a file is locked)</td></tr>
+        <tr><td><code>initial_sync_workers:</code></td><td><code>2</code></td><td>Bounded parallel copy workers for initial sync</td></tr>
+        <tr><td><code>lock_handling:</code></td><td><code>retry</code></td><td>Source lock contention behavior (<code>retry</code> waits with backoff | <code>ignore</code> fail-fast shared lock)</td></tr>
+        <tr><td><code>lock_wait_seconds:</code></td><td><code>60</code></td><td>Total seconds to wait on a held source lock when <code>lock_handling: retry</code> (example configs set <code>600</code>)</td></tr>
+        <tr><td><code>min_free_gb:</code></td><td>unset</td><td>Optional minimum free space floor (GB) on destination drive</td></tr>
+        <tr><td><code>strict_fit_check:</code></td><td><code>false</code></td><td>When <code>true</code>, pre-flight refuses initial sync upfront if total planned copy bytes exceed destination headroom</td></tr>
+        <tr><td><code>destination_protect:</code></td><td><code>false</code></td><td>Harden destination ACLs (Windows deny-write for Users) or permissions (Linux strip group/other write) at startup</td></tr>
+        <tr><td><code>delete_threshold_count:</code></td><td><code>1000</code></td><td>Hold deletion burst if batch count &ge; N files (<code>0</code> disables)</td></tr>
+        <tr><td><code>delete_threshold_size_gb:</code></td><td><code>50</code></td><td>Hold deletion burst if batch total size &ge; N GB (<code>0</code> disables)</td></tr>
+        <tr><td><code>delete_threshold_percent:</code></td><td><code>50</code></td><td>Hold deletion burst if batch &ge; N% of known files (requires 50+ known files; unknown baseline fails closed)</td></tr>
+        <tr><td><code>bulk_cleanup_percent:</code></td><td><code>0</code> (off)</td><td>Allow a localized deletion burst when one parent folder owns &ge; N% of the batch (requires 10+ files)</td></tr>
+        <tr><td><code>delete_hold_days:</code></td><td><code>7</code></td><td>Days to hold blocked deletion bursts in SQLite before expiring</td></tr>
+        <tr><td><code>full_routine_check_days:</code></td><td><code>14</code></td><td>Days between full byte-comparison checks of unchanged files (<code>0</code> disables)</td></tr>
+        <tr><td><code>routine_check_days:</code></td><td><code>0</code> (off)</td><td>Days between random destination hash-verify sample checks (<code>0</code> disables)</td></tr>
+        <tr><td><code>routine_check_files:</code></td><td><code>10</code></td><td>Number of destination files re-hashed per routine sample check</td></tr>
+        <tr><td><code>spike_window_minutes:</code></td><td><code>60</code></td><td>Sliding window (minutes) for the churn circuit-breaker</td></tr>
+        <tr><td><code>spike_bytes_gb:</code></td><td><code>100</code></td><td>Trip <code>.tictack-churn-hold</code> when copied bytes in window reach N GB</td></tr>
+        <tr><td><code>spike_files:</code></td><td><code>50000</code></td><td>Trip <code>.tictack-churn-hold</code> when copied files in window reach N</td></tr>
+        <tr><td><code>spike_renames:</code></td><td><code>10000</code></td><td>Trip <code>.tictack-churn-hold</code> when replayed renames in window reach N</td></tr>
+      </table>
+    </div>
+
+<h3 id="cfg-retry"><code>retry:</code> <span class="cfg-badge">Under sync:</span></h3>
+    <p>Per-file retry attempts and exponential backoff for transient I/O or sharing-lock errors.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>max_attempts:</code></td><td><code>5</code></td><td>Maximum per-file copy attempts on transient I/O or sharing failure</td></tr>
+        <tr><td><code>delay_ms:</code></td><td><code>1000</code></td><td>Initial retry delay in milliseconds</td></tr>
+        <tr><td><code>backoff:</code></td><td><code>2.0</code></td><td>Exponential delay multiplier per retry</td></tr>
+      </table>
+    </div>
+
+<h3 id="cfg-versioning"><code>versioning:</code> <span class="cfg-badge">Under sync:</span></h3>
+    <p>Archives overwritten destination files into <code>.versions</code> with independent GFS retention (<code>--forget</code>).</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>path:</code></td><td>unset (off)</td><td>Directory where overwritten file versions are archived with timestamp+guid suffixes</td></tr>
+        <tr><td><code>max_versions:</code></td><td><code>10</code></td><td>Legacy flat cap per file when no <code>keep_*</code> key is set (any <code>keep_*</code> key replaces it)</td></tr>
+        <tr><td><code>keep_last:</code> / <code>keep_within:</code></td><td>unset</td><td>Retain N newest versions or versions within duration (<code>30d</code>, <code>12h</code>)</td></tr>
+        <tr><td><code>keep_daily:</code> / <code>keep_weekly:</code> / <code>keep_monthly:</code> / <code>keep_yearly:</code></td><td>unset</td><td>Retain 1 newest version per calendar day, ISO week, month, or year bucket</td></tr>
+      </table>
+    </div>
+
+<h3 id="cfg-deletion"><code>deletion:</code> <span class="cfg-badge">Under sync:</span></h3>
+    <p>Controls whether source deletions are archived to <code>.archive</code> (with independent <code>--archive-forget</code> GFS pruning) or mirrored.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>mode:</code></td><td><code>archive</code></td><td>Source deletion policy (<code>archive</code> moves to <code>deletion.path</code> | <code>mirror</code> deletes from destination)</td></tr>
+        <tr><td><code>path:</code></td><td><code>&lt;dest&gt;\.archive</code></td><td>Target directory for archived deletions when <code>mode: archive</code></td></tr>
+        <tr><td><code>keep_last:</code> / <code>keep_within:</code></td><td>unset</td><td>Retain N newest archived deletions or those within duration (<code>30d</code>, <code>12h</code>)</td></tr>
+        <tr><td><code>keep_daily:</code> / <code>keep_weekly:</code> / <code>keep_monthly:</code> / <code>keep_yearly:</code></td><td>unset</td><td>Retain 1 newest archived deletion per calendar day, ISO week, month, or year bucket</td></tr>
+      </table>
+    </div>
+
+<h2 id="cfg-monitor"><code>monitor:</code></h2>
+    <p>Selects how TicTack detects file changes (OS kernel watcher, Windows NTFS USN journal, polling, or composite).</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>type:</code></td><td><code>watcher</code></td><td><code>watcher</code> (OS kernel events) | <code>usn</code> (Windows NTFS journal) | <code>polling</code> | <code>composite</code></td></tr>
+        <tr><td><code>usn:</code></td><td><code>false</code></td><td>Composite-only toggle to add the NTFS USN journal as a third observer</td></tr>
+        <tr><td><code>watcher_buffer_kb:</code></td><td><code>64</code></td><td>Kernel notification buffer in KB (use <code>512+</code> for heavy build/git churn)</td></tr>
+        <tr><td><code>polling_interval_seconds:</code></td><td><code>3600</code></td><td>Full directory scan interval in seconds (clamped to &ge; 10s)</td></tr>
+        <tr><td><code>polling_backstop:</code></td><td><code>true</code></td><td>Composite-only toggle to keep periodic polling active when USN is healthy</td></tr>
+        <tr><td><code>restart_delay_seconds:</code></td><td><code>10</code></td><td>Delay before restarting a faulted watcher</td></tr>
+        <tr><td><code>usn_poll_interval_ms:</code></td><td><code>200</code></td><td>Idle sleep in ms between NTFS USN journal reads (clamped to &ge; 50ms)</td></tr>
+        <tr><td><code>usn_parent_prefilter:</code></td><td><code>true</code></td><td>Skip USN records outside the watched tree before path resolution</td></tr>
+        <tr><td><code>usn_resolve_gap:</code></td><td><code>true</code></td><td>Trigger a rate-limited covering scan when a deleted item's parent no longer resolves</td></tr>
+        <tr><td><code>usn_checkpoint:</code></td><td><code>true</code></td><td>Persist USN cursor across restarts to replay the offline window (up to 100k records / 60s)</td></tr>
+      </table>
+    </div>
+
+<h2 id="cfg-logging"><code>logging:</code></h2>
+    <p>Rotating log file settings, console mirroring, and optional Desktop <code>WARN</code>/<code>ERROR</code> alert files.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>level:</code></td><td><code>info</code></td><td>Log verbosity (<code>debug</code> | <code>info</code> | <code>warn</code> | <code>error</code>)</td></tr>
+        <tr><td><code>path:</code></td><td><code>tictack.log</code></td><td>Rotating log file path</td></tr>
+        <tr><td><code>max_size_mb:</code></td><td><code>10</code></td><td>Rotate log file when it reaches N MB</td></tr>
+        <tr><td><code>max_files:</code></td><td><code>5</code></td><td>Number of rotated log files to keep</td></tr>
+        <tr><td><code>console:</code></td><td><code>false</code></td><td>Mirror logs to stdout (auto-enabled in CLI modes)</td></tr>
+        <tr><td><code>alert_path:</code></td><td>unset</td><td>Directory for <code>TicTack-WARN/ERROR-*.txt</code> alert files</td></tr>
+        <tr><td><code>alert_enabled:</code></td><td>unset</td><td>Optional hard switch (<code>false</code> disables alert files)</td></tr>
+      </table>
+    </div>
+
+<h2 id="cfg-watchdog"><code>watchdog:</code></h2>
+    <p>Periodic stall-detection check for the Windows background service.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>enabled:</code></td><td><code>true</code></td><td>Enable Windows service stall watchdog</td></tr>
+        <tr><td><code>interval_minutes:</code></td><td><code>30</code></td><td>Windows service stall check cadence in minutes</td></tr>
+      </table>
+    </div>
+
+<h2 id="cfg-external"><code>external_drives:</code></h2>
+    <p>On-demand cold-storage USB backup: discovers plugged-in drives carrying a marker file when running <code>TicTackSv --external-drives</code>, prompts <code>Proceed? (y/n)</code>, and runs your configured command.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>command:</code></td><td>unset</td><td>Required for <code>--external-drives</code>: command to run per matched drive (supports <code>{source}</code> and <code>{drive}</code> placeholders)</td></tr>
+        <tr><td><code>working_dir:</code></td><td>exe dir</td><td>Working directory for the external drive command</td></tr>
+        <tr><td><code>require_marker_file:</code></td><td><code>true</code></td><td>Require marker file at drive root before running</td></tr>
+        <tr><td><code>marker_file_name:</code></td><td><code>.tictack-target</code></td><td>Marker file name checked at the drive root</td></tr>
+        <tr><td><code>exclude_drives:</code></td><td><code>[]</code></td><td>Drive letters to always skip</td></tr>
+      </table>
+    </div>
+
+<h2 id="cfg-top">Top-level</h2>
+    <p>Global service, EcoQoS, USB volume-mount wait, and Windows SCM/IFEO tuning options at the root of <code>config.yaml</code>.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>eco_qos:</code></td><td><code>false</code></td><td>Enable Windows 11 EcoQoS (<code>PROCESS_POWER_THROTTLING_EXECUTION_SPEED</code> + low I/O priority) or Linux <code>nice +10</code></td></tr>
+        <tr><td><code>volume_wait_minutes:</code></td><td><code>2</code></td><td>Minutes to wait at startup for a slow USB <code>[VolumeLabel]</code> drive to mount (<code>0</code> fails immediately)</td></tr>
+        <tr><td><code>strict_config_perms:</code></td><td><code>false</code></td><td>Refuse startup if <code>config.yaml</code> or secret files are writable by non-admin/non-owner users</td></tr>
+        <tr><td><code>delayed_autostart:</code></td><td><code>false</code></td><td>Windows SCM <code>DelayedAutostart</code> toggle (<code>true</code> starts the service after disks and network settle on next boot)</td></tr>
+        <tr><td><code>service_name:</code></td><td><code>TicTackSv</code></td><td>Windows SCM service name override for side-by-side installs</td></tr>
+        <tr><td><code>preshutdown_timeout_ms:</code></td><td>unset</td><td>Windows SCM <code>PreshutdownTimeout</code> in ms (e.g. <code>180000</code>) for clean shutdown flushing</td></tr>
+        <tr><td><code>services_pipe_timeout_ms:</code></td><td>unset</td><td>Windows SCM <code>ServicesPipeTimeout</code> in ms (e.g. <code>120000</code>), only raises above the global value</td></tr>
+        <tr><td><code>cpu_priority_class:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> CPU priority DWORD (<code>1</code> Idle, <code>2</code> Normal, <code>5</code> BelowNormal)</td></tr>
+        <tr><td><code>io_priority:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> I/O priority DWORD (<code>1</code> Inherit, <code>2</code> VeryLow, <code>3</code> Low)</td></tr>
+        <tr><td><code>page_priority:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> memory page priority DWORD (<code>1</code> VeryLow .. <code>4</code> BelowNormal)</td></tr>
+        <tr><td><code>required_privileges:</code></td><td>4 least-priv</td><td>Windows service token privileges list (defaults to <code>SeChangeNotifyPrivilege</code>, <code>SeBackupPrivilege</code>, <code>SeRestorePrivilege</code>, <code>SeManageVolumePrivilege</code>; <code>[]</code> opts out)</td></tr>
+      </table>
+    </div>
+
+<h2 id="cfg-example">Example <code>config.yaml</code></h2>
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">config.yaml</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre><span class="key">eco_qos:</span> true
+<span class="key">volume_wait_minutes:</span> 2
+
+<span class="key">sources:</span>
+  - <span class="key">path:</span> C:\Users\Alice\Documents
+    <span class="key">destination:</span> <span class="str">"[Backup-Disk]\\Sync"</span>
+    <span class="key">debounce_seconds:</span> 10
+    <span class="key">filter:</span>
+      <span class="key">max_file_size_mb:</span> no-limit
+      <span class="key">exclude:</span> [<span class="str">"*.tmp"</span>, <span class="str">".git/*"</span>]
+    <span class="key">sync:</span>
+      <span class="key">verification:</span> date_and_size
+      <span class="key">durability:</span> full
+      <span class="key">file_access:</span> vss
+      <span class="key">retry:</span>
+        <span class="key">max_attempts:</span> 5
+        <span class="key">delay_ms:</span> 1000
+        <span class="key">backoff:</span> 2.0
+      <span class="key">versioning:</span>
+        <span class="key">path:</span> <span class="str">"[Backup-Disk]\\Sync\\.versions"</span>
+        <span class="key">keep_daily:</span> 7
+        <span class="key">keep_weekly:</span> 4
+      <span class="key">deletion:</span>
+        <span class="key">mode:</span> archive
+        <span class="key">path:</span> <span class="str">"[Backup-Disk]\\Sync\\.archive"</span>
+        <span class="key">keep_within:</span> 30d
+
+<span class="key">monitor:</span>
+  <span class="key">type:</span> watcher
+  <span class="key">watcher_buffer_kb:</span> 512
+
+<span class="key">logging:</span>
+  <span class="key">level:</span> info
+  <span class="key">path:</span> tictack.log
+  <span class="key">max_size_mb:</span> 10
+  <span class="key">max_files:</span> 5
+
+<span class="key">watchdog:</span>
+  <span class="key">enabled:</span> true
+  <span class="key">interval_minutes:</span> 30</pre>
+      </div>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-cli">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">CLI flags</span>
+      </a>
+      <a class="pager-link next" href="#page-remote">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">Remote sync</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-remote">
+<header class="article-header">
+    <h1 id="remote">Remote sync</h1>
+    <p class="article-lede">Built-in encrypted TCP synchronization (<code>TTRM</code> v1) with ephemeral TLS, mutual PSK auth, and OS sandboxing.</p>
+  </header>
+
+<h2 id="tcp-arch">Architecture &amp; protocol (<code>TTRM</code> v1)</h2>
+    <p>TicTack includes a built-in, zero-dependency binary TCP synchronization protocol (<code>TTRM</code> v1) so a host can pull live file changes from a remote machine or VM without exposing SMB/CIFS shares. The agent (<code>TicTackSv --remote-agent</code>) exports a single read-only directory tree (<code>remote_sync.root</code>) over an encrypted, mutually authenticated channel while running inside an OS sandbox.</p>
+
+    <h3 id="tcp-flow">Handshake &amp; binary framing</h3>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">TTRM v1 handshake, framing, and sandbox layers</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre>  Client (SyncPipeline + RemoteFileAccessor)               Server (TicTackSv --remote-agent)
+  ──────────────────────────────────────────               ─────────────────────────────────
+  1. TCP Connect (NoDelay, 4 MiB socket buffers) ────────► IP Allowlist (allow_ip:) &amp; Ban Check
+                                                           (5 auth/frame/traversal errors = 60s ban)
+
+  2. TLS 1.2 / 1.3 Handshake (SslStream)       ◄────────► Ephemeral ECDSA P-256 X.509 Cert
+     (tls: true by default; single-record                  (CN=TicTackRemote, generated in-memory
+      coalesced ArrayPool frames)                           at agent startup; zero CA files needed)
+
+  3. Mutual HMAC-SHA256 PSK Challenge-Response
+     (pskKey = SHA-256(psk | psk_env | psk_file))
+                                               ◄─────────  Auth Challenge: [WireVer=1 (2B) | sNonce (32B)]
+     cNonce = CSPRNG(32B)
+     cMac   = HMAC-SHA256(pskKey, "TTRM-C" || sNonce || cNonce)
+     Send [cNonce (32B) | cMac (32B)]          ─────────►  FixedTimeEquals(cMac, expected)
+                                                           sMac = HMAC-SHA256(pskKey, "TTRM-S" || cNonce || sNonce)
+     FixedTimeEquals(sMac, expected)           ◄─────────  Auth Ok: [sMac (32B)]
+
+  4. Binary Frame Stream (12-byte LE header: [Magic "TTRM" 0x5454524D (4B) | Op (4B) | Len (4B)])
+     • Control Pool: List(2), Stat(3), ReadChunk(4), Hash(5), ReadFile(7), HashPrefix(8)
+     • Push Stream:  Subscribe(6) ◄─────────────────────── ChangeEvent(0x80000001) from OS Watcher</pre>
+      </div>
+    </div>
+
+    <h3 id="tcp-layers">Encryption, PSK &amp; OS sandbox layers</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Security Layer</th><th>Implementation</th></tr>
+        <tr><td><strong>Transport encryption (<code>tls: true</code>)</strong></td><td>Uses <code>SslStream</code> with <code>Tls12 | Tls13</code> and an in-memory ephemeral ECDSA P-256 (<code>nistP256</code>) self-signed certificate generated at startup. Frames coalesce <code>[12B Header | Metadata | Payload]</code> into one rented <code>ArrayPool&lt;byte&gt;</code> buffer so each frame emits a single TLS record. When <code>tls: false</code> on trusted loopback/WireGuard links, <code>SendGather</code> uses zero-copy scatter/gather I/O (<code>WSASend</code> / <code>writev</code>)</td></tr>
+        <tr><td><strong>Mutual PSK authentication (<code>psk:</code> / <code>psk_env:</code> / <code>psk_file:</code>)</strong></td><td>Derives a 32-byte key via <code>SHA-256(secret)</code> and runs a 3-way challenge-response with 32-byte CSPRNG nonces (<code>serverNonce</code>, <code>clientNonce</code>) and domain-separated HMAC tags (<code>"TTRM-C"</code>, <code>"TTRM-S"</code>) verified via <code>CryptographicOperations.FixedTimeEquals</code>. Proves both peers hold the PSK and prevents MITM against the ephemeral TLS certificate</td></tr>
+        <tr><td><strong>Wire framing &amp; resource caps</strong></td><td>Every frame carries magic <code>0x5454524D</code> (<code>"TTRM"</code>), a 32-bit operation code, and a 32-bit length capped at <code>MaxFrameBytes = 16 MiB</code> (file chunks stream in <code>4 MiB</code> windows). Remote SHA-256 (<code>Op.Hash</code> and append-proof <code>Op.HashPrefix</code>) offloads hashing to the agent so unchanged files never cross the network</td></tr>
+        <tr><td><strong>Root path jail &amp; auto-ban</strong></td><td>Every requested relative path is canonicalized via <code>Path.GetFullPath</code> and verified to reside strictly under <code>remote_sync.root</code>. Any traversal attempt (<code>UnauthorizedAccessException</code>), malformed/oversized frame (<code>InvalidDataException</code>), or bad HMAC increments the per-IP failure counter; 5 failures ban the IP for 60 seconds</td></tr>
+        <tr><td><strong>Windows OS sandbox (<code>RemoteSandbox</code>)</strong></td><td>Strips all process token privileges (<code>AdjustTokenPrivileges(disableAllPrivileges: true)</code>), lowers the token to <strong>Low Mandatory Integrity (<code>S-1-16-4096</code>)</strong> under <code>sandbox_level: low</code> (or <code>restricted</code>), and assigns a Windows JobObject with <code>ACTIVE_PROCESS = 1</code>, <code>KILL_ON_JOB_CLOSE</code>, and <code>UILIMIT_ALL</code></td></tr>
+        <tr><td><strong>Linux kernel sandbox (<code>RemoteSandbox</code>)</strong></td><td>Sets <code>prctl(PR_SET_NO_NEW_PRIVS)</code>, sets <code>RLIMIT_NPROC = 0</code> (forbids fork/exec), and enforces a <strong>Landlock LSM</strong> ruleset restricting kernel filesystem access to read-only beneath <code>remote_sync.root</code> (plus read/exec on <code>/usr</code>, <code>/lib</code>, <code>/lib64</code>, <code>/etc</code>) with zero write access anywhere on the system</td></tr>
+      </table>
+    </div>
+
+<h2 id="cfg-remote"><code>remote_sync:</code></h2>
+    <p>Configure the <code>remote_sync:</code> block in <code>config.yaml</code> for either the <code>--remote-agent</code> server or a pulling client.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>listen:</code></td><td>unset</td><td>Agent: TCP bind endpoint (e.g. <code>0.0.0.0:9443</code>)</td></tr>
+        <tr><td><code>root:</code></td><td>unset</td><td>Agent: jailed read-only root directory</td></tr>
+        <tr><td><code>allow_ip:</code></td><td>unset</td><td>Agent: optional client IP allowlist</td></tr>
+        <tr><td><code>max_clients:</code></td><td><code>8</code></td><td>Agent: maximum concurrent client connections</td></tr>
+        <tr><td><code>sandbox:</code></td><td><code>true</code></td><td>Agent: enable OS process/token sandbox</td></tr>
+        <tr><td><code>sandbox_level:</code></td><td><code>low</code></td><td>Agent: Windows token isolation (<code>low</code> for Low-Integrity <code>S-1-16-4096</code> + JobObject, or <code>restricted</code>)</td></tr>
+        <tr><td><code>host:</code></td><td>unset</td><td>Client: single remote agent endpoint (<code>host:port</code>)</td></tr>
+        <tr><td><code>hosts:</code></td><td>unset</td><td>Client: list of remote agent endpoints (<code>host:port</code>)</td></tr>
+        <tr><td><code>destination:</code></td><td>unset</td><td>Client: local mirror destination directory</td></tr>
+        <tr><td><code>tls:</code></td><td><code>true</code></td><td>Enable TLS 1.2/1.3 encryption (disable only on trusted loopback/WireGuard links)</td></tr>
+        <tr><td><code>psk:</code></td><td>unset</td><td>Inline 32-byte hex HMAC pre-shared key</td></tr>
+        <tr><td><code>psk_env:</code></td><td>unset</td><td>Environment variable name holding the PSK</td></tr>
+        <tr><td><code>psk_file:</code></td><td>unset</td><td>Path to file holding the PSK</td></tr>
+      </table>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-configuration">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">YAML (TicTack)</span>
+      </a>
+      <a class="pager-link next" href="#page-jobs">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">Jobs & scheduler</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-jobs">
+<header class="article-header">
+    <h1 id="jobs">Jobs &amp; scheduler</h1>
+    <p class="article-lede">Schedule restic, rclone, and Corpus with sandboxed execution and pre-flight checks.</p>
+  </header>
+
+<h2 id="jobs-triggers">Schedules &amp; triggers</h2>
+    <p>The <code>jobs:</code> scheduler runs external commands (<code>Corpus.exe</code>, <code>restic</code>, <code>rclone</code>, custom scripts) on daily, weekly, monthly, interval (<code>every: 6h</code>), or one-shot schedules with pre-flight network checks and Windows JobObject sandboxing.</p>
+
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>name:</code></td><td>none</td><td>Required job label</td></tr>
+        <tr><td><code>command:</code></td><td>none</td><td>Shell command (<code>cmd.exe /c</code> on Windows, <code>/bin/sh -c</code> on Linux; <code>{source}</code> expands to all quoted source paths)</td></tr>
+        <tr><td><code>time:</code></td><td>unset</td><td>24h trigger time (e.g. <code>"02:30"</code>) paired with <code>schedule:</code></td></tr>
+        <tr><td><code>schedule:</code></td><td><code>daily</code></td><td>Calendar cadence (<code>daily</code> | <code>weekly</code> | <code>monthly</code>)</td></tr>
+        <tr><td><code>day:</code></td><td>unset</td><td>For <code>weekly</code>: weekday name (<code>Monday</code>..<code>Sunday</code>). For <code>monthly</code>: day <code>1</code>..<code>31</code> (clamped to short months)</td></tr>
+        <tr><td><code>days:</code></td><td>unset</td><td>For <code>weekly</code>: weekday mask (e.g. <code>[mon, wed, fri]</code>)</td></tr>
+        <tr><td><code>run_once_on:</code></td><td>unset</td><td>One-shot ISO date <code>YYYY-MM-DD</code> paired with <code>time:</code> (mutually exclusive with <code>schedule:</code> / <code>every:</code>)</td></tr>
+        <tr><td><code>every:</code></td><td>unset</td><td>Sub-daily/interval trigger (<code>30s</code>, <code>15m</code>, <code>6h</code>, <code>1d</code>; minimum <code>30s</code>, mutually exclusive with calendar keys)</td></tr>
+      </table>
+    </div>
+
+<h2 id="jobs-execution">Execution, sandbox &amp; pre-flight</h2>
+    <p>Control Windows JobObject sandboxing, overlap/catch-up behavior, pre-flight network checks, power gates, and lifecycle hooks.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>working_dir:</code></td><td>exe dir</td><td>Working directory for the command and its hooks</td></tr>
+        <tr><td><code>missed_run:</code></td><td><code>catch_up</code></td><td><code>catch_up</code> fires missed slots at startup | <code>skip</code> drops missed slots (configurable in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>overlap:</code></td><td><code>skip</code></td><td><code>skip</code> stands down while previous run is active | <code>queue</code> waits and runs once</td></tr>
+        <tr><td><code>jitter:</code></td><td>unset</td><td>Random <code>0..span</code> delay before each fire (e.g. <code>15m</code>) to prevent I/O storms</td></tr>
+        <tr><td><code>timeout_minutes:</code></td><td><code>10</code></td><td>Kill command if it exceeds N minutes (falls back to <code>jobs_defaults:</code>, then <code>10</code>)</td></tr>
+        <tr><td><code>sandbox:</code></td><td><code>false</code></td><td>Run child process tree inside a Windows JobObject with <code>JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE</code> and <code>JOB_OBJECT_UILIMIT_ALL</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>show_terminal:</code></td><td><code>false</code></td><td>Show a visible console window when launching the job on Windows (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>net_check:</code></td><td><code>false</code></td><td>Passive local network stability pre-check before cloud jobs (verifies default route, NIC link state, packet error/drop delta, and gateway RTT; also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>net_check_icmp:</code></td><td><code>true</code></td><td>Enable local gateway ICMP RTT sampling during <code>net_check</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>net_check_host:</code></td><td>unset</td><td>Optional endpoint override for <code>net_check</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>net_check_samples:</code></td><td><code>4</code></td><td>Ping sample count (<code>2..10</code>; also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>net_check_max_ms:</code></td><td><code>250</code></td><td>Max gateway RTT/jitter ceiling in ms (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>net_check_wait_seconds:</code></td><td><code>60</code></td><td>Retry wait budget in seconds before failing pre-flight (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>low_priority:</code></td><td><code>false</code></td><td>Run job with background CPU priority</td></tr>
+        <tr><td><code>on_ac_only:</code></td><td><code>false</code></td><td>Skip job when running on battery power</td></tr>
+        <tr><td><code>prevent_sleep:</code></td><td><code>false</code></td><td>Hold an OS sleep inhibitor while the job runs</td></tr>
+        <tr><td><code>pre_command:</code></td><td>unset</td><td>Pre-gate command (non-zero exit skips main job)</td></tr>
+        <tr><td><code>post_command:</code></td><td>unset</td><td>Post-run cleanup command</td></tr>
+        <tr><td><code>on_failure:</code></td><td>unset</td><td>Failure alert hook</td></tr>
+      </table>
+    </div>
+
+<h2 id="jobs-examples">Example configuration</h2>
+    <p>Complete <code>jobs:</code> example combining <code>Corpus.exe</code>, <code>restic</code>, and <code>rclone</code> under <code>jobs_defaults:</code>.</p>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">config.yaml (Jobs showcase: Corpus + restic + rclone)</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre><span class="key">jobs_defaults:</span>
+  <span class="key">missed_run:</span> catch_up
+  <span class="key">timeout_minutes:</span> 60
+  <span class="key">sandbox:</span> true
+
+<span class="key">jobs:</span>
+  <span class="comment"># 1. Windows block-level volume snapshot via Corpus (atomic C: + D: consistency group)</span>
+  - <span class="key">name:</span> corpus-system-image
+    <span class="key">time:</span> <span class="str">"02:00"</span>
+    <span class="key">on_ac_only:</span> true
+    <span class="key">prevent_sleep:</span> true
+    <span class="key">command:</span> <span class="str">"Corpus.exe --config C:\\ProgramData\\TicTack\\config_corpus.yaml --image --volumes C:,D: --name nightly"</span>
+
+  <span class="comment"># 2. Deduplicated encrypted repository snapshot via restic</span>
+  - <span class="key">name:</span> restic-local-repo
+    <span class="key">time:</span> <span class="str">"03:00"</span>
+    <span class="key">low_priority:</span> true
+    <span class="key">command:</span> <span class="str">"restic -r [Backup-Disk]\\ResticRepo backup {source} &amp;&amp; restic -r [Backup-Disk]\\ResticRepo forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 1 --prune"</span>
+
+  <span class="comment"># 3. Offsite cloud sync via rclone, gated by passive local network stability check</span>
+  - <span class="key">name:</span> rclone-cloud-offload
+    <span class="key">time:</span> <span class="str">"04:00"</span>
+    <span class="key">net_check:</span> true
+    <span class="key">low_priority:</span> true
+    <span class="key">command:</span> <span class="str">"rclone sync [Backup-Disk]\\ResticRepo s3:my-offsite-bucket/restic --transfers 4"</span></pre>
+      </div>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-remote">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">Remote sync</span>
+      </a>
+      <a class="pager-link next" href="#page-corpus">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">Corpus (Windows)</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-diagnostics">
+<header class="article-header">
+    <h1 id="diagnostics">Diagnostics &amp; profiling</h1>
+    <p class="article-lede">Three-phase profiling harness: live triage, static analysis, and throughput benchmarks.</p>
+  </header>
+
+<h2 id="diag-harness">Profiling harness (<code>diag.ps1</code> / <code>diag.sh</code>)</h2>
+    <p>A three-phase harness in <code>benchmarks/</code> wraps the <code>dotnet-*</code> diagnostic tools, static analysis, the xUnit suite, and fixtured copy benchmarks. Every run writes <code>diag-out/&lt;timestamp&gt;-perf/</code> with a <code>SUMMARY.md</code> report.</p>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <div class="tab-list" role="tablist">
+          <button type="button" class="tab-btn active" role="tab">Windows (diag.ps1)</button>
+          <button type="button" class="tab-btn" role="tab">Linux (diag.sh)</button>
+        </div>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+
+      <div class="tab-pane active">
+        <pre><span class="cmd">benchmarks\diag.ps1</span> [-p1] [-p2] [-p3] [-Root DIR] [-Full] [-Dump] [PID|NAME] [-Published] [SCENARIOS...]
+<span class="cmd">benchmarks\diag.ps1</span> test [-Filter EXPR] [-WindowsOnly] [-Coverage] [-Elevated] [-NoBuild]</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="cmd">benchmarks/diag.sh</span> [-p1] [-p2] [-p3] [--full] [--dump] [--io] [--kuni] [--published] [PID|NAME] [SCENARIOS...]
+<span class="cmd">benchmarks/diag.sh</span> test [--filter EXPR]</pre>
+      </div>
+    </div>
+
+<h2 id="diag-phases">Three-phase workflow</h2>
+    <ul>
+      <li><strong>Phase 1 (Live triage and tracing):</strong> Escalates from thread states and CPU delta to <code>dotnet-counters</code> (including in-app <code>TicTack</code> metrics: files/bytes copied, copy+fsync latency, pending events). <code>-Full</code> adds <code>dotnet-gcstats</code>, <code>dotnet-gcdump</code> diffs, <code>dotnet-trace</code> + Speedscope flame graphs, PerfView GC captures on Windows, and <code>bpftrace</code> / <code>perf</code> / unified kernel+managed tracing (<code>--io</code>, <code>--kuni</code>) on Linux.</li>
+      <li><strong>Phase 2 (Static analysis and tests):</strong> Runs <code>semgrep --config r/csharp</code>, <code>ast-grep scan</code> against banked rules in <code>rules/</code>, and the xUnit test suite.</li>
+      <li><strong>Phase 3 (Fixtured throughput and BenchmarkDotNet):</strong> Generates a 2 GB fixture (9,000 small files + 1,000&times;1 MB + 10&times;100 MB), baselines filesystem <code>fsync</code> latency via <code>diskspd</code> (Windows) or <code>fio</code> (Linux), drops page caches (<code>RAMMap -Et</code> / <code>drop_caches</code>), and benchmarks <code>cold-initial</code>, <code>warm-noop</code>, <code>hash-verify</code>, and <code>workers=1|2|4</code> alongside <code>BenchmarkDotNet</code> microbenchmarks.</li>
+    </ul>
+
+<h2 id="tests">Running tests</h2>
+    <p>Run the cross-platform xUnit suites for TicTack and Corpus, or filter for Windows-only native tests.</p>
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">terminal</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre><span class="comment"># Cross-platform unit + crash-injection tests</span>
+<span class="cmd">dotnet test</span> tests/TicTack.Tests.csproj
+<span class="cmd">dotnet test</span> corpus/tests/Corpus.Tests.csproj
+
+<span class="comment"># Windows-only native watcher / VSS / JobObject tests</span>
+<span class="cmd">dotnet test</span> tests\TicTack.Tests.csproj --filter <span class="str">"Category=Windows"</span></pre>
+      </div>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-corpus-yaml">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">YAML (Corpus)</span>
+      </a>
+      <a class="pager-link next" href="#page-overview">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">Overview</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-corpus">
+<header class="article-header">
+    <h1 id="corpus">Corpus (Architecture)</h1>
+    <p class="article-lede">Incremental, deduplicated, GFS-rotated, VSS snapshot-based volume and disk backup for Windows 10/11.</p>
+  </header>
+
+<h2 id="capabilities">Core capabilities</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Capability</th><th>Implementation</th></tr>
+        <tr><td><strong>Snapshot-based capture</strong></td><td>In-box COM <code>IVssBackupComponents</code> requester in <code>VSS_CTX_BACKUP</code> component mode. Refuses writerless degradations (<code>NO_WRITERS 0x10</code>) and checks per-writer status via <code>GatherWriterStatus</code></td></tr>
+        <tr><td><strong>512e &amp; 4Kn physical disk support</strong></td><td>Whole-disk GPT capture (<code>--disk N</code>) auto-detects 512-byte (<code>512n</code>/<code>512e</code>) and 4,096-byte (<code>4Kn</code>) logical sector geometry at LBA 1</td></tr>
+        <tr><td><strong>Incremental &amp; deduplicated</strong></td><td>USN journal + per-record MFT digest change tracking reads only dirty clusters. Fixed (4 MiB) or Buzhash CDC chunks are content-addressed (keyed BLAKE2b/HMAC), zstd-compressed, with depth-1 sub-chunk deltas and optional Reed-Solomon ECC sidecars</td></tr>
+        <tr><td><strong>Sparse volume &amp; file support</strong></td><td>NTFS volume bitmap (<code>ISparseBlockSource</code>) records unallocated clusters as <code>IsHole</code> without reading or storing zeros. VHDX export and selective file extraction (<code>--extract</code>) preserve sparse NTFS runs (<code>Lcn == -1</code>) via <code>FSCTL_SET_SPARSE</code> and hole seeking</td></tr>
+        <tr><td><strong>Power-loss &amp; crash resume</strong></td><td>Chunk index commits per sealed 16 MiB pack (<code>CPK1</code>). Interrupted captures recover orphan sealed packs on startup and resume from <code>.capture-progress.json</code> without re-hashing completed chunks</td></tr>
+        <tr><td><strong>Pre-flight fit check</strong></td><td>Calculates planned allocated bytes from the NTFS bitmap before streaming and verifies destination headroom (<code>min_free_gb</code> and <code>strict_fit_check</code>)</td></tr>
+      </table>
+    </div>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <div class="tab-list" role="tablist">
+          <button type="button" class="tab-btn active" role="tab">Volume &amp; incremental capture</button>
+          <button type="button" class="tab-btn" role="tab">Single-file VHDX &amp; extract</button>
+        </div>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+
+      <div class="tab-pane active">
+        <pre><span class="comment">REM Validate VSS writer health and config</span>
+<span class="cmd">Corpus.exe</span> --validate
+
+<span class="comment">REM Capture a live volume into the deduplicated chunk store</span>
+<span class="cmd">Corpus.exe</span> --image --volume C: --name daily-os
+
+<span class="comment">REM Capture an incremental snapshot inline</span>
+<span class="cmd">Corpus.exe</span> --image --volume C: --name daily-os --inline --incremental</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment">REM Direct single-file dynamic VHDX backup (sparse-verified)</span>
+<span class="cmd">Corpus.exe</span> --image --volume C: --to-vhdx D:\backups\system.vhdx
+
+<span class="comment">REM Selective file/folder extract from generation 12 (preserves sparse files)</span>
+<span class="cmd">Corpus.exe</span> --extract --snapshot 12 --paths <span class="str">"Users\Alice\VMs"</span> --out D:\restore</pre>
+      </div>
+    </div>
+
+<h2 id="consistency-groups">Consistency groups and I/O freeze</h2>
+    <p>When an application and its database span multiple volumes or disks (for example, application state on <code>C:</code> and database files on <code>D:</code>), snapshotting volumes one after another risks state skew. Corpus prevents this with three guards:</p>
+
+    <ul>
+      <li><strong>Multi-volume atomic VSS snapshot sets (<code>--volumes C:,D:</code>):</strong> Adds all target volumes to a single <code>StartSnapshotSet</code> / <code>DoSnapshotSet</code> freeze window and links the resulting manifests with a shared <code>ConsistencyGroupId</code>.</li>
+      <li><strong>Fail-closed VSS writer status verification (<code>strict_vss_writers: true</code>):</strong> Calls <code>GatherWriterStatus</code> after <code>PrepareForBackup</code> and <code>DoSnapshotSet</code>. If a participating writer (such as SQL Server or Hyper-V) reports <code>FailedAtFreeze</code> or any error state, Corpus aborts instead of recording an inconsistent snapshot (set <code>strict_vss_writers: false</code> to downgrade to warning-only).</li>
+      <li><strong>Pre-freeze and post-thaw hooks (<code>pre_freeze</code> / <code>post_thaw</code>):</strong> Brackets <code>DoSnapshotSet</code> in a <code>try/finally</code> block so non-VSS databases (PostgreSQL, MySQL, SQLite, custom daemons) can flush and freeze I/O for only the few seconds it takes VSS to commit the shadow copy.</li>
+    </ul>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <div class="tab-list" role="tablist">
+          <button type="button" class="tab-btn active" role="tab">config_corpus.yaml</button>
+          <button type="button" class="tab-btn" role="tab">Multi-volume CLI</button>
+        </div>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+
+      <div class="tab-pane active">
+        <pre><span class="key">store_path:</span> <span class="str">"E:\\CorpusStore"</span>
+<span class="key">chunk_mib:</span> 4
+<span class="key">eco_qos:</span> true
+<span class="key">min_free_gb:</span> 25
+<span class="key">strict_fit_check:</span> true
+
+<span class="comment"># Consistency group &amp; writer guards</span>
+<span class="key">strict_vss_writers:</span> true
+<span class="key">pre_freeze:</span> <span class="str">"psql -U postgres -c \"CHECKPOINT;\""</span>
+<span class="key">post_thaw:</span> <span class="str">"echo thawed"</span>
+
+<span class="key">retention:</span>
+  <span class="key">keep_last:</span> 4
+  <span class="key">keep_within_days:</span> 7
+  <span class="key">keep_daily:</span> 7
+  <span class="key">keep_weekly:</span> 4
+  <span class="key">keep_monthly:</span> 6
+  <span class="key">keep_yearly:</span> 1
+  <span class="key">pin:</span> [1]</pre>
+      </div>
+
+      <div class="tab-pane">
+        <pre><span class="comment">REM Freeze C: and D: in one atomic VSS set with shared ConsistencyGroupId</span>
+<span class="cmd">Corpus.exe</span> --image --volumes C:,D: --name app-db-cg</pre>
+      </div>
+    </div>
+
+<h2 id="retention">GFS retention and garbage collection</h2>
+    <p>Corpus manifests are self-contained (incremental generations remain restorable after their parent generation is pruned, and depth-1 delta chunks automatically pin their base chunks). Mark-sweep garbage collection retains the union of:</p>
+    <ul>
+      <li><code>keep_last</code>: N most recent generations</li>
+      <li><code>keep_within_days</code>: all generations newer than N days</li>
+      <li><code>keep_daily</code> / <code>keep_weekly</code> / <code>keep_monthly</code> / <code>keep_yearly</code>: newest generation in each calendar bucket (<code>yyyy-MM-dd</code>, ISO week <code>yyyy-Www</code>, <code>yyyy-MM</code>, <code>yyyy</code>)</li>
+      <li><code>pin</code>: explicitly listed generation numbers</li>
+    </ul>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">cmd</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre><span class="comment">REM Preview GC plan with GFS overrides</span>
+<span class="cmd">Corpus.exe</span> --gc --dry-run --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 1
+
+<span class="comment">REM Execute GC plan</span>
+<span class="cmd">Corpus.exe</span> --gc --confirm --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 1</pre>
+      </div>
+    </div>
+
+<h2 id="exclusions">Exclusions (<code>--exclude</code> / <code>exclude:</code>)</h2>
+    <p>Exclusions are NTFS-name based and match against volume-relative paths (without a drive letter, e.g. <code>Users\Bob\Desktop</code>), case-insensitively:</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Form</th><th>Meaning</th></tr>
+        <tr><td><code>--exclude Desktop</code></td><td>Every directory named <code>Desktop</code> at any depth plus its subtree (bare file names match at the volume root only)</td></tr>
+        <tr><td><code>--exclude Users\Bob\Desktop</code></td><td>Exactly that volume-relative path (file or directory)</td></tr>
+      </table>
+    </div>
+    <ul>
+      <li><strong>No drive prefix:</strong> <code>--exclude C:\Users\Bob\Desktop</code> matches nothing because volume-relative paths do not include <code>C:</code>.</li>
+      <li><strong>No <code>%VAR%</code> expansion inside <code>Corpus.exe</code>:</strong> Pass expanded paths or let <code>cmd.exe</code> expand <code>%USERPROFILE%</code> (and remember to strip the drive letter).</li>
+    </ul>
+
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-jobs">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">Jobs & scheduler</span>
+      </a>
+      <a class="pager-link next" href="#page-corpus-cli">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">CLI (Corpus)</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-corpus-cli">
+<header class="article-header">
+    <h1 id="corpus-cli">CLI (Corpus)</h1>
+    <p class="article-lede">Every <code>Corpus.exe</code> command-line verb and flag: capture, export, verification, GC, bare-metal restore, and VSS probes.</p>
+  </header>
+
+<h2 id="ccli-capture">Volume &amp; disk capture</h2>
+    <p>Capture live NTFS volumes, multi-volume consistency groups, or whole GPT disks into the chunk store, VHDX, or WIM/ESD.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--image --volume &lt;path|X:&gt; --name &lt;snap&gt;</code></td><td>Fast landing capture into the store (default full; fold later via <code>--gc</code> or <code>--service</code>). Optional: <code>--inline</code>, <code>--incremental</code>, <code>--parent &lt;gen&gt;</code>, <code>--full</code>, <code>--skip-if-unchanged</code>, <code>--buffered-io</code>, <code>--exclude &lt;path&gt;</code></td></tr>
+        <tr><td><code>--image --volumes &lt;C:,D:&gt; --name &lt;snap&gt;</code></td><td>Multi-volume atomic VSS consistency group capture across one or more disks, stamping a shared <code>ConsistencyGroupId</code> on each manifest</td></tr>
+        <tr><td><code>--image --disk &lt;N&gt; --name &lt;snap&gt;</code></td><td>Whole-disk GPT capture of every non-skipped partition on <code>PhysicalDriveN</code> (auto-detects <code>512e</code> and <code>4Kn</code> sectors; supports <code>--incremental</code>, <code>--parent &lt;layoutGen&gt;</code>, <code>--full</code>, <code>--skip-if-unchanged</code>)</td></tr>
+        <tr><td><code>--image --volume &lt;X:&gt; --to-vhdx &lt;path&gt;</code></td><td>Storeless single-file dynamic VHDX backup (sparse-verified). Optional: <code>--zstd</code>, <code>--vhdx-writer &lt;discutils|virtdisk&gt;</code>, <code>--parent &lt;base.vhdx&gt;</code>, <code>--optimize-vhd</code></td></tr>
+        <tr><td><code>--image --volume &lt;X:&gt; --to-wim &lt;path&gt;</code></td><td>Storeless single-file WIM capture via DISM/wimlib from a VSS snapshot (optional <code>--append</code>, <code>--split-swm &lt;sizeMb&gt;</code>)</td></tr>
+        <tr><td><code>--image --volume &lt;X:&gt; --to-esd &lt;path&gt;</code></td><td>Storeless single-file solid ESD capture via DISM/wimlib from a VSS snapshot</td></tr>
+      </table>
+    </div>
+
+<h2 id="ccli-export">Export, extract &amp; mount</h2>
+    <p>Export stored snapshot generations to raw images, dynamic VHDX, selective file trees, or read-only mounts.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--export --snapshot &lt;gen&gt; --out &lt;path&gt;</code></td><td>Export a stored snapshot generation to a raw volume image file</td></tr>
+        <tr><td><code>--export-vhdx --snapshot &lt;gen&gt; --out &lt;path&gt;</code></td><td>Export a stored snapshot to a dynamic VHDX (optional <code>--clone-from &lt;base.vhdx&gt;</code> for ReFS/COW reflink dirty-range export)</td></tr>
+        <tr><td><code>--extract --snapshot &lt;gen&gt; --paths &lt;a,b&gt; --out &lt;dir&gt;</code></td><td>Selective file/folder extraction directly from snapshot chunks without mounting (preserves sparse NTFS runs)</td></tr>
+        <tr><td><code>--mount-snapshot --snapshot &lt;gen&gt;</code></td><td>Expose a snapshot read-only under a temporary directory until <code>Ctrl+C</code></td></tr>
+      </table>
+    </div>
+
+<h2 id="ccli-store">Verification, GC &amp; replication</h2>
+    <p>Verify chunk integrity, run GFS garbage collection, compact landing chunks, or replicate stores.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--verify --snapshot &lt;gen&gt; [--chain]</code></td><td>Verify snapshot manifest HMAC and chunk index reachability (<code>--chain</code> walks all parent links to genesis)</td></tr>
+        <tr><td><code>--deep-verify --snapshot &lt;gen&gt;</code></td><td>Re-read and hash-compare <code>deep_verify_percent:</code> of pack chunks on disk</td></tr>
+        <tr><td><code>--gc [--dry-run | --confirm]</code></td><td>Mark-sweep garbage collection over retained roots. One-shot GFS overrides: <code>--keep-daily N</code>, <code>--keep-weekly N</code>, <code>--keep-monthly N</code>, <code>--keep-yearly N</code></td></tr>
+        <tr><td><code>--optimize-to-fit [--bytes N]</code></td><td>Fold pending landing chunks into compressed packs and optionally prune oldest generations to fit within <code>--bytes N</code></td></tr>
+        <tr><td><code>--service</code></td><td>Run scheduled daily GC (<code>gc_daily_at:</code>) and periodic landing compaction (<code>optimize_every:</code>) until <code>Ctrl+C</code></td></tr>
+        <tr><td><code>--copy --from &lt;store&gt; --to &lt;store&gt; --snapshot &lt;gen&gt;</code></td><td>Replicate one snapshot generation (plus optional <code>--chain [&lt;gen&gt;]</code>), transferring only missing packs</td></tr>
+        <tr><td><code>--sync --from &lt;store&gt; --to &lt;store&gt;</code></td><td>Replicate all missing snapshots from source store to target store</td></tr>
+      </table>
+    </div>
+
+<h2 id="ccli-restore">Bare-metal restore, WinPE media &amp; WIM servicing</h2>
+    <p>Restore volumes or whole GPT disks, build WinPE recovery media, and service offline Windows/WIM images.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--restore --snapshot &lt;gen&gt; --target &lt;disk|file&gt;</code></td><td>Block-restore a volume snapshot to a target disk/partition/file (requires <code>--confirm-type &lt;TOKEN&gt;</code>; optional <code>--store &lt;p&gt;</code>, <code>--index &lt;p&gt;</code>, <code>--allow-boot-disk</code>, <code>--skip-verify</code>, <code>--dry-run</code>)</td></tr>
+        <tr><td><code>--restore-disk --layout &lt;gen&gt; --target &lt;disk|file&gt;</code></td><td>Recreate GPT layout and restore all (or <code>--partitions &lt;1,3,4&gt;</code>) partitions of a whole-disk capture, with optional <code>--repair-boot</code></td></tr>
+        <tr><td><code>--build-media --staging-dir &lt;d&gt; | --usb &lt;X:&gt; | --iso &lt;f&gt;</code></td><td>Build bootable WinPE recovery media (optional <code>--adk &lt;dir&gt;</code>, <code>--include-store &lt;store&gt;</code>, <code>--db &lt;db&gt;</code>, <code>--driver &lt;infdir&gt;</code>, <code>--initialize</code>, <code>--payload &lt;dir&gt;</code>)</td></tr>
+        <tr><td><code>--prepare-universal --windows-dir &lt;dir&gt;</code></td><td>Offline Windows servicing: <code>--driver &lt;dir&gt;</code>, <code>--nic-dir &lt;d&gt;</code>, <code>--gpu-dir &lt;d&gt;</code>, <code>--unattend &lt;file&gt;</code>, <code>--lang-pack &lt;cab&gt;</code>, <code>--trim-*</code>, <code>--remove-kb &lt;id&gt;</code>, <code>--reg-hive</code>, <code>--dry-run</code></td></tr>
+        <tr><td><code>--convert --wim &lt;src&gt; --to &lt;dst&gt;</code></td><td>Convert WIM/ESD image (optional <code>--index N</code>, <code>--compress max|recovery</code>)</td></tr>
+        <tr><td><code>--merge-swm --swm &lt;first.swm&gt; --to &lt;dst.wim&gt;</code></td><td>Merge split <code>.swm</code> parts back into a single WIM</td></tr>
+        <tr><td><code>--wim-info --wim &lt;f&gt;</code></td><td>Print WIM/ESD image metadata and indexes</td></tr>
+        <tr><td><code>--optimize-wim --wim &lt;f&gt; [--recompress]</code></td><td>Optimize/recompress a WIM file</td></tr>
+        <tr><td><code>--mount --wim &lt;f&gt; --index &lt;N&gt; --mount-dir &lt;dir&gt;</code></td><td>Mount a WIM image index to a directory</td></tr>
+        <tr><td><code>--unmount --mount-dir &lt;dir&gt; --commit | --discard</code></td><td>Unmount a WIM directory and commit or discard changes</td></tr>
+        <tr><td><code>--apply --wim &lt;f&gt; [--index N] --target &lt;D:&gt;</code></td><td>Apply a WIM image index to a target volume</td></tr>
+      </table>
+    </div>
+
+<h2 id="ccli-inspect">Boot diagnostics, inventory &amp; VSS probes</h2>
+    <p>Inspect boot readiness, Hyper-V boot verification, disk layouts, VSS writers, and NTFS <code>$Bitmap</code> stats.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td><code>--check-boot-mode --disk &lt;N&gt; --firmware &lt;UEFI|BIOS&gt;</code></td><td>Verify disk partition style matches target firmware boot mode</td></tr>
+        <tr><td><code>--check-repair --disk &lt;N&gt;</code></td><td>Check Windows boot repair readiness on disk <code>N</code></td></tr>
+        <tr><td><code>--boot-verify --vhdx &lt;p&gt;</code></td><td>Boot-verify a VHDX in Hyper-V (optional <code>--vm-name &lt;n&gt;</code>, <code>--timeout-seconds &lt;s&gt;</code>, <code>--memory-mb &lt;mb&gt;</code>)</td></tr>
+        <tr><td><code>--locate-winre</code></td><td>Locate the active Windows Recovery Environment (WinRE) partition/image</td></tr>
+        <tr><td><code>--record-compact --snapshot &lt;gen&gt; [--windows-dir &lt;d&gt;]</code></td><td>Record compact OS metadata for a snapshot generation</td></tr>
+        <tr><td><code>--list-snapshots</code></td><td>List stored snapshot generations and metadata</td></tr>
+        <tr><td><code>--list-volumes</code></td><td>List available Windows volumes</td></tr>
+        <tr><td><code>--list-disks</code></td><td>List physical disks and sector geometries</td></tr>
+        <tr><td><code>--disk-layout --disk &lt;N&gt;</code></td><td>Inspect GPT/MBR partition layout of physical disk <code>N</code></td></tr>
+        <tr><td><code>--vss-list</code></td><td>List registered VSS writers and their states</td></tr>
+        <tr><td><code>--vss-snap --volume &lt;X:&gt;</code></td><td>Create a diagnostic VSS snapshot of volume <code>X:</code></td></tr>
+        <tr><td><code>--vss-read --device &lt;dev&gt;</code></td><td>Test reading blocks from a VSS snapshot device</td></tr>
+        <tr><td><code>--vss-dump --device &lt;dev&gt; --out &lt;file&gt;</code></td><td>Dump a VSS snapshot device to a file</td></tr>
+        <tr><td><code>--bitmap-stats --volume &lt;X:&gt;</code></td><td>Print NTFS <code>$Bitmap</code> allocated/free cluster statistics</td></tr>
+        <tr><td><code>--bitmap-dump --volume &lt;X:&gt; --out &lt;file&gt;</code></td><td>Dump NTFS <code>$Bitmap</code> to a file</td></tr>
+        <tr><td><code>--validate</code></td><td>Validate <code>config_corpus.yaml</code> and VSS service/driver health</td></tr>
+        <tr><td><code>--retry-lock &lt;dur&gt;</code></td><td>Wait on a contended store lock (e.g. <code>90</code>, <code>10m</code>, <code>2h</code>)</td></tr>
+        <tr><td><code>--config &lt;path&gt;</code></td><td>Path to <code>config_corpus.yaml</code></td></tr>
+        <tr><td><code>--help</code> / <code>--version</code></td><td>Print CLI usage help or version and exit</td></tr>
+      </table>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-corpus">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">Corpus (Architecture)</span>
+      </a>
+      <a class="pager-link next" href="#page-corpus-yaml">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">YAML (Corpus)</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+
+  <section class="doc-page" id="page-corpus-yaml">
+<header class="article-header">
+    <h1 id="corpus-config">YAML (Corpus)</h1>
+    <p class="article-lede">Complete <code>config_corpus.yaml</code> schema: retention, compression, logging, and top-level store settings.</p>
+  </header>
+
+<h2 id="cyaml-retention"><code>retention:</code></h2>
+    <p>GFS retention rules and pinned generations applied by <code>Corpus.exe --gc</code>.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>keep_last:</code></td><td><code>4</code></td><td>Retain N most recent generations</td></tr>
+        <tr><td><code>keep_within_days:</code></td><td><code>0</code></td><td>Retain all generations newer than N days</td></tr>
+        <tr><td><code>keep_daily:</code></td><td><code>0</code></td><td>Retain newest generation per calendar day</td></tr>
+        <tr><td><code>keep_weekly:</code></td><td><code>0</code></td><td>Retain newest generation per ISO week</td></tr>
+        <tr><td><code>keep_monthly:</code></td><td><code>0</code></td><td>Retain newest generation per calendar month</td></tr>
+        <tr><td><code>keep_yearly:</code></td><td><code>0</code></td><td>Retain newest generation per calendar year</td></tr>
+        <tr><td><code>pin:</code></td><td><code>[]</code></td><td>List of explicitly pinned generation numbers</td></tr>
+      </table>
+    </div>
+
+<h2 id="cyaml-compression"><code>compression:</code></h2>
+    <p>Zstd compression level for packed chunks and fast landing captures.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>level:</code></td><td><code>3</code></td><td>Zstd compression level (1..22; 3 for packed store, 1 for fast landing tier)</td></tr>
+      </table>
+    </div>
+
+<h2 id="cyaml-logging"><code>logging:</code></h2>
+    <p>Rotating log file, stdout echo, and live console progress bar settings for Corpus.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>level:</code></td><td><code>info</code></td><td>Log verbosity (<code>debug</code> | <code>info</code> | <code>warn</code> | <code>error</code>)</td></tr>
+        <tr><td><code>path:</code></td><td><code>corpus.log</code></td><td>Log file path</td></tr>
+        <tr><td><code>console:</code></td><td><code>true</code></td><td>Echo logs to stdout</td></tr>
+        <tr><td><code>backup:</code></td><td><code>true</code></td><td>Keep daily <code>.bak</code> log copy</td></tr>
+        <tr><td><code>progress:</code></td><td><code>auto</code></td><td>Live console progress bar mode</td></tr>
+        <tr><td><code>progress_name:</code></td><td><code>true</code></td><td>Show snapshot name in progress bar</td></tr>
+        <tr><td><code>progress_path:</code></td><td><code>false</code></td><td>Show store path in progress bar</td></tr>
+      </table>
+    </div>
+
+<h2 id="cyaml-top">Top-level (<code>config_corpus.yaml</code>)</h2>
+    <p>Store paths, chunking, VSS writer guards, encryption/ECC, and service cadence at the root of <code>config_corpus.yaml</code>.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>store_path:</code></td><td>required</td><td>Root directory for chunk packs (<code>packs/</code>), manifests (<code>manifests/</code>), layouts (<code>layouts/</code>), and landing files</td></tr>
+        <tr><td><code>state_db_path:</code></td><td><code>C:\ProgramData\Corpus</code> / <code>/var/lib/corpus</code></td><td>Directory for the SQLite chunk index (<code>corpus-chunks.db</code>)</td></tr>
+        <tr><td><code>chunk_mib:</code></td><td><code>4</code></td><td>Chunk size in MiB (1..64)</td></tr>
+        <tr><td><code>chunker:</code></td><td><code>fixed</code></td><td>Chunking strategy (<code>fixed</code> grid or <code>buzhash</code> content-defined chunking)</td></tr>
+        <tr><td><code>workers:</code></td><td><code>0</code> (auto 2..16)</td><td>Parallel hash/compress worker count</td></tr>
+        <tr><td><code>eco_qos:</code></td><td><code>false</code></td><td>Enable Windows 11 EcoQoS or Linux <code>nice +10</code> background mode</td></tr>
+        <tr><td><code>min_free_gb:</code></td><td>unset</td><td>Destination store free-space floor in GB</td></tr>
+        <tr><td><code>strict_fit_check:</code></td><td><code>false</code></td><td>Pre-flight whole-image fit refusal toggle</td></tr>
+        <tr><td><code>strict_vss_writers:</code></td><td><code>true</code></td><td>Fail-closed verification of participating VSS writers via <code>GatherWriterStatus</code> (<code>false</code> downgrades to warning)</td></tr>
+        <tr><td><code>pre_freeze:</code></td><td>empty</td><td>Shell command executed immediately before <code>DoSnapshotSet</code> to quiesce non-VSS databases</td></tr>
+        <tr><td><code>post_thaw:</code></td><td>empty</td><td>Shell command executed in <code>finally</code> after <code>DoSnapshotSet</code></td></tr>
+        <tr><td><code>encrypt:</code></td><td>empty</td><td>Per-pack external encryption command (<code>{input}</code> / <code>{output}</code>)</td></tr>
+        <tr><td><code>key_path:</code></td><td>unset</td><td>Off-store HMAC key file path</td></tr>
+        <tr><td><code>key_env:</code></td><td>unset</td><td>Environment variable name holding the off-store HMAC key</td></tr>
+        <tr><td><code>ecc_overhead_percent:</code></td><td><code>0</code></td><td>Reed-Solomon parity sidecar overhead (%) per sealed pack</td></tr>
+        <tr><td><code>deep_verify_percent:</code></td><td><code>0</code></td><td>Background pack scrub percentage per run</td></tr>
+        <tr><td><code>worm_mode:</code></td><td><code>false</code></td><td>Refuse all GC/prune/delete mutations when <code>true</code></td></tr>
+        <tr><td><code>change_alarm_percent:</code></td><td><code>0</code></td><td>Log Error alert if one generation changes &gt; N% of store bytes</td></tr>
+        <tr><td><code>strict_config_perms:</code></td><td><code>false</code></td><td>Enforce strict owner/ACL permissions on config/key files</td></tr>
+        <tr><td><code>destination_protect:</code></td><td><code>false</code></td><td>Harden store directory against non-service writes</td></tr>
+        <tr><td><code>gc_daily_at:</code></td><td><code>02:00</code></td><td>Daily garbage collection time in <code>--service</code> mode</td></tr>
+        <tr><td><code>optimize_every:</code></td><td><code>00:15:00</code></td><td>Idle landing-zone pack compaction cadence in <code>--service</code> mode</td></tr>
+        <tr><td><code>exclude:</code></td><td>CapturePolicy defaults</td><td>Volume-relative NTFS exclusion list (<code>pagefile.sys</code>, <code>hiberfil.sys</code>, <code>swapfile.sys</code>, <code>$Recycle.Bin</code>, etc.)</td></tr>
+      </table>
+    </div>
+
+<h2 id="cyaml-example">Example <code>config_corpus.yaml</code></h2>
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">config_corpus.yaml</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre><span class="key">store_path:</span> <span class="str">"E:\\CorpusStore"</span>
+<span class="key">chunk_mib:</span> 4
+<span class="key">chunker:</span> fixed
+<span class="key">eco_qos:</span> true
+<span class="key">min_free_gb:</span> 25
+<span class="key">strict_fit_check:</span> true
+<span class="key">strict_vss_writers:</span> true
+
+<span class="key">compression:</span>
+  <span class="key">level:</span> 3
+
+<span class="key">retention:</span>
+  <span class="key">keep_last:</span> 4
+  <span class="key">keep_within_days:</span> 7
+  <span class="key">keep_daily:</span> 7
+  <span class="key">keep_weekly:</span> 4
+  <span class="key">keep_monthly:</span> 6
+  <span class="key">keep_yearly:</span> 1
+  <span class="key">pin:</span> [1]
+
+<span class="key">logging:</span>
+  <span class="key">level:</span> info
+  <span class="key">path:</span> corpus.log
+  <span class="key">console:</span> true</pre>
+      </div>
+    </div>
+  <footer class="article-footer">
+    <nav class="pager-grid" aria-label="Pagination">
+      <a class="pager-link" href="#page-corpus-cli">
+        <span class="pager-dir">&larr; Previous</span>
+        <span class="pager-title">CLI (Corpus)</span>
+      </a>
+      <a class="pager-link next" href="#page-diagnostics">
+        <span class="pager-dir">Next &rarr;</span>
+        <span class="pager-title">Diagnostics & profiling</span>
+      </a>
+    </nav>
+  </footer>
+  </section>
+  </footer>
+  </section>
+  </main>
+
+<aside class="toc" aria-label="On this page" style="visibility:hidden">
+    <div class="toc-title">On this page</div>
+    <ul class="toc-list">
+      <li style="display:none"><a class="toc-link" data-page="overview" href="#three-roles">Two paired binaries</a></li>
+      <li style="display:none"><a class="toc-link" data-page="overview" href="#design-goals">Design goals</a></li>
+      <li style="display:none"><a class="toc-link" data-page="overview" href="#architecture">Architecture</a></li>
+      <li style="display:none"><a class="toc-link" data-page="overview" href="#features">Feature matrix</a></li>
+      <li style="display:none"><a class="toc-link" data-page="requirements" href="#requirements">Core requirements</a></li>
+      <li style="display:none"><a class="toc-link" data-page="requirements" href="#feature-deps">Feature-specific OS dependencies</a></li>
+      <li style="display:none"><a class="toc-link" data-page="requirements" href="#aot-matrix">JIT vs. NativeAOT (--aot)</a></li>
+      <li style="display:none"><a class="toc-link" data-page="requirements" href="#limitations">Limitations and constraints</a></li>
+      <li style="display:none"><a class="toc-link" data-page="setup" href="#quickstart">TicTack quickstart</a></li>
+      <li style="display:none"><a class="toc-link" data-page="setup" href="#corpus-quickstart">Corpus quickstart</a></li>
+      <li style="display:none"><a class="toc-link" data-page="setup" href="#windows">Windows 10/11 setup</a></li>
+      <li style="display:none"><a class="toc-link" data-page="setup" href="#linux">Linux setup (systemd or CLI)</a></li>
+      <li style="display:none"><a class="toc-link" data-page="cli" href="#cli-modes">Service &amp; sync modes</a></li>
+      <li style="display:none"><a class="toc-link" data-page="cli" href="#cli-retention">Version &amp; archive retention</a></li>
+      <li style="display:none"><a class="toc-link" data-page="cli" href="#cli-holds">Deferred deletions &amp; external drives</a></li>
+      <li style="display:none"><a class="toc-link" data-page="cli" href="#cli-capture">OS capture, remote agent &amp; utility</a></li>
+      <li style="display:none"><a class="toc-link" data-page="configuration" href="#cfg-sources">sources:</a></li>
+      <li style="display:none"><a class="toc-link toc-sub" data-page="configuration" href="#cfg-filter">filter:</a></li>
+      <li style="display:none"><a class="toc-link toc-sub" data-page="configuration" href="#cfg-sync">sync:</a></li>
+      <li style="display:none"><a class="toc-link toc-sub" data-page="configuration" href="#cfg-retry">retry:</a></li>
+      <li style="display:none"><a class="toc-link toc-sub" data-page="configuration" href="#cfg-versioning">versioning:</a></li>
+      <li style="display:none"><a class="toc-link toc-sub" data-page="configuration" href="#cfg-deletion">deletion:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="configuration" href="#cfg-monitor">monitor:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="configuration" href="#cfg-logging">logging:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="configuration" href="#cfg-watchdog">watchdog:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="configuration" href="#cfg-external">external_drives:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="configuration" href="#cfg-top">Top-level</a></li>
+      <li style="display:none"><a class="toc-link" data-page="configuration" href="#cfg-example">Example config.yaml</a></li>
+      <li style="display:none"><a class="toc-link" data-page="remote" href="#tcp-arch">Architecture &amp; protocol (TTRM v1)</a></li>
+      <li style="display:none"><a class="toc-link toc-sub" data-page="remote" href="#tcp-flow">Handshake &amp; binary framing</a></li>
+      <li style="display:none"><a class="toc-link toc-sub" data-page="remote" href="#tcp-layers">Encryption, PSK &amp; OS sandbox</a></li>
+      <li style="display:none"><a class="toc-link" data-page="remote" href="#cfg-remote">remote_sync:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="jobs" href="#jobs-triggers">Schedules &amp; triggers</a></li>
+      <li style="display:none"><a class="toc-link" data-page="jobs" href="#jobs-execution">Execution, sandbox &amp; pre-flight</a></li>
+      <li style="display:none"><a class="toc-link" data-page="jobs" href="#jobs-examples">Example configuration</a></li>
+      <li style="display:none"><a class="toc-link" data-page="diagnostics" href="#diag-harness">Profiling harness</a></li>
+      <li style="display:none"><a class="toc-link" data-page="diagnostics" href="#diag-phases">Three-phase workflow</a></li>
+      <li style="display:none"><a class="toc-link" data-page="diagnostics" href="#tests">Running tests</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus" href="#capabilities">Core capabilities</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus" href="#consistency-groups">Consistency groups and I/O freeze</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus" href="#retention">GFS retention and garbage collection</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus" href="#exclusions">Exclusions (--exclude / exclude:)</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-cli" href="#ccli-capture">Volume &amp; disk capture</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-cli" href="#ccli-export">Export, extract &amp; mount</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-cli" href="#ccli-store">Verification, GC &amp; replication</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-cli" href="#ccli-restore">Bare-metal restore &amp; WIM</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-cli" href="#ccli-inspect">Boot diagnostics &amp; probes</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-yaml" href="#cyaml-retention">retention:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-yaml" href="#cyaml-compression">compression:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-yaml" href="#cyaml-logging">logging:</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-yaml" href="#cyaml-top">Top-level</a></li>
+      <li style="display:none"><a class="toc-link" data-page="corpus-yaml" href="#cyaml-example">Example config_corpus.yaml</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+<div id="search-overlay" class="search-overlay" role="dialog" aria-modal="true" aria-label="Search documentation">
+  <div class="search-dialog">
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="Search documentation, CLI flags, YAML keys, or Corpus..." autocomplete="off" />
+      <button type="button" id="search-esc" class="search-esc" aria-label="Close search">Esc</button>
+    </div>
+    <div id="search-list" class="search-list"></div>
+  </div>
+</div>
+
+<script src="app.js?v=13"></script>
+</body>
+</html>

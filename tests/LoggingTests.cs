@@ -405,4 +405,14 @@ public class LoggingTests
         }
         finally { try { File.Delete(path); } catch { } }
     }
+
+    [Fact]
+    public void EventLogLogger_WarnAndError_DoNotThrow()
+    {
+        var logger = new EventLogLogger("Corpus", LogLevel.Warn);
+        logger.Debug("ignored");
+        logger.Info("ignored");
+        logger.Warn("warn test");
+        logger.Error("error test", new InvalidOperationException("boom"));
+    }
 }

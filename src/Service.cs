@@ -63,12 +63,13 @@ namespace TicTack
                     throw new InvalidOperationException("Volume(s) not available; see log for labels.");
 
                 PowerGuard.Cleanup(cfg, _log);
+                DiskCacheGuard.WarnIfWriteCacheEnabled(cfg, _log);
 
                 if (!Config.Validate(cfg, _log))
                     throw new InvalidOperationException("Invalid configuration");
                 if (!ConfigGuard.CheckConfigFile(_configPath, _log, cfg.StrictConfigPerms))
                     throw new InvalidOperationException("Insecure config permissions under strict_config_perms");
-                if (cfg.RemoteSystem != null && !ConfigGuard.CheckSecretFile(cfg.RemoteSystem.PskFile, _log, cfg.StrictConfigPerms))
+                if (cfg.RemoteSync != null && !ConfigGuard.CheckSecretFile(cfg.RemoteSync.PskFile, _log, cfg.StrictConfigPerms))
                     throw new InvalidOperationException("Insecure PSK file permissions under strict_config_perms");
 
                 ProcessHardening.Apply(_log);

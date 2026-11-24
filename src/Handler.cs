@@ -103,7 +103,7 @@ namespace TicTack
     {
         internal static readonly TimeSpan SnapshotTtl = TimeSpan.FromMinutes(10);
 
-        const int VSS_CTX_FILE_SHARE_BACKUP = 1;
+        const int VSS_CTX_BACKUP = 0;
         const int VSS_OBJECT_SNAPSHOT_SET = 2;
         const int ERROR_SHARING_VIOLATION = 32;
         const int ERROR_LOCK_VIOLATION = 33;
@@ -111,7 +111,7 @@ namespace TicTack
         internal enum VssBackupType { Undefined = 0, Full = 1, Incremental = 2, Differential = 3, Log = 4, Copy = 5, Other = 6 }
 
         [GeneratedComInterface(StringMarshalling = StringMarshalling.Utf16)]
-        [Guid("507c37b4-cf5b-48e0-b0e6-ef342a56e633")]
+        [Guid("507c37b4-cf5b-4e95-b0af-14eb9767467e")]
         internal partial interface IVssAsync
         {
             void Cancel();
@@ -179,20 +179,25 @@ namespace TicTack
             public Guid SnapshotId;
             public Guid SnapshotSetId;
             public int SnapshotsCount;
-            [MarshalAs(UnmanagedType.LPWStr)] public string SnapshotDeviceObject;
-            [MarshalAs(UnmanagedType.LPWStr)] public string OriginalVolumeName;
-            [MarshalAs(UnmanagedType.LPWStr)] public string OriginatingMachine;
-            [MarshalAs(UnmanagedType.LPWStr)] public string ServiceMachine;
-            [MarshalAs(UnmanagedType.LPWStr)] public string ExposedName;
-            [MarshalAs(UnmanagedType.LPWStr)] public string ExposedPath;
+            public nint SnapshotDeviceObject;
+            public nint OriginalVolumeName;
+            public nint OriginatingMachine;
+            public nint ServiceMachine;
+            public nint ExposedName;
+            public nint ExposedPath;
             public Guid ProviderId;
             public int SnapshotAttributes;
             public long CreationTimestamp;
             public int Status;
         }
 
-        [DllImport("vssapi.dll", PreserveSig = true)]
-        static extern int CreateVssBackupComponentsInternal(out IVssBackupComponents backup);
+        private static readonly StrategyBasedComWrappers s_comWrappers = new();
+
+        [LibraryImport("vssapi.dll", EntryPoint = "?CreateVssBackupComponents@@YAJPEAPEAVIVssBackupComponents@@@Z")]
+        private static partial int CreateVssBackupComponentsNative(out nint backupPtr);
+
+        [LibraryImport("ole32.dll")]
+        private static partial int CoInitializeSecurity(nint secDesc, int authnSvcCount, nint authnSvc, nint reserved1, uint authnLevel, uint impLevel, nint authList, uint capabilities, nint reserved3);
 
         [DllImport("vssapi.dll")]
         static extern void VssFreeSnapshotProperties(nint prop);
@@ -231,8 +236,8 @@ namespace TicTack
             // VSS protocol order: the interface must be initialized before any
             // other call. SetContext first AVs on uninitialized native state
             // instead of returning an HRESULT (observed 0xC0000005 on Win x64).
-            components.InitializeForBackup(nint.Zero);
-            components.SetContext(VSS_CTX_FILE_SHARE_BACKUP);
+            RunVssStep("Probe.InitializeForBackup", () => components.InitializeForBackup(nint.Zero));
+            RunVssStep("Probe.SetContext", () => components.SetContext(VSS_CTX_BACKUP));
         }
 
         public Stream OpenRead(string path)
@@ -253,17 +258,29 @@ namespace TicTack
             }
         }
 
-        // #pragma cannot suppress this trim-analyzer diagnostic (reported at the
-        // call site regardless); attribute suppression is the reliable channel.
-        // Justification: TicTackSv is fully preserved via TrimmerRootAssembly
-        // in the Aot publish profile, so the trimmer cannot remove the
-        // interface methods this P/Invoke marshals.
-        [UnconditionalSuppressMessage("TrimAnalysis", "IL2050", Justification = "VSS COM interface rooted via TrimmerRootAssembly in Aot.pubxml.")]
         static IVssBackupComponents CreateComponents()
         {
-            int hr = CreateVssBackupComponentsInternal(out var components);
-            if (hr != 0) Marshal.ThrowExceptionForHR(hr);
-            return components!;
+            _ = CoInitializeSecurity(nint.Zero, -1, nint.Zero, nint.Zero, 6u, 3u, nint.Zero, 0u, nint.Zero);
+            nint backupPtr = nint.Zero;
+            RunVssStep("CreateVssBackupComponents", () =>
+            {
+                int hr = CreateVssBackupComponentsNative(out backupPtr);
+                if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+                if (backupPtr == nint.Zero) throw new IOException("VSS: CreateVssBackupComponents returned null.");
+            });
+            try
+            {
+                IVssBackupComponents? com = null;
+                RunVssStep("ComWrappers.GetOrCreateObjectForComInstance", () =>
+                {
+                    com = (IVssBackupComponents)s_comWrappers.GetOrCreateObjectForComInstance(backupPtr, CreateObjectFlags.UniqueInstance);
+                });
+                return com!;
+            }
+            finally
+            {
+                Marshal.Release(backupPtr);
+            }
         }
 
         Stream OpenFromSnapshot(string path)
@@ -317,24 +334,40 @@ namespace TicTack
             catch { return false; }
         }
 
+        static void RunVssStep(string step, Action action)
+        {
+            try { action(); }
+            catch (Exception ex) when (ex is not IOException)
+            {
+                throw new IOException($"VSS {step} failed (0x{ex.HResult:X8}): {ex.Message}", ex);
+            }
+        }
+
         SnapshotEntry CreateSnapshot(string canonicalVolume)
         {
             var components = CreateComponents();
-            components.InitializeForBackup(nint.Zero);
-            components.SetContext(VSS_CTX_FILE_SHARE_BACKUP);
-            components.SetBackupState(false, false, VssBackupType.Copy, false);
-            components.StartSnapshotSet(out var setId);
-            components.AddToSnapshotSet(canonicalVolume, Guid.Empty, out var snapshotId);
-            components.DoSnapshotSet(out var async);
-            async.Wait();
-            async.QueryStatus(out int hr, out _);
+            RunVssStep("InitializeForBackup", () => components.InitializeForBackup(nint.Zero));
+            RunVssStep("SetContext", () => components.SetContext(VSS_CTX_BACKUP));
+            RunVssStep("SetBackupState", () => components.SetBackupState(false, false, VssBackupType.Copy, false));
+            Guid setId = Guid.Empty, snapshotId = Guid.Empty;
+            RunVssStep("StartSnapshotSet", () => components.StartSnapshotSet(out setId));
+            RunVssStep("AddToSnapshotSet", () => components.AddToSnapshotSet(canonicalVolume, Guid.Empty, out snapshotId));
+            IVssAsync? async = null;
+            RunVssStep("DoSnapshotSet", () => components.DoSnapshotSet(out async));
+            RunVssStep("IVssAsync.Wait", () => async!.Wait());
+            int hr = 0;
+            RunVssStep("IVssAsync.QueryStatus", () => async!.QueryStatus(out hr, out _));
             if (hr != 0) Marshal.ThrowExceptionForHR(hr);
-            components.GetSnapshotProperties(snapshotId, out nint propPtr);
+            nint propPtr = nint.Zero;
+            RunVssStep("GetSnapshotProperties", () => components.GetSnapshotProperties(snapshotId, out propPtr));
             string device;
             try
             {
-                var prop = Marshal.PtrToStructure<VssSnapshotProp>(propPtr);
-                device = prop.SnapshotDeviceObject;
+                unsafe
+                {
+                    var prop = *(VssSnapshotProp*)propPtr;
+                    device = Marshal.PtrToStringUni(prop.SnapshotDeviceObject) ?? string.Empty;
+                }
             }
             finally { VssFreeSnapshotProperties(propPtr); }
             if (string.IsNullOrEmpty(device))

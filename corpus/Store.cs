@@ -1236,9 +1236,7 @@ namespace Corpus
             var path = Path.Combine(_landingDir, hex + ".chunk");
             if (File.Exists(path))
                 return false;
-            var tmp = path + "." + Guid.NewGuid().ToString("n") + ".tmp";
-            File.WriteAllBytes(tmp, data);
-            File.Move(tmp, path, true);
+            AtomicFile.WriteAllBytes(path, data, overwrite: true);
             return true;
         }
 

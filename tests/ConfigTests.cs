@@ -437,11 +437,9 @@ logging:
     }
 
     [Fact]
-    public void ExternalDrives_DefaultCommand_IsLinuxShape()
+    public void ExternalDrives_DefaultCommand_IsNull()
     {
-        if (OperatingSystem.IsWindows()) return;
-        Assert.Equal("restic backup --compression auto \"{source}\" -r \"{drive}/restic-repo\"",
-            new ExternalDrivesConfig().Command);
+        Assert.Null(new ExternalDrivesConfig().Command);
     }
 
     [Fact]
@@ -581,5 +579,35 @@ logging:
     {
         Assert.Null(new VersioningConfig().MaxVersions);
         Assert.Equal(0, new JobConfig().TimeoutMinutes);
+    }
+
+    [Fact]
+    public async Task Durability_WriteThrough_ValidatesAndCopies()
+    {
+        var tmpRoot = Path.Combine(Path.GetTempPath(), "tt-wt-" + Guid.NewGuid().ToString("n"));
+        var srcDir = Path.Combine(tmpRoot, "src");
+        var dstDir = Path.Combine(tmpRoot, "dst");
+        Directory.CreateDirectory(srcDir);
+        Directory.CreateDirectory(dstDir);
+        var cfgPath = Path.Combine(tmpRoot, "config.yaml");
+        try
+        {
+            var srcFile = Path.Combine(srcDir, "a.bin");
+            File.WriteAllBytes(srcFile, new byte[] { 1, 2, 3, 4 });
+            File.WriteAllText(cfgPath,
+                $"sources:\n  - path: \"{srcDir.Replace("\\", "\\\\")}\"\n    destination: \"{dstDir.Replace("\\", "\\\\")}\"\n    sync:\n      durability: write-through\n");
+            var cfg = Config.Load(cfgPath);
+            Assert.NotNull(cfg);
+            Assert.Empty(cfg.Errors);
+            Assert.Equal(FileDurability.WriteThrough, Program.ParseDurability(cfg.Sources[0]));
+
+            var dstFile = Path.Combine(dstDir, "a.bin");
+            var args = new FileActionArgs(new FileChangedEventArgs(ChangeType.Created, srcFile), srcDir, dstDir);
+            var res = await new CopyAction(new FileAccessor(), FileDurability.WriteThrough)
+                .ExecuteAsync(args, CancellationToken.None);
+            Assert.True(res.Success);
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(dstFile));
+        }
+        finally { try { Directory.Delete(tmpRoot, true); } catch { } }
     }
 }

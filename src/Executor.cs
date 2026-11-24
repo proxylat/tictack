@@ -23,6 +23,7 @@ namespace TicTack
     public enum FileDurability
     {
         Full,
+        WriteThrough,
         FDataSync,
         RenameOnly
     }
@@ -273,10 +274,15 @@ namespace TicTack
             string? sourceHash = null;
             bool resumed = TryPrepareResume(src, tmp, snap, out long resumeOffset);
 
+            var dstOpts = _durability == FileDurability.WriteThrough ? FileOptions.WriteThrough : FileOptions.None;
             using (var srcStream = _accessor.OpenRead(src))
-            using (var dstStream = resumed
-                ? new FileStream(tmp, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
-                : File.Create(tmp))
+            using (var dstStream = new FileStream(
+                tmp,
+                resumed ? FileMode.Open : FileMode.Create,
+                resumed ? FileAccess.ReadWrite : FileAccess.Write,
+                FileShare.None,
+                4096,
+                dstOpts))
             {
                 _checkpoint?.Invoke(CopyCheckpoint.TempCreated);
                 var timed = TicTackEventSource.Log.IsEnabled();
@@ -450,7 +456,10 @@ namespace TicTack
             try
             {
                 dstStream.Flush(true);
-                File.WriteAllText(tmp + ".resume", $"{snap.Length}|{snap.LastWriteTimeUtcTicks}|{dstStream.Position}");
+                using var rs = new FileStream(tmp + ".resume", FileMode.Create, FileAccess.Write, FileShare.None, 256, FileOptions.WriteThrough);
+                var payload = System.Text.Encoding.UTF8.GetBytes($"{snap.Length}|{snap.LastWriteTimeUtcTicks}|{dstStream.Position}");
+                rs.Write(payload);
+                rs.Flush(true);
             }
             catch { }
         }

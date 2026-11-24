@@ -57,7 +57,7 @@ namespace TicTack
             ILogger log)
         {
             if (string.IsNullOrWhiteSpace(root))
-                throw new ArgumentException("remote_system.root is required.", nameof(root));
+                throw new ArgumentException("remote_sync.root is required.", nameof(root));
             _rootFull = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             if (!Directory.Exists(_rootFull))
                 throw new DirectoryNotFoundException("Remote agent root does not exist: " + _rootFull);

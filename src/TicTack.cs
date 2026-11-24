@@ -72,12 +72,13 @@ namespace TicTack
                 return 1;
                 if (!ConfigGuard.CheckConfigFile(o.CfgPath, log, cfg.StrictConfigPerms))
                     return 1;
-                if (cfg.RemoteSystem != null && !ConfigGuard.CheckSecretFile(cfg.RemoteSystem.PskFile, log, cfg.StrictConfigPerms))
+                if (cfg.RemoteSync != null && !ConfigGuard.CheckSecretFile(cfg.RemoteSync.PskFile, log, cfg.StrictConfigPerms))
                     return 1;
                 ProcessHardening.Apply(log);
                 if (cfg.EcoQos)
                     ProcessHardening.ApplyEcoQos(log);
                 PowerGuard.Cleanup(cfg, log);
+                DiskCacheGuard.WarnIfWriteCacheEnabled(cfg, log);
                 int? maint = await RunMaintenanceModesAsync(o, args, cfg, log);
                 if (maint.HasValue)
                     return maint.Value;
@@ -1141,7 +1142,11 @@ namespace TicTack
                     {
                         if (!File.Exists(TimestampVersioning.PinPath(t)))
                         {
-                            File.WriteAllText(TimestampVersioning.PinPath(t), "pinned " + DateTime.UtcNow.ToString("o"));
+                            using (var ps = new FileStream(TimestampVersioning.PinPath(t), FileMode.CreateNew, FileAccess.Write, FileShare.None, 256, FileOptions.WriteThrough))
+                            {
+                                ps.Write(System.Text.Encoding.UTF8.GetBytes("pinned " + DateTime.UtcNow.ToString("o")));
+                                ps.Flush(true);
+                            }
                             changed++;
                         }
                     }
@@ -1439,7 +1444,7 @@ namespace TicTack
 
         internal static RemoteAgentServer? StartRemoteAgentIfConfigured(TicTackConfig cfg, ILogger log)
         {
-            var rs = cfg.RemoteSystem;
+            var rs = cfg.RemoteSync;
             if (rs == null || !rs.HasAgent) return null;
             var psk = RemoteProto.ResolvePsk(rs.Psk, rs.PskEnv, rs.PskFile);
             var agent = new RemoteAgentServer(rs.Root!, rs.Listen!, rs.AllowIp, rs.MaxClients, rs.Tls, psk, log);
@@ -1449,9 +1454,9 @@ namespace TicTack
 
         static void RunRemoteAgent(TicTackConfig cfg, ILogger log)
         {
-            var rs = cfg.RemoteSystem;
+            var rs = cfg.RemoteSync;
             if (rs == null || !rs.HasAgent)
-                throw new InvalidOperationException("remote_system.listen and remote_system.root must be configured for --remote-agent.");
+                throw new InvalidOperationException("remote_sync.listen and remote_sync.root must be configured for --remote-agent.");
             if (rs.Sandbox)
                 RemoteSandbox.Apply(log, rs.Root, rs.SandboxLevel);
 
@@ -1473,8 +1478,8 @@ namespace TicTack
 
         internal static SyncPipeline BuildPipeline(SourceConfig src, TicTackConfig cfg, ILogger log, bool logMonitorStartup = false)
         {
-            var remotePsk = src.RemotePsk ?? (cfg.RemoteSystem != null
-                ? RemoteProto.ResolvePsk(cfg.RemoteSystem.Psk, cfg.RemoteSystem.PskEnv, cfg.RemoteSystem.PskFile)
+            var remotePsk = src.RemotePsk ?? (cfg.RemoteSync != null
+                ? RemoteProto.ResolvePsk(cfg.RemoteSync.Psk, cfg.RemoteSync.PskEnv, cfg.RemoteSync.PskFile)
                 : Array.Empty<byte>());
             var remoteAccessor = src.RemoteEndpoint != null
                 ? new RemoteFileAccessor(src.RemoteEndpoint, src.RemoteTls, remotePsk)
@@ -1590,6 +1595,7 @@ namespace TicTack
                 if (src.Sync != null)
                 {
                     if (string.Equals(src.Sync.Durability, "rename-only", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.RenameOnly;
+                    else if (string.Equals(src.Sync.Durability, "write-through", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.WriteThrough;
                     else if (string.Equals(src.Sync.Durability, "fdatasync", StringComparison.OrdinalIgnoreCase)) durability = FileDurability.FDataSync;
                 }
             return durability;

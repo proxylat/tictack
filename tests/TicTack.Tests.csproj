@@ -70,6 +70,7 @@
     <Compile Include="../src/ProcessHardening.cs" Link="src/ProcessHardening.cs" />
     <Compile Include="../src/ConfigGuard.cs" Link="src/ConfigGuard.cs" />
     <Compile Include="../src/DiskSpaceGuard.cs" Link="src/DiskSpaceGuard.cs" />
+    <Compile Include="../src/DiskCacheGuard.cs" Link="src/DiskCacheGuard.cs" />
     <Compile Include="../src/NetCheck.cs" Link="src/NetCheck.cs" />
     <Compile Include="../src/ReadyDrain.cs" Link="src/ReadyDrain.cs" />
     <Compile Include="../src/DeletionGuard.cs" Link="src/DeletionGuard.cs" />

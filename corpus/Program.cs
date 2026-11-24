@@ -850,8 +850,9 @@ namespace Corpus
                 cfg != null && cfg.Logging != null ? cfg.Logging.Level : null,
                 logPath, 10, 5, null,
                 console: cfg == null || cfg.Logging == null || cfg.Logging.Console,
-                eventLog: false,
-                backupPath: Path.Combine(dir, "corpus.log.bak"));
+                eventLog: OperatingSystem.IsWindows(),
+                backupPath: Path.Combine(dir, "corpus.log.bak"),
+                eventLogSource: "Corpus");
         }
 
         private static Store CreateStore(CorpusConfig cfg, ILogger log)

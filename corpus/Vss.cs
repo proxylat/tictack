@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.Marshalling;
 using System.Security.Principal;
 using System.Xml.Linq;
 using TicTack;
@@ -97,8 +98,9 @@ namespace Corpus
         public int Status;
     }
 
-    [ComImport, Guid("507c37b4-cf5b-4e95-b0af-14eb9767467e"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    internal interface IVssAsync
+    [GeneratedComInterface(StringMarshalling = StringMarshalling.Utf16)]
+    [Guid("507c37b4-cf5b-4e95-b0af-14eb9767467e")]
+    internal partial interface IVssAsync
     {
         [PreserveSig] int Cancel();
         [PreserveSig] int Wait(uint milliseconds);
@@ -108,30 +110,32 @@ namespace Corpus
     // Truncated after slot 9: identity + metadata-as-XML are all the
     // requester reads. (IVssWMComponent has a zero IID in the IDL, so the
     // XML carries component discovery instead of v-table calls.)
-    [ComImport, Guid("902fcf7f-b7fd-42f8-81f1-b2e400b1e5bd"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    internal interface IVssExamineWriterMetadata
+    [GeneratedComInterface(StringMarshalling = StringMarshalling.Utf16)]
+    [Guid("902fcf7f-b7fd-42f8-81f1-b2e400b1e5bd")]
+    internal partial interface IVssExamineWriterMetadata
     {
         [PreserveSig] int GetIdentity(out Guid instance, out Guid writer, [MarshalAs(UnmanagedType.BStr)] out string name, out int usage, out int source);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetFileCounts(out uint inc, out uint exc, out uint comp);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetIncludeFile(uint i, out IntPtr desc);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetExcludeFile(uint i, out IntPtr desc);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetComponent(uint i, out IntPtr comp);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetRestoreMethod(out IntPtr method, out IntPtr service, out IntPtr proc, out int restore, out byte reboot, out uint maps);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetAlternateLocationMapping(uint i, out IntPtr desc);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetBackupSchema(out uint mask);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetDocument(out IntPtr doc);
+        [PreserveSig] int GetFileCounts(out uint inc, out uint exc, out uint comp);
+        [PreserveSig] int GetIncludeFile(uint i, out IntPtr desc);
+        [PreserveSig] int GetExcludeFile(uint i, out IntPtr desc);
+        [PreserveSig] int GetComponent(uint i, out IntPtr comp);
+        [PreserveSig] int GetRestoreMethod(out IntPtr method, out IntPtr service, out IntPtr proc, out int restore, out byte reboot, out uint maps);
+        [PreserveSig] int GetAlternateLocationMapping(uint i, out IntPtr desc);
+        [PreserveSig] int GetBackupSchema(out uint mask);
+        [PreserveSig] int GetDocument(out IntPtr doc);
         [PreserveSig] int SaveAsXML([MarshalAs(UnmanagedType.BStr)] out string xml);
     }
 
-    [ComImport, Guid("665c1d5f-c218-414d-a05d-7fef5f9d5c86"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    internal interface IVssBackupComponents
+    [GeneratedComInterface(StringMarshalling = StringMarshalling.Utf16)]
+    [Guid("665c1d5f-c218-414d-a05d-7fef5f9d5c86")]
+    internal partial interface IVssBackupComponents
     {
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetWriterComponentsCount(out uint count);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int GetWriterComponents(uint i, out IntPtr writer);
+        [PreserveSig] int GetWriterComponentsCount(out uint count);
+        [PreserveSig] int GetWriterComponents(uint i, out IntPtr writer);
         [PreserveSig] int InitializeForBackup([MarshalAs(UnmanagedType.BStr)] string? xml);
         [PreserveSig] int SetBackupState([MarshalAs(UnmanagedType.U1)] bool selectComponents, [MarshalAs(UnmanagedType.U1)] bool bootableSystemState, VssBackupType type, [MarshalAs(UnmanagedType.U1)] bool partialFileSupport);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int InitializeForRestore(IntPtr xml);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetRestoreState(int type);
+        [PreserveSig] int InitializeForRestore(IntPtr xml);
+        [PreserveSig] int SetRestoreState(int type);
         [PreserveSig] int GatherWriterMetadata(out IVssAsync async);
         [PreserveSig] int GetWriterMetadataCount(out uint count);
         [PreserveSig] int GetWriterMetadata(uint i, out Guid instance, out IVssExamineWriterMetadata metadata);
@@ -144,44 +148,63 @@ namespace Corpus
         [PreserveSig] int FreeWriterStatus();
         [PreserveSig] int GetWriterStatus(uint i, out Guid instance, out Guid writer, [MarshalAs(UnmanagedType.BStr)] out string name, out int state, out int failure);
         [PreserveSig] int SetBackupSucceeded(Guid instance, Guid writer, int type, [MarshalAs(UnmanagedType.LPWStr)] string? path, [MarshalAs(UnmanagedType.LPWStr)] string name, [MarshalAs(UnmanagedType.U1)] bool succeeded);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetBackupOptions(Guid writer, int type, IntPtr path, IntPtr name, IntPtr options);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetSelectedForRestore(Guid writer, int type, IntPtr path, IntPtr name, byte selected);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetRestoreOptions(Guid writer, int type, IntPtr path, IntPtr name, IntPtr options);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetAdditionalRestores(Guid writer, int type, IntPtr path, IntPtr name, byte additional);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetPreviousBackupStamp(Guid writer, int type, IntPtr path, IntPtr name, IntPtr stamp);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SaveAsXML(out IntPtr xml);
+        [PreserveSig] int SetBackupOptions(Guid writer, int type, IntPtr path, IntPtr name, IntPtr options);
+        [PreserveSig] int SetSelectedForRestore(Guid writer, int type, IntPtr path, IntPtr name, byte selected);
+        [PreserveSig] int SetRestoreOptions(Guid writer, int type, IntPtr path, IntPtr name, IntPtr options);
+        [PreserveSig] int SetAdditionalRestores(Guid writer, int type, IntPtr path, IntPtr name, byte additional);
+        [PreserveSig] int SetPreviousBackupStamp(Guid writer, int type, IntPtr path, IntPtr name, IntPtr stamp);
+        [PreserveSig] int SaveAsXML(out IntPtr xml);
         [PreserveSig] int BackupComplete(out IVssAsync async);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int AddAlternativeLocationMapping(Guid writer, int type, IntPtr path, IntPtr name, IntPtr p, IntPtr spec, byte rec, IntPtr dest);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int AddRestoreSubcomponent(Guid writer, int type, IntPtr path, IntPtr name, IntPtr subPath, IntPtr subName, byte repair);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetFileRestoreStatus(Guid writer, int type, IntPtr path, IntPtr name, int status);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int AddNewTarget(Guid writer, int type, IntPtr path, IntPtr name, IntPtr p, IntPtr file, byte rec, IntPtr alt);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int SetRangesFilePath(Guid writer, int type, IntPtr path, IntPtr name, uint i, IntPtr ranges);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int PreRestore(out IVssAsync async);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int PostRestore(out IVssAsync async);
+        [PreserveSig] int AddAlternativeLocationMapping(Guid writer, int type, IntPtr path, IntPtr name, IntPtr p, IntPtr spec, byte rec, IntPtr dest);
+        [PreserveSig] int AddRestoreSubcomponent(Guid writer, int type, IntPtr path, IntPtr name, IntPtr subPath, IntPtr subName, byte repair);
+        [PreserveSig] int SetFileRestoreStatus(Guid writer, int type, IntPtr path, IntPtr name, int status);
+        [PreserveSig] int AddNewTarget(Guid writer, int type, IntPtr path, IntPtr name, IntPtr p, IntPtr file, byte rec, IntPtr alt);
+        [PreserveSig] int SetRangesFilePath(Guid writer, int type, IntPtr path, IntPtr name, uint i, IntPtr ranges);
+        [PreserveSig] int PreRestore(out IVssAsync async);
+        [PreserveSig] int PostRestore(out IVssAsync async);
         [PreserveSig] int SetContext(int context);
         [PreserveSig] int StartSnapshotSet(out Guid setId);
         [PreserveSig] int AddToSnapshotSet([MarshalAs(UnmanagedType.LPWStr)] string volume, Guid provider, out Guid snapshotId);
         [PreserveSig] int DoSnapshotSet(out IVssAsync async);
-        [Obsolete("VSS v-table padding — never call (BACKUP context auto-releases; explicit delete always NOT_FOUND)", true)] [PreserveSig] int DeleteSnapshots(Guid sourceId, VssObjectType type, [MarshalAs(UnmanagedType.Bool)] bool force, out int deleted, out Guid nonDeleted);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int ImportSnapshots(out IVssAsync async);
-        [Obsolete("VSS v-table padding — never call", true)] [PreserveSig] int BreakSnapshotSet(Guid setId);
+        [PreserveSig] int DeleteSnapshots(Guid sourceId, VssObjectType type, [MarshalAs(UnmanagedType.Bool)] bool force, out int deleted, out Guid nonDeleted);
+        [PreserveSig] int ImportSnapshots(out IVssAsync async);
+        [PreserveSig] int BreakSnapshotSet(Guid setId);
         [PreserveSig] int GetSnapshotProperties(Guid snapshotId, out VssSnapshotProp prop);
     }
 
-    internal static class VssApi
+    internal static partial class VssApi
     {
-        // The factory export is C++-MANGLED (verified via export-table dump
-        // on Win11 26100: the undecorated name does not exist, GetProcAddress
-        // → NULL). x64 ignores the calling convention, Cdecl documents it.
-        // AOT: built-in COM interop on NativeAOT Windows; the interfaces are
-        // rooted via TrimmerRootAssembly Corpus and proven by --validate +
-        // vss-list smoke on an AOT binary.
-        [UnconditionalSuppressMessage("Trimming", "IL2050", Justification = "Built-in COM interop on NativeAOT Windows; interfaces rooted via TrimmerRootAssembly Corpus, proven by smoke test.")]
-        [DllImport("vssapi.dll", EntryPoint = "?CreateVssBackupComponents@@YAJPEAPEAVIVssBackupComponents@@@Z", CallingConvention = CallingConvention.Cdecl, PreserveSig = true)]
-        internal static extern int CreateVssBackupComponents(out IVssBackupComponents components);
+        private static readonly StrategyBasedComWrappers s_comWrappers = new();
 
-        [DllImport("vssapi.dll")]
-        internal static extern void VssFreeSnapshotProperties(ref VssSnapshotProp prop);
+        [LibraryImport("vssapi.dll", EntryPoint = "?CreateVssBackupComponents@@YAJPEAPEAVIVssBackupComponents@@@Z")]
+        private static partial int CreateVssBackupComponentsNative(out IntPtr ptr);
+
+        internal static int CreateVssBackupComponents(out IVssBackupComponents components)
+        {
+            int hr = CreateVssBackupComponentsNative(out IntPtr ptr);
+            if (hr != 0 || ptr == IntPtr.Zero)
+            {
+                components = null!;
+                return hr;
+            }
+            try
+            {
+                components = (IVssBackupComponents)s_comWrappers.GetOrCreateObjectForComInstance(ptr, CreateObjectFlags.UniqueInstance);
+                return 0;
+            }
+            finally
+            {
+                Marshal.Release(ptr);
+            }
+        }
+
+        internal static void Release(object? comObject)
+        {
+            if (comObject is IDisposable d) d.Dispose();
+        }
+
+        [LibraryImport("vssapi.dll")]
+        internal static partial void VssFreeSnapshotProperties(ref VssSnapshotProp prop);
 
         // DCOM privacy for the VSS service RPC: .NET's default process
         // blanket (CONNECT) is below what VSS demands (PKT_PRIVACY), which
@@ -220,9 +243,6 @@ namespace Corpus
             _log = log;
         }
 
-        // AOT: the VSS COM entry point above; same justification (built-in COM
-        // interop on NativeAOT Windows, proven by smoke test).
-        [UnconditionalSuppressMessage("Trimming", "IL2050", Justification = "Built-in COM interop on NativeAOT Windows; VSS API surface rooted, proven by smoke test.")]
         public static VssSnapshot Create(string drive, ILogger log, bool strictWriters = true, Action? preFreeze = null, Action? postThaw = null)
         {
             ArgumentNullException.ThrowIfNull(drive);
@@ -284,7 +304,7 @@ namespace Corpus
                     }
                     finally
                     {
-                        Marshal.ReleaseComObject(meta);
+                        VssApi.Release(meta);
                     }
                 }
                 Hr(com.StartSnapshotSet(out var setId), "StartSnapshotSet");
@@ -330,7 +350,7 @@ namespace Corpus
             catch
             {
                 try { com.AbortBackup(); } catch (Exception ex) { log.Warn("VSS AbortBackup after failure: " + ex.Message); }
-                Marshal.ReleaseComObject(com);
+                VssApi.Release(com);
                 throw;
             }
         }
@@ -374,7 +394,7 @@ namespace Corpus
                 // on-box in both paths). Releasing the object triggers any
                 // remaining auto-release; the loop script's stranded-shadow
                 // checks are the tripwire. Never persist this context.
-                Marshal.ReleaseComObject(_com);
+                VssApi.Release(_com);
             }
         }
 
@@ -388,7 +408,7 @@ namespace Corpus
             }
             finally
             {
-                Marshal.ReleaseComObject(async);
+                VssApi.Release(async);
             }
         }
 

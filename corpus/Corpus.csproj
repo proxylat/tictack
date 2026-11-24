@@ -8,6 +8,8 @@
     <AssemblyName>Corpus</AssemblyName>
     <RootNamespace>Corpus</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
   <!-- Segment-reader unit tests exercise VssReadStream over MemoryStream. -->
   <ItemGroup>

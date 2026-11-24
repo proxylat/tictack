@@ -554,7 +554,7 @@ namespace Corpus
                     }
                     finally
                     {
-                        Marshal.ReleaseComObject(meta);
+                        VssApi.Release(meta);
                     }
                 }
                 Hr(com.StartSnapshotSet(out var setId), "StartSnapshotSet");
@@ -610,7 +610,7 @@ namespace Corpus
             {
                 VssHealth.ReportSnapshotFailure(log, ex);
                 try { com.AbortBackup(); } catch (Exception abex) { log.Warn("VSS AbortBackup after failure: " + abex.Message); }
-                Marshal.ReleaseComObject(com);
+                VssApi.Release(com);
                 throw;
             }
         }
@@ -655,7 +655,7 @@ namespace Corpus
                 // No explicit DeleteSnapshots: BACKUP-context shadows are
                 // volatile + auto-release by definition (same finding as
                 // VssSnapshot — an explicit delete only answers NOT_FOUND).
-                Marshal.ReleaseComObject(_com);
+                VssApi.Release(_com);
             }
         }
 
@@ -672,7 +672,7 @@ namespace Corpus
             }
             finally
             {
-                Marshal.ReleaseComObject(async);
+                VssApi.Release(async);
             }
         }
 

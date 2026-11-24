@@ -186,7 +186,7 @@ namespace TicTack.Tests
                     },
                 }
             },
-            RemoteSystem = new RemoteSystemConfig
+            RemoteSync = new RemoteSystemConfig
             {
                 Host = $"127.0.0.1:{port}",
                 Destination = _hostDest,

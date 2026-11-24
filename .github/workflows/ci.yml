@@ -188,7 +188,7 @@ jobs:
           choco install innosetup -y
           iscc service/win/setup.iss
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             service/win/TicTackSetup-*.exe
@@ -219,7 +219,7 @@ jobs:
         run: |
           Copy-Item corpus/win/config_corpus.yaml.example corpus/win/config_corpus.yaml
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             corpus/win/Corpus.exe
