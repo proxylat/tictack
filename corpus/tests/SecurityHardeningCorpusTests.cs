@@ -5,6 +5,10 @@ using Xunit;
 
 namespace Corpus.Tests
 {
+    [CollectionDefinition("ChunkIdOverride", DisableParallelization = true)]
+    public class ChunkIdOverrideCollection { }
+
+    [Collection("ChunkIdOverride")]
     public class SecurityHardeningCorpusTests : IDisposable
     {
         private readonly string _tempDir;

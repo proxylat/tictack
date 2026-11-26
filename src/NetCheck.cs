@@ -66,27 +66,12 @@ namespace TicTack
             if (interactivePrompt != null)
                 return interactivePrompt(result.Reason);
 
-            if (Environment.UserInteractive && !Console.IsInputRedirected)
-                return PromptTerminal(jobName, result.Reason);
+            var promptMsg = $"Job '{jobName}' detected severe network instability: {result.Reason}. Continue anyway?";
+            if (DesktopAlert.PromptYesNo("TicTack NetCheck", promptMsg, defaultOnTimeout: false))
+                return true;
 
-            log.Warn($"Job '{jobName}' skipped due to severe network instability (non-interactive).");
+            log.Warn($"Job '{jobName}' skipped due to severe network instability.");
             return false;
-        }
-
-        private static bool PromptTerminal(string jobName, string reason)
-        {
-            Console.WriteLine();
-            Console.WriteLine($"[TicTack NetCheck] Job '{jobName}' detected severe network instability:");
-            Console.WriteLine($"  {reason}");
-            Console.Write("Continue anyway? [c]ontinue / [s]kip (auto-skip in 30s): ");
-            var readTask = Task.Run(() => Console.ReadLine());
-            if (!readTask.Wait(TimeSpan.FromSeconds(30)))
-            {
-                Console.WriteLine("\nTimed out; skipping job.");
-                return false;
-            }
-            var ans = (readTask.Result ?? string.Empty).Trim().ToLowerInvariant();
-            return ans == "c" || ans == "continue" || ans == "y" || ans == "yes";
         }
 
         private static async Task<NetCheckResult> EvaluateOnceAsync(

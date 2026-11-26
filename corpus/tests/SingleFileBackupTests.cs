@@ -539,7 +539,7 @@ public sealed class SingleFileBackupTests : IDisposable
     {
         var ex = new SingleFileVerifyException("x.vhdx", "byte mismatch at offset 5", 5);
         Assert.Equal(5, ex.MismatchOffset);
-        Assert.Equal(null, new SingleFileVerifyException("x.vhdx", "other").MismatchOffset);
+        Assert.Null(new SingleFileVerifyException("x.vhdx", "other").MismatchOffset);
     }
 
     [Fact]

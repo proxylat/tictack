@@ -1,6 +1,8 @@
 using System.Globalization;
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace TicTack
@@ -128,6 +130,96 @@ namespace TicTack
             {
                 // Unreadable right now: do not destroy the only copy.
                 return Match.Unknown;
+            }
+        }
+    }
+
+    // Sleep inhibitor for prevent_sleep, held for one run or sync pass.
+    // Windows: thread execution state. Linux: systemd-inhibit companion.
+    internal sealed class SleepInhibit : IDisposable
+    {
+        [DllImport("kernel32.dll")]
+        private static extern uint SetThreadExecutionState(uint esFlags);
+
+        private const uint EsContinuous = 0x80000000;
+        private const uint EsSystemRequired = 0x00000001;
+
+        private Process? _companion;
+        private bool _windowsHeld;
+        private bool _disposed;
+
+        public static SleepInhibit Hold(bool enabled, string? label, int timeoutMinutes, ILogger log)
+        {
+            var h = new SleepInhibit();
+            if (!enabled) return h;
+            try
+            {
+                if (OperatingSystem.IsWindows())
+                {
+                    SetThreadExecutionState(EsContinuous | EsSystemRequired);
+                    h._windowsHeld = true;
+                }
+                else
+                {
+                    var exe = FindOnPath("systemd-inhibit");
+                    if (exe == null)
+                    {
+                        log.Debug("Sleep inhibit unavailable (no systemd-inhibit), running uninhibited");
+                        return h;
+                    }
+                    var secs = Math.Min(Math.Max(timeoutMinutes, 1), 1440) * 60 + 300;
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = exe,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                    };
+                    psi.ArgumentList.Add("--what=sleep:idle");
+                    psi.ArgumentList.Add("--who=TicTackSv");
+                    psi.ArgumentList.Add("--why=" + (label ?? "tictack"));
+                    psi.ArgumentList.Add("--mode=block");
+                    psi.ArgumentList.Add("sleep");
+                    psi.ArgumentList.Add(secs.ToString(CultureInfo.InvariantCulture));
+                    h._companion = Process.Start(psi);
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Debug("Sleep inhibit failed, running uninhibited: " + ex.Message);
+            }
+            return h;
+        }
+
+        private static string? FindOnPath(string name)
+        {
+            var path = Environment.GetEnvironmentVariable("PATH");
+            if (string.IsNullOrEmpty(path)) return null;
+            foreach (var dir in path.Split(Path.PathSeparator))
+            {
+                try
+                {
+                    var candidate = Path.Combine(dir.Trim(), name);
+                    if (File.Exists(candidate)) return candidate;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (_windowsHeld)
+            {
+                try { SetThreadExecutionState(EsContinuous); } catch { }
+                _windowsHeld = false;
+            }
+            if (_companion != null)
+            {
+                try { if (!_companion.HasExited) _companion.Kill(entireProcessTree: true); } catch { }
+                try { _companion.Dispose(); } catch { }
+                _companion = null;
             }
         }
     }

@@ -82,4 +82,23 @@ public class AlertTests : IDisposable
             try { Directory.Delete(dir, true); } catch { }
         }
     }
+
+    [Fact]
+    public void SeparateToggles_FailSafeWhenDisabled()
+    {
+        DesktopAlert.Configure(path: null, osNotifications: false, cmdPrompts: false, osPrompts: false, timeoutSeconds: 0);
+        Assert.False(DesktopAlert.PromptYesNo("Test", "Proceed?", defaultOnTimeout: false));
+        DesktopAlert.Notify("Test", "Silent when disabled", "WARN");
+    }
+
+    [Fact]
+    public void LoggingConfig_DefaultsMatchContract_AndEscapeXmlSanitizes()
+    {
+        var cfg = new LoggingConfig();
+        Assert.False(cfg.AlertEnabled);
+        Assert.True(cfg.OsNotifications);
+        Assert.False(cfg.CmdPrompts);
+        Assert.True(cfg.OsPrompts);
+        Assert.Equal("a &amp; &lt;b&gt; &quot;c&quot; &apos;d&apos;", DesktopAlert.EscapeXml("a & <b> \"c\" 'd'"));
+    }
 }

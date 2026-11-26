@@ -567,7 +567,7 @@ logging:
             Assert.Equal("echo pre", job.PreCommand);
             Assert.Equal("echo post", job.PostCommand);
             Assert.Equal("echo fail", job.OnFailure);
-            Assert.True(job.LowPriority);
+            Assert.True(job.LowPriority == true);
             Assert.True(job.OnAcOnly);
             Assert.True(job.PreventSleep);
         }
@@ -609,5 +609,21 @@ logging:
             Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(dstFile));
         }
         finally { try { Directory.Delete(tmpRoot, true); } catch { } }
+    }
+
+    [Fact]
+    public void Validate_AllowsZeroSourcesWithJobs_RejectsZeroSourcesWithoutJobs()
+    {
+        var noJobs = new TicTackConfig();
+        Assert.False(Config.Validate(noJobs, new RecordingLogger()));
+
+        var withJobs = new TicTackConfig
+        {
+            Jobs = new List<JobConfig>
+            {
+                new JobConfig { Name = "j1", Watch = true, Source = Path.GetTempPath(), Command = "echo ok" }
+            }
+        };
+        Assert.True(Config.Validate(withJobs, new RecordingLogger()));
     }
 }

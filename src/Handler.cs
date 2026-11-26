@@ -103,7 +103,7 @@ namespace TicTack
     {
         internal static readonly TimeSpan SnapshotTtl = TimeSpan.FromMinutes(10);
 
-        const int VSS_CTX_BACKUP = 0;
+        const int VSS_CTX_FILE_SHARE_BACKUP = 0x10;
         const int VSS_OBJECT_SNAPSHOT_SET = 2;
         const int ERROR_SHARING_VIOLATION = 32;
         const int ERROR_LOCK_VIOLATION = 33;
@@ -162,7 +162,7 @@ namespace TicTack
             void DeleteSnapshots(Guid sourceObjectId, int objectType, [MarshalAs(UnmanagedType.Bool)] bool forceDelete, out int deletedSnapshots, out Guid nondeletedSnapshotId);
             void ImportSnapshots(out nint async);
             void BreakSnapshotSet(Guid snapshotSetId);
-            void GetSnapshotProperties(Guid snapshotId, out nint prop);
+            void GetSnapshotProperties(Guid snapshotId, nint prop);
             void Query(Guid queriedObjectId, int queriedObjectType, int returnedObjectType, out nint enums);
             void IsVolumeSupported(Guid providerId, string volumeName, [MarshalAs(UnmanagedType.Bool)] out bool supported);
             void DisableWriterClasses(nint writerIds, uint classId);
@@ -206,7 +206,7 @@ namespace TicTack
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool GetVolumeNameForVolumeMountPoint(string volumeMountPoint, StringBuilder volumeName, uint bufferLength);
 
-        sealed class SnapshotEntry
+        internal sealed class SnapshotEntry
         {
             public Guid SetId;
             public string DeviceObject = string.Empty;
@@ -237,7 +237,7 @@ namespace TicTack
             // other call. SetContext first AVs on uninitialized native state
             // instead of returning an HRESULT (observed 0xC0000005 on Win x64).
             RunVssStep("Probe.InitializeForBackup", () => components.InitializeForBackup(nint.Zero));
-            RunVssStep("Probe.SetContext", () => components.SetContext(VSS_CTX_BACKUP));
+            RunVssStep("Probe.SetContext", () => components.SetContext(VSS_CTX_FILE_SHARE_BACKUP));
         }
 
         public Stream OpenRead(string path)
@@ -343,11 +343,11 @@ namespace TicTack
             }
         }
 
-        SnapshotEntry CreateSnapshot(string canonicalVolume)
+        internal SnapshotEntry CreateSnapshot(string canonicalVolume)
         {
             var components = CreateComponents();
             RunVssStep("InitializeForBackup", () => components.InitializeForBackup(nint.Zero));
-            RunVssStep("SetContext", () => components.SetContext(VSS_CTX_BACKUP));
+            RunVssStep("SetContext", () => components.SetContext(VSS_CTX_FILE_SHARE_BACKUP));
             RunVssStep("SetBackupState", () => components.SetBackupState(false, false, VssBackupType.Copy, false));
             Guid setId = Guid.Empty, snapshotId = Guid.Empty;
             RunVssStep("StartSnapshotSet", () => components.StartSnapshotSet(out setId));
@@ -358,24 +358,29 @@ namespace TicTack
             int hr = 0;
             RunVssStep("IVssAsync.QueryStatus", () => async!.QueryStatus(out hr, out _));
             if (hr != 0) Marshal.ThrowExceptionForHR(hr);
-            nint propPtr = nint.Zero;
-            RunVssStep("GetSnapshotProperties", () => components.GetSnapshotProperties(snapshotId, out propPtr));
+            nint propPtr = Marshal.AllocHGlobal(Marshal.SizeOf<VssSnapshotProp>());
             string device;
             try
             {
-                unsafe
+                unsafe { System.Runtime.InteropServices.NativeMemory.Clear((void*)propPtr, (nuint)Marshal.SizeOf<VssSnapshotProp>()); }
+                RunVssStep("GetSnapshotProperties", () => components.GetSnapshotProperties(snapshotId, propPtr));
+                try
                 {
-                    var prop = *(VssSnapshotProp*)propPtr;
-                    device = Marshal.PtrToStringUni(prop.SnapshotDeviceObject) ?? string.Empty;
+                    unsafe
+                    {
+                        var prop = *(VssSnapshotProp*)propPtr;
+                        device = Marshal.PtrToStringUni(prop.SnapshotDeviceObject) ?? string.Empty;
+                    }
                 }
+                finally { VssFreeSnapshotProperties(propPtr); }
             }
-            finally { VssFreeSnapshotProperties(propPtr); }
+            finally { Marshal.FreeHGlobal(propPtr); }
             if (string.IsNullOrEmpty(device))
                 throw new IOException("VSS: snapshot has no device object.");
             return new SnapshotEntry { SetId = setId, DeviceObject = device, CreatedUtc = DateTime.UtcNow, Components = components };
         }
 
-        void EvictLocked(SnapshotEntry entry)
+        internal static void EvictLocked(SnapshotEntry entry)
         {
             // Best effort: the FILE_SHARE_BACKUP snapshot is nonpersistent and
             // dies with the components handle anyway; explicit delete keeps
@@ -427,6 +432,182 @@ namespace TicTack
         {
             return (ex.HResult & 0xFFFF) == ERROR_SHARING_VIOLATION
                 || (ex.HResult & 0xFFFF) == ERROR_LOCK_VIOLATION;
+        }
+    }
+
+    internal interface ISnapshotScope : IDisposable
+    {
+        string MountPath { get; }
+    }
+
+    internal static class SnapshotMount
+    {
+        public static ISnapshotScope? TryCreate(string watchPath, ILogger? log) =>
+            OperatingSystem.IsWindows() ? VssSnapshotScope.TryCreateMount(watchPath, log)
+            : OperatingSystem.IsLinux() ? LinuxSnapshotScope.TryCreateMount(watchPath, log)
+            : null;
+    }
+
+    internal sealed class VssSnapshotScope : ISnapshotScope
+    {
+        private readonly VssFileAccessor _accessor;
+        private readonly VssFileAccessor.SnapshotEntry _entry;
+        private bool _disposed;
+
+        public string MountPath { get; }
+
+        private VssSnapshotScope(VssFileAccessor accessor, VssFileAccessor.SnapshotEntry entry, string mountPath)
+        {
+            _accessor = accessor;
+            _entry = entry;
+            MountPath = mountPath;
+        }
+
+        public static VssSnapshotScope? TryCreateMount(string watchPath, ILogger? log)
+        {
+            if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(watchPath))
+                return null;
+            VssFileAccessor? accessor = null;
+            VssFileAccessor.SnapshotEntry? entry = null;
+            string? mountPath = null;
+            try
+            {
+                var fullPath = Path.GetFullPath(watchPath).TrimEnd('\\', '/');
+                var root = Path.GetPathRoot(fullPath);
+                if (string.IsNullOrEmpty(root)) return null;
+                accessor = new VssFileAccessor(log);
+                var canonical = VssFileAccessor.CanonicalVolumeName(root);
+                entry = accessor.CreateSnapshot(canonical);
+                var mapped = VssFileAccessor.MapToSnapshot(entry.DeviceObject, root, fullPath);
+                if (!mapped.EndsWith("\\", StringComparison.Ordinal)) mapped += "\\";
+                mountPath = Path.Combine(Path.GetTempPath(), "tictack-vss-" + Guid.NewGuid().ToString("n"));
+                Directory.CreateSymbolicLink(mountPath, mapped);
+                return new VssSnapshotScope(accessor, entry, mountPath);
+            }
+            catch (Exception ex)
+            {
+                log?.Warn("VSS mount unavailable for job, using live path: " + ex.Message);
+                if (mountPath != null) { try { Directory.Delete(mountPath); } catch { } }
+                if (entry != null) { try { VssFileAccessor.EvictLocked(entry); } catch { } }
+                accessor?.Dispose();
+                return null;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try { if (Directory.Exists(MountPath)) Directory.Delete(MountPath); } catch { }
+            try { VssFileAccessor.EvictLocked(_entry); } catch { }
+            _accessor.Dispose();
+        }
+    }
+
+    internal sealed class LinuxSnapshotScope : ISnapshotScope
+    {
+        private readonly string _cleanupExe;
+        private readonly string[] _cleanupArgs;
+        private bool _disposed;
+
+        public string MountPath { get; }
+
+        private LinuxSnapshotScope(string mountPath, string cleanupExe, string[] cleanupArgs)
+        {
+            MountPath = mountPath;
+            _cleanupExe = cleanupExe;
+            _cleanupArgs = cleanupArgs;
+        }
+
+        internal static (string FsType, string MountPoint, string Source)? ParseMountFs(string path, string[] mountInfoLines)
+        {
+            string full;
+            try { full = Path.GetFullPath(path).TrimEnd('/'); }
+            catch { return null; }
+            if (string.IsNullOrEmpty(full)) full = "/";
+
+            (string FsType, string MountPoint, string Source)? best = null;
+            foreach (var line in mountInfoLines)
+            {
+                var sep = line.IndexOf(" - ", StringComparison.Ordinal);
+                if (sep < 0) continue;
+                var left = line.Substring(0, sep).Split(' ');
+                var right = line.Substring(sep + 3).Split(' ');
+                if (left.Length < 5 || right.Length < 2) continue;
+                var mp = left[4].Replace("\\040", " ", StringComparison.Ordinal);
+                var matches = mp == "/" || full.Equals(mp, StringComparison.Ordinal) || full.StartsWith(mp + "/", StringComparison.Ordinal);
+                if (matches && (best == null || mp.Length > best.Value.MountPoint.Length))
+                    best = (right[0], mp, right[1]);
+            }
+            return best;
+        }
+
+        public static LinuxSnapshotScope? TryCreateMount(string watchPath, ILogger? log)
+        {
+            if (!OperatingSystem.IsLinux() || string.IsNullOrWhiteSpace(watchPath)) return null;
+            try
+            {
+                var fullPath = Path.GetFullPath(watchPath).TrimEnd('/');
+                var info = ParseMountFs(fullPath, File.ReadAllLines("/proc/self/mountinfo"));
+                if (info == null) return null;
+                var (fsType, mountPoint, source) = info.Value;
+                var rel = fullPath.Length > mountPoint.Length ? fullPath.Substring(mountPoint.Length).TrimStart('/') : string.Empty;
+
+                if (string.Equals(fsType, "btrfs", StringComparison.OrdinalIgnoreCase))
+                {
+                    var snapDir = Path.Combine(Path.GetTempPath(), "tictack-btrfs-" + Guid.NewGuid().ToString("n"));
+                    if (RunTool("btrfs", new[] { "subvolume", "snapshot", "-r", mountPoint, snapDir }))
+                    {
+                        var mapped = string.IsNullOrEmpty(rel) ? snapDir : Path.Combine(snapDir, rel);
+                        return new LinuxSnapshotScope(mapped, "btrfs", new[] { "subvolume", "delete", snapDir });
+                    }
+                    log?.Warn("Btrfs snapshot failed (needs root/CAP_SYS_ADMIN), using live path");
+                    return null;
+                }
+                if (string.Equals(fsType, "zfs", StringComparison.OrdinalIgnoreCase))
+                {
+                    var snapName = "tictack-" + Guid.NewGuid().ToString("n");
+                    var fullSnap = source + "@" + snapName;
+                    if (RunTool("zfs", new[] { "snapshot", fullSnap }))
+                    {
+                        var snapRoot = Path.Combine(mountPoint, ".zfs", "snapshot", snapName);
+                        var mapped = string.IsNullOrEmpty(rel) ? snapRoot : Path.Combine(snapRoot, rel);
+                        return new LinuxSnapshotScope(mapped, "zfs", new[] { "destroy", fullSnap });
+                    }
+                    log?.Warn("ZFS snapshot failed (needs root/zfs-allow), using live path");
+                    return null;
+                }
+                log?.Warn($"Linux snapshot unsupported on filesystem '{fsType}' (requires btrfs or zfs), using live path");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                log?.Warn("Linux snapshot unavailable, using live path: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static bool RunTool(string exe, string[] args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = exe,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            foreach (var a in args) psi.ArgumentList.Add(a);
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return false;
+            return proc.WaitForExit(15000) && proc.ExitCode == 0;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try { RunTool(_cleanupExe, _cleanupArgs); } catch { }
         }
     }
 }

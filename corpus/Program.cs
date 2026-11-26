@@ -668,7 +668,7 @@ namespace Corpus
                         if (parentArg != null && !TryParent(parentArg, log, out parentGen))
                             return 1;
                         using (var store = CreateStore(cfg, log))
-                        using (var source = OpenSource(volume, log, !bufferedIo))
+                        using (var source = OpenSource(volume, log, !bufferedIo, cfg))
                         {
                             // MFT-digest default (USN hint inside for
                             // pre-digest parents and non-MFT sources).
@@ -1278,7 +1278,7 @@ namespace Corpus
                     log.Error("--append needs --to-wim <base.wim> (new image index in an existing WIM)");
                     return 1;
                 }
-                using (var source = OpenSource(volume, log))
+                using (var source = OpenSource(volume, log, cfg: cfg))
                 {
                     var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
                     if (snap == null)
@@ -1331,7 +1331,7 @@ namespace Corpus
                         log.Error("--parent <base.vhdx> needs the DiscUtils writer (differencing create is a DiscUtils path)");
                         return 1;
                     }
-                    using (var source = OpenSource(volume, log, useUnbuffered))
+                    using (var source = OpenSource(volume, log, useUnbuffered, cfg))
                     {
                         // The diff is a block compare: exclusions bake into a
                         // full parent at creation and mean nothing here, so
@@ -1351,7 +1351,7 @@ namespace Corpus
                     }
                     return 0;
                 }
-                using (var source = OpenSource(volume, log, useUnbuffered))
+                using (var source = OpenSource(volume, log, useUnbuffered, cfg))
                 {
                     var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
                     var path = SingleFileBackup.BackupVhdx(source, volume, toVhdx, kind, excl, log);
@@ -1368,7 +1368,7 @@ namespace Corpus
             // WIM/ESD capture from the VSS snapshot dir — a live volume, not
             // a file. Trailing backslash: the shadow device object is only a
             // valid directory path in root form.
-            using (var source = OpenSource(volume, log))
+            using (var source = OpenSource(volume, log, cfg: cfg))
             {
                 var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
                 if (snap == null)

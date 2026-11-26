@@ -20,6 +20,7 @@ namespace TicTack
         public RemoteSystemConfig? RemoteSync { get; set; }
         public bool StrictConfigPerms { get; set; }
         public bool EcoQos { get; set; }
+        public bool PreventSleep { get; set; }
 
         // Minutes to wait for [VolumeLabel] volumes to appear (slow USB
         // spin-up) before failing fast on unresolved labels. Top-level on
@@ -321,6 +322,10 @@ namespace TicTack
         // write .txt even if alert_path is set. Warn/Error still reach
         // tictack.log via the primary logger.
         public bool? AlertEnabled { get; set; }
+        public bool OsNotifications { get; set; }
+        public bool? CmdPrompts { get; set; }
+        public bool OsPrompts { get; set; }
+        public int? AlertTimeoutSeconds { get; set; }
         public int MaxSizeMb { get; set; }
         public int MaxFiles { get; set; }
         public bool Console { get; set; }
@@ -328,6 +333,10 @@ namespace TicTack
         public LoggingConfig()
         {
             Level = "info";
+            AlertEnabled = false;
+            OsNotifications = true;
+            CmdPrompts = false;
+            OsPrompts = true;
             MaxSizeMb = 10;
             MaxFiles = 5;
             Console = false;
@@ -350,9 +359,9 @@ namespace TicTack
         public string? Schedule { get; set; }
         public string? Day { get; set; }
         public string? RunOnceOn { get; set; }
-        // Interval trigger ("6h", "15m", "30s", "1d"): fires every span after
-        // the previous run finished. Never combined with schedule/day/time/
-        // run_once_on — a job is calendar, one-shot, or interval.
+        // Interval trigger ("6h", "15m", "30s", "1s", "1d"): fires every span
+        // after the previous run finished. Never combined with schedule/day/
+        // time/run_once_on — a job is calendar, one-shot, or interval.
         public string? Every { get; set; }
         // Weekly mask ("days: [mon, wed, fri]"): fires on each listed weekday.
         // Only valid with schedule weekly; mutually exclusive with day.
@@ -373,14 +382,31 @@ namespace TicTack
         public string? PreCommand { get; set; }
         public string? PostCommand { get; set; }
         public string? OnFailure { get; set; }
-        // Laptop trio: idle CPU priority, skip while on battery, hold a
-        // sleep inhibitor for the run. All default false.
-        public bool LowPriority { get; set; }
+        // Laptop trio: idle CPU priority (null = inherit jobs_defaults / eco_qos),
+        // skip while on battery, hold a sleep inhibitor for the run.
+        public bool? LowPriority { get; set; }
         public bool OnAcOnly { get; set; }
         public bool PreventSleep { get; set; }
         // Null = inherit jobs_defaults.show_terminal (default false).
         public bool? ShowTerminal { get; set; }
         public bool? Sandbox { get; set; }
+        public bool Watch { get; set; }
+        public string? Source { get; set; }
+        public bool? Inherit { get; set; }
+        public double? DebounceSeconds { get; set; }
+        public IList<string> Exclude { get; set; } = new List<string>();
+        public object? MaxFileSizeMb { get; set; }
+        public string? FileAccess { get; set; }
+        public string? LockHandling { get; set; }
+        public int? LockWaitSeconds { get; set; }
+        public string? Destination { get; set; }
+        public double? MinFreeGb { get; set; }
+        public RetryConfig? Retry { get; set; }
+        public int? SpikeWindowMinutes { get; set; }
+        public long? SpikeBytesGb { get; set; }
+        public int? SpikeFiles { get; set; }
+        public int? SpikeRenames { get; set; }
+        public MonitorConfig? Monitor { get; set; }
         // Optional cloud/network stability gate before launching the job.
         public bool? NetCheck { get; set; }
         public string? NetCheckHost { get; set; }
@@ -400,6 +426,21 @@ namespace TicTack
     // sharing live here — triggers and commands stay per job.
     public class JobsDefaultsConfig
     {
+        public bool? Inherit { get; set; }
+        public double? DebounceSeconds { get; set; }
+        public IList<string>? Exclude { get; set; }
+        public object? MaxFileSizeMb { get; set; }
+        public string? FileAccess { get; set; }
+        public string? LockHandling { get; set; }
+        public int? LockWaitSeconds { get; set; }
+        public double? MinFreeGb { get; set; }
+        public RetryConfig? Retry { get; set; }
+        public int? SpikeWindowMinutes { get; set; }
+        public long? SpikeBytesGb { get; set; }
+        public int? SpikeFiles { get; set; }
+        public int? SpikeRenames { get; set; }
+        public MonitorConfig? Monitor { get; set; }
+        public bool? LowPriority { get; set; }
         public string? MissedRun { get; set; }
         public int? TimeoutMinutes { get; set; }
         public bool? ShowTerminal { get; set; }
@@ -467,15 +508,38 @@ namespace TicTack
             }
         }
 
+        private static bool ValidateJobLimits(TicTackConfig cfg, ILogger log)
+        {
+            bool valid = true;
+            if (cfg.JobsDefaults != null && !IsValidFileSizeLimit(cfg.JobsDefaults.MaxFileSizeMb))
+            {
+                log.Error("jobs_defaults.max_file_size_mb must be a positive number, 'no-limit', or 'none'");
+                valid = false;
+            }
+            if (cfg.Jobs != null)
+            {
+                foreach (var job in cfg.Jobs)
+                {
+                    if (!IsValidFileSizeLimit(job.MaxFileSizeMb))
+                    {
+                        log.Error("max_file_size_mb must be a positive number, 'no-limit', or 'none' for job: " + (job.Name ?? "<unnamed>"));
+                        valid = false;
+                    }
+                }
+            }
+            return valid;
+        }
+
         public static bool Validate(TicTackConfig cfg, ILogger log)
         {
             bool hasRemote = cfg.RemoteSync != null && (cfg.RemoteSync.HasAgent || cfg.RemoteSync.HasClient);
-            if ((cfg.Sources == null || cfg.Sources.Count == 0) && !hasRemote)
+            bool hasJobs = cfg.Jobs != null && cfg.Jobs.Count > 0;
+            if ((cfg.Sources == null || cfg.Sources.Count == 0) && !hasRemote && !hasJobs)
             {
                 log.Error("No sources configured");
                 return false;
             }
-            bool valid = true;
+            bool valid = ValidateJobLimits(cfg, log);
             if (cfg.Errors != null)
             {
                 foreach (var err in cfg.Errors)
@@ -974,6 +1038,7 @@ namespace TicTack
             {
                 foreach (var job in cfg.Jobs)
                 {
+                    if (job.Source != null) job.Source = Resolve(job.Source, map);
                     if (job.WorkingDir != null) job.WorkingDir = Resolve(job.WorkingDir, map);
                     if (job.Command != null) job.Command = Resolve(job.Command, map);
                 }
@@ -986,15 +1051,18 @@ namespace TicTack
         internal static List<string> FindUnresolvedLabels(TicTackConfig cfg)
         {
             var fields = new List<string>();
-            if (cfg == null || cfg.Sources == null) return fields;
-            foreach (var src in cfg.Sources)
+            if (cfg == null) return fields;
+            if (cfg.Sources != null)
             {
-                AddField(fields, src.Path);
-                if (src.Paths != null) fields.AddRange(src.Paths);
-                AddField(fields, src.Destination);
-                AddField(fields, src.StateDbPath);
-                if (src.Sync?.Versioning != null) AddField(fields, src.Sync.Versioning.Path);
-                if (src.Sync?.Deletion != null) AddField(fields, src.Sync.Deletion.Path);
+                foreach (var src in cfg.Sources)
+                {
+                    AddField(fields, src.Path);
+                    if (src.Paths != null) fields.AddRange(src.Paths);
+                    AddField(fields, src.Destination);
+                    AddField(fields, src.StateDbPath);
+                    if (src.Sync?.Versioning != null) AddField(fields, src.Sync.Versioning.Path);
+                    if (src.Sync?.Deletion != null) AddField(fields, src.Sync.Deletion.Path);
+                }
             }
             if (cfg.Logging != null)
             {
@@ -1010,7 +1078,11 @@ namespace TicTack
             }
             if (cfg.Jobs != null)
             {
-                foreach (var job in cfg.Jobs) AddField(fields, job.WorkingDir);
+                foreach (var job in cfg.Jobs)
+                {
+                    AddField(fields, job.Source);
+                    AddField(fields, job.WorkingDir);
+                }
             }
             if (cfg.ExternalDrives != null) AddField(fields, cfg.ExternalDrives.WorkingDir);
 

@@ -193,9 +193,10 @@ namespace TicTack
         {
             try
             {
+                var currentProc = new IntPtr(-1); // GetCurrentProcess() pseudo-handle: valid even after lowering integrity.
                 bool useLow = !string.Equals(sandboxLevel, "restricted", StringComparison.OrdinalIgnoreCase);
                 uint access = TOKEN_ADJUST_PRIVILEGES | (useLow ? TOKEN_ADJUST_DEFAULT : 0);
-                if (OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, access, out var tok))
+                if (OpenProcessToken(currentProc, access, out var tok))
                 {
                     try
                     {
@@ -229,7 +230,7 @@ namespace TicTack
                     throw new InvalidOperationException("SetInformationJobObject(UIRestrictions) failed.");
                 }
 
-                AssignProcessToJobObject(job, System.Diagnostics.Process.GetCurrentProcess().Handle);
+                AssignProcessToJobObject(job, currentProc);
                 log.Info($"Remote agent Windows sandbox applied (level={(useLow ? "low" : "restricted")}, privileges stripped, JobObject active-process=1).");
             }
             catch (Exception ex)
@@ -285,10 +286,10 @@ namespace TicTack
             try
             {
                 _ = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                var rlim = new RLimit { RlimCur = 0, RlimMax = 0 };
-                _ = setrlimit(RLIMIT_NPROC, ref rlim);
+                // Do not set RLIMIT_NPROC=0: on Linux it caps pthread_create (threads),
+                // causing the .NET threadpool to abort with OOM on incoming connections.
                 bool landlock = !string.IsNullOrEmpty(rootPath) && TryApplyLandlock(rootPath);
-                log.Info("Remote agent Linux sandbox applied (NO_NEW_PRIVS, RLIMIT_NPROC=0" + (landlock ? ", Landlock=ro" : "") + ").");
+                log.Info("Remote agent Linux sandbox applied (NO_NEW_PRIVS" + (landlock ? ", Landlock=ro" : "") + ").");
             }
             catch (Exception ex)
             {

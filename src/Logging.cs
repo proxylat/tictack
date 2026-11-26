@@ -397,6 +397,12 @@ namespace TicTack
 
     public class EventLogLogger : ILogger
     {
+        private const int LogDaemonWarn = (3 << 3) | 4;
+        private const int LogDaemonErr = (3 << 3) | 3;
+
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "syslog")]
+        private static extern void LinuxSyslog(int priority, string format, string message);
+
         private readonly string _source;
         private readonly LogLevel _minLevel;
         public EventLogLogger(string source = "TicTackSv", LogLevel minLevel = LogLevel.Warn)
@@ -408,16 +414,33 @@ namespace TicTack
         public void Info(string msg) { }
         public void Warn(string msg)
         {
-            if (_minLevel > LogLevel.Warn || !OperatingSystem.IsWindows()) return;
-            try { EventLog.WriteEntry(_source, LogLevelParser.Clean(msg), EventLogEntryType.Warning); }
-            catch { }
+            if (_minLevel > LogLevel.Warn) return;
+            var clean = LogLevelParser.Clean(msg);
+            if (OperatingSystem.IsWindows())
+            {
+                try { EventLog.WriteEntry(_source, clean, EventLogEntryType.Warning); }
+                catch { }
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                try { LinuxSyslog(LogDaemonWarn, "%s", _source + ": " + clean); }
+                catch { }
+            }
         }
         public void Error(string msg, Exception? ex = null)
         {
-            if (_minLevel > LogLevel.Error || !OperatingSystem.IsWindows()) return;
+            if (_minLevel > LogLevel.Error) return;
             var body = LogLevelParser.Clean(msg) + (ex != null ? " " + LogLevelParser.Clean(ex.ToString()) : "");
-            try { EventLog.WriteEntry(_source, body, EventLogEntryType.Error); }
-            catch { }
+            if (OperatingSystem.IsWindows())
+            {
+                try { EventLog.WriteEntry(_source, body, EventLogEntryType.Error); }
+                catch { }
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                try { LinuxSyslog(LogDaemonErr, "%s", _source + ": " + body); }
+                catch { }
+            }
         }
     }
 
@@ -471,7 +494,8 @@ namespace TicTack
     {
         public static ILogger Create(string? levelName, string logPath, int maxSizeMb, int maxFiles,
             string? alertPath, bool console, bool eventLog, string? backupPath = null, bool? alertEnabled = null,
-            string eventLogSource = "TicTackSv")
+            string eventLogSource = "TicTackSv", bool osNotifications = true, bool cmdPrompts = false,
+            bool osPrompts = true, int alertTimeoutSeconds = 15)
         {
             var level = LogLevelParser.Parse(levelName);
             var loggers = new List<ILogger>
@@ -485,8 +509,9 @@ namespace TicTack
                 loggers.Add(new DailyBackupLogger(backupPath, level));
             if (console) loggers.Add(new ConsoleLogger(level));
             // Alerts are a Warn/Error channel per the documented contract.
-            // alert_enabled: false is a hard off even if alert_path is set.
+            // alert_enabled: false is a hard off for .txt files even if alert_path is set.
             var effectiveAlertPath = alertEnabled == false ? null : alertPath;
+            DesktopAlert.Configure(effectiveAlertPath, osNotifications, cmdPrompts, osPrompts, alertTimeoutSeconds);
             loggers.Add(new DesktopAlertLogger(LogLevel.Warn, effectiveAlertPath));
             if (eventLog) loggers.Add(new EventLogLogger(eventLogSource));
             var log = new MultiLogger(loggers);

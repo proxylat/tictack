@@ -302,9 +302,13 @@ namespace TicTack
                 cfg.Logging.MaxFiles,
                 cfg.Logging.AlertPath,
                 console: o.isCli || o.isOnce || o.isValidate || o.isRebuild || o.isDeferredList || o.deferredVerb != null || o.isForget || o.isArchiveForget || o.isVersionsList || o.pinVerb != null || o.isOsCapture || o.isOsRestore || cfg.Logging.Console,
-                eventLog: OperatingSystem.IsWindows() && (o.isService || !Environment.UserInteractive),
+                eventLog: (OperatingSystem.IsWindows() || OperatingSystem.IsLinux()) && (o.isService || !Environment.UserInteractive),
                 backupPath: Path.Combine(StateDbRoot(cfg), "tictack.log.bak"),
-                alertEnabled: cfg.Logging.AlertEnabled);
+                alertEnabled: cfg.Logging.AlertEnabled,
+                osNotifications: cfg.Logging.OsNotifications,
+                cmdPrompts: cfg.Logging.CmdPrompts ?? false,
+                osPrompts: cfg.Logging.OsPrompts,
+                alertTimeoutSeconds: cfg.Logging.AlertTimeoutSeconds ?? 15);
             return (log, logPath);
         }
 
@@ -1457,10 +1461,9 @@ namespace TicTack
             var rs = cfg.RemoteSync;
             if (rs == null || !rs.HasAgent)
                 throw new InvalidOperationException("remote_sync.listen and remote_sync.root must be configured for --remote-agent.");
+            using var agent = StartRemoteAgentIfConfigured(cfg, log);
             if (rs.Sandbox)
                 RemoteSandbox.Apply(log, rs.Root, rs.SandboxLevel);
-
-            using var agent = StartRemoteAgentIfConfigured(cfg, log);
             log.Info("Remote agent running. Press Ctrl+C or Enter to stop.");
             using (var wait = new ManualResetEvent(false))
             {

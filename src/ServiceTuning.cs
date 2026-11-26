@@ -17,11 +17,72 @@ namespace TicTack
     {
         public static void Apply(TicTackConfig cfg, ILogger log, string serviceName)
         {
+            if (OperatingSystem.IsLinux())
+            {
+                ApplyLinux(cfg, log);
+                return;
+            }
             if (!OperatingSystem.IsWindows()) return;
             ApplyPreshutdown(cfg, log, serviceName);
             ApplyPipeTimeout(cfg, log, serviceName);
             ApplyRequiredPrivileges(cfg, log, serviceName);
             ApplyIfeo(cfg, log);
+        }
+
+        private static void ApplyLinux(TicTackConfig cfg, ILogger log)
+        {
+            if (cfg.CpuPriorityClass.HasValue)
+            {
+                int nice = cfg.CpuPriorityClass.Value switch
+                {
+                    1 => 19,
+                    5 => 10,
+                    _ => 0
+                };
+                try
+                {
+                    if (LinuxNative.SetPriority(0, 0, nice) == 0)
+                        log.Debug("Linux nice set to " + nice);
+                    else
+                        log.Warn("Linux setpriority(" + nice + ") failed (errno " + Marshal.GetLastWin32Error() + ")");
+                }
+                catch (Exception ex) { log.Warn("Linux setpriority failed: " + ex.Message); }
+            }
+            if (cfg.IoPriority.HasValue)
+            {
+                int ioprio = cfg.IoPriority.Value switch
+                {
+                    0 => 3 << 13,
+                    1 => (2 << 13) | 7,
+                    _ => (2 << 13) | 4
+                };
+                long sysNum = RuntimeInformation.ProcessArchitecture switch
+                {
+                    Architecture.X64 => 251,
+                    Architecture.Arm64 => 30,
+                    _ => -1
+                };
+                if (sysNum > 0)
+                {
+                    try
+                    {
+                        if (LinuxNative.Syscall3(sysNum, 1, 0, ioprio) == 0)
+                            log.Debug("Linux ioprio set to 0x" + ioprio.ToString("X", System.Globalization.CultureInfo.InvariantCulture));
+                        else
+                            log.Warn("Linux ioprio_set failed (errno " + Marshal.GetLastWin32Error() + ")");
+                    }
+                    catch (Exception ex) { log.Warn("Linux ioprio_set failed: " + ex.Message); }
+                }
+            }
+        }
+
+        private static class LinuxNative
+        {
+            [DllImport("libc", EntryPoint = "setpriority", SetLastError = true)]
+            public static extern int SetPriority(int which, uint who, int prio);
+
+            [DllImport("libc", EntryPoint = "syscall", SetLastError = true)]
+            public static extern long Syscall3(long number, int arg1, int arg2, int arg3);
         }
 
         private static void ApplyPreshutdown(TicTackConfig cfg, ILogger log, string serviceName)

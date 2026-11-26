@@ -419,6 +419,50 @@ public class SchedulerTests
     }
 
     [Fact]
+    public void TickFor_HonoursSubMinuteIntervals()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(30), TimerScheduler.TickFor(Array.Empty<TimeSpan>()));
+        Assert.Equal(TimeSpan.FromSeconds(30), TimerScheduler.TickFor(new[] { TimeSpan.FromMinutes(1) }));
+        Assert.Equal(TimeSpan.FromMilliseconds(500), TimerScheduler.TickFor(new[] { TimeSpan.FromSeconds(1) }));
+        Assert.Equal(TimeSpan.FromSeconds(5), TimerScheduler.TickFor(new[] { TimeSpan.FromSeconds(10) }));
+        // No 250ms floor: minimum interval is 1s (500ms half-tick).
+        Assert.Equal(TimeSpan.FromMilliseconds(150), TimerScheduler.TickFor(new[] { TimeSpan.FromMilliseconds(300) }));
+        // The shortest interval wins regardless of order.
+        Assert.Equal(TimeSpan.FromSeconds(1), TimerScheduler.TickFor(new[] { TimeSpan.FromHours(1), TimeSpan.FromSeconds(2) }));
+    }
+
+    [Fact]
+    public void Every_AcceptsSecondsAndRejectsZero()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_jobsec_" + Guid.NewGuid());
+        Directory.CreateDirectory(dir);
+        var log = new RecordingLogger();
+        var cfg = new TicTackConfig
+        {
+            Sources = new List<SourceConfig>
+            {
+                new SourceConfig { Path = dir, Destination = dir, StateDbPath = Path.Combine(dir, "state.db") }
+            },
+            Jobs = new List<JobConfig>
+            {
+                new JobConfig { Name = "secs", Every = "1s", Command = "echo x" },
+                new JobConfig { Name = "zero", Every = "0s", Command = "echo x" },
+            }
+        };
+        var scheduler = new TimerScheduler(cfg, log);
+        try
+        {
+            Assert.DoesNotContain(log.Messages, m => m.Contains("Job 'secs'") && m.Contains("Invalid every"));
+            Assert.Contains(log.Messages, m => m.Contains("for job 'zero'") && m.Contains("minimum 1s"));
+        }
+        finally
+        {
+            scheduler.Dispose();
+            try { Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    [Fact]
     public void TriggerConflicts_SkipJobWithWarning()
     {
         var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_jobconflict_" + Guid.NewGuid());
@@ -619,5 +663,597 @@ public class SchedulerTests
         var psiHidden = ProcessRunner.CreateStartInfo("echo hi", Directory.GetCurrentDirectory(), redirect: true);
         Assert.True(psiHidden.CreateNoWindow);
         Assert.True(psiHidden.RedirectStandardOutput);
+    }
+
+    [Fact]
+    public void SchedulerOnly_EmptySources_StartsCleanly()
+    {
+        var cfg = new TicTackConfig
+        {
+            Sources = new List<SourceConfig>(),
+            Jobs = new List<JobConfig>
+            {
+                new JobConfig { Name = "j1", Every = "1h", Command = "echo ok" }
+            }
+        };
+        using var scheduler = new TimerScheduler(cfg, new RecordingLogger());
+        scheduler.Start();
+        scheduler.Stop();
+    }
+
+    [Fact]
+    public void WatchJob_InapplicableFields_WarnOnceAndIgnore()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_watchwarn_" + Guid.NewGuid());
+        Directory.CreateDirectory(dir);
+        var log = new RecordingLogger();
+        try
+        {
+            var cfg = new TicTackConfig
+            {
+                Sources = new List<SourceConfig>(),
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig
+                    {
+                        Name = "w1",
+                        Watch = true,
+                        Source = dir,
+                        Command = "echo ok",
+                        Time = "02:00",
+                        Every = "5m",
+                        Jitter = "1m",
+                        MissedRun = "skip"
+                    }
+                }
+            };
+            using var scheduler = new TimerScheduler(cfg, log);
+            Assert.Contains(log.Messages, w => w.Contains("WRN:") && w.Contains("field 'time'"));
+            Assert.Contains(log.Messages, w => w.Contains("WRN:") && w.Contains("field 'every'"));
+            Assert.Contains(log.Messages, w => w.Contains("WRN:") && w.Contains("field 'jitter'"));
+            Assert.Contains(log.Messages, w => w.Contains("WRN:") && w.Contains("field 'missed_run'"));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void WatchJob_InheritanceAndOverrides_Work()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "TicTackTest_inherit_" + Guid.NewGuid());
+        Directory.CreateDirectory(dir);
+        var log = new RecordingLogger();
+        try
+        {
+            var cfg = new TicTackConfig
+            {
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig
+                    {
+                        Path = dir,
+                        Destination = dir + "_dst",
+                        DebounceSeconds = 20,
+                        Filter = new FilterConfig { Exclude = new List<string> { "*.tmp" } }
+                    }
+                },
+                JobsDefaults = new JobsDefaultsConfig { Inherit = true, DebounceSeconds = 30 },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "inherit-src", Watch = true, Command = "echo 1" },
+                    new JobConfig { Name = "override-job", Watch = true, DebounceSeconds = 10, Exclude = new List<string> { "*.log" }, Command = "echo 2" }
+                }
+            };
+            using var scheduler = new TimerScheduler(cfg, log);
+            Assert.DoesNotContain(log.Messages, w => w.Contains("WRN:") && w.Contains("skipping"));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_FileChange_FiresOncePerQuietPeriod_WithSourceExpansion()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_watchfire_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "watched");
+        var marker = Path.Combine(root, "ran.txt");
+        Directory.CreateDirectory(watchDir);
+        var log = new RecordingLogger();
+        try
+        {
+            var cmd = OperatingSystem.IsWindows()
+                ? $"echo {{source}}> \"{marker}\""
+                : $"printf '%s\\n' {{source}} >> \"{marker}\"";
+            var cfg = new TicTackConfig
+            {
+                Sources = new List<SourceConfig>(),
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig
+                    {
+                        Name = "watch-fire",
+                        Watch = true,
+                        Source = watchDir,
+                        DebounceSeconds = 0.2,
+                        Exclude = new List<string> { "*.tmp" },
+                        Command = cmd
+                    }
+                }
+            };
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+            await Task.Delay(150);
+
+            File.WriteAllText(Path.Combine(watchDir, "ignore.tmp"), "skip");
+            File.WriteAllText(Path.Combine(watchDir, "a.txt"), "one");
+            File.WriteAllText(Path.Combine(watchDir, "b.txt"), "two");
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < deadline && !File.Exists(marker))
+                await Task.Delay(50);
+
+            Assert.True(File.Exists(marker), "Watch job should have fired after quiet period");
+            var lines = File.ReadAllLines(marker);
+            Assert.Single(lines);
+            Assert.Contains(watchDir, lines[0]);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_FilesPlaceholders_WriteAndCleanupManifests_AndRespectSizeFilter()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_filesfrom_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "src");
+        var outList = Path.Combine(root, "captured.txt");
+        Directory.CreateDirectory(watchDir);
+        var log = new RecordingLogger();
+        try
+        {
+            var cmd = OperatingSystem.IsWindows()
+                ? $"type \"{{files}}\"> \"{outList}\" & echo ABS:{{files_abs}}>> \"{outList}\""
+                : $"cat \"{{files}}\" > \"{outList}\" && printf 'ABS:%s\\n' \"{{files_abs}}\" >> \"{outList}\"";
+            var cfg = new TicTackConfig
+            {
+                EcoQos = true,
+                Monitor = new MonitorConfig { Type = "watcher", WatcherBufferKb = 128 },
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig
+                    {
+                        Path = watchDir,
+                        Destination = Path.Combine(root, "dst"),
+                        DebounceSeconds = 0.2,
+                        Filter = new FilterConfig { Exclude = new List<string> { "*.tmp" }, MaxFileSizeMb = 1 }
+                    }
+                },
+                JobsDefaults = new JobsDefaultsConfig { Inherit = true },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig
+                    {
+                        Name = "files-from-job",
+                        Watch = true,
+                        Command = cmd
+                    }
+                }
+            };
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+            await Task.Delay(150);
+
+            File.WriteAllText(Path.Combine(watchDir, "skip.tmp"), "ignored");
+            File.WriteAllText(Path.Combine(watchDir, "keep.txt"), "hello");
+            File.WriteAllBytes(Path.Combine(watchDir, "huge.bin"), new byte[2 * 1024 * 1024]);
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < deadline && !File.Exists(outList))
+                await Task.Delay(50);
+
+            Assert.True(File.Exists(outList), "Watch job should have written captured manifest");
+            // Give finally block a moment to clean up the temp manifest files
+            await Task.Delay(100);
+            var text = File.ReadAllText(outList);
+            Assert.Contains("keep.txt", text);
+            Assert.DoesNotContain("skip.tmp", text);
+            Assert.DoesNotContain("huge.bin", text);
+
+            var absLine = File.ReadAllLines(outList).FirstOrDefault(l => l.StartsWith("ABS:", StringComparison.Ordinal));
+            Assert.NotNull(absLine);
+            var manifestPath = absLine!.Substring(4).Trim();
+            Assert.False(File.Exists(manifestPath), "Temp manifest file should be deleted after job exit");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public void WatchJob_MultiSourceInherit_WatchesAllSources()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_multi_" + Guid.NewGuid());
+        var d1 = Path.Combine(root, "s1");
+        var d2 = Path.Combine(root, "s2");
+        Directory.CreateDirectory(d1);
+        Directory.CreateDirectory(d2);
+        var log = new RecordingLogger();
+        try
+        {
+            var cfg = new TicTackConfig
+            {
+                EcoQos = true,
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig { Path = d1, Destination = root + "_d1", DebounceSeconds = 5 },
+                    new SourceConfig { Path = d2, Destination = root + "_d2", DebounceSeconds = 15 }
+                },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "multi", Watch = true, Inherit = true, Command = "echo {source}" }
+                }
+            };
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+            Assert.DoesNotContain(log.Messages, m => m.Contains("WRN:") && m.Contains("skipping"));
+            scheduler.Stop();
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public void JobRunStore_PendingWatchFiles_RoundTripsAcrossReopen()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_pending_" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        var dbPath = Path.Combine(root, "jobs.db");
+        try
+        {
+            using (var store = new JobRunStore(dbPath))
+            {
+                store.EnqueueWatchFiles("sync-job", "/src", new[] { "a.txt", "b.txt", "a.txt" });
+                var loaded = store.GetPendingWatchFiles("sync-job");
+                Assert.Single(loaded);
+                Assert.Equal(2, loaded["/src"].Length);
+            }
+            using (var reopened = new JobRunStore(dbPath))
+            {
+                var loaded = reopened.GetPendingWatchFiles("sync-job");
+                Assert.Equal(2, loaded["/src"].Length);
+                reopened.RemoveWatchFiles("sync-job", "/src", new[] { "a.txt" });
+                var after = reopened.GetPendingWatchFiles("sync-job");
+                Assert.Single(after["/src"]);
+                Assert.Equal("b.txt", after["/src"][0]);
+            }
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_FailedRunRetainsPendingFiles_AndReplaysOnBoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_replay_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "src");
+        var stateDir = Path.Combine(root, "state");
+        Directory.CreateDirectory(watchDir);
+        Directory.CreateDirectory(stateDir);
+        var filePath = Path.Combine(watchDir, "missed.txt");
+        File.WriteAllText(filePath, "important");
+        var outFile = Path.Combine(root, "replayed.txt");
+        var log = new RecordingLogger();
+
+        try
+        {
+            // Simulate a crashed/power-cut run: pending row left in jobs.db
+            using (var store = new JobRunStore(Path.Combine(stateDir, "jobs.db")))
+                store.EnqueueWatchFiles("replay-job", watchDir, new[] { "missed.txt" });
+
+            var cmd = OperatingSystem.IsWindows()
+                ? $"cmd /c copy \"{{files}}\" \"{outFile}\""
+                : $"cp \"{{files}}\" \"{outFile}\"";
+
+            var cfg = new TicTackConfig
+            {
+                Monitor = new MonitorConfig { Type = "watcher" },
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig { Path = watchDir, Destination = Path.Combine(root, "dst"), StateDbPath = stateDir, DebounceSeconds = 0.05 }
+                },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "replay-job", Watch = true, Inherit = true, Command = cmd }
+                }
+            };
+
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < deadline && !File.Exists(outFile))
+                await Task.Delay(50);
+
+            Assert.True(File.Exists(outFile), "Boot replay should have run pending watch file");
+            Assert.Contains("missed.txt", File.ReadAllText(outFile));
+
+            await Task.Delay(150);
+            using var verifyStore = new JobRunStore(Path.Combine(stateDir, "jobs.db"));
+            Assert.Empty(verifyStore.GetPendingWatchFiles("replay-job"));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_ChurnGuard_HoldsLaunchOnSpike()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_churn_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "src");
+        var stateDir = Path.Combine(root, "state");
+        Directory.CreateDirectory(watchDir);
+        Directory.CreateDirectory(stateDir);
+        File.WriteAllText(Path.Combine(watchDir, "f1.txt"), "1");
+        File.WriteAllText(Path.Combine(watchDir, "f2.txt"), "2");
+        var ranMarker = Path.Combine(root, "ran.txt");
+        var log = new RecordingLogger();
+
+        try
+        {
+            using (var store = new JobRunStore(Path.Combine(stateDir, "jobs.db")))
+                store.EnqueueWatchFiles("churn-job", watchDir, new[] { "f1.txt", "f2.txt" });
+
+            var cmd = OperatingSystem.IsWindows()
+                ? $"cmd /c echo ran > \"{ranMarker}\""
+                : $"touch \"{ranMarker}\"";
+
+            var cfg = new TicTackConfig
+            {
+                Monitor = new MonitorConfig { Type = "watcher" },
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig
+                    {
+                        Path = watchDir,
+                        Destination = Path.Combine(root, "dst"),
+                        StateDbPath = stateDir,
+                        Sync = new SyncConfig { SpikeFiles = 2, SpikeBytesGb = 0, SpikeRenames = 0 }
+                    }
+                },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "churn-job", Watch = true, Inherit = true, Command = cmd }
+                }
+            };
+
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+            var marker = Path.Combine(stateDir, ".tictack-watch-churn-churn-job-hold");
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < deadline && !File.Exists(marker))
+                await Task.Delay(50);
+
+            Assert.False(File.Exists(ranMarker), "Spike guard should have blocked job execution");
+            Assert.True(File.Exists(marker));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_InheritRetry_RetriesTransientFailure()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_retry_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "src");
+        var stateDir = Path.Combine(root, "state");
+        Directory.CreateDirectory(watchDir);
+        Directory.CreateDirectory(stateDir);
+        File.WriteAllText(Path.Combine(watchDir, "f1.txt"), "1");
+        var attemptFile = Path.Combine(root, "attempts.txt");
+        var okFile = Path.Combine(root, "ok.txt");
+        var log = new RecordingLogger();
+
+        try
+        {
+            using (var store = new JobRunStore(Path.Combine(stateDir, "jobs.db")))
+                store.EnqueueWatchFiles("retry-job", watchDir, new[] { "f1.txt" });
+
+            // First invocation appends "1" and fails; second succeeds and creates okFile.
+            var cmd = OperatingSystem.IsWindows()
+                ? $"cmd /c \"if exist \\\"{attemptFile}\\\" (echo ok > \\\"{okFile}\\\") else (echo 1 > \\\"{attemptFile}\\\" & exit /b 1)\""
+                : $"sh -c 'if [ -f \"{attemptFile}\" ]; then touch \"{okFile}\"; else touch \"{attemptFile}\" && exit 1; fi'";
+
+            var cfg = new TicTackConfig
+            {
+                Monitor = new MonitorConfig { Type = "watcher" },
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig
+                    {
+                        Path = watchDir,
+                        Destination = Path.Combine(root, "dst"),
+                        StateDbPath = stateDir,
+                        Sync = new SyncConfig { Retry = new RetryConfig { MaxAttempts = 2, DelayMs = 50, Backoff = 1.0 } }
+                    }
+                },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "retry-job", Watch = true, Inherit = true, Command = cmd }
+                }
+            };
+
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < deadline && !File.Exists(okFile))
+                await Task.Delay(50);
+
+            Assert.True(File.Exists(okFile), "Inherited retry should have succeeded on second attempt");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_MinFreeGb_BlocksWhenBelowFloor()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_minfree_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "src");
+        var stateDir = Path.Combine(root, "state");
+        var destDir = Path.Combine(root, "dst");
+        Directory.CreateDirectory(watchDir);
+        Directory.CreateDirectory(stateDir);
+        Directory.CreateDirectory(destDir);
+        File.WriteAllText(Path.Combine(watchDir, "f1.txt"), "1");
+        var ranMarker = Path.Combine(root, "ran.txt");
+        var log = new RecordingLogger();
+
+        try
+        {
+            using (var store = new JobRunStore(Path.Combine(stateDir, "jobs.db")))
+                store.EnqueueWatchFiles("minfree-job", watchDir, new[] { "f1.txt" });
+
+            var cmd = OperatingSystem.IsWindows()
+                ? $"cmd /c echo ran > \"{ranMarker}\""
+                : $"touch \"{ranMarker}\"";
+
+            var cfg = new TicTackConfig
+            {
+                Monitor = new MonitorConfig { Type = "watcher" },
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig
+                    {
+                        Path = watchDir,
+                        Destination = destDir,
+                        StateDbPath = stateDir,
+                        Sync = new SyncConfig { MinFreeGb = 999_999_999 }
+                    }
+                },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "minfree-job", Watch = true, Inherit = true, Destination = destDir, Command = cmd }
+                }
+            };
+
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+            await Task.Delay(300);
+
+            Assert.False(File.Exists(ranMarker), "min_free_gb should have blocked launch");
+            Assert.Contains(log.Messages, m => m.Contains("min_free_gb"));
+            using var verifyStore = new JobRunStore(Path.Combine(stateDir, "jobs.db"));
+            Assert.NotEmpty(verifyStore.GetPendingWatchFiles("minfree-job"));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_LockWaitSeconds_WaitsForExclusiveLockRelease()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_lockwait_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "src");
+        var stateDir = Path.Combine(root, "state");
+        Directory.CreateDirectory(watchDir);
+        Directory.CreateDirectory(stateDir);
+        var lockedFile = Path.Combine(watchDir, "locked.txt");
+        File.WriteAllText(lockedFile, "data");
+        var okFile = Path.Combine(root, "unlocked-ok.txt");
+        var log = new RecordingLogger();
+
+        try
+        {
+            using (var store = new JobRunStore(Path.Combine(stateDir, "jobs.db")))
+                store.EnqueueWatchFiles("lockwait-job", watchDir, new[] { "locked.txt" });
+
+            var cmd = OperatingSystem.IsWindows()
+                ? $"cmd /c echo ok > \"{okFile}\""
+                : $"touch \"{okFile}\"";
+
+            var cfg = new TicTackConfig
+            {
+                Monitor = new MonitorConfig { Type = "watcher" },
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig
+                    {
+                        Path = watchDir,
+                        Destination = Path.Combine(root, "dst"),
+                        StateDbPath = stateDir,
+                        Sync = new SyncConfig { LockWaitSeconds = 5 }
+                    }
+                },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "lockwait-job", Watch = true, Inherit = true, Command = cmd }
+                }
+            };
+
+            var fs = new FileStream(lockedFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+            await Task.Delay(350);
+            Assert.False(File.Exists(okFile), "Job should still be waiting while file is locked");
+            fs.Dispose();
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < deadline && !File.Exists(okFile))
+                await Task.Delay(50);
+
+            Assert.True(File.Exists(okFile), "Job should have run after lock was released");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task WatchJob_LockHandlingSkip_DefersImmediatelyWhenLocked()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "TicTackTest_lockskip_" + Guid.NewGuid());
+        var watchDir = Path.Combine(root, "src");
+        var stateDir = Path.Combine(root, "state");
+        Directory.CreateDirectory(watchDir);
+        Directory.CreateDirectory(stateDir);
+        var lockedFile = Path.Combine(watchDir, "locked.txt");
+        File.WriteAllText(lockedFile, "data");
+        var ranMarker = Path.Combine(root, "ran.txt");
+        var log = new RecordingLogger();
+
+        try
+        {
+            using (var store = new JobRunStore(Path.Combine(stateDir, "jobs.db")))
+                store.EnqueueWatchFiles("lockskip-job", watchDir, new[] { "locked.txt" });
+
+            var cmd = OperatingSystem.IsWindows()
+                ? $"cmd /c echo ok > \"{ranMarker}\""
+                : $"touch \"{ranMarker}\"";
+
+            var cfg = new TicTackConfig
+            {
+                Monitor = new MonitorConfig { Type = "watcher" },
+                Sources = new List<SourceConfig>
+                {
+                    new SourceConfig
+                    {
+                        Path = watchDir,
+                        Destination = Path.Combine(root, "dst"),
+                        StateDbPath = stateDir,
+                        Sync = new SyncConfig { LockHandling = "skip", LockWaitSeconds = 5 }
+                    }
+                },
+                Jobs = new List<JobConfig>
+                {
+                    new JobConfig { Name = "lockskip-job", Watch = true, Inherit = true, Command = cmd }
+                }
+            };
+
+            using var fs = new FileStream(lockedFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            using var scheduler = new TimerScheduler(cfg, log);
+            scheduler.Start();
+            await Task.Delay(300);
+
+            Assert.False(File.Exists(ranMarker), "lock_handling: skip should defer immediately when locked");
+            Assert.Contains(log.Messages, m => m.Contains("lock_handling: skip"));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public void VssSnapshotScope_GracefulFallbackWhenUnavailable()
+    {
+        var log = new RecordingLogger();
+        using var scope = VssSnapshotScope.TryCreateMount(Path.GetTempPath(), log);
+        if (!OperatingSystem.IsWindows())
+            Assert.Null(scope);
     }
 }

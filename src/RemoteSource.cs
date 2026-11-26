@@ -30,6 +30,8 @@ namespace TicTack
             _psk = psk;
         }
 
+        public bool IsConnected => _stream != null && _tcp != null && _tcp.Connected;
+
         public void Connect(int timeoutMs = 10000)
         {
             Close();
@@ -274,7 +276,8 @@ namespace TicTack
             bool broken = false;
             try
             {
-                conn.Connect();
+                if (!conn.IsConnected)
+                    conn.Connect();
                 return true;
             }
             catch
@@ -611,6 +614,7 @@ namespace TicTack
             while (!ct.IsCancellationRequested)
             {
                 using var conn = new RemoteConn(_host, _port, _useTls, _psk);
+                using var reg = ct.Register(conn.Close);
                 try
                 {
                     conn.Connect();

@@ -10,7 +10,7 @@ using System.Threading.Tasks;
 
 namespace TicTack
 {
-    public sealed class TimerScheduler
+    public sealed class TimerScheduler : IDisposable
     {
         private Timer? _timer;
         private readonly List<JobEntry> _jobs;
@@ -19,12 +19,19 @@ namespace TicTack
         private readonly JobRunStore? _store;
         private readonly List<Task> _running = new List<Task>();
         private readonly object _runningLock = new object();
+        private readonly List<IFileMonitor> _watchMonitors = new List<IFileMonitor>();
+        private readonly List<Timer> _watchTimers = new List<Timer>();
+        private readonly List<StateDb> _watchStateDbs = new List<StateDb>();
+        private readonly MonitorConfig _monitorConfig;
+        private readonly string _stateDir;
         private CancellationTokenSource? _cts;
 
         public TimerScheduler(TicTackConfig config, ILogger log)
         {
             _log = log;
             _jobs = new List<JobEntry>();
+            _monitorConfig = config.Monitor ?? new MonitorConfig();
+            _stateDir = ResolveStateDir(config);
 
             if (config.Jobs == null || config.Jobs.Count == 0)
             {
@@ -51,41 +58,204 @@ namespace TicTack
 
             foreach (var job in config.Jobs)
             {
-                var hasEvery = !string.IsNullOrWhiteSpace(job.Every);
-                if (string.IsNullOrEmpty(job.Name) || string.IsNullOrEmpty(job.Command)
-                    || (!hasEvery && string.IsNullOrEmpty(job.Time)))
-                {
-                    log.Warn("Skipping incomplete job '" + (job.Name ?? "<unnamed>") + "' (needs name, command, and time — or every)");
-                    continue;
-                }
-                if (job.TimeoutMinutes < 0)
-                {
-                    log.Warn("Invalid timeout_minutes '" + job.TimeoutMinutes + "' for job '" + job.Name + "'");
-                    continue;
-                }
-                var entry = new JobEntry
-                {
-                    Config = job,
-                    TimeoutMinutes = EffectiveTimeout(job, defaults),
-                    ShowTerminal = EffectiveShowTerminal(job, defaults),
-                    Sandbox = job.Sandbox ?? defaults?.Sandbox ?? false,
-                    NetCheckHost = EffectiveNetCheckHost(job, defaults),
-                    NetCheckEnabled = EffectiveNetCheckEnabled(job, defaults),
-                    NetCheckSamples = job.NetCheckSamples ?? defaults?.NetCheckSamples ?? 3,
-                    NetCheckMaxMs = job.NetCheckMaxMs ?? defaults?.NetCheckMaxMs ?? 500,
-                    NetCheckWaitSeconds = job.NetCheckWaitSeconds ?? defaults?.NetCheckWaitSeconds ?? 0,
-                    NetCheckIcmp = job.NetCheckIcmp ?? defaults?.NetCheckIcmp ?? true,
-                };
-                if (!ParseSchedule(job, entry, defaultMissed, log)) continue;
+                var entry = TryBuildEntry(job, config, defaults, defaultMissed, log);
+                if (entry == null) continue;
                 SeedJobHistory(job, entry, log);
                 SeedJobEntry(job, entry, log);
                 _jobs.Add(entry);
             }
         }
 
+        private static JobEntry? TryBuildEntry(JobConfig job, TicTackConfig config, JobsDefaultsConfig? defaults, MissedPolicy defaultMissed, ILogger log)
+        {
+            var hasEvery = !string.IsNullOrWhiteSpace(job.Every);
+            if (string.IsNullOrEmpty(job.Name) || string.IsNullOrEmpty(job.Command)
+                || (!job.Watch && !hasEvery && string.IsNullOrEmpty(job.Time)))
+            {
+                log.Warn("Skipping incomplete job '" + (job.Name ?? "<unnamed>") + "' (needs name, command, and time — or every / watch)");
+                return null;
+            }
+            if (job.TimeoutMinutes < 0)
+            {
+                log.Warn("Invalid timeout_minutes '" + job.TimeoutMinutes + "' for job '" + job.Name + "'");
+                return null;
+            }
+            var entry = new JobEntry
+            {
+                Config = job,
+                TimeoutMinutes = EffectiveTimeout(job, defaults),
+                ShowTerminal = EffectiveShowTerminal(job, defaults),
+                Sandbox = job.Sandbox ?? defaults?.Sandbox ?? false,
+                LowPriority = job.LowPriority ?? defaults?.LowPriority ?? ((job.Inherit ?? defaults?.Inherit ?? false) && config.EcoQos),
+                PreventSleep = job.PreventSleep || ((job.Inherit ?? defaults?.Inherit ?? false) && config.PreventSleep),
+                NetCheckHost = EffectiveNetCheckHost(job, defaults),
+                NetCheckEnabled = EffectiveNetCheckEnabled(job, defaults),
+                NetCheckSamples = job.NetCheckSamples ?? defaults?.NetCheckSamples ?? 3,
+                NetCheckMaxMs = job.NetCheckMaxMs ?? defaults?.NetCheckMaxMs ?? 500,
+                NetCheckWaitSeconds = job.NetCheckWaitSeconds ?? defaults?.NetCheckWaitSeconds ?? 0,
+                NetCheckIcmp = job.NetCheckIcmp ?? defaults?.NetCheckIcmp ?? true,
+                UseVss = string.Equals(job.FileAccess ?? defaults?.FileAccess, "vss", StringComparison.OrdinalIgnoreCase),
+                LockHandling = job.LockHandling ?? defaults?.LockHandling,
+                LockWaitSeconds = Math.Max(0, job.LockWaitSeconds ?? defaults?.LockWaitSeconds ?? 0),
+                MinFreeGb = job.MinFreeGb ?? defaults?.MinFreeGb,
+                Destination = job.Destination,
+                Retry = (job.Retry ?? defaults?.Retry) is { MaxAttempts: > 1 } r ? r : null,
+            };
+            if (job.Watch)
+            {
+                if (!ConfigureWatchJob(job, entry, config, defaults, log)) return null;
+            }
+            else
+            {
+                WarnInapplicableWatchFields(job, hasEvery ? "interval" : "calendar", log);
+                if (!ParseSchedule(job, entry, defaultMissed, log)) return null;
+            }
+            return entry;
+        }
+
+        private static void WarnInapplicableWatchFields(JobConfig job, string trigger, ILogger log)
+        {
+            if (!string.IsNullOrWhiteSpace(job.Source))
+                log.Warn($"Job '{job.Name}': field 'source' does not apply to {trigger} trigger (ignored)");
+            if (job.Inherit.HasValue)
+                log.Warn($"Job '{job.Name}': field 'inherit' does not apply to {trigger} trigger (ignored)");
+            if (job.DebounceSeconds.HasValue)
+                log.Warn($"Job '{job.Name}': field 'debounce_seconds' does not apply to {trigger} trigger (ignored)");
+            if (job.Exclude != null && job.Exclude.Count > 0)
+                log.Warn($"Job '{job.Name}': field 'exclude' does not apply to {trigger} trigger (ignored)");
+            if (job.MaxFileSizeMb != null)
+                log.Warn($"Job '{job.Name}': field 'max_file_size_mb' does not apply to {trigger} trigger (ignored)");
+        }
+
+        private static void WarnInapplicableTimerFieldsOnWatch(JobConfig job, ILogger log)
+        {
+            if (!string.IsNullOrWhiteSpace(job.Time))
+                log.Warn($"Job '{job.Name}': field 'time' does not apply to watch trigger (ignored)");
+            if (!string.IsNullOrWhiteSpace(job.Every))
+                log.Warn($"Job '{job.Name}': field 'every' does not apply to watch trigger (ignored)");
+            if (!string.IsNullOrWhiteSpace(job.Schedule))
+                log.Warn($"Job '{job.Name}': field 'schedule' does not apply to watch trigger (ignored)");
+            if (!string.IsNullOrWhiteSpace(job.Day))
+                log.Warn($"Job '{job.Name}': field 'day' does not apply to watch trigger (ignored)");
+            if (job.Days != null && job.Days.Count > 0)
+                log.Warn($"Job '{job.Name}': field 'days' does not apply to watch trigger (ignored)");
+            if (!string.IsNullOrWhiteSpace(job.RunOnceOn))
+                log.Warn($"Job '{job.Name}': field 'run_once_on' does not apply to watch trigger (ignored)");
+            if (!string.IsNullOrWhiteSpace(job.Jitter))
+                log.Warn($"Job '{job.Name}': field 'jitter' does not apply to watch trigger (ignored)");
+            if (!string.IsNullOrWhiteSpace(job.MissedRun))
+                log.Warn($"Job '{job.Name}': field 'missed_run' does not apply to watch trigger (ignored)");
+        }
+
+        private static bool ConfigureWatchJob(JobConfig job, JobEntry entry, TicTackConfig config, JobsDefaultsConfig? defaults, ILogger log)
+        {
+            WarnInapplicableTimerFieldsOnWatch(job, log);
+
+            bool inherit = job.Inherit ?? defaults?.Inherit ?? false;
+            var targetSources = ResolveWatchTargets(job, config, inherit, log);
+            if (targetSources.Count == 0)
+            {
+                log.Warn($"Job '{job.Name}': watch job needs 'source:' when zero or multiple sources exist without inherit: true, skipping");
+                return false;
+            }
+
+            foreach (var (path, matched) in targetSources)
+            {
+                double debounce = Math.Max(0, job.DebounceSeconds
+                    ?? (inherit ? matched?.DebounceSeconds : null)
+                    ?? defaults?.DebounceSeconds
+                    ?? 0.0);
+                IList<string>? exclude = (job.Exclude != null && job.Exclude.Count > 0)
+                    ? job.Exclude
+                    : (inherit && matched?.Filter?.Exclude != null && matched.Filter.Exclude.Count > 0
+                        ? matched.Filter.Exclude
+                        : defaults?.Exclude);
+                object? rawMax = job.MaxFileSizeMb ?? (inherit ? matched?.Filter?.MaxFileSizeMb : null) ?? defaults?.MaxFileSizeMb;
+
+                entry.WatchTargets.Add(new WatchTarget
+                {
+                    WatchPath = path,
+                    Debounce = TimeSpan.FromSeconds(debounce),
+                    ExcludeFilter = exclude != null && exclude.Count > 0 ? new PatternFilter(exclude.ToArray()) : null,
+                    MaxSizeMb = Config.ParseFileSizeLimit(rawMax),
+                    StateDbDir = !string.IsNullOrEmpty(matched?.StateDbPath) ? matched.StateDbPath : ResolveStateDir(config),
+                    Churn = CreateWatchChurnMonitor(job, defaults, matched, config, log),
+                    Monitor = job.Monitor ?? defaults?.Monitor
+                });
+                if (entry.Retry == null && inherit && matched?.Sync?.Retry != null && matched.Sync.Retry.MaxAttempts > 1)
+                    entry.Retry = matched.Sync.Retry;
+                if (inherit && matched?.Sync != null)
+                {
+                    if (job.FileAccess == null && defaults?.FileAccess == null && string.Equals(matched.Sync.FileAccess, "vss", StringComparison.OrdinalIgnoreCase))
+                        entry.UseVss = true;
+                    if (job.LockHandling == null && defaults?.LockHandling == null && !string.IsNullOrWhiteSpace(matched.Sync.LockHandling))
+                        entry.LockHandling = matched.Sync.LockHandling;
+                    if (!job.LockWaitSeconds.HasValue && defaults?.LockWaitSeconds == null && matched.Sync.LockWaitSeconds > 0)
+                        entry.LockWaitSeconds = matched.Sync.LockWaitSeconds;
+                    if (!job.MinFreeGb.HasValue && defaults?.MinFreeGb == null && matched.Sync.MinFreeGb.HasValue)
+                        entry.MinFreeGb = matched.Sync.MinFreeGb;
+                }
+            }
+
+            WarnIfWatchWithoutUsnOrCatchup(job, config, log);
+            entry.Kind = JobKind.Watch;
+            ParseExecutionOptions(job, entry, MissedPolicy.Skip, log);
+            return true;
+        }
+
+        private static List<(string path, SourceConfig? matched)> ResolveWatchTargets(JobConfig job, TicTackConfig config, bool inherit, ILogger log)
+        {
+            var sources = config.Sources ?? Array.Empty<SourceConfig>();
+            var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            var targetSources = new List<(string path, SourceConfig? matched)>();
+            if (!string.IsNullOrWhiteSpace(job.Source))
+            {
+                var matched = inherit ? sources.FirstOrDefault(s => string.Equals(s.Path, job.Source, cmp)) : null;
+                targetSources.Add((job.Source!, matched));
+            }
+            else if (inherit && sources.Count > 0)
+            {
+                foreach (var s in sources)
+                    if (!string.IsNullOrEmpty(s.Path)) targetSources.Add((s.Path, s));
+            }
+            else if (sources.Count == 1 && !string.IsNullOrEmpty(sources[0].Path))
+            {
+                targetSources.Add((sources[0].Path, null));
+            }
+            return targetSources;
+        }
+
+        private static ChurnMonitor? CreateWatchChurnMonitor(JobConfig job, JobsDefaultsConfig? defaults, SourceConfig? matched, TicTackConfig config, ILogger log)
+        {
+            var sync = (job.Inherit ?? defaults?.Inherit ?? false) ? matched?.Sync : null;
+            var windowMin = job.SpikeWindowMinutes ?? defaults?.SpikeWindowMinutes ?? sync?.SpikeWindowMinutes ?? 60;
+            var bytesGb = job.SpikeBytesGb ?? defaults?.SpikeBytesGb ?? sync?.SpikeBytesGb ?? 0;
+            var files = job.SpikeFiles ?? defaults?.SpikeFiles ?? sync?.SpikeFiles ?? 0;
+            var renames = job.SpikeRenames ?? defaults?.SpikeRenames ?? sync?.SpikeRenames ?? 0;
+            if (bytesGb <= 0 && files <= 0 && renames <= 0) return null;
+            var dir = !string.IsNullOrEmpty(matched?.StateDbPath) ? matched.StateDbPath : ResolveStateDir(config);
+            var safeName = string.Concat(job.Name!.Select(c => char.IsLetterOrDigit(c) || c == '-' || c == '_' ? c : '_'));
+            var marker = Path.Combine(dir, ".tictack-watch-churn-" + safeName + "-hold");
+            var window = TimeSpan.FromMinutes(Math.Max(1, windowMin));
+            var bytesTrip = bytesGb > 0 ? bytesGb * 1024L * 1024L * 1024L : 0L;
+            return new ChurnMonitor(marker, window, bytesTrip, files, renames, log);
+        }
+
+        private static void WarnIfWatchWithoutUsnOrCatchup(JobConfig job, TicTackConfig config, ILogger log)
+        {
+            var monType = config.Monitor?.Type ?? "watcher";
+            var usesUsn = OperatingSystem.IsWindows() &&
+                (string.Equals(monType, "usn", StringComparison.OrdinalIgnoreCase)
+                || (string.Equals(monType, "composite", StringComparison.OrdinalIgnoreCase) && config.Monitor?.Usn == true));
+            if (usesUsn) return;
+            var hasCatchup = config.Jobs != null && config.Jobs.Any(j => !j.Watch && !string.IsNullOrWhiteSpace(j.Name));
+            if (!hasCatchup)
+                log.Warn($"Job '{job.Name}': uses watch: without USN or a periodic catch-up job — changes made while TicTack is stopped won't be detected.");
+        }
+
         private void SeedJobEntry(JobConfig job, JobEntry entry, ILogger log)
         {
-        if (entry.Kind != JobKind.Interval)
+        if (entry.Kind != JobKind.Interval && entry.Kind != JobKind.Watch)
         {
             var last = _store!.GetLastRun(job.Name!); // set unless zero jobs; runs once per parsed job
             if (last == null && entry.Kind != JobKind.Once)
@@ -129,17 +299,14 @@ namespace TicTack
             }
         }
 
+        private static string ResolveStateDir(TicTackConfig config) =>
+            config.Sources != null && config.Sources.Count > 0 && !string.IsNullOrEmpty(config.Sources[0].StateDbPath)
+                ? config.Sources[0].StateDbPath
+                : AppContext.BaseDirectory;
+
         private JobRunStore CreateStore(TicTackConfig config)
         {
-            string dir;
-            // StateDbPath is a directory root (GetStateDbPath appends
-            // "<sourcename>.db"), so use it directly — GetDirectoryName
-            // would strip it and land jobs.db one level too high.
-            if (config.Sources != null && config.Sources.Count > 0 && !string.IsNullOrEmpty(config.Sources[0].StateDbPath))
-                dir = config.Sources[0].StateDbPath;
-            else
-                dir = AppContext.BaseDirectory;
-            var dbPath = Path.Combine(dir, "jobs.db");
+            var dbPath = Path.Combine(ResolveStateDir(config), "jobs.db");
             try
             {
                 return new JobRunStore(dbPath);
@@ -382,9 +549,9 @@ namespace TicTack
                 log.Warn("Job '" + job.Name + "': every is mutually exclusive with schedule/day/days/time/run_once_on, skipping");
                 return false;
             }
-            if (!Config.TryParseDuration(job.Every, out var interval) || interval < TimeSpan.FromSeconds(30))
+            if (!Config.TryParseDuration(job.Every, out var interval) || interval < TimeSpan.FromSeconds(1))
             {
-                log.Warn("Invalid every '" + job.Every + "' for job '" + job.Name + "' (use 30s/15m/6h/1d, minimum 30s), skipping");
+                log.Warn("Invalid every '" + job.Every + "' for job '" + job.Name + "' (use 1s/15m/6h/1d, minimum 1s), skipping");
                 return false;
             }
             entry.Kind = JobKind.Interval;
@@ -571,7 +738,259 @@ namespace TicTack
             if (_jobs.Count == 0) return;
             _cts = new CancellationTokenSource();
             _log.Info("Scheduler started with " + _jobs.Count + " job(s)");
-            _timer = new Timer(RunDueJobs, null, 0, 30000);
+            var intervals = _jobs.Where(j => j.Kind == JobKind.Interval).Select(j => j.Interval);
+            _timer = new Timer(RunDueJobs, null, 0, (int)TickFor(intervals).TotalMilliseconds);
+            StartWatchers();
+            ReplayPendingWatchFiles();
+        }
+
+        private void ReplayPendingWatchFiles()
+        {
+            if (_store == null) return;
+            foreach (var job in _jobs)
+            {
+                if (job.Kind != JobKind.Watch || string.IsNullOrEmpty(job.Config.Name)) continue;
+                IReadOnlyDictionary<string, string[]> pending;
+                try { pending = _store.GetPendingWatchFiles(job.Config.Name); }
+                catch (Exception ex)
+                {
+                    _log.Debug("Pending watch replay query failed for '" + job.Config.Name + "': " + ex.Message);
+                    continue;
+                }
+                foreach (var (watchPath, relPaths) in pending)
+                {
+                    var existing = new List<string>(relPaths.Length);
+                    var missing = new List<string>();
+                    foreach (var rel in relPaths)
+                    {
+                        var abs = Path.Combine(watchPath, rel);
+                        if (File.Exists(abs)) existing.Add(rel);
+                        else missing.Add(rel);
+                    }
+                    if (missing.Count > 0)
+                    {
+                        try { _store.RemoveWatchFiles(job.Config.Name, watchPath, missing); }
+                        catch (Exception ex) { _log.Debug("Stale pending watch cleanup failed: " + ex.Message); }
+                    }
+                    if (existing.Count > 0)
+                    {
+                        _log.Info($"Job '{job.Config.Name}': replaying {existing.Count} pending watch file(s) from previous run");
+                        TryLaunch(job, DateTime.Now, watchPath, existing.ToArray());
+                    }
+                }
+            }
+        }
+
+        private void StartWatchers()
+        {
+            var pairs = _jobs
+                .Where(j => j.Kind == JobKind.Watch)
+                .SelectMany(j => j.WatchTargets.Select(t => (Job: j, Target: t)))
+                .Where(p => !string.IsNullOrEmpty(p.Target.WatchPath))
+                .ToList();
+            if (pairs.Count == 0) return;
+
+            var cmp = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            foreach (var group in pairs.GroupBy(p => p.Target.WatchPath, cmp))
+                foreach (var monGroup in group.GroupBy(p => p.Target.Monitor))
+                    StartWatchGroup(group.Key, monGroup.Key ?? _monitorConfig, monGroup.ToList());
+        }
+
+        private void StartWatchGroup(string path, MonitorConfig monCfg, List<(JobEntry Job, WatchTarget Target)> members)
+        {
+            var timers = new Dictionary<WatchTarget, Timer>();
+            foreach (var (job, target) in members)
+            {
+                var j = job;
+                var tgt = target;
+                var t = new Timer(_ =>
+                {
+                    var drained = DrainPendingFiles(tgt);
+                    TryLaunch(j, DateTime.Now, tgt.WatchPath, drained);
+                }, null, Timeout.Infinite, Timeout.Infinite);
+                timers[tgt] = t;
+                _watchTimers.Add(t);
+            }
+
+            var stateDir = members.Select(m => m.Target.StateDbDir).FirstOrDefault(d => !string.IsNullOrEmpty(d)) ?? _stateDir;
+            var watchDb = OpenWatchStateDbOrNull(path, stateDir, _log);
+            if (watchDb != null) _watchStateDbs.Add(watchDb);
+
+            var syntheticSrc = new SourceConfig { Path = path };
+            var (monitor, compositeMembers) = Program.CreateMonitor(monCfg, syntheticSrc, watchDb, _log, logMonitorStartup: true);
+            monitor.Changed += (_, e) => EnqueueWatchChange(path, e.FullPath, members, timers);
+
+            int gapScanActive = 0;
+            void HandleGap(object? s, EventArgs e)
+            {
+                if (Interlocked.Exchange(ref gapScanActive, 1) == 1) return;
+                _ = System.Threading.Tasks.Task.Run(() =>
+                {
+                    try { ScanWatchPathOnGap(path, members, timers); }
+                    catch (Exception ex) { _log.Debug("Watch gap scan failed for '" + path + "': " + ex.Message); }
+                    finally { Interlocked.Exchange(ref gapScanActive, 0); }
+                });
+            }
+            if (monitor is IGapSource directGap) directGap.GapDetected += HandleGap;
+            if (compositeMembers != null)
+            {
+                foreach (var m in compositeMembers)
+                    if (m is IGapSource memberGap) memberGap.GapDetected += HandleGap;
+            }
+
+            monitor.Start();
+            _watchMonitors.Add(monitor);
+
+            if (!OperatingSystem.IsWindows() && watchDb != null)
+            {
+                _ = System.Threading.Tasks.Task.Run(() => CatchUpWatchPathFromStateDbAsync(path, watchDb, members, timers));
+            }
+        }
+
+        private async Task CatchUpWatchPathFromStateDbAsync(string watchPath, StateDb watchDb, List<(JobEntry Job, WatchTarget Target)> members, Dictionary<WatchTarget, Timer> timers)
+        {
+            try
+            {
+                if (!Directory.Exists(watchPath)) return;
+                var opts = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
+                var files = new List<(string Rel, long Size, long Mtime)>();
+                foreach (var full in Directory.EnumerateFiles(watchPath, "*", opts))
+                {
+                    try
+                    {
+                        var fi = new FileInfo(full);
+                        if (!fi.Exists) continue;
+                        files.Add((Path.GetRelativePath(watchPath, full), fi.Length, fi.LastWriteTimeUtc.Ticks));
+                    }
+                    catch { }
+                }
+                if (files.Count == 0) return;
+
+                var existing = await watchDb.GetStatesAsync(files.Select(f => f.Rel)).ConfigureAwait(false);
+                var hadBaseline = existing.Count > 0;
+                var changed = new List<string>();
+                foreach (var (rel, size, mtime) in files)
+                {
+                    if (!existing.TryGetValue(rel, out var prev) || prev.size != size || prev.mtime != mtime)
+                        if (hadBaseline) changed.Add(rel);
+                }
+
+                await watchDb.UpsertBatchAsync(files.Select(f => (f.Rel, f.Size, f.Mtime))).ConfigureAwait(false);
+                if (changed.Count == 0) return;
+
+                foreach (var (job, tgt) in members)
+                {
+                    var matched = changed.Where(rel => ShouldIncludeWatchEvent(tgt, Path.Combine(watchPath, rel))).ToList();
+                    if (matched.Count == 0) continue;
+                    foreach (var rel in matched) tgt.PendingRelPaths.TryAdd(rel, 0);
+                    try { _store?.EnqueueWatchFiles(job.Config.Name!, watchPath, matched); }
+                    catch (Exception ex) { _log.Debug("Offline catch-up persist failed: " + ex.Message); }
+                    var dueMs = Math.Max(0, (int)tgt.Debounce.TotalMilliseconds);
+                    try { timers[tgt].Change(dueMs, Timeout.Infinite); }
+                    catch (ObjectDisposedException) { }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Debug("Offline watch catch-up failed for '" + watchPath + "': " + ex.Message);
+            }
+        }
+
+        private void EnqueueWatchChange(string watchPath, string fullPath, List<(JobEntry Job, WatchTarget Target)> members, Dictionary<WatchTarget, Timer> timers)
+        {
+            var rel = Path.GetRelativePath(watchPath, fullPath);
+            foreach (var (job, tgt) in members)
+            {
+                if (!ShouldIncludeWatchEvent(tgt, fullPath)) continue;
+                tgt.PendingRelPaths.TryAdd(rel, 0);
+                try { _store?.EnqueueWatchFiles(job.Config.Name!, watchPath, new[] { rel }); }
+                catch (Exception ex) { _log.Debug("Pending watch persist failed: " + ex.Message); }
+                var dueMs = Math.Max(0, (int)tgt.Debounce.TotalMilliseconds);
+                try { timers[tgt].Change(dueMs, Timeout.Infinite); }
+                catch (ObjectDisposedException) { }
+            }
+        }
+
+        private void ScanWatchPathOnGap(string watchPath, List<(JobEntry Job, WatchTarget Target)> members, Dictionary<WatchTarget, Timer> timers)
+        {
+            if (!Directory.Exists(watchPath)) return;
+            var opts = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
+            var perMember = new Dictionary<WatchTarget, List<string>>();
+            foreach (var (_, tgt) in members) perMember[tgt] = new List<string>();
+
+            foreach (var fullPath in Directory.EnumerateFiles(watchPath, "*", opts))
+            {
+                var rel = Path.GetRelativePath(watchPath, fullPath);
+                foreach (var (_, tgt) in members)
+                {
+                    if (!ShouldIncludeWatchEvent(tgt, fullPath)) continue;
+                    tgt.PendingRelPaths.TryAdd(rel, 0);
+                    perMember[tgt].Add(rel);
+                }
+            }
+
+            foreach (var (job, tgt) in members)
+            {
+                var list = perMember[tgt];
+                if (list.Count == 0) continue;
+                try { _store?.EnqueueWatchFiles(job.Config.Name!, watchPath, list); }
+                catch (Exception ex) { _log.Debug("Gap scan persist failed: " + ex.Message); }
+                var dueMs = Math.Max(0, (int)tgt.Debounce.TotalMilliseconds);
+                try { timers[tgt].Change(dueMs, Timeout.Infinite); }
+                catch (ObjectDisposedException) { }
+            }
+        }
+
+        private static StateDb? OpenWatchStateDbOrNull(string watchPath, string stateDir, ILogger log)
+        {
+            try
+            {
+                var bytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(watchPath));
+                var hash = Convert.ToHexString(bytes, 0, 4).ToLowerInvariant();
+                var dbPath = Path.Combine(stateDir, "watch-usn-" + hash + ".db");
+                return new StateDb(dbPath, log);
+            }
+            catch (Exception ex)
+            {
+                log.Warn("Watch StateDB init failed, continuing without USN checkpoint: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static bool ShouldIncludeWatchEvent(WatchTarget tgt, string fullPath)
+        {
+            if (tgt.ExcludeFilter != null && !tgt.ExcludeFilter.ShouldProcess(fullPath))
+                return false;
+            if (!tgt.MaxSizeMb.HasValue) return true;
+            if (tgt.MaxSizeMb.Value <= 0) return false;
+            return new SizeFilter(tgt.MaxSizeMb.Value).ShouldProcess(fullPath);
+        }
+
+        private static string[] DrainPendingFiles(WatchTarget tgt)
+        {
+            var keys = tgt.PendingRelPaths.Keys.ToArray();
+            var existing = new List<string>(keys.Length);
+            foreach (var k in keys)
+            {
+                tgt.PendingRelPaths.TryRemove(k, out _);
+                var abs = Path.Combine(tgt.WatchPath, k);
+                if (File.Exists(abs)) existing.Add(k);
+            }
+            return existing.ToArray();
+        }
+
+        // A fixed 30s tick cannot honour sub-minute intervals. Half the
+        // shortest interval keeps the due check ahead of each fire without
+        // spinning on a 1s job's exact boundary.
+        internal static TimeSpan TickFor(IEnumerable<TimeSpan> intervals)
+        {
+            var tick = TimeSpan.FromSeconds(30);
+            foreach (var interval in intervals)
+            {
+                var half = TimeSpan.FromTicks(interval.Ticks / 2);
+                if (half < tick) tick = half;
+            }
+            return tick;
         }
 
         private void RunDueJobs(object? state)
@@ -580,6 +999,7 @@ namespace TicTack
             var now = DateTime.Now;
             foreach (var job in _jobs)
             {
+                if (job.Kind == JobKind.Watch) continue;
                 // Interval + skip backlog resync: overdue by 2+ spans means
                 // the box was away long enough that the backlog is stale —
                 // restart the clock silently instead of firing catch-up.
@@ -592,41 +1012,36 @@ namespace TicTack
                     continue;
                 }
                 if (!EntryIsDue(now, job)) continue;
-                lock (job.RunLock)
+                TryLaunch(job, now);
+            }
+        }
+
+        private void TryLaunch(JobEntry job, DateTime now, string? watchPath = null, string[]? changedFiles = null)
+        {
+            if (_cts == null || _cts.IsCancellationRequested) return;
+            lock (job.RunLock)
+            {
+                switch (DecideOverlap(job.Running, job.Queued, job.Overlap))
                 {
-                    // Queue chaining: the follow-up fires once the in-flight
-                    // run settles (success or fail). Stop() cancels the token
-                    // the chained run checks first, so chains cannot outlive
-                    // the scheduler.
-                    switch (DecideOverlap(job.Running, job.Queued, job.Overlap))
-                    {
-                        case OverlapDecision.Skip:
-                            _log.Debug("Job '" + job.Config.Name + "' skipped, previous run still active");
-                            continue;
-                        case OverlapDecision.Chain:
-                            job.Queued = true;
-                            var chained = job.Running!.ContinueWith(_ => RunJobAsync(job), TaskScheduler.Default).Unwrap();
-                            job.Running = chained;
-                            Track(chained);
-                            continue;
-                        default:
-                            break;
-                    }
-                    // In-memory guard against re-trigger while running (the
-                    // store stamps only on success). Interval jobs stamp the
-                    // launch instant: a failure retries after one span, and a
-                    // run that overruns its span re-fires right after finish.
-                    if (job.Kind == JobKind.Interval) job.LastRunAt = now;
-                    else job.LastRunOn = now.Date;
-                    // Deliberate fire-and-forget: jobs must not block the
-                    // timer. Tracked so Stop() can cancel and wait instead of
-                    // letting a job race into a disposed store/logger.
-#pragma warning disable MA0134 // Fire-and-forget kill at shutdown: awaiting would block process exit on a hung child.
-                    var task = System.Threading.Tasks.Task.Run(() => RunJobAsync(job));
-#pragma warning restore MA0134
-                    job.Running = task;
-                    Track(task);
+                    case OverlapDecision.Skip:
+                        _log.Debug("Job '" + job.Config.Name + "' skipped, previous run still active");
+                        return;
+                    case OverlapDecision.Chain:
+                        job.Queued = true;
+                        var chained = job.Running!.ContinueWith(_ => RunJobAsync(job, watchPath, changedFiles), TaskScheduler.Default).Unwrap();
+                        job.Running = chained;
+                        Track(chained);
+                        return;
+                    default:
+                        break;
                 }
+                if (job.Kind == JobKind.Interval) job.LastRunAt = now;
+                else if (job.Kind != JobKind.Watch) job.LastRunOn = now.Date;
+#pragma warning disable MA0134 // Fire-and-forget kill at shutdown: awaiting would block process exit on a hung child.
+                var task = System.Threading.Tasks.Task.Run(() => RunJobAsync(job, watchPath, changedFiles));
+#pragma warning restore MA0134
+                job.Running = task;
+                Track(task);
             }
         }
 
@@ -639,7 +1054,7 @@ namespace TicTack
             }
         }
 
-        private async Task RunJobAsync(JobEntry job)
+        private async Task RunJobAsync(JobEntry job, string? watchPath = null, string[]? changedFiles = null)
         {
             lock (job.RunLock) { job.Queued = false; }
             var ct = _cts?.Token ?? CancellationToken.None;
@@ -660,6 +1075,18 @@ namespace TicTack
                     _log.Info("Job '" + job.Config.Name + "' skipped, running on battery power");
                     return;
                 }
+                if (job.Kind == JobKind.Watch && !string.IsNullOrEmpty(watchPath))
+                {
+                    if (!DriveGuard.IsReady(watchPath))
+                    {
+                        _log.Warn("Job '" + job.Config.Name + "' deferred, watch path drive not ready: " + watchPath);
+                        return;
+                    }
+                    if (!CheckWatchChurnGuard(job, watchPath, changedFiles))
+                        return;
+                }
+                if (!HasDestinationHeadroom(job, watchPath, changedFiles))
+                    return;
                 if (job.NetCheckEnabled)
                 {
                     var netResult = await NetCheck.EvaluateAsync(
@@ -668,8 +1095,8 @@ namespace TicTack
                     if (!NetCheck.DecideOnResult(netResult, job.Config.Name ?? "job", _log))
                         return;
                 }
-                using (SleepInhibit.Hold(job.Config.PreventSleep, job.Config.Name, job.TimeoutMinutes, _log))
-                    await RunJobBodyAsync(job, ct).ConfigureAwait(false);
+                using (SleepInhibit.Hold(job.PreventSleep, job.Config.Name, job.TimeoutMinutes, _log))
+                    await RunJobWithManifestsAsync(job, watchPath, changedFiles, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
@@ -678,13 +1105,161 @@ namespace TicTack
             }
         }
 
-        private async Task RunJobBodyAsync(JobEntry job, CancellationToken ct)
+        private async Task RunJobWithManifestsAsync(JobEntry job, string? watchPath, string[]? changedFiles, CancellationToken ct)
+        {
+            var cfg = job.Config;
+            var filesList = changedFiles ?? Array.Empty<string>();
+            string? relManifest = null;
+            string? absManifest = null;
+            using var vss = (job.UseVss && !string.IsNullOrEmpty(watchPath))
+                ? SnapshotMount.TryCreate(watchPath, _log)
+                : null;
+            var effectiveWatchPath = vss?.MountPath ?? watchPath;
+            try
+            {
+                if (vss == null && !string.IsNullOrEmpty(watchPath) && filesList.Length > 0)
+                {
+                    if (string.Equals(job.LockHandling, "skip", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var locked = FindLockedFile(watchPath, filesList);
+                        if (locked != null)
+                        {
+                            _log.Warn($"Job '{cfg.Name}' skipped (lock_handling: skip), file is locked: {locked}");
+                            return;
+                        }
+                    }
+                    else if (job.LockWaitSeconds > 0)
+                    {
+                        await WaitForFilesUnlockedAsync(watchPath, filesList, job.LockWaitSeconds, cfg.Name, ct).ConfigureAwait(false);
+                    }
+                }
+                if (ContainsPlaceholder(cfg, "{files}"))
+                {
+                    relManifest = Path.Combine(Path.GetTempPath(), "tictack-files-" + Guid.NewGuid().ToString("n") + ".txt");
+                    File.WriteAllLines(relManifest, filesList);
+                }
+                if (ContainsPlaceholder(cfg, "{files_abs}"))
+                {
+                    absManifest = Path.Combine(Path.GetTempPath(), "tictack-files-abs-" + Guid.NewGuid().ToString("n") + ".txt");
+                    var absLines = !string.IsNullOrEmpty(effectiveWatchPath) ? filesList.Select(f => Path.Combine(effectiveWatchPath, f)) : filesList;
+                    File.WriteAllLines(absManifest, absLines);
+                }
+                await RunJobBodyAsync(job, effectiveWatchPath, watchPath, filesList, relManifest, absManifest, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (relManifest != null) { try { File.Delete(relManifest); } catch { } }
+                if (absManifest != null) { try { File.Delete(absManifest); } catch { } }
+            }
+        }
+
+        private bool HasDestinationHeadroom(JobEntry job, string? watchPath, string[]? changedFiles)
+        {
+            if (!job.MinFreeGb.HasValue || job.MinFreeGb.Value <= 0 || string.IsNullOrWhiteSpace(job.Destination))
+                return true;
+            var minBytes = DiskSpaceGuard.GbToBytes(job.MinFreeGb.Value);
+            long requiredBytes = 0;
+            if (!string.IsNullOrEmpty(watchPath) && changedFiles != null)
+            {
+                foreach (var rel in changedFiles)
+                {
+                    try
+                    {
+                        var fi = new FileInfo(Path.Combine(watchPath, rel));
+                        if (fi.Exists) requiredBytes += fi.Length;
+                    }
+                    catch { }
+                }
+            }
+            if (!DiskSpaceGuard.HasHeadroom(job.Destination, requiredBytes, minBytes, out var availBytes))
+            {
+                _log.Error($"Job '{job.Config.Name}' blocked: free space on '{job.Destination}' ({availBytes / (1024 * 1024)} MB) is below min_free_gb ({job.MinFreeGb.Value:0.##} GB)");
+                return false;
+            }
+            return true;
+        }
+
+        private static string? FindLockedFile(string watchPath, string[] filesList)
+        {
+            foreach (var rel in filesList)
+            {
+                var abs = Path.Combine(watchPath, rel);
+                if (!File.Exists(abs)) continue;
+                try
+                {
+                    using var fs = new FileStream(abs, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                }
+                catch (IOException) { return rel; }
+                catch { }
+            }
+            return null;
+        }
+
+        private async Task WaitForFilesUnlockedAsync(string watchPath, string[] filesList, int lockWaitSeconds, string? jobName, CancellationToken ct)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(lockWaitSeconds);
+            while (true)
+            {
+                var lockedFile = FindLockedFile(watchPath, filesList);
+                if (lockedFile == null) return;
+                if (DateTime.UtcNow >= deadline)
+                {
+                    _log.Warn($"Job '{jobName}': file '{lockedFile}' still locked after {lockWaitSeconds}s, proceeding");
+                    return;
+                }
+                await Task.Delay(250, ct).ConfigureAwait(false);
+            }
+        }
+
+        private bool CheckWatchChurnGuard(JobEntry job, string watchPath, string[]? changedFiles)
+        {
+            var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            var tgt = job.WatchTargets.FirstOrDefault(t => string.Equals(t.WatchPath, watchPath, cmp));
+            if (tgt?.Churn == null) return true;
+            if (tgt.Churn.IsHeld())
+            {
+                _log.Warn("Job '" + job.Config.Name + "' held by spike guard");
+                return false;
+            }
+            if (changedFiles != null && changedFiles.Length > 0)
+            {
+                long totalBytes = 0;
+                foreach (var rel in changedFiles)
+                {
+                    try
+                    {
+                        var fi = new FileInfo(Path.Combine(watchPath, rel));
+                        if (fi.Exists) totalBytes += fi.Length;
+                    }
+                    catch { }
+                }
+                tgt.Churn.ReportBulkDelete(totalBytes, changedFiles.Length);
+                if (tgt.Churn.IsHeld()) return false;
+            }
+            return true;
+        }
+
+        private static bool ContainsPlaceholder(JobConfig cfg, string token) =>
+            (cfg.Command != null && cfg.Command.Contains(token, StringComparison.Ordinal))
+            || (cfg.PreCommand != null && cfg.PreCommand.Contains(token, StringComparison.Ordinal))
+            || (cfg.PostCommand != null && cfg.PostCommand.Contains(token, StringComparison.Ordinal))
+            || (cfg.OnFailure != null && cfg.OnFailure.Contains(token, StringComparison.Ordinal));
+
+        private async Task RunJobBodyAsync(JobEntry job, string? effectiveWatchPath, string? storeWatchPath, string[] filesList, string? relManifest, string? absManifest, CancellationToken ct)
         {
             var cfg = job.Config;
             var wd = cfg.WorkingDir ?? AppDomain.CurrentDomain.BaseDirectory;
             var timeoutMs = job.TimeoutMinutes * 60000;
-            var low = cfg.LowPriority;
-            string Sub(string cmd) => _sourcePaths != null ? cmd.Replace("{source}", _sourcePaths) : cmd;
+            var low = job.LowPriority;
+            string Sub(string cmd)
+            {
+                var s = job.Kind == JobKind.Watch && !string.IsNullOrEmpty(effectiveWatchPath)
+                    ? cmd.Replace("{source}", "\"" + effectiveWatchPath + "\"")
+                    : (_sourcePaths != null ? cmd.Replace("{source}", _sourcePaths) : cmd);
+                if (relManifest != null) s = s.Replace("{files}", relManifest);
+                if (absManifest != null) s = s.Replace("{files_abs}", absManifest);
+                return s;
+            }
 
             if (!string.IsNullOrWhiteSpace(cfg.PreCommand))
             {
@@ -693,17 +1268,20 @@ namespace TicTack
 
             var cmd = Sub(cfg.Command!);
             _log.Info("Running job '" + cfg.Name + "': " + cmd);
-            var (exitCode, _, err, timedOut) = await ProcessRunner.RunAsync(
-                cmd, wd, redirect: !job.ShowTerminal, ct, timeoutMs, low, job.Sandbox).ConfigureAwait(false);
+            var (exitCode, _, err, timedOut) = await RunCommandWithRetryAsync(job, cmd, wd, timeoutMs, low, ct).ConfigureAwait(false);
 
             if (timedOut)
             {
-                _log.Error(TimeoutMessage(cfg.Name, job.TimeoutMinutes));
+                var msg = TimeoutMessage(cfg.Name, job.TimeoutMinutes);
+                _log.Error(msg);
+                DesktopAlert.Notify("TicTack Job Timeout", msg, "ERROR");
                 await RunFailureHookAsync(job, wd, Sub, timeoutMs, low, ct).ConfigureAwait(false);
             }
             else if (exitCode != 0)
             {
-                _log.Error("Job '" + cfg.Name + "' exited " + exitCode + ": " + err);
+                var msg = "Job '" + cfg.Name + "' exited " + exitCode + ": " + err;
+                _log.Error(msg);
+                DesktopAlert.Notify("TicTack Job Failed", msg, "ERROR");
                 // Jobs run as the service account (LocalSystem on Windows,
                 // the systemd unit user on Linux): bare commands that work
                 // in a terminal fail here on machine-PATH/ACL grounds.
@@ -714,13 +1292,7 @@ namespace TicTack
             }
             else
             {
-                _log.Info("Job '" + cfg.Name + "' completed");
-                try
-                {
-                    if (job.Kind == JobKind.Interval) _store?.SetLastRunAt(cfg.Name!, DateTime.Now);
-                    else _store?.SetLastRun(cfg.Name!, DateTime.Today);
-                }
-                catch (Exception ex) { _log.Error("Failed to persist run state for job '" + cfg.Name + "'", ex); }
+                RecordJobSuccess(job, storeWatchPath, filesList);
             }
 
             // Post runs whenever main ran (success, failure, or timeout):
@@ -729,6 +1301,48 @@ namespace TicTack
             if (!string.IsNullOrWhiteSpace(cfg.PostCommand))
             {
                 await RunPostCommandAsync(job, wd, Sub, timeoutMs, low, ct).ConfigureAwait(false);
+            }
+        }
+
+        private void RecordJobSuccess(JobEntry job, string? watchPath, string[] filesList)
+        {
+            var cfg = job.Config;
+            _log.Info("Job '" + cfg.Name + "' completed");
+            if (job.Kind == JobKind.Watch && !string.IsNullOrEmpty(watchPath) && filesList.Length > 0)
+            {
+                try { _store?.RemoveWatchFiles(cfg.Name!, watchPath, filesList); }
+                catch (Exception ex) { _log.Debug("Pending watch clear failed for '" + cfg.Name + "': " + ex.Message); }
+            }
+            try
+            {
+                if (job.Kind == JobKind.Interval) _store?.SetLastRunAt(cfg.Name!, DateTime.Now);
+                else if (job.Kind != JobKind.Watch) _store?.SetLastRun(cfg.Name!, DateTime.Today);
+            }
+            catch (Exception ex) { _log.Error("Failed to persist run state for job '" + cfg.Name + "'", ex); }
+        }
+
+        private async Task<(int ExitCode, string StdOut, string StdErr, bool TimedOut)> RunCommandWithRetryAsync(
+            JobEntry job, string cmd, string wd, int timeoutMs, bool low, CancellationToken ct)
+        {
+            if (job.Retry == null || job.Retry.MaxAttempts <= 1)
+                return await ProcessRunner.RunAsync(cmd, wd, redirect: !job.ShowTerminal, ct, timeoutMs, low, job.Sandbox).ConfigureAwait(false);
+
+            var retry = new ExponentialBackoffRetry(job.Retry.MaxAttempts, job.Retry.DelayMs, job.Retry.Backoff, _log);
+            (int ExitCode, string StdOut, string StdErr, bool TimedOut) last = default;
+            try
+            {
+                return await retry.ExecuteAsync(async () =>
+                {
+                    last = await ProcessRunner.RunAsync(cmd, wd, redirect: !job.ShowTerminal, ct, timeoutMs, low, job.Sandbox).ConfigureAwait(false);
+                    if (last.TimedOut) return last;
+                    if (last.ExitCode != 0) throw new InvalidOperationException("exit " + last.ExitCode);
+                    return last;
+                }, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch
+            {
+                return last;
             }
         }
 
@@ -799,99 +1413,6 @@ namespace TicTack
         [DllImport("kernel32.dll")]
         private static extern bool GetSystemPowerStatus(ref SystemPowerStatus status);
 
-        [DllImport("kernel32.dll")]
-        private static extern uint SetThreadExecutionState(uint esFlags);
-
-        private const uint EsContinuous = 0x80000000;
-        private const uint EsSystemRequired = 0x00000001;
-
-        // Sleep inhibitor for prevent_sleep, held for one run. Windows:
-        // thread execution state. Linux: a systemd-inhibit companion
-        // sleeping out the timeout budget (killed on dispose). Anything
-        // missing degrades to no-op with a debug line — inhibition is a
-        // courtesy, never a gate.
-        private sealed class SleepInhibit : IDisposable
-        {
-            private Process? _companion;
-            private bool _windowsHeld;
-            private bool _disposed;
-
-            public static SleepInhibit Hold(bool enabled, string? jobName, int timeoutMinutes, ILogger log)
-            {
-                var h = new SleepInhibit();
-                if (!enabled) return h;
-                try
-                {
-                    if (OperatingSystem.IsWindows())
-                    {
-                        SetThreadExecutionState(EsContinuous | EsSystemRequired);
-                        h._windowsHeld = true;
-                    }
-                    else
-                    {
-                        var exe = FindOnPath("systemd-inhibit");
-                        if (exe == null)
-                        {
-                            log.Debug("Sleep inhibit unavailable (no systemd-inhibit), job runs uninhibited");
-                            return h;
-                        }
-                        var secs = Math.Min(Math.Max(timeoutMinutes, 1), 1440) * 60 + 300;
-                        var psi = new ProcessStartInfo
-                        {
-                            FileName = exe,
-                            UseShellExecute = false,
-                            CreateNoWindow = true,
-                        };
-                        psi.ArgumentList.Add("--what=sleep:idle");
-                        psi.ArgumentList.Add("--who=TicTackSv");
-                        psi.ArgumentList.Add("--why=scheduled job " + (jobName ?? "unnamed"));
-                        psi.ArgumentList.Add("--mode=block");
-                        psi.ArgumentList.Add("sleep");
-                        psi.ArgumentList.Add(secs.ToString(CultureInfo.InvariantCulture));
-                        h._companion = Process.Start(psi);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    log.Debug("Sleep inhibit failed, job runs uninhibited: " + ex.Message);
-                }
-                return h;
-            }
-
-            private static string? FindOnPath(string name)
-            {
-                var path = Environment.GetEnvironmentVariable("PATH");
-                if (string.IsNullOrEmpty(path)) return null;
-                foreach (var dir in path.Split(Path.PathSeparator))
-                {
-                    try
-                    {
-                        var candidate = Path.Combine(dir.Trim(), name);
-                        if (File.Exists(candidate)) return candidate;
-                    }
-                    catch { }
-                }
-                return null;
-            }
-
-            public void Dispose()
-            {
-                if (_disposed) return;
-                _disposed = true;
-                if (_windowsHeld)
-                {
-                    try { SetThreadExecutionState(EsContinuous); } catch { }
-                    _windowsHeld = false;
-                }
-                if (_companion != null)
-                {
-                    try { if (!_companion.HasExited) _companion.Kill(entireProcessTree: true); } catch { }
-                    try { _companion.Dispose(); } catch { }
-                    _companion = null;
-                }
-            }
-        }
-
         internal static string TimeoutMessage(string? jobName, int timeoutMinutes) =>
             "Job '" + jobName + "' timed out after " + timeoutMinutes + " minutes, killed";
 
@@ -952,6 +1473,12 @@ namespace TicTack
 
         public void Stop()
         {
+            foreach (var t in _watchTimers) { try { t.Dispose(); } catch { } }
+            _watchTimers.Clear();
+            foreach (var m in _watchMonitors) { try { m.Stop(); (m as IDisposable)?.Dispose(); } catch { } }
+            _watchMonitors.Clear();
+            foreach (var db in _watchStateDbs) { try { db.Dispose(); } catch { } }
+            _watchStateDbs.Clear();
             if (_timer != null)
             {
                 _timer.Dispose();
@@ -977,7 +1504,7 @@ namespace TicTack
             _store?.Dispose();
         }
 
-        private enum JobKind { Daily, Weekly, Monthly, Once, Interval }
+        private enum JobKind { Daily, Weekly, Monthly, Once, Interval, Watch }
 
         public enum MissedPolicy { CatchUp, Skip }
 
@@ -995,6 +1522,15 @@ namespace TicTack
             public int DayOfMonth { get; set; }
             public DateTime RunDate { get; set; }
             public TimeSpan Interval { get; set; }
+            public bool LowPriority { get; set; }
+            public bool PreventSleep { get; set; }
+            public RetryConfig? Retry { get; set; }
+            public bool UseVss { get; set; }
+            public string? LockHandling { get; set; }
+            public int LockWaitSeconds { get; set; }
+            public double? MinFreeGb { get; set; }
+            public string? Destination { get; set; }
+            public List<WatchTarget> WatchTargets { get; } = new List<WatchTarget>();
             public MissedPolicy Missed { get; set; }
             public OverlapPolicy Overlap { get; set; }
             public TimeSpan Jitter { get; set; }
@@ -1010,6 +1546,19 @@ namespace TicTack
             public Task? Running { get; set; }
             public bool Queued { get; set; }
             public object RunLock { get; } = new object();
+        }
+
+        private sealed class WatchTarget
+        {
+            public string WatchPath { get; set; } = string.Empty;
+            public TimeSpan Debounce { get; set; }
+            public PatternFilter? ExcludeFilter { get; set; }
+            public long? MaxSizeMb { get; set; }
+            public string? StateDbDir { get; set; }
+            public ChurnMonitor? Churn { get; set; }
+            public MonitorConfig? Monitor { get; set; }
+            public System.Collections.Concurrent.ConcurrentDictionary<string, byte> PendingRelPaths { get; } =
+                new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         }
 
         private async Task<bool> RunPreCommandAsync(JobEntry job, string wd, Func<string, string> sub, int timeoutMs, bool low, CancellationToken ct)

@@ -92,6 +92,7 @@
       <li><strong>Crash consistency, sparse preservation, and power-loss recovery:</strong> Existing backup files are never overwritten in place. New data streams to a temporary file beside the target, flushes to physical disk along with the parent directory entry, and swaps in atomically. Thin-provisioned virtual machine disks (sparse files) copy only their allocated data blocks without inflating to their full virtual size, and interrupted large transfers resume from where they stopped.</li>
       <li><strong>Fail fast, fail loud, and circuit-break anomalies:</strong> A pre-read check catches file lock and permission failures before copying begins. Pre-flight disk fit checks verify the entire backup fits on the destination drive, and passive local network checks verify routing, link health, packet error deltas, and local gateway latency before cloud jobs start. Mass-deletion holds and sliding-window churn circuit-breakers pause ransomware-like spikes during a cooling-off period and write warning files to your Desktop.</li>
       <li><strong>Sandboxed job orchestration and low-latency remote sync:</strong> Scheduled third-party tools (<code>restic</code>, <code>rclone</code>, <code>Corpus</code>) run inside OS process sandboxes (Windows JobObjects that block UI popups and terminate orphan child processes on timeout). Built-in remote LAN and VM transfers run over authenticated TCP inside a Low-Integrity or restricted OS token locked to the destination folder.</li>
+      <li><strong>Encryption scope:</strong> Remote VM sync (<code>TTRM</code> v1) is encrypted in transit by default (TLS 1.2/1.3 + mutual PSK). Local <code>fsync</code> mirrors are plain 1:1 files by design &mdash; encryption at rest is a major security responsibility and is intentionally not implemented in TicTack for now. For encrypted storage, use OS volume encryption (BitLocker / LUKS), schedule <code>restic</code> / <code>rclone crypt</code> via <code>jobs:</code>, or use Corpus's external per-pack <code>encrypt:</code> / <code>decrypt:</code> commands (<code>{input}</code> / <code>{output}</code>, e.g. <code>age</code> or <code>gpg</code>).</li>
     </ul>
 
 <h2 id="architecture">Architecture</h2>
@@ -195,6 +196,7 @@
         <tr><td><strong>Live Volume / Disk Imaging (<code>Corpus</code>) &amp; Locked-File VSS (<code>sync.file_access: vss</code>)</strong></td><td>Windows 10/11 (Admin / <code>LocalSystem</code>)</td><td><strong>Services:</strong> <code>VSS</code> (Volume Shadow Copy), <code>EventSystem</code> (COM+ Event System), <code>swprv</code> (Microsoft Software Shadow Copy Provider, must not be disabled).<br /><strong>Kernel drivers:</strong> <code>volsnap</code> (Volume Shadow Copy driver), <code>volmgr</code> / <code>volmgrx</code> (Volume Manager / Dynamic Volume Manager).<br /><strong>Inbox DLL / CLI:</strong> <code>vssapi.dll</code> (requires JIT/framework build for COM interop), <code>vssadmin.exe</code> (writer diagnostics on failure). Verified automatically by <code>Corpus.exe --validate</code>.</td></tr>
         <tr><td><strong>NTFS USN Journal Monitoring (<code>monitor.type: usn</code> &amp; Corpus incremental USN)</strong></td><td>Windows 10/11 (Admin / <code>LocalSystem</code>)</td><td>NTFS volume + Administrator / <code>LocalSystem</code> privileges (<code>FSCTL_READ_USN_JOURNAL</code>). Falls back to standard folder watcher when unprivileged.</td></tr>
         <tr><td><strong>BitLocker Volume Imaging (<code>Corpus</code> on encrypted drives)</strong></td><td>Windows 10/11 (Admin)</td><td><strong>Service &amp; driver:</strong> <code>BDESVC</code> (BitLocker Drive Encryption Service) and <code>fvevol</code> (BitLocker Filter Driver).<br /><strong>Inbox CLI:</strong> <code>manage-bde.exe</code> (suspends protection across the VSS freeze window and resumes immediately after).</td></tr>
+        <tr><td><strong>OS Notifications (<code>os_notifications</code>)</strong></td><td>Windows 10/11</td><td><strong>Service:</strong> <code>WpnService</code> / <code>WpnUserService</code> (Windows Push Notifications for Action Center Toasts; automatically falls back to <code>WTSSendMessageW</code> if stopped or in Session 0).</td></tr>
         <tr><td><strong>WIM / ESD / Bare-Metal Restore &amp; Recovery Media (<code>Corpus</code> optional verbs)</strong></td><td>Windows 10/11 (or Linux with <code>wimlib</code>)</td><td><code>dism.exe</code> (Windows inbox) or <code>wimlib-imagex</code> (for <code>--to-wim</code>, <code>--to-esd</code>, <code>--mount-wim</code>, offline servicing); <code>diskpart.exe</code> and <code>bcdboot.exe</code> (inbox, for <code>--restore-disk</code> and <code>--repair-boot</code>); Windows ADK <code>oscdimg.exe</code> (only for <code>--build-media</code>); Hyper-V PowerShell module (only for <code>--optimize-vhd</code> and <code>--boot-verify</code>).</td></tr>
         <tr><td><strong>Local Network Stability Check (<code>net_check: true</code> on <code>jobs:</code>)</strong></td><td>Windows 10/11 &amp; Linux</td><td>Windows: in-box <code>.NET NetworkInformation</code> APIs (zero external binaries).<br />Linux: <code>/proc/net/route</code>, <code>/proc/net/dev</code>, <code>/sys/class/net</code>, and <code>ping</code> (only when <code>net_check_icmp: true</code>).</td></tr>
         <tr><td><strong>Third-Party Scheduled Jobs (<code>jobs:</code> &amp; <code>external_drives:</code>)</strong></td><td>Windows 10/11 &amp; Linux</td><td>Whichever external CLI binaries your jobs invoke (<code>restic</code>, <code>rclone</code>, <code>rsync</code>, <code>age</code>, <code>Corpus.exe</code>).</td></tr>
@@ -229,6 +231,16 @@
         </summary>
         <div class="spec-body">
           TicTack targets <strong>Windows 10/11 and Linux</strong>; there is no macOS service, watcher, or snapshot integration. <strong>Corpus</strong> is currently Windows-only because it relies on Windows VSS (<code>vssapi.dll</code>), NTFS raw <code>$MFT</code>, <code>$Bitmap</code>, and USN parsing, and VHDX/WIM APIs.
+        </div>
+      </details>
+
+      <details class="spec-item">
+        <summary>
+          <span>No built-in local encryption at rest</span>
+          <span class="spec-marker"></span>
+        </summary>
+        <div class="spec-body">
+          Remote VM sync (<code>TTRM</code> v1) is encrypted in transit by default (TLS 1.2/1.3 + mutual PSK), but TicTack's local <code>fsync</code> mirror writes plain 1:1 files by design. Encryption at rest is a major security responsibility and is intentionally not implemented in TicTack for now &mdash; use OS volume encryption (BitLocker / LUKS), schedule <code>restic</code> or <code>rclone crypt</code> via <code>jobs:</code>, or use Corpus's external per-pack <code>encrypt:</code> / <code>decrypt:</code> commands (<code>{input}</code> / <code>{output}</code>, e.g. <code>age</code> or <code>gpg</code>).
         </div>
       </details>
 
@@ -614,7 +626,7 @@
         <tr><td><code>drain_strategy:</code></td><td><code>scan</code></td><td>Backlog drain order (<code>scan</code> unordered zero-overhead scan | <code>ready_queue</code> earliest-expiry heap)</td></tr>
         <tr><td><code>dir_sync:</code></td><td><code>per-file</code></td><td>Parent directory fsync cadence on initial sync (<code>per-file</code> | <code>per-batch</code>; <code>per-batch</code> is faster on initial sync but can lag behind <code>StateDb</code> on sudden power loss)</td></tr>
         <tr><td><code>complete_mode:</code></td><td><code>inline</code></td><td>Copy completion pipeline (<code>inline</code> on worker thread | <code>pipelined</code> dedicated completer thread)</td></tr>
-        <tr><td><code>file_access:</code></td><td><code>direct</code></td><td><code>direct</code> | <code>vss</code> (Windows on-demand shadow copy fallback when a file is locked)</td></tr>
+        <tr><td><code>file_access:</code></td><td><code>direct</code></td><td><code>direct</code> | <code>vss</code> (Windows on-demand shadow copy; on Linux, Btrfs read-only subvolume or ZFS snapshot with graceful fallback)</td></tr>
         <tr><td><code>initial_sync_workers:</code></td><td><code>2</code></td><td>Bounded parallel copy workers for initial sync</td></tr>
         <tr><td><code>lock_handling:</code></td><td><code>retry</code></td><td>Source lock contention behavior (<code>retry</code> waits with backoff | <code>ignore</code> fail-fast shared lock)</td></tr>
         <tr><td><code>lock_wait_seconds:</code></td><td><code>60</code></td><td>Total seconds to wait on a held source lock when <code>lock_handling: retry</code> (example configs set <code>600</code>)</td></tr>
@@ -700,7 +712,11 @@
         <tr><td><code>max_files:</code></td><td><code>5</code></td><td>Number of rotated log files to keep</td></tr>
         <tr><td><code>console:</code></td><td><code>false</code></td><td>Mirror logs to stdout (auto-enabled in CLI modes)</td></tr>
         <tr><td><code>alert_path:</code></td><td>unset</td><td>Directory for <code>TicTack-WARN/ERROR-*.txt</code> alert files</td></tr>
-        <tr><td><code>alert_enabled:</code></td><td>unset</td><td>Optional hard switch (<code>false</code> disables alert files)</td></tr>
+        <tr><td><code>alert_enabled:</code></td><td><code>false</code></td><td>Enable <code>.txt</code> alert files in <code>alert_path:</code> (default <code>false</code>)</td></tr>
+        <tr><td><code>os_notifications:</code></td><td><code>true</code></td><td>Enable native OS notifications (Windows 10/11 Action Center Toasts via <code>WpnService</code> with Session-0 <code>WTSSendMessageW</code> fallback / Linux <code>notify-send</code>) for warnings, errors, watchdog, spike guard, deferred holds, and job failures</td></tr>
+        <tr><td><code>cmd_prompts:</code></td><td><code>false</code></td><td>Enable interactive CLI console prompts (<code>[y/n]</code>) for <code>net_check</code> Severe gates and actionable prompts when attached to a terminal</td></tr>
+        <tr><td><code>os_prompts:</code></td><td><code>true</code></td><td>Enable interactive OS Yes/No dialogs (Windows <code>WTSSendMessageW</code> / Linux <code>zenity</code>) even when running as a background service (always fails safe on timeout)</td></tr>
+        <tr><td><code>alert_timeout_seconds:</code></td><td><code>15</code></td><td>Auto-dismiss timeout in seconds for OS notifications and prompts (<code>0</code> = persistent until dismissed)</td></tr>
       </table>
     </div>
 
@@ -733,14 +749,15 @@
       <table>
         <tr><th>Field</th><th>Default</th><th>Description</th></tr>
         <tr><td><code>eco_qos:</code></td><td><code>false</code></td><td>Enable Windows 11 EcoQoS (<code>PROCESS_POWER_THROTTLING_EXECUTION_SPEED</code> + low I/O priority) or Linux <code>nice +10</code></td></tr>
+        <tr><td><code>prevent_sleep:</code></td><td><code>false</code></td><td>Hold an OS sleep inhibitor (Windows <code>SetThreadExecutionState</code> / Linux <code>systemd-inhibit</code>) during active syncs and inherited jobs</td></tr>
         <tr><td><code>volume_wait_minutes:</code></td><td><code>2</code></td><td>Minutes to wait at startup for a slow USB <code>[VolumeLabel]</code> drive to mount (<code>0</code> fails immediately)</td></tr>
         <tr><td><code>strict_config_perms:</code></td><td><code>false</code></td><td>Refuse startup if <code>config.yaml</code> or secret files are writable by non-admin/non-owner users</td></tr>
         <tr><td><code>delayed_autostart:</code></td><td><code>false</code></td><td>Windows SCM <code>DelayedAutostart</code> toggle (<code>true</code> starts the service after disks and network settle on next boot)</td></tr>
         <tr><td><code>service_name:</code></td><td><code>TicTackSv</code></td><td>Windows SCM service name override for side-by-side installs</td></tr>
         <tr><td><code>preshutdown_timeout_ms:</code></td><td>unset</td><td>Windows SCM <code>PreshutdownTimeout</code> in ms (e.g. <code>180000</code>) for clean shutdown flushing</td></tr>
         <tr><td><code>services_pipe_timeout_ms:</code></td><td>unset</td><td>Windows SCM <code>ServicesPipeTimeout</code> in ms (e.g. <code>120000</code>), only raises above the global value</td></tr>
-        <tr><td><code>cpu_priority_class:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> CPU priority DWORD (<code>1</code> Idle, <code>2</code> Normal, <code>5</code> BelowNormal)</td></tr>
-        <tr><td><code>io_priority:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> I/O priority DWORD (<code>1</code> Inherit, <code>2</code> VeryLow, <code>3</code> Low)</td></tr>
+        <tr><td><code>cpu_priority_class:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> CPU priority DWORD (<code>1</code> Idle, <code>2</code> Normal, <code>5</code> BelowNormal); on Linux maps to <code>setpriority</code> (<code>nice</code> +19 / 0 / +10)</td></tr>
+        <tr><td><code>io_priority:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> I/O priority DWORD (<code>1</code> Inherit, <code>2</code> VeryLow, <code>3</code> Low); on Linux maps to <code>SYS_ioprio_set</code> (Idle / Best-Effort)</td></tr>
         <tr><td><code>page_priority:</code></td><td>unset</td><td>Windows IFEO <code>PerfOptions</code> memory page priority DWORD (<code>1</code> VeryLow .. <code>4</code> BelowNormal)</td></tr>
         <tr><td><code>required_privileges:</code></td><td>4 least-priv</td><td>Windows service token privileges list (defaults to <code>SeChangeNotifyPrivilege</code>, <code>SeBackupPrivilege</code>, <code>SeRestorePrivilege</code>, <code>SeManageVolumePrivilege</code>; <code>[]</code> opts out)</td></tr>
       </table>
@@ -904,19 +921,19 @@
   </header>
 
 <h2 id="jobs-triggers">Schedules &amp; triggers</h2>
-    <p>The <code>jobs:</code> scheduler runs external commands (<code>Corpus.exe</code>, <code>restic</code>, <code>rclone</code>, custom scripts) on daily, weekly, monthly, interval (<code>every: 6h</code>), or one-shot schedules with pre-flight network checks and Windows JobObject sandboxing.</p>
+    <p>The <code>jobs:</code> scheduler runs external commands (<code>Corpus.exe</code>, <code>restic</code>, <code>rclone</code>, custom scripts) on daily, weekly, monthly, interval (<code>every: 6h</code>), or one-shot schedules. Every job <strong>must</strong> set <code>name:</code>, <code>command:</code>, and one trigger (<code>time:</code>, <code>every:</code>, or <a href="#jobs-watch"><code>watch: true</code></a>); incomplete jobs are skipped at startup with a warning.</p>
 
     <div class="table-scroll">
       <table>
         <tr><th>Field</th><th>Default</th><th>Description</th></tr>
-        <tr><td><code>name:</code></td><td>none</td><td>Required job label</td></tr>
-        <tr><td><code>command:</code></td><td>none</td><td>Shell command (<code>cmd.exe /c</code> on Windows, <code>/bin/sh -c</code> on Linux; <code>{source}</code> expands to all quoted source paths)</td></tr>
-        <tr><td><code>time:</code></td><td>unset</td><td>24h trigger time (e.g. <code>"02:30"</code>) paired with <code>schedule:</code></td></tr>
+        <tr><td><code>name:</code></td><td><strong>required</strong></td><td>Required job label</td></tr>
+        <tr><td><code>command:</code></td><td><strong>required</strong></td><td>Required shell command (<code>cmd.exe /c</code> on Windows, <code>/bin/sh -c</code> on Linux; <code>{source}</code> expands to watched/source paths; in <code>watch:</code> jobs, <code>{files}</code> expands to a temp manifest of changed relative paths and <code>{files_abs}</code> to full paths)</td></tr>
+        <tr><td><code>time:</code></td><td>trigger (1 of 3 required)</td><td>24h trigger time (e.g. <code>"02:30"</code>) paired with <code>schedule:</code></td></tr>
         <tr><td><code>schedule:</code></td><td><code>daily</code></td><td>Calendar cadence (<code>daily</code> | <code>weekly</code> | <code>monthly</code>)</td></tr>
         <tr><td><code>day:</code></td><td>unset</td><td>For <code>weekly</code>: weekday name (<code>Monday</code>..<code>Sunday</code>). For <code>monthly</code>: day <code>1</code>..<code>31</code> (clamped to short months)</td></tr>
         <tr><td><code>days:</code></td><td>unset</td><td>For <code>weekly</code>: weekday mask (e.g. <code>[mon, wed, fri]</code>)</td></tr>
         <tr><td><code>run_once_on:</code></td><td>unset</td><td>One-shot ISO date <code>YYYY-MM-DD</code> paired with <code>time:</code> (mutually exclusive with <code>schedule:</code> / <code>every:</code>)</td></tr>
-        <tr><td><code>every:</code></td><td>unset</td><td>Sub-daily/interval trigger (<code>30s</code>, <code>15m</code>, <code>6h</code>, <code>1d</code>; minimum <code>30s</code>, mutually exclusive with calendar keys)</td></tr>
+        <tr><td><code>every:</code></td><td>trigger (1 of 3 required)</td><td>Sub-daily/interval trigger (<code>1s</code>, <code>30s</code>, <code>15m</code>, <code>6h</code>, <code>1d</code>; minimum <code>1s</code>, mutually exclusive with calendar keys and <code>watch:</code>)</td></tr>
       </table>
     </div>
 
@@ -981,6 +998,99 @@
     <span class="key">net_check:</span> true
     <span class="key">low_priority:</span> true
     <span class="key">command:</span> <span class="str">"rclone sync [Backup-Disk]\\ResticRepo s3:my-offsite-bucket/restic --transfers 4"</span></pre>
+      </div>
+    </div>
+
+<h2 id="jobs-watch">Watch &amp; engine inheritance (<code>watch:</code> / <code>inherit:</code>)</h2>
+    <p>When a job uses <code>watch: true</code> and <code>inherit: true</code>, TicTack encapsulates the external tool (<code>rclone</code>, <code>restic</code>, <code>rsync</code>, etc.) inside TicTack's own <code>fsync</code> change-detection, durability, and pre-flight guard engine, leaving only transfer, dedup, encryption, and destination storage to the external command. Every inherited setting has a matching per-job and <code>jobs_defaults:</code> override.</p>
+
+    <div class="table-scroll">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Inherited From (<code>inherit: true</code>) &amp; Override Behavior</th></tr>
+        <tr><td><code>watch:</code></td><td><code>false</code> (trigger)</td><td>Filesystem trigger: reuses TicTack's monitor stack and persists pending paths in <code>jobs.db</code> across power loss (mutually exclusive with <code>time:</code> / <code>every:</code>)</td></tr>
+        <tr><td><code>source:</code></td><td>single source</td><td>Directory path to watch. When omitted with <code>inherit: true</code>, watches all paths under <code>sources:</code></td></tr>
+        <tr><td><code>inherit:</code></td><td><code>false</code></td><td>Pulls all compatible settings from matching <code>sources:</code>, <code>monitor:</code>, and <code>eco_qos:</code> (also in <code>jobs_defaults:</code>). Explicit job or <code>jobs_defaults:</code> values override inherited ones</td></tr>
+        <tr><td><code>monitor:</code></td><td>global <code>monitor:</code></td><td>Overrides top-level <code>monitor:</code> (<code>type</code>, <code>watcher_buffer_kb</code>, <code>polling_interval_seconds</code>, <code>usn</code>, etc.) per job or in <code>jobs_defaults:</code></td></tr>
+        <tr><td><code>debounce_seconds:</code></td><td><code>0</code></td><td>Overrides <code>sources[].debounce_seconds</code> (fallback: job &rarr; source &rarr; <code>jobs_defaults:</code> &rarr; <code>0</code>)</td></tr>
+        <tr><td><code>exclude:</code></td><td><code>[]</code></td><td>Overrides <code>sources[].filter.exclude</code> when non-empty</td></tr>
+        <tr><td><code>max_file_size_mb:</code></td><td><code>no-limit</code></td><td>Overrides <code>sources[].filter.max_file_size_mb</code> (<code>no-limit</code> or <code>none</code>)</td></tr>
+        <tr><td><code>file_access:</code></td><td><code>direct</code></td><td>Overrides <code>sources[].sync.file_access</code> (also in <code>jobs_defaults:</code>). Set <code>vss</code> to mount a temporary snapshot (Windows VSS symlink, Linux Btrfs/ZFS snapshot) for <code>{source}</code> / <code>{files_abs}</code></td></tr>
+        <tr><td><code>lock_handling:</code></td><td><code>retry</code></td><td>Overrides <code>sources[].sync.lock_handling</code> (also in <code>jobs_defaults:</code>). <code>retry</code> waits up to <code>lock_wait_seconds:</code> | <code>skip</code> defers immediately keeping rows in <code>jobs.db</code></td></tr>
+        <tr><td><code>lock_wait_seconds:</code></td><td><code>0</code></td><td>Overrides <code>sources[].sync.lock_wait_seconds</code> (also in <code>jobs_defaults:</code>). Seconds to wait for locked files when VSS is not mounted</td></tr>
+        <tr><td><code>destination:</code></td><td>unset</td><td>Optional local/mounted target path used with <code>min_free_gb:</code> for pre-flight free-space checks</td></tr>
+        <tr><td><code>min_free_gb:</code></td><td>unset</td><td>Overrides <code>sources[].sync.min_free_gb</code> (also in <code>jobs_defaults:</code>). Blocks launch if local <code>destination:</code> free space is below N GB</td></tr>
+        <tr><td><code>retry:</code></td><td>unset</td><td>Overrides <code>sources[].sync.retry</code> (<code>max_attempts</code>, <code>delay_ms</code>, <code>backoff</code>; also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>spike_window_minutes:</code></td><td><code>60</code></td><td>Overrides <code>sources[].sync.spike_window_minutes</code> for <code>ChurnMonitor</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>spike_bytes_gb:</code></td><td><code>0</code></td><td>Overrides <code>sources[].sync.spike_bytes_gb</code> for <code>ChurnMonitor</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>spike_files:</code></td><td><code>0</code></td><td>Overrides <code>sources[].sync.spike_files</code> for <code>ChurnMonitor</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>spike_renames:</code></td><td><code>0</code></td><td>Overrides <code>sources[].sync.spike_renames</code> for <code>ChurnMonitor</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>low_priority:</code></td><td><code>false</code></td><td>Overrides <code>eco_qos:</code> when <code>inherit: true</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>prevent_sleep:</code></td><td><code>false</code></td><td>Inherits top-level <code>prevent_sleep:</code> when <code>inherit: true</code></td></tr>
+      </table>
+    </div>
+
+    <p><strong>Built-in safety layers (always active on <code>watch:</code> jobs):</strong> <code>DriveGuard</code> mount readiness check, <code>IGapSource.GapDetected</code> covering directory rescan, non-Windows <code>StateDb</code> startup diff catch-up, and durable <code>pending_watch_files</code> queue in <code>jobs.db</code> (replayed on boot, cleared only on <code>exitCode == 0</code>).</p>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">Architecture: Engine Boundary (watch: jobs)</span>
+      </div>
+      <div class="tab-pane active">
+        <pre>┌─────────────────────────────────────────────────────────────────────────┐
+│                    TicTack fsync Engine (Reused by watch:)              │
+│                                                                         │
+│  1. Change Detection : CreateMonitor() -&gt; Watcher + USN + Polling       │
+│  2. Gap Recovery     : IGapSource.GapDetected -&gt; covering dir scan      │
+│  3. Filtering        : ExcludeFilter + MaxSizeMb (inherited/job)        │
+│  4. Crash Durability : pending_watch_files in jobs.db (WAL, boot replay)│
+│  5. Safety Guards    : DriveGuard + OnAcOnly + NetCheck + ChurnMonitor  │
+│                        + MinFreeGb + LockHandling/LockWait + VSS Mount  │
+│  6. Execution        : LowPriority (EcoQos) + PreventSleep + Retry      │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │ {source}, {files}, {files_abs}
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    External Engine (rclone / restic / etc.)             │
+│                                                                         │
+│  • Transfer protocol, remote auth, bandwidth/chunks                     │
+│  • Dedup, compression, encryption, remote retention/versioning          │
+│  • Destination-side atomicity &amp; remote storage                          │
+└─────────────────────────────────────────────────────────────────────────┘</pre>
+      </div>
+    </div>
+
+    <div class="code-block">
+      <div class="code-bar">
+        <span class="code-title">config.yaml (Exclusive watch: + inherit: example with rclone)</span>
+        <button type="button" class="copy-btn">Copy</button>
+      </div>
+      <div class="tab-pane active">
+        <pre><span class="key">monitor:</span>
+  <span class="key">type:</span> <span class="str">composite</span>
+  <span class="key">usn:</span> <span class="val">true</span>
+
+<span class="key">eco_qos:</span> <span class="val">true</span>
+
+<span class="key">sources:</span>
+  - <span class="key">path:</span> <span class="str">C:\Users\me\Documents</span>
+    <span class="key">destination:</span> <span class="str">D:\Mirror\Documents</span>
+    <span class="key">debounce_seconds:</span> <span class="val">15</span>
+    <span class="key">filter:</span>
+      <span class="key">exclude:</span> [<span class="str">"*.tmp"</span>, <span class="str">"~$*"</span>]
+      <span class="key">max_file_size_mb:</span> <span class="val">500</span>
+    <span class="key">sync:</span>
+      <span class="key">file_access:</span> <span class="str">vss</span>
+      <span class="key">lock_handling:</span> <span class="str">retry</span>
+      <span class="key">lock_wait_seconds:</span> <span class="val">30</span>
+      <span class="key">retry:</span> { <span class="key">max_attempts:</span> <span class="val">3</span>, <span class="key">delay_ms:</span> <span class="val">2000</span>, <span class="key">backoff:</span> <span class="val">2.0</span> }
+
+<span class="key">jobs:</span>
+  - <span class="key">name:</span> <span class="str">cloud-realtime</span>
+    <span class="key">watch:</span> <span class="val">true</span>
+    <span class="key">inherit:</span> <span class="val">true</span>
+    <span class="key">debounce_seconds:</span> <span class="val">5</span>   <span class="cmt"># overrides 15s from source</span>
+    <span class="key">net_check:</span> <span class="val">true</span>
+    <span class="key">command:</span> <span class="str">rclone copy {source} gdrive:Documents --files-from {files}</span></pre>
       </div>
     </div>
   <footer class="article-footer">

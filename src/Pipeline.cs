@@ -121,7 +121,7 @@ namespace TicTack
             _deletion = deletion;
             _log = log;
             _stateDb = stateDb;
-            _directoryExists = directoryExists ?? Directory.Exists;
+            _directoryExists = directoryExists ?? (p => _config.RemoteEndpoint != null && string.Equals(p, _config.Path, StringComparison.Ordinal) || Directory.Exists(p));
             _enumerateFiles = enumerateFiles ?? ((path, option) => Directory.EnumerateFiles(path, "*", option));
             _enumerateDirectories = enumerateDirectories ?? ((path, option) => Directory.EnumerateDirectories(path, "*", option));
             _driveReady = driveReady ?? (path => DriveGuard.IsReady(path));
@@ -364,7 +364,12 @@ namespace TicTack
                     DateTime removed;
                     _debounce.TryRemove(kv.Key, out removed);
                     var path = kv.Key;
-                    if (File.Exists(path))
+                    if (_config.RemoteEndpoint != null)
+                    {
+                        if (!_pendingEvents.ContainsKey(path))
+                            _pendingEvents[path] = new FileChangedEventArgs(ChangeType.Modified, path);
+                    }
+                    else if (File.Exists(path))
                         _pendingEvents[path] = new FileChangedEventArgs(ChangeType.Modified, path);
                     else if (_directoryExists(Path.GetDirectoryName(path)!))
                         _pendingEvents[path] = new FileChangedEventArgs(ChangeType.Deleted, path);
@@ -1032,7 +1037,7 @@ namespace TicTack
         private async Task HandleCreatedOrModifiedAsync(FileChangedEventArgs e, FileActionArgs args, CancellationToken ct)
         {
                     await _deletions.FlushAsync(ct);
-                    if (!File.Exists(e.FullPath))
+                    if (_sourceStat == null && !File.Exists(e.FullPath))
                     {
                         if (_directoryExists(e.FullPath))
                             return;
@@ -1644,7 +1649,6 @@ namespace TicTack
         {
             long minFree = DiskSpaceGuard.GbToBytes(_config.Sync?.MinFreeGb);
             bool strict = _config.Sync?.StrictFitCheck ?? false;
-            if (minFree <= 0 && !strict) return true;
             if (!DiskSpaceGuard.TryGetAvailableBytes(_config.Destination, out var avail)) return true;
 
             long delta = 0;
