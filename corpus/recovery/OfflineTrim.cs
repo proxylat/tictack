@@ -46,7 +46,7 @@ namespace Corpus
     // Fake for Linux-green tests: records commands, replays queued results.
     public sealed class FakeTrimRunner : ITrimRunner
     {
-        public readonly List<string> Calls = new();
+        public readonly IList<string> Calls = new List<string>();
         public Func<string, TrimResult>? Handler;
 
         public TrimResult Run(string command)
@@ -87,66 +87,66 @@ namespace Corpus
                 log.Error($"offline trim: cannot derive the image root from {opts.OfflineWindowsDir}");
                 return 1;
             }
-            var failures = 0;
-            var commands = new List<string>();
-            if (opts.ResetBase)
-            {
-                // Irreversible: resets the servicing base so superseded
-                // updates can never be uninstalled. Says so here and in
-                // the log line below; the CLI flag help must repeat it.
-                commands.Add($"dism /Image:{ProcessRunner.QuoteArg(image)} /Cleanup-Image /ResetBase");
-            }
-            foreach (var feature in opts.DisableFeatures ?? [])
-            {
-                if (string.IsNullOrWhiteSpace(feature))
-                    continue;
-                commands.Add($"dism /Image:{ProcessRunner.QuoteArg(image)} /Disable-Feature /FeatureName:{feature} /Remove");
-            }
-            foreach (var package in opts.RemovePackages ?? [])
-            {
-                if (string.IsNullOrWhiteSpace(package))
-                    continue;
-                commands.Add($"dism /Image:{ProcessRunner.QuoteArg(image)} /Remove-Package /PackageName:{package}");
-            }
-            // powercfg has no offline /Image switch: this runs against the
-            // booted OS, so schedule it for first boot on the target (or run
-            // booted into the image). It releases hiberfil.sys on next boot —
-            // it never touches the image bytes themselves.
-            if (opts.DisableHibernation)
-                commands.Add("powercfg /h off");
+            var commands = BuildTrimCommands(opts, image);
             if (commands.Count == 0)
             {
                 log.Info("offline trim: no ops selected, nothing to do");
                 return 0;
             }
+            var failures = 0;
             foreach (var command in commands)
             {
-                if (opts.DryRun)
-                {
-                    log.Info($"dry run: trim planned, nothing applied: {command}");
-                    continue;
-                }
-                TrimResult r;
-                try
-                {
-                    r = runner.Run(command);
-                }
-                catch (Exception ex)
-                {
-                    log.Error($"offline trim failed: {command}", ex);
+                if (!ExecuteTrimCommand(command, opts.DryRun, runner, log))
                     failures++;
-                    continue;
-                }
-                var detail = string.IsNullOrWhiteSpace(r.Output) ? string.Empty : $" ({Tail(r.Output)})";
-                if (r.ExitCode == 0)
-                    log.Info($"offline trim applied (exit 0): {command}{detail}");
-                else
-                {
-                    log.Error($"offline trim failed (exit {r.ExitCode}): {command}{detail}");
-                    failures++;
-                }
             }
             return failures == 0 ? 0 : 1;
+        }
+
+        private static List<string> BuildTrimCommands(OfflineTrimOptions opts, string image)
+        {
+            var commands = new List<string>();
+            if (opts.ResetBase)
+                commands.Add($"dism /Image:{ProcessRunner.QuoteArg(image)} /Cleanup-Image /ResetBase");
+            foreach (var feature in opts.DisableFeatures ?? [])
+            {
+                if (!string.IsNullOrWhiteSpace(feature))
+                    commands.Add($"dism /Image:{ProcessRunner.QuoteArg(image)} /Disable-Feature /FeatureName:{feature} /Remove");
+            }
+            foreach (var package in opts.RemovePackages ?? [])
+            {
+                if (!string.IsNullOrWhiteSpace(package))
+                    commands.Add($"dism /Image:{ProcessRunner.QuoteArg(image)} /Remove-Package /PackageName:{package}");
+            }
+            if (opts.DisableHibernation)
+                commands.Add("powercfg /h off");
+            return commands;
+        }
+
+        private static bool ExecuteTrimCommand(string command, bool dryRun, ITrimRunner runner, ILogger log)
+        {
+            if (dryRun)
+            {
+                log.Info($"dry run: trim planned, nothing applied: {command}");
+                return true;
+            }
+            TrimResult r;
+            try
+            {
+                r = runner.Run(command);
+            }
+            catch (Exception ex)
+            {
+                log.Error($"offline trim failed: {command}", ex);
+                return false;
+            }
+            var detail = string.IsNullOrWhiteSpace(r.Output) ? string.Empty : $" ({Tail(r.Output)})";
+            if (r.ExitCode == 0)
+            {
+                log.Info($"offline trim applied (exit 0): {command}{detail}");
+                return true;
+            }
+            log.Error($"offline trim failed (exit {r.ExitCode}): {command}{detail}");
+            return false;
         }
 
         // First-boot hibernation off: powercfg has no offline switch and

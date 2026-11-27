@@ -14,12 +14,12 @@ namespace Corpus
     // Disk layouts drop iff ALL referenced partition gens drop (a layout
     // survives while any referenced partition is restorable).
     public sealed record GcPlan(
-        List<string> DropManifests,
-        List<string> DropPacks,
+        IReadOnlyList<string> DropManifests,
+        IReadOnlyList<string> DropPacks,
         long DeadChunks,
         long DeadBytes,
-        List<string> Notes,
-        List<string> DropLayouts);
+        IReadOnlyList<string> Notes,
+        IReadOnlyList<string> DropLayouts);
 
     public sealed class GarbageCollector
     {
@@ -48,29 +48,13 @@ namespace Corpus
 
         public GcPlan Plan()
         {
-            var listed = ManifestStore.List(_manifestsDir);
             // Load EVERYTHING before any mutation: a corrupt (HMAC-failing)
-            // manifest throws here, leaving store + index untouched. Layouts
-            // load here too (corrupt layout aborts the same clean way).
+            // manifest or layout throws here, leaving store + index untouched.
             var key = ChunkId.EnsureKey(_storeRoot);
-            var manifests = new Dictionary<int, (string Path, SnapshotManifest Manifest)>();
-            foreach (var (gen, name) in listed)
-            {
-                var path = Path.Combine(_manifestsDir, $"{gen:D6}-{name}.json");
-                manifests[gen] = (path, ManifestStore.Load(path, key));
-            }
-            var layouts = new List<(string Path, DiskLayout Layout)>();
-            var layoutsDir = Path.Combine(_storeRoot, "layouts");
-            if (Directory.Exists(layoutsDir))
-            {
-                var layoutPaths = new List<string>(Directory.EnumerateFiles(layoutsDir, "*.json"));
-                layoutPaths.Sort(StringComparer.Ordinal);
-                foreach (var path in layoutPaths)
-                    layouts.Add((path, LayoutStore.Load(path, key)));
-            }
+            var manifests = LoadAllManifests(key);
+            var layouts = LoadAllLayouts(key);
 
             var notes = new List<string>();
-            // Keep-last-N by generation.
             var gens = new List<int>(manifests.Keys);
             gens.Sort();
             var roots = ComputeRoots(manifests, gens, notes);
@@ -81,10 +65,56 @@ namespace Corpus
                 if (!roots.Contains(gen))
                     drops.Add(gen);
             }
-            // Layout rule: L (referencing gens G1..Gn, SnapshotGeneration > 0;
-            // 0 = skipped/never, never restorable) drops iff every referenced
-            // gen is dropped or already gone. Retention roots are manifest
-            // gens only — the pool is shared between volume and disk snapshots.
+            var dropLayouts = FindDroppedLayouts(layouts, manifests, drops);
+            AddProvenanceGapNotes(manifests, gens, roots, drops, notes);
+            var live = CollectLiveDigests(manifests, gens, roots, notes);
+
+            // Marking is idempotent bookkeeping, not a mutation of user data.
+            using (var index = new ChunkIndex(_dbPath))
+            {
+                index.SetAllMarks(0);
+                index.MarkBatch(live);
+                var (deadChunks, deadBytes) = index.UnmarkedStats();
+                var livePacks = new HashSet<string>(index.LivePacks(), StringComparer.Ordinal);
+                var dropPacks = FindDroppedPacks(livePacks);
+
+                var dropManifests = new List<string>();
+                foreach (var drop in drops)
+                    dropManifests.Add(manifests[drop].Path);
+                return new GcPlan(dropManifests, dropPacks, deadChunks, deadBytes, notes, dropLayouts);
+            }
+        }
+
+        private Dictionary<int, (string Path, SnapshotManifest Manifest)> LoadAllManifests(byte[] key)
+        {
+            var manifests = new Dictionary<int, (string Path, SnapshotManifest Manifest)>();
+            foreach (var (gen, name) in ManifestStore.List(_manifestsDir))
+            {
+                var path = Path.Combine(_manifestsDir, $"{gen:D6}-{name}.json");
+                manifests[gen] = (path, ManifestStore.Load(path, key));
+            }
+            return manifests;
+        }
+
+        private List<(string Path, DiskLayout Layout)> LoadAllLayouts(byte[] key)
+        {
+            var layouts = new List<(string Path, DiskLayout Layout)>();
+            var layoutsDir = Path.Combine(_storeRoot, "layouts");
+            if (!Directory.Exists(layoutsDir))
+                return layouts;
+            var layoutPaths = new List<string>(Directory.EnumerateFiles(layoutsDir, "*.json"));
+            layoutPaths.Sort(StringComparer.Ordinal);
+            foreach (var path in layoutPaths)
+                layouts.Add((path, LayoutStore.Load(path, key)));
+            return layouts;
+        }
+
+        // Layout rule: L drops iff every referenced SnapshotGeneration > 0 is dropped or already gone.
+        private static List<string> FindDroppedLayouts(
+            List<(string Path, DiskLayout Layout)> layouts,
+            Dictionary<int, (string Path, SnapshotManifest Manifest)> manifests,
+            List<int> drops)
+        {
             var dropSet = new HashSet<int>(drops);
             var dropLayouts = new List<string>();
             foreach (var (layoutPath, layout) in layouts)
@@ -103,6 +133,16 @@ namespace Corpus
                 if (!survives)
                     dropLayouts.Add(layoutPath);
             }
+            return dropLayouts;
+        }
+
+        private static void AddProvenanceGapNotes(
+            Dictionary<int, (string Path, SnapshotManifest Manifest)> manifests,
+            List<int> gens,
+            HashSet<int> roots,
+            List<int> drops,
+            List<string> notes)
+        {
             // Pruning a parent of a retained child: data unaffected (child is
             // self-contained), only --chain provenance gaps.
             foreach (var drop in drops)
@@ -116,12 +156,14 @@ namespace Corpus
                     }
                 }
             }
+        }
 
-            // Live = union of non-hole digests over ROOT manifests only.
-            // Digest strings need no key threading (identity binds the key).
-            // §12.7: a delta counts as a reference to its base digest —
-            // pruning a parent keeps bases while any retained delta
-            // references them (extends whole-chain expiry to chunk pairs).
+        private static List<byte[]> CollectLiveDigests(
+            Dictionary<int, (string Path, SnapshotManifest Manifest)> manifests,
+            List<int> gens,
+            HashSet<int> roots,
+            List<string> notes)
+        {
             var liveHex = new HashSet<string>(StringComparer.Ordinal);
             var deltaRefs = 0;
             foreach (var gen in gens)
@@ -144,36 +186,24 @@ namespace Corpus
             var live = new List<byte[]>(liveHex.Count);
             foreach (var hex in liveHex)
                 live.Add(Convert.FromHexString(hex));
+            return live;
+        }
 
-            // Marking is idempotent bookkeeping, not a mutation of user data.
-            using (var index = new ChunkIndex(_dbPath))
+        private List<string> FindDroppedPacks(HashSet<string> livePacks)
+        {
+            // Dead packs = pack-*.pack with no live chunk. *.tmp is never touched.
+            var dropPacks = new List<string>();
+            if (!Directory.Exists(_packsDir))
+                return dropPacks;
+            foreach (var path in Directory.EnumerateFiles(_packsDir, "pack-*.pack"))
             {
-                index.SetAllMarks(0);
-                index.MarkBatch(live);
-                var (deadChunks, deadBytes) = index.UnmarkedStats();
-                var livePacks = new HashSet<string>(index.LivePacks(), StringComparer.Ordinal);
-
-                // Dead packs = pack-*.pack with no live chunk. *.tmp is never
-                // touched (a crash-mid-seal tmp is PackWriter business, and
-                // the pattern below can't match it anyway — belt + braces).
-                var dropPacks = new List<string>();
-                if (Directory.Exists(_packsDir))
-                {
-                    foreach (var path in Directory.EnumerateFiles(_packsDir, "pack-*.pack"))
-                    {
-                        if (path.EndsWith(".tmp", StringComparison.Ordinal))
-                            continue;
-                        if (!livePacks.Contains(Path.GetFileName(path)))
-                            dropPacks.Add(path);
-                    }
-                }
-                dropPacks.Sort(StringComparer.Ordinal);
-
-                var dropManifests = new List<string>();
-                foreach (var drop in drops)
-                    dropManifests.Add(manifests[drop].Path);
-                return new GcPlan(dropManifests, dropPacks, deadChunks, deadBytes, notes, dropLayouts);
+                if (path.EndsWith(".tmp", StringComparison.Ordinal))
+                    continue;
+                if (!livePacks.Contains(Path.GetFileName(path)))
+                    dropPacks.Add(path);
             }
+            dropPacks.Sort(StringComparer.Ordinal);
+            return dropPacks;
         }
 
         // Retention roots shared by Plan (liveness) and LiveDigestHex (idle
@@ -190,7 +220,7 @@ namespace Corpus
                 var now = DateTime.UtcNow;
                 foreach (var (gen, (_, m)) in manifests)
                 {
-                    if (!DateTime.TryParse(m.CreatedUtc, out var created))
+                    if (!DateTime.TryParse(m.CreatedUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var created))
                     {
                         roots.Add(gen);
                         continue;
@@ -268,7 +298,7 @@ namespace Corpus
         // idle optimizer's filter (landing chunks outside this set drop
         // unpacked). HMAC-checked loads — a corrupt manifest throws before
         // any mutation, same as Plan.
-        public HashSet<string> LiveDigestHex()
+        public IReadOnlySet<string> LiveDigestHex()
         {
             var key = ChunkId.EnsureKey(_storeRoot);
             var manifests = new Dictionary<int, (string Path, SnapshotManifest Manifest)>();
@@ -424,7 +454,7 @@ namespace Corpus
         {
             try
             {
-                if (File.Exists(path) && DateTime.TryParse(File.ReadAllText(path), out var at))
+                if (File.Exists(path) && DateTime.TryParse(File.ReadAllText(path), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var at))
                     return at;
             }
             catch { }
@@ -493,7 +523,7 @@ namespace Corpus
                 WriteStamp(_optStamp, now);
                 return;
             }
-            var (packed, deduped, dropped) = store.OptimizeLanding(gc.LiveDigestHex());
+            var (packed, deduped, dropped) = store.OptimizeLanding(new HashSet<string>(gc.LiveDigestHex(), StringComparer.OrdinalIgnoreCase));
             _log.Info($"scheduled optimize: {packed} packed, {deduped} deduped, {dropped} dropped");
             WriteStamp(_optStamp, now);
         }

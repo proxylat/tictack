@@ -40,7 +40,7 @@ namespace Corpus
     public interface IBitLockerVolume
     {
         string? BitLockerState { get; }
-        List<string>? BitLockerKeyIds { get; }
+        IReadOnlyList<string>? BitLockerKeyIds { get; }
     }
 
     // manage-bde, not CIM Win32_EncryptableVolume: a plain promptless exe already driven via ProcessRunner by both existing probes (DiskImager, RestoreOrchestrator), with zero COM/WMI surface.
@@ -169,10 +169,10 @@ namespace Corpus
 
         // State DURING capture (post-suspend), for the manifest record.
         public string CaptureState { get; }
-        public List<string>? CaptureKeyIds { get; }
+        public IReadOnlyList<string>? CaptureKeyIds { get; }
 
         string? IBitLockerVolume.BitLockerState => CaptureState;
-        List<string>? IBitLockerVolume.BitLockerKeyIds => CaptureKeyIds;
+        IReadOnlyList<string>? IBitLockerVolume.BitLockerKeyIds => CaptureKeyIds;
 
         private BitLockerCaptureScope(IBitLockerController controller, string volume, ILogger log, bool suspendedByUs, string captureState, List<string>? captureKeyIds)
         {
@@ -199,37 +199,7 @@ namespace Corpus
                     // command, throw before a single byte is imaged.
                     throw new InvalidDataException($"refusing VSS snapshot: volume {volume} is BitLocker-locked (unlock with manage-bde -unlock {volume} first)");
                 case BitLockerState.ProtectedUnlocked:
-                    log.Info($"BitLocker: volume {volume} is protected-unlocked, suspending protectors for capture");
-                    try
-                    {
-                        controller.Suspend(volume);
-                    }
-                    catch (Exception ex)
-                    {
-                        // 12a: VSS captures protected-unlocked volumes fine, so
-                        // a suspend failure degrades to Warn+proceed — refusing
-                        // would lose the backup for nothing. Re-query first: a
-                        // half-applied suspend must be resumed immediately and
-                        // the manifest must name the honest end state.
-                        log.Warn($"BitLocker: suspend failed on {volume}, capturing protected-unlocked ({ex.Message})");
-                        var captureState = info.State;
-                        if (controller.Query(volume).State == BitLockerState.Suspended)
-                        {
-                            log.Warn($"BitLocker: suspend half-applied on {volume}, re-enabling immediately");
-                            try
-                            {
-                                controller.Resume(volume);
-                            }
-                            catch (Exception rex)
-                            {
-                                log.Error($"BitLocker: FAILED to re-enable protectors on {volume} — run 'manage-bde -protectors -enable {volume}' manually", rex);
-                                captureState = BitLockerState.Suspended;
-                            }
-                        }
-                        return new BitLockerCaptureScope(controller, volume, log, false, captureState.ToString(), keyIds);
-                    }
-                    log.Info($"BitLocker: protectors suspended on {volume}, capturing while suspended");
-                    return new BitLockerCaptureScope(controller, volume, log, true, BitLockerState.Suspended.ToString(), keyIds);
+                    return ArmProtectedUnlocked(volume, info, keyIds, controller, log);
                 case BitLockerState.Suspended:
                     log.Info($"BitLocker: volume {volume} is already suspended, leaving as-is (no re-enable on teardown)");
                     return new BitLockerCaptureScope(controller, volume, log, false, info.State.ToString(), keyIds);
@@ -237,20 +207,58 @@ namespace Corpus
                     log.Info($"BitLocker: volume {volume} is unprotected, no suspension needed");
                     return new BitLockerCaptureScope(controller, volume, log, false, info.State.ToString(), keyIds);
                 default:
-                {
-                    // Unknown is not Silent: BitLocker absence/disability is
-                    // provable (no fvevol = no encryption possible), so only
-                    // warn when the state is genuinely indeterminate.
-                    var env = VssHealth.QueryBitLockerEnv();
-                    if (VssHealth.IsAbsentOrDisabled(env))
-                    {
-                        log.Info($"BitLocker not present or disabled by policy ({VssHealth.Summarize(env)}); capturing {volume} without suspension");
-                        return new BitLockerCaptureScope(controller, volume, log, false, BitLockerState.Unprotected.ToString(), keyIds);
-                    }
-                    log.Warn($"BitLocker: could not determine protection state of {volume} ({VssHealth.Summarize(env)}), proceeding without suspension");
-                    return new BitLockerCaptureScope(controller, volume, log, false, info.State.ToString(), keyIds);
-                }
+                    return ArmUnknown(volume, info, keyIds, controller, log);
             }
+        }
+
+        private static BitLockerCaptureScope ArmProtectedUnlocked(string volume, BitLockerInfo info, List<string>? keyIds, IBitLockerController controller, ILogger log)
+        {
+            log.Info($"BitLocker: volume {volume} is protected-unlocked, suspending protectors for capture");
+            try
+            {
+                controller.Suspend(volume);
+            }
+            catch (Exception ex)
+            {
+                // 12a: VSS captures protected-unlocked volumes fine, so
+                // a suspend failure degrades to Warn+proceed — refusing
+                // would lose the backup for nothing. Re-query first: a
+                // half-applied suspend must be resumed immediately and
+                // the manifest must name the honest end state.
+                log.Warn($"BitLocker: suspend failed on {volume}, capturing protected-unlocked ({ex.Message})");
+                var captureState = info.State;
+                if (controller.Query(volume).State == BitLockerState.Suspended)
+                {
+                    log.Warn($"BitLocker: suspend half-applied on {volume}, re-enabling immediately");
+                    try
+                    {
+                        controller.Resume(volume);
+                    }
+                    catch (Exception rex)
+                    {
+                        log.Error($"BitLocker: FAILED to re-enable protectors on {volume} — run 'manage-bde -protectors -enable {volume}' manually", rex);
+                        captureState = BitLockerState.Suspended;
+                    }
+                }
+                return new BitLockerCaptureScope(controller, volume, log, false, captureState.ToString(), keyIds);
+            }
+            log.Info($"BitLocker: protectors suspended on {volume}, capturing while suspended");
+            return new BitLockerCaptureScope(controller, volume, log, true, BitLockerState.Suspended.ToString(), keyIds);
+        }
+
+        private static BitLockerCaptureScope ArmUnknown(string volume, BitLockerInfo info, List<string>? keyIds, IBitLockerController controller, ILogger log)
+        {
+            // Unknown is not Silent: BitLocker absence/disability is
+            // provable (no fvevol = no encryption possible), so only
+            // warn when the state is genuinely indeterminate.
+            var env = VssHealth.QueryBitLockerEnv();
+            if (VssHealth.IsAbsentOrDisabled(env))
+            {
+                log.Info($"BitLocker not present or disabled by policy ({VssHealth.Summarize(env)}); capturing {volume} without suspension");
+                return new BitLockerCaptureScope(controller, volume, log, false, BitLockerState.Unprotected.ToString(), keyIds);
+            }
+            log.Warn($"BitLocker: could not determine protection state of {volume} ({VssHealth.Summarize(env)}), proceeding without suspension");
+            return new BitLockerCaptureScope(controller, volume, log, false, info.State.ToString(), keyIds);
         }
 
         public void Dispose()

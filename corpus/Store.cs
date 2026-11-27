@@ -228,7 +228,7 @@ namespace Corpus
             int recovered = 0;
             foreach (var packPath in Directory.EnumerateFiles(_packsDir, "pack-*.pack"))
             {
-                List<(byte[] Digest, long Offset, int Stored, int Plain)> rows;
+                IReadOnlyList<(byte[] Digest, long Offset, int Stored, int Plain)> rows;
                 try { rows = PackReader.ReadIndex(packPath); }
                 catch { continue; }
                 if (rows.Count == 0) continue;
@@ -310,42 +310,9 @@ namespace Corpus
             if (_chunker == "buzhash")
                 return ImageFull(source, name, generation, prevDigest, opts,
                     skipIfUnchanged && !opts.ForceFull && existing.Count > 0 ? existing[existing.Count - 1].Generation : null, progress);
-            SnapshotManifest? parent = null;
-            if (!opts.ForceFull && (opts.Incremental || opts.ParentGeneration > 0))
-            {
-                int? wantGen = opts.ParentGeneration > 0 ? opts.ParentGeneration : latest?.Generation;
-                if (wantGen == null)
-                {
-                    _log.Info($"no parent snapshot, full image ('{name}' will be gen {generation})");
-                }
-                else if (latest != null && wantGen.Value == latest.Generation)
-                {
-                    parent = CheckParent(latest, source);
-                }
-                else
-                {
-                    string? parentName = null;
-                    foreach (var (gen, snap) in existing)
-                    {
-                        if (gen == wantGen.Value)
-                        {
-                            parentName = snap;
-                            break;
-                        }
-                    }
-                    if (parentName == null)
-                    {
-                        if (opts.ParentGeneration > 0)
-                            throw new InvalidDataException($"--parent gen {wantGen.Value} not found in {_manifestsDir}");
-                        _log.Info($"parent gen {wantGen.Value} missing, full image");
-                    }
-                    else
-                    {
-                        // HMAC-checked; corrupt → throw (never image onto a corrupt parent).
-                        parent = CheckParent(ManifestStore.Load(Path.Combine(_manifestsDir, $"{wantGen.Value:D6}-{parentName}.json"), _key), source);
-                    }
-                }
-            }
+            var parent = (!opts.ForceFull && (opts.Incremental || opts.ParentGeneration > 0))
+                ? ResolveParentManifest(existing, latest, source, name, generation, opts)
+                : null;
             if (parent != null)
             {
                 parent = CheckRelocation(parent, source, opts);
@@ -356,8 +323,6 @@ namespace Corpus
                 var plan = (opts.ChangeSource ?? DefaultChangeSource()).Plan(parent, source, _chunkMib * 1024 * 1024, _log);
                 if (plan != null)
                 {
-                    // Empty plan = skip before ANY bulk read (the plan itself
-                    // is MFT/journal metadata only, never volume bytes).
                     if (skipIfUnchanged && !opts.ForceFull && plan.DirtyChunks.Count == 0)
                         SkipUnchanged(parent.Generation);
                     return ImageIncremental(source, name, generation, prevDigest, parent, plan, opts, skipIfUnchanged && !opts.ForceFull, progress);
@@ -365,6 +330,37 @@ namespace Corpus
             }
             return ImageFull(source, name, generation, prevDigest, opts,
                 skipIfUnchanged && !opts.ForceFull && existing.Count > 0 ? existing[existing.Count - 1].Generation : null, progress);
+        }
+
+        private SnapshotManifest? ResolveParentManifest(
+            IReadOnlyList<(int Generation, string Name)> existing,
+            SnapshotManifest? latest,
+            IBlockSource source,
+            string name,
+            int generation,
+            ImageOptions opts)
+        {
+            int? wantGen = opts.ParentGeneration > 0 ? opts.ParentGeneration : latest?.Generation;
+            if (wantGen == null)
+            {
+                _log.Info($"no parent snapshot, full image ('{name}' will be gen {generation})");
+                return null;
+            }
+            if (latest != null && wantGen.Value == latest.Generation)
+                return CheckParent(latest, source);
+            string? parentName = null;
+            foreach (var (gen, snap) in existing)
+            {
+                if (gen == wantGen.Value) { parentName = snap; break; }
+            }
+            if (parentName == null)
+            {
+                if (opts.ParentGeneration > 0)
+                    throw new InvalidDataException($"--parent gen {wantGen.Value} not found in {_manifestsDir}");
+                _log.Info($"parent gen {wantGen.Value} missing, full image");
+                return null;
+            }
+            return CheckParent(ManifestStore.Load(Path.Combine(_manifestsDir, $"{wantGen.Value:D6}-{parentName}.json"), _key), source);
         }
 
         private static IChangeSource DefaultChangeSource() => new MftDigestChangeSource();
@@ -405,7 +401,7 @@ namespace Corpus
         // config-effective names ∪ CLI names, $LogFile stripped again,
         // case-insensitive dedup. Explicit config never regains defaults
         // through the union.
-        internal static IReadOnlyList<string> MergeExclusionNames(IReadOnlyList<string>? configured, IReadOnlyList<string> cli)
+        internal static IReadOnlyList<string> MergeExclusionNames(IEnumerable<string>? configured, IEnumerable<string> cli)
         {
             ArgumentNullException.ThrowIfNull(cli);
             var merged = new List<string>(CapturePolicy.EffectiveSkip(configured));
@@ -427,7 +423,7 @@ namespace Corpus
         // intent conflicts with it; refusing on defaults the user never
         // typed (Windows) while passing them elsewhere (Linux, where the
         // resolver comes back null) was platform-divergent.
-        internal static IReadOnlyList<string> ExplicitExclusionNames(IReadOnlyList<string>? configured, IReadOnlyList<string> cli)
+        internal static IReadOnlyList<string> ExplicitExclusionNames(IEnumerable<string>? configured, IEnumerable<string> cli)
         {
             ArgumentNullException.ThrowIfNull(cli);
             var merged = new List<string>();
@@ -526,122 +522,18 @@ namespace Corpus
         private SnapshotManifest ImageFull(IBlockSource source, string name, int generation, string prevDigest, ImageOptions opts, int? skipSince, IProgress<long>? progress = null)
         {
             var entries = new List<ManifestEntry>(GridCount(source.Length, _chunkMib));
-            var pending = new List<ChunkRow>();
-            // Digests packed but not yet flushed: TryGet can't see them, so
-            // without this set intra-image duplicates pack twice and the
-            // index ends up pointing at the last copy. Cleared on every
-            // flush (≤500 entries — never grows with volume size).
-            var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
-            var newChunks = 0;
-            var totalBytes = 0L;
-            var holes = 0;
             var chunkBytes = _chunkMib * 1024 * 1024;
             EnsureDestinationHeadroom(chunkBytes);
             RecoverOrphanPacks();
             var excl = ResolveExclusions(source, opts);
-            var exclBpc = excl?.BytesPerCluster ?? 0;
-            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent, wormMode: WormMode))
-            using (var stream = source.OpenRead())
-            {
-                bool[]? holeMap = null;
-                IEnumerable<Chunk> enumerable;
-                if (_chunker == "buzhash")
-                {
-                    // CDC has no grid: sparse holes stream as zeros (same
-                    // bytes, deduped by content hash); hole markers stay a
-                    // fixed-grid optimization.
-                    // shortcut: sparse hole-skipping is fixed-grid only — a sparse source under buzhash streams dense (correct, possibly larger). Revisit if sparse+buzhash volumes show bloat.
-                    var (minBytes, maxBytes) = Chunker.BuzHashBounds(chunkBytes);
-                    enumerable = Chunker.ReadVariable(stream, chunkBytes, minBytes, maxBytes);
-                }
-                else
-                {
-                    if (source is ISparseBlockSource sparse)
-                        holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
-                    enumerable = holeMap != null
-                        ? Chunker.ReadSparse(stream, chunkBytes, i => i < holeMap.Length && holeMap[i])
-                        : Chunker.Read(stream, chunkBytes);
-                }
-                // Denominator = planned bytes (whole volume; holes excluded
-                // above). A caller-supplied progress (disk aggregate) owns
-                // the throttle; direct calls get their own reporter.
-                var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
-                CheckImageFit(planned, !string.IsNullOrEmpty(prevDigest));
-                var reporter = progress ?? LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source), progress) ?? new ImageProgress(_log, planned);
-                var done = 0L;
-                var window = new EncodeWindow(pack, pending, _zstdLevel, workers: Workers);
-                int lastSealed = pack.SealedPackCount;
-                foreach (var item in ChunkPipeline.HashBatched(enumerable, _key, exclRuns, exclBpc, Workers))
-                {
-                    var chunk = item.Chunk;
-                    if (chunk.IsHole)
-                    {
-                        var holeSize = Math.Min((long)chunkBytes, source.Length - chunk.Offset);
-                        entries.Add(ManifestEntry.Hole(holeSize));
-                        totalBytes += holeSize;
-                        holes++;
-                        continue;
-                    }
-                    var digest = item.Digest;
-                    var hex = item.Hex;
-                    entries.Add(new ManifestEntry(hex, chunk.Data.Length));
-                    totalBytes += chunk.Data.Length;
-                    done += chunk.Data.Length;
-                    reporter.Report(done);
-                    if (packedThisImage.Contains(hex) || _index.TryGet(digest, out _))
-                        continue;
-                    packedThisImage.Add(hex);
-                    window.Add(digest, chunk.Data);
-                    newChunks++;
-                    if ((newChunks & 15) == 0)
-                        EnsureDestinationHeadroom(chunkBytes);
-                    if (pack.SealedPackCount != lastSealed || pending.Count >= 64)
-                    {
-                        window.Drain();
-                        _index.UpsertBatch(pending);
-                        pending.Clear();
-                        packedThisImage.Clear();
-                        lastSealed = pack.SealedPackCount;
-                    }
-                }
-                window.Drain();
-                _index.UpsertBatch(pending);
-                pending.Clear();
-                // The loop's last data chunk already reported 100% (final
-                // reports bypass the throttle); top up only when
-                // throttling or holes left the series short — and always
-                // for empty (all-hole) volumes.
-                if (planned <= 0 || done < planned)
-                    reporter.Report(planned);
-            }
+            var (newChunks, totalBytes, holes) = StreamFullChunks(source, chunkBytes, excl, prevDigest, entries, progress);
 
-            // §12.8: full re-read with zero new chunks = unchanged (covers the
-            // null-plan fallback path, where no empty-plan short-circuit can
-            // fire). The manifest write is withheld — the gen stays free.
-            // Zero-Add PackWriter seals nothing (Dispose no-ops on no stream).
+            // §12.8: full re-read with zero new chunks = unchanged.
             if (skipSince != null && newChunks == 0)
                 SkipUnchanged(skipSince.Value);
 
-            // Bitmap status logs only when a skip decision could consume
-            // these records (skipSince set); full images stay quiet.
             var (mftDigests, mftRecords, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log, skipSince != null ? _log : null);
-            // Ransomware alarm (gap 4): a full re-read compares against the
-            // latest gen; over-threshold churn refuses the commit
-            // (fail-closed) unless --force-full. Orphaned pack/index rows
-            // from this run are unreferenced and GC-swept, never restorable
-            // data — same withhold shape as the §12.8 skip above.
-            if (_changeAlarmPercent > 0)
-            {
-                SnapshotManifest? alarmParent = null;
-                var alarmListed = ManifestStore.List(_manifestsDir);
-                if (alarmListed.Count > 0)
-                {
-                    var (alarmGen, alarmSnap) = alarmListed[alarmListed.Count - 1];
-                    alarmParent = ManifestStore.Load(Path.Combine(_manifestsDir, $"{alarmGen:D6}-{alarmSnap}.json"), _key);
-                }
-                Hardening.CheckChangeAlarm(alarmParent, entries, _changeAlarmPercent, opts.ForceFull, _log);
-            }
+            CheckChangeAlarmAgainstLatest(entries, opts.ForceFull);
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
                 ChunkId.KeyId(_key), prevDigest, entries,
@@ -659,6 +551,102 @@ namespace Corpus
             return manifest;
         }
 
+        private (int NewChunks, long TotalBytes, int Holes) StreamFullChunks(
+            IBlockSource source, int chunkBytes, IExclusionResolver? excl, string prevDigest,
+            List<ManifestEntry> entries, IProgress<long>? progress)
+        {
+            var pending = new List<ChunkRow>();
+            var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
+            var newChunks = 0;
+            var totalBytes = 0L;
+            var holes = 0;
+            var exclBpc = excl?.BytesPerCluster ?? 0;
+            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
+            using var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent, wormMode: WormMode);
+            using var stream = source.OpenRead();
+            var enumerable = BuildChunkEnumerable(stream, source, chunkBytes, out var holeMap);
+            var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
+            CheckImageFit(planned, !string.IsNullOrEmpty(prevDigest));
+            var reporter = progress ?? LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source), progress) ?? new ImageProgress(_log, planned);
+            var done = 0L;
+            var window = new EncodeWindow(pack, pending, _zstdLevel, workers: Workers);
+            int lastSealed = pack.SealedPackCount;
+            foreach (var item in ChunkPipeline.HashBatched(enumerable, _key, exclRuns, exclBpc, Workers))
+            {
+                var chunk = item.Chunk;
+                if (chunk.IsHole)
+                {
+                    var holeSize = Math.Min((long)chunkBytes, source.Length - chunk.Offset);
+                    entries.Add(ManifestEntry.Hole(holeSize));
+                    totalBytes += holeSize;
+                    holes++;
+                    continue;
+                }
+                entries.Add(new ManifestEntry(item.Hex, chunk.Data.Length));
+                totalBytes += chunk.Data.Length;
+                done += chunk.Data.Length;
+                reporter.Report(done);
+                if (!packedThisImage.Contains(item.Hex) && !_index.TryGet(item.Digest, out _))
+                    PackNewFullChunk(item.Digest, item.Hex, chunk.Data, chunkBytes, pack, window, pending, packedThisImage, ref newChunks, ref lastSealed);
+            }
+            window.Drain();
+            _index.UpsertBatch(pending);
+            pending.Clear();
+            if (planned <= 0 || done < planned)
+                reporter.Report(planned);
+            return (newChunks, totalBytes, holes);
+        }
+
+        private void PackNewFullChunk(
+            byte[] digest, string hex, byte[] data, int chunkBytes, PackWriter pack, EncodeWindow window,
+            List<ChunkRow> pending, HashSet<string> packedThisImage, ref int newChunks, ref int lastSealed)
+        {
+            packedThisImage.Add(hex);
+            window.Add(digest, data);
+            newChunks++;
+            if ((newChunks & 15) == 0)
+                EnsureDestinationHeadroom(chunkBytes);
+            if (pack.SealedPackCount != lastSealed || pending.Count >= 64)
+            {
+                window.Drain();
+                _index.UpsertBatch(pending);
+                pending.Clear();
+                packedThisImage.Clear();
+                lastSealed = pack.SealedPackCount;
+            }
+        }
+
+        // shortcut: sparse hole-skipping is fixed-grid only — buzhash streams dense (deduped by content hash).
+        private IEnumerable<Chunk> BuildChunkEnumerable(Stream stream, IBlockSource source, int chunkBytes, out bool[]? holeMap)
+        {
+            holeMap = null;
+            if (_chunker == "buzhash")
+            {
+                var (minBytes, maxBytes) = Chunker.BuzHashBounds(chunkBytes);
+                return Chunker.ReadVariable(stream, chunkBytes, minBytes, maxBytes);
+            }
+            if (source is ISparseBlockSource sparse)
+                holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
+            var map = holeMap;
+            return map != null
+                ? Chunker.ReadSparse(stream, chunkBytes, i => i < map.Length && map[i])
+                : Chunker.Read(stream, chunkBytes);
+        }
+
+        private void CheckChangeAlarmAgainstLatest(List<ManifestEntry> entries, bool forceFull)
+        {
+            if (_changeAlarmPercent <= 0)
+                return;
+            SnapshotManifest? alarmParent = null;
+            var alarmListed = ManifestStore.List(_manifestsDir);
+            if (alarmListed.Count > 0)
+            {
+                var (alarmGen, alarmSnap) = alarmListed[alarmListed.Count - 1];
+                alarmParent = ManifestStore.Load(Path.Combine(_manifestsDir, $"{alarmGen:D6}-{alarmSnap}.json"), _key);
+            }
+            Hardening.CheckChangeAlarm(alarmParent, entries, _changeAlarmPercent, forceFull, _log);
+        }
+
         // Incremental capture: clean chunks reuse the parent's digests with
         // ZERO reads; only dirty chunks are seek-read, hashed, and packed.
         // The child manifest is self-contained (full chunk list) — export
@@ -668,106 +656,13 @@ namespace Corpus
             var chunkBytes = _chunkMib * 1024 * 1024;
             var grid = GridCount(source.Length, _chunkMib);
             var entries = new List<ManifestEntry>(parent.Chunks.Count);
-            var pending = new List<ChunkRow>();
-            // Prototype per digest packed this run: reuses the stored kind
-            // (whole or delta) for intra-image dupes without a pack re-read.
-            var packedThisImage = new Dictionary<string, ManifestEntry>(StringComparer.Ordinal);
             var excl = ResolveExclusions(source, opts);
-            var exclBpc = excl?.BytesPerCluster ?? 0;
-            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
-            var reread = 0;
-            var newChunks = 0;
-            using (var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent, wormMode: WormMode))
-            using (var stream = source.OpenRead())
-            {
-                bool[]? holeMap = null;
-                if (source is ISparseBlockSource sparse)
-                    holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
-                // Denominator = digest-plan total: dirty non-hole chunk
-                // bytes (clean chunks cost zero reads, holes win over
-                // dirty — neither advances the numerator).
-                var planned = 0L;
-                for (var i = 0; i < grid; i++)
-                {
-                    if (!plan.DirtyChunks.Contains(i))
-                        continue;
-                    if (holeMap != null && i < holeMap.Length && holeMap[i])
-                        continue;
-                    planned += Math.Min((long)chunkBytes, source.Length - i * (long)chunkBytes);
-                }
-                var reporter = progress ?? LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source), progress) ?? new ImageProgress(_log, planned);
-                var done = 0L;
-                var window = new EncodeWindow(pack, pending, _zstdLevel);
-                for (var i = 0; i < grid; i++)
-                {
-                    if (holeMap != null && i < holeMap.Length && holeMap[i])
-                    {
-                        entries.Add(ManifestEntry.Hole(Math.Min((long)chunkBytes, source.Length - i * (long)chunkBytes)));
-                        continue; // hole wins over dirty — no read either way
-                    }
-                    if (!plan.DirtyChunks.Contains(i))
-                    {
-                        entries.Add(parent.Chunks[i]); // clean: reuse digest, ZERO reads
-                        continue;
-                    }
-                    var data = ReadChunkAt(stream, i, chunkBytes, source.Length);
-                    reread++;
-                    if (exclRuns != null && exclRuns.Count > 0)
-                        CapturePolicy.ZeroExcludedRanges(data, i * (long)chunkBytes, exclRuns, exclBpc);
-                    var digest = ChunkId.ComputeId(data, _key);
-                    var hex = ChunkId.ToHex(digest);
-                    ManifestEntry entry;
-                    if (packedThisImage.TryGetValue(hex, out var proto))
-                    {
-                        entry = proto;
-                    }
-                    else if (_index.TryGet(digest, out var row))
-                    {
-                        entry = ReuseIndexedEntry(digest, row, hex, data.Length, i, generation);
-                    }
-                    else if (TryPackDelta(parent, i, data, hex, digest, pack, pending, packedThisImage))
-                    {
-                        entry = packedThisImage[hex];
-                        newChunks++;
-                        if (pending.Count >= 500)
-                        {
-                            _index.UpsertBatch(pending);
-                            pending.Clear();
-                            packedThisImage.Clear();
-                        }
-                    }
-                    else
-                    {
-                        entry = new ManifestEntry(hex, data.Length);
-                        packedThisImage[hex] = entry;
-                        window.Add(digest, data);
-                        newChunks++;
-                        if (pending.Count >= 500)
-                        {
-                            window.Drain();
-                            _index.UpsertBatch(pending);
-                            pending.Clear();
-                            packedThisImage.Clear();
-                        }
-                    }
-                    entries.Add(entry);
-                    done += data.Length;
-                    reporter.Report(done);
-                }
-                window.Drain();
-                _index.UpsertBatch(pending);
-                pending.Clear();
-                if (planned <= 0 || done < planned)
-                    reporter.Report(planned);
-            }
+            var (reread, newChunks) = StreamIncrementalChunks(source, generation, parent, plan, chunkBytes, grid, excl, entries, progress);
 
-            // §12.8: dirty-but-deduped (every re-read chunk already indexed) =
-            // unchanged. Withhold the manifest write — the gen stays free.
+            // §12.8: dirty-but-deduped (every re-read chunk already indexed) = unchanged.
             if (skip && newChunks == 0)
                 SkipUnchanged(parent.Generation);
 
-            // Ransomware alarm (gap 4): over-threshold churn vs the parent
-            // refuses the commit (fail-closed) unless --force-full.
             Hardening.CheckChangeAlarm(parent, entries, _changeAlarmPercent, opts.ForceFull, _log);
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
@@ -781,6 +676,103 @@ namespace Corpus
             ManifestStore.Save(_manifestsDir, manifest, _key, WormMode);
             _log.Info($"incremental gen {generation} from parent {parent.Generation}: {reread}/{grid} chunks re-read, {newChunks} new");
             return manifest;
+        }
+
+        private (int Reread, int NewChunks) StreamIncrementalChunks(
+            IBlockSource source, int generation, SnapshotManifest parent, IncrementalPlan plan,
+            int chunkBytes, int grid, IExclusionResolver? excl, List<ManifestEntry> entries, IProgress<long>? progress)
+        {
+            var pending = new List<ChunkRow>();
+            var packedThisImage = new Dictionary<string, ManifestEntry>(StringComparer.Ordinal);
+            var exclBpc = excl?.BytesPerCluster ?? 0;
+            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
+            var reread = 0;
+            var newChunks = 0;
+            using var pack = new PackWriter(_packsDir, encryptHook: _encryptHook, eccOverheadPercent: _eccOverheadPercent, wormMode: WormMode);
+            using var stream = source.OpenRead();
+            var holeMap = source is ISparseBlockSource sparse
+                ? Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes)
+                : null;
+            var planned = ComputeIncrementalPlannedBytes(source.Length, grid, chunkBytes, holeMap, plan.DirtyChunks);
+            var reporter = progress ?? LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source), progress) ?? new ImageProgress(_log, planned);
+            var done = 0L;
+            var window = new EncodeWindow(pack, pending, _zstdLevel);
+            for (var i = 0; i < grid; i++)
+            {
+                if (holeMap != null && i < holeMap.Length && holeMap[i])
+                {
+                    entries.Add(ManifestEntry.Hole(Math.Min((long)chunkBytes, source.Length - i * (long)chunkBytes)));
+                    continue;
+                }
+                if (!plan.DirtyChunks.Contains(i))
+                {
+                    entries.Add(parent.Chunks[i]);
+                    continue;
+                }
+                var data = ReadChunkAt(stream, i, chunkBytes, source.Length);
+                reread++;
+                if (exclRuns != null && exclRuns.Count > 0)
+                    CapturePolicy.ZeroExcludedRanges(data, i * (long)chunkBytes, exclRuns, exclBpc);
+                var entry = PackOrReuseIncrementalChunk(parent, i, generation, data, pack, window, pending, packedThisImage, ref newChunks);
+                entries.Add(entry);
+                done += data.Length;
+                reporter.Report(done);
+            }
+            window.Drain();
+            _index.UpsertBatch(pending);
+            pending.Clear();
+            if (planned <= 0 || done < planned)
+                reporter.Report(planned);
+            return (reread, newChunks);
+        }
+
+        private static long ComputeIncrementalPlannedBytes(long sourceLength, int grid, int chunkBytes, bool[]? holeMap, IReadOnlySet<long> dirtyChunks)
+        {
+            var planned = 0L;
+            for (var i = 0; i < grid; i++)
+            {
+                if (!dirtyChunks.Contains(i)) continue;
+                if (holeMap != null && i < holeMap.Length && holeMap[i]) continue;
+                planned += Math.Min((long)chunkBytes, sourceLength - i * (long)chunkBytes);
+            }
+            return planned;
+        }
+
+        private ManifestEntry PackOrReuseIncrementalChunk(
+            SnapshotManifest parent, int index, int generation, byte[] data,
+            PackWriter pack, EncodeWindow window, List<ChunkRow> pending,
+            Dictionary<string, ManifestEntry> packedThisImage, ref int newChunks)
+        {
+            var digest = ChunkId.ComputeId(data, _key);
+            var hex = ChunkId.ToHex(digest);
+            if (packedThisImage.TryGetValue(hex, out var proto))
+                return proto;
+            if (_index.TryGet(digest, out var row))
+                return ReuseIndexedEntry(digest, row, hex, data.Length, index, generation);
+            if (TryPackDelta(parent, index, data, hex, digest, pack, pending, packedThisImage))
+            {
+                var entry = packedThisImage[hex];
+                newChunks++;
+                if (pending.Count >= 500)
+                {
+                    _index.UpsertBatch(pending);
+                    pending.Clear();
+                    packedThisImage.Clear();
+                }
+                return entry;
+            }
+            var whole = new ManifestEntry(hex, data.Length);
+            packedThisImage[hex] = whole;
+            window.Add(digest, data);
+            newChunks++;
+            if (pending.Count >= 500)
+            {
+                window.Drain();
+                _index.UpsertBatch(pending);
+                pending.Clear();
+                packedThisImage.Clear();
+            }
+            return whole;
         }
 
         // §12.7 capture: try patch-from the parent-gen same-index chunk.
@@ -926,55 +918,11 @@ namespace Corpus
             var diskDone = 0L;
             try
             {
-            foreach (var part in plan.Partitions)
-            {
-                var key = DiskImager.PartitionKey(diskNumber, part.PartitionNumber, part.UniqueGuid);
-                var record = new PartitionRecord
-                {
-                    PartitionNumber = part.PartitionNumber,
-                    Name = part.Name,
-                    TypeGuid = part.TypeGuid,
-                    UniqueGuid = part.UniqueGuid,
-                    FirstLba = part.FirstLba,
-                    LastLba = part.LastLba,
-                    OffsetBytes = part.OffsetBytes,
-                    LengthBytes = part.LengthBytes,
-                    Filesystem = part.Filesystem,
-                    Skipped = part.Skipped,
-                    SkipReason = part.SkipReason,
-                    SnapshotGeneration = 0,
-                    PartitionKey = key,
-                };
-                layout.Partitions.Add(record);
-                if (part.Skipped || part.Source == null)
-                    continue;
-                var parent = ResolveDiskParent(key, part.Filesystem, part.PartitionNumber, opts);
-                var imageOpts = parent != null
-                    ? new ImageOptions(ParentGeneration: parent.Generation, Incremental: true, ChangeSource: part.ChangeSource)
-                    : new ImageOptions(ChangeSource: part.ChangeSource);
-                var manifest = Image(part.Source, name, imageOpts,
-                    progress: diskProgress != null ? new OffsetProgress(diskProgress, diskDone) : null);
-                // Stamp partition identity post-hoc: the Image path is shared
-                // with volume snapshots so its options carry no partition
-                // fields. Same gen+name → same file, overwritten sealed.
-                manifest.PartitionKey = key;
-                manifest.DiskNumber = diskNumber;
-                manifest.PartitionNumber = part.PartitionNumber;
-                ManifestStore.Save(_manifestsDir, manifest, _key, WormMode);
-                record.SnapshotGeneration = manifest.Generation;
-                if (manifest.Generation > maxGen)
-                    maxGen = manifest.Generation;
-                diskDone += part.Source.Length;
-                diskProgress?.Report(diskDone);
-            }
+                foreach (var part in plan.Partitions)
+                    ImageDiskPartition(diskNumber, name, opts, part, layout, diskProgress, ref maxGen, ref diskDone);
             }
             finally
             {
-                // Mirror the volume path's `using`: per-partition sources
-                // hold a shared VSS set + BitLocker scopes that only
-                // complete/resume on release. Dispose-all (not
-                // per-iteration) so a mid-disk failure still tears down
-                // partitions never imaged; Dispose is idempotent.
                 foreach (var part in plan.Partitions)
                     part.Source?.Dispose();
             }
@@ -982,6 +930,38 @@ namespace Corpus
             LayoutStore.Save(_layoutsDir, layout, _key);
             _log.Info($"imaged disk {diskNumber} '{name}': {layout.Partitions.Count} partitions, layout gen {maxGen}");
             return layout;
+        }
+
+        private void ImageDiskPartition(
+            int diskNumber, string name, DiskImageOptions opts, PartitionImageInput part,
+            DiskLayout layout, IProgress<long>? diskProgress, ref int maxGen, ref long diskDone)
+        {
+            var key = DiskImager.PartitionKey(diskNumber, part.PartitionNumber, part.UniqueGuid);
+            var record = new PartitionRecord
+            {
+                PartitionNumber = part.PartitionNumber, Name = part.Name, TypeGuid = part.TypeGuid,
+                UniqueGuid = part.UniqueGuid, FirstLba = part.FirstLba, LastLba = part.LastLba,
+                OffsetBytes = part.OffsetBytes, LengthBytes = part.LengthBytes, Filesystem = part.Filesystem,
+                Skipped = part.Skipped, SkipReason = part.SkipReason, SnapshotGeneration = 0, PartitionKey = key,
+            };
+            layout.Partitions.Add(record);
+            if (part.Skipped || part.Source == null)
+                return;
+            var parent = ResolveDiskParent(key, part.Filesystem, part.PartitionNumber, opts);
+            var imageOpts = parent != null
+                ? new ImageOptions(ParentGeneration: parent.Generation, Incremental: true, ChangeSource: part.ChangeSource)
+                : new ImageOptions(ChangeSource: part.ChangeSource);
+            var manifest = Image(part.Source, name, imageOpts,
+                progress: diskProgress != null ? new OffsetProgress(diskProgress, diskDone) : null);
+            manifest.PartitionKey = key;
+            manifest.DiskNumber = diskNumber;
+            manifest.PartitionNumber = part.PartitionNumber;
+            ManifestStore.Save(_manifestsDir, manifest, _key, WormMode);
+            record.SnapshotGeneration = manifest.Generation;
+            if (manifest.Generation > maxGen)
+                maxGen = manifest.Generation;
+            diskDone += part.Source.Length;
+            diskProgress?.Report(diskDone);
         }
 
         // Shared by the disk loop and the §12.8 all-empty pre-check: newest
@@ -1109,108 +1089,38 @@ namespace Corpus
                     skipParent = latest;
             }
             var chunkBytes = _chunkMib * 1024 * 1024;
-            if (skipParent != null)
-            {
-                // §12.8 landing short-circuit: the MFT-digest plan costs an
-                // MFT read only. Empty user-dirty → skip before ANY bulk
-                // streaming — without this the flag saves nothing on the
-                // default path. Sys-only dirt (FRN<16 churn) still skips:
-                // see PlanMatchesExceptSys. Group-flip-only dirt (any VSS
-                // touch flips group 0, unioning every live file's extents)
-                // falls through to the record-level decision below.
-                var skipPlan = (opts.ChangeSource ?? DefaultChangeSource()).Plan(skipParent, source, chunkBytes, _log);
-                if (skipPlan != null && (PlanMatchesExceptSys(skipPlan, source, chunkBytes, _log)
-                    || RecordsMatchExceptSys(skipParent, skipPlan, source, _log)))
-                    SkipUnchanged(skipParent.Generation);
-            }
+            TrySkipFastImage(skipParent, source, opts, chunkBytes);
             Directory.CreateDirectory(_landingDir);
             EnsureDestinationHeadroom(chunkBytes);
             RecoverOrphanPacks();
-            // §12.13 automatic resume: a matching fingerprint reuses
-            // hash-verified landed chunks; a mismatch discards them with
-            // an INF line naming the cause — never a silent mix.
             var resumedHexes = BeginLandingResume(CurrentLandingFingerprint(source, opts));
             var entries = new List<ManifestEntry>(GridCount(source.Length, _chunkMib));
             var excl = ResolveExclusions(source, opts);
-            var exclBpc = excl?.BytesPerCluster ?? 0;
-            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
-            var holes = 0;
-            var landed = 0;
-            var newChunks = 0;
-            var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
-            var landedThisRun = new List<string>();
-            using (var stream = source.OpenRead())
-            {
-                bool[]? holeMap = null;
-                if (source is ISparseBlockSource sparse)
-                    holeMap = Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes);
-                var enumerable = holeMap != null
-                    ? Chunker.ReadSparse(stream, chunkBytes, i => i < holeMap.Length && holeMap[i])
-                    : Chunker.Read(stream, chunkBytes);
-                // §12.10 denominator = volume used bytes: allocated for
-                // sparse sources, plain length otherwise. Resumed chunks
-                // still stream through here, so they advance the series.
-                var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
-                CheckImageFit(planned, skipParent != null);
-                var reporter = LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source)) ?? new ImageProgress(_log, planned);
-                var done = 0L;
-                foreach (var item in ChunkPipeline.HashBatched(enumerable, _key, exclRuns, exclBpc, Workers))
-                {
-                    var chunk = item.Chunk;
-                    if (chunk.IsHole)
-                    {
-                        var holeSize = Math.Min((long)chunkBytes, source.Length - chunk.Offset);
-                        entries.Add(ManifestEntry.Hole(holeSize));
-                        holes++;
-                        continue;
-                    }
-                    var digest = item.Digest;
-                    var hex = item.Hex;
-                    entries.Add(new ManifestEntry(hex, chunk.Data.Length));
-                    done += chunk.Data.Length;
-                    reporter.Report(done);
-                    // §12.8 zero-new accounting: intra-image dupes and index
-                    // hits are not new. (LandChunk's own skip-if-present is
-                    // landing-state, not store-state — post-optimize reruns
-                    // land fresh files for indexed bytes.)
-                    if (!packedThisImage.Contains(hex) && !_index.TryGet(digest, out _))
-                    {
-                        packedThisImage.Add(hex);
-                        newChunks++;
-                    }
-                    // Resumed chunks were hash-verified at Begin this run
-                    // (crash wrote them, paranoia re-read them), so only
-                    // new hexes reach the disk. LandChunk's own
-                    // skip-if-present then covers intra-run duplicates only.
-                    if (!resumedHexes.Contains(hex) && LandChunk(hex, chunk.Data))
-                    {
-                        landed++;
-                        landedThisRun.Add(Path.Combine(_landingDir, hex + ".chunk"));
-                        if ((landed & 15) == 0)
-                            EnsureDestinationHeadroom(chunkBytes);
-                    }
-                }
-                if (planned <= 0 || done < planned)
-                    reporter.Report(planned);
-            }
+            var (holes, landed, newChunks, landedThisRun) = StreamFastLandingChunks(source, chunkBytes, excl, resumedHexes, skipParent != null, entries);
             if (skipParent != null && (newChunks == 0 || EntriesEqualExceptSys(entries, skipParent, source, chunkBytes)))
             {
-                // Withhold: no manifest, and the just-landed duplicates go
-                // back. Manifest-compare covers pre-optimize reruns (landing
-                // bytes aren't indexed until optimize folds them); every
-                // distinct hex is then index-resident (a first-seen hex
-                // always counts as new), so no manifest loses its landing
-                // read-through. The compare ignores sys-only churn (FRN<16
-                // extents): see EntriesEqualExceptSys.
                 foreach (var path in landedThisRun)
                     File.Delete(path);
                 SkipUnchanged(skipParent.Generation);
             }
-            // Same skip-gating as above: no parent, no future skip decision.
-            var (mftDigests, mftRecords, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log, skipParent != null ? _log : null);
-            // Ransomware alarm (gap 4): see ImageFull. Refused fast-images
-            // leave hash-verified landed chunks behind; the next run resumes
-            // or discards them by fingerprint — never silently mixed.
+            return SaveFastManifest(generation, name, prevDigest, source, opts, chunkBytes, excl, alarmParent, skipParent != null, entries, holes, landed);
+        }
+
+        private void TrySkipFastImage(SnapshotManifest? skipParent, IBlockSource source, ImageOptions opts, int chunkBytes)
+        {
+            if (skipParent == null)
+                return;
+            var skipPlan = (opts.ChangeSource ?? DefaultChangeSource()).Plan(skipParent, source, chunkBytes, _log);
+            if (skipPlan != null && (PlanMatchesExceptSys(skipPlan, source, chunkBytes, _log)
+                || RecordsMatchExceptSys(skipParent, skipPlan, source, _log)))
+                SkipUnchanged(skipParent.Generation);
+        }
+
+        private SnapshotManifest SaveFastManifest(
+            int generation, string name, string prevDigest, IBlockSource source, ImageOptions opts, int chunkBytes,
+            IExclusionResolver? excl, SnapshotManifest? alarmParent, bool hasSkipParent, List<ManifestEntry> entries, int holes, int landed)
+        {
+            var (mftDigests, mftRecords, mftRecordBytes) = TryMftBaseline(source, chunkBytes, _log, hasSkipParent ? _log : null);
             Hardening.CheckChangeAlarm(alarmParent, entries, _changeAlarmPercent, opts.ForceFull, _log);
             var manifest = ManifestStore.Build(
                 generation, name, source.Length, _chunkMib, _zstdLevel,
@@ -1226,6 +1136,58 @@ namespace Corpus
                 _log.Warn($"excluded extents restored as zeros: {string.Join(", ", manifest.SkippedExclusions)}");
             _log.Info($"fast-imaged '{name}' gen {generation}: {entries.Count} chunks ({holes} holes), {landed} landed (optimize pending)");
             return manifest;
+        }
+
+        private (int Holes, int Landed, int NewChunks, List<string> LandedThisRun) StreamFastLandingChunks(
+            IBlockSource source, int chunkBytes, IExclusionResolver? excl, IReadOnlySet<string> resumedHexes,
+            bool hasSkipParent, List<ManifestEntry> entries)
+        {
+            var exclBpc = excl?.BytesPerCluster ?? 0;
+            var exclRuns = exclBpc > 0 ? excl!.ExcludedRuns() : null;
+            var holes = 0;
+            var landed = 0;
+            var newChunks = 0;
+            var packedThisImage = new HashSet<string>(StringComparer.Ordinal);
+            var landedThisRun = new List<string>();
+            using var stream = source.OpenRead();
+            var holeMap = source is ISparseBlockSource sparse
+                ? Chunker.BuildHoleMap(sparse.GetAllocatedRuns(), sparse.BytesPerCluster, source.Length, chunkBytes)
+                : null;
+            var enumerable = holeMap != null
+                ? Chunker.ReadSparse(stream, chunkBytes, i => i < holeMap.Length && holeMap[i])
+                : Chunker.Read(stream, chunkBytes);
+            var planned = PlannedDataBytes(source.Length, chunkBytes, holeMap);
+            CheckImageFit(planned, hasSkipParent);
+            var reporter = LiveProgress.Create(_log, ProgressOpts, "image", planned, MftOf(source)) ?? new ImageProgress(_log, planned);
+            var done = 0L;
+            foreach (var item in ChunkPipeline.HashBatched(enumerable, _key, exclRuns, exclBpc, Workers))
+            {
+                var chunk = item.Chunk;
+                if (chunk.IsHole)
+                {
+                    entries.Add(ManifestEntry.Hole(Math.Min((long)chunkBytes, source.Length - chunk.Offset)));
+                    holes++;
+                    continue;
+                }
+                entries.Add(new ManifestEntry(item.Hex, chunk.Data.Length));
+                done += chunk.Data.Length;
+                reporter.Report(done);
+                if (!packedThisImage.Contains(item.Hex) && !_index.TryGet(item.Digest, out _))
+                {
+                    packedThisImage.Add(item.Hex);
+                    newChunks++;
+                }
+                if (!resumedHexes.Contains(item.Hex) && LandChunk(item.Hex, chunk.Data))
+                {
+                    landed++;
+                    landedThisRun.Add(Path.Combine(_landingDir, item.Hex + ".chunk"));
+                    if ((landed & 15) == 0)
+                        EnsureDestinationHeadroom(chunkBytes);
+                }
+            }
+            if (planned <= 0 || done < planned)
+                reporter.Report(planned);
+            return (holes, landed, newChunks, landedThisRun);
         }
 
         // Crash-safe loose write: skip-if-present (intra-landing dedup, no
@@ -1246,7 +1208,7 @@ namespace Corpus
         // than risk stranding a snapshot it cannot see.
         private HashSet<string>? ReferencedLandingHexes()
         {
-            List<(int Generation, string Name)> list;
+            IReadOnlyList<(int Generation, string Name)> list;
             try
             {
                 list = ManifestStore.List(_manifestsDir);
@@ -1363,48 +1325,8 @@ namespace Corpus
                 var mask = MftSkipMask.Resolve(liveVol ?? vol, log);
                 if (mask == null)
                     return false;
-            var changed = 0;
-            var live = 0;
-            var dead = 0;
-            var empty = 0;
-            var anyOutside = false;
-            var firstOutside = new List<long>();
-            var common = Math.Min(parentRecords.Count, currentRecords.Count);
-            for (var r = 0; r < currentRecords.Count; r++)
-            {
-                var cur = currentRecords[r];
-                if (!MftDigest.IsLiveDigest(cur))
-                {
-                    if (string.Equals(cur, MftDigest.DeadRecordSentinel, StringComparison.Ordinal))
-                        dead++;
-                    else
-                        empty++;
-                    continue;
-                }
-                live++;
-                if (r >= common)
-                {
-                    changed++; // live growth tail: unproven, refuse (backstop decides)
-                    if (IsSysMaskedRecord(r, mask.Value.AdvisoryRecords))
-                        continue;
-                    anyOutside = true;
-                    if (firstOutside.Count < 8)
-                        firstOutside.Add(r);
-                    continue;
-                }
-                if (!MftDigest.IsLiveDigest(parentRecords[r]))
-                    continue; // absent on the parent side → drops out, never a veto
-                if (string.Equals(parentRecords[r], cur, StringComparison.Ordinal))
-                    continue;
-                changed++;
-                if (IsSysMaskedRecord(r, mask.Value.AdvisoryRecords))
-                    continue;
-                anyOutside = true;
-                if (firstOutside.Count < 8)
-                    firstOutside.Add(r);
-            }
-            log.Info($"skip-records: {changed} changed of {live} records, outside-sys: [{string.Join(",", firstOutside)}], dead:{dead} empty:{empty}");
-                if (!anyOutside)
+                var firstOutside = CompareRecordDigests(parentRecords, currentRecords, mask.Value.AdvisoryRecords, log);
+                if (firstOutside.Count == 0)
                     return true;
                 return RetryOutsideSys(parentRecords, liveVol, firstOutside, log);
             }
@@ -1413,6 +1335,43 @@ namespace Corpus
                 if (liveVol != null && !ReferenceEquals(liveVol, vol))
                     liveVol.Dispose();
             }
+        }
+
+        private static List<long> CompareRecordDigests(
+            IReadOnlyList<string> parentRecords, IReadOnlyList<string> currentRecords,
+            IReadOnlySet<long> advisoryRecords, ILogger log)
+        {
+            var changed = 0;
+            var live = 0;
+            var dead = 0;
+            var empty = 0;
+            var firstOutside = new List<long>();
+            var common = Math.Min(parentRecords.Count, currentRecords.Count);
+            for (var r = 0; r < currentRecords.Count; r++)
+            {
+                var cur = currentRecords[r];
+                if (!MftDigest.IsLiveDigest(cur))
+                {
+                    if (string.Equals(cur, MftDigest.DeadRecordSentinel, StringComparison.Ordinal)) dead++;
+                    else empty++;
+                    continue;
+                }
+                live++;
+                if (r >= common)
+                {
+                    changed++;
+                    if (!IsSysMaskedRecord(r, advisoryRecords) && firstOutside.Count < 8)
+                        firstOutside.Add(r);
+                    continue;
+                }
+                if (!MftDigest.IsLiveDigest(parentRecords[r]) || string.Equals(parentRecords[r], cur, StringComparison.Ordinal))
+                    continue;
+                changed++;
+                if (!IsSysMaskedRecord(r, advisoryRecords) && firstOutside.Count < 8)
+                    firstOutside.Add(r);
+            }
+            log.Info($"skip-records: {changed} changed of {live} records, outside-sys: [{string.Join(",", firstOutside)}], dead:{dead} empty:{empty}");
+            return firstOutside;
         }
 
         // §9 design-B race net (B6P/B6Q: FRN 38 = U:\big re-stamps its USN on
@@ -1439,7 +1398,7 @@ namespace Corpus
         // (fail-safe). One log line, same format as before.
         internal const int SkipRecordRetryAttempts = 12;
 
-        private static bool RetryOutsideSys(List<string> parentRecords, IMftVolume? liveVol, List<long> outside, ILogger log)
+        private static bool RetryOutsideSys(IReadOnlyList<string> parentRecords, IMftVolume? liveVol, IReadOnlyList<long> outside, ILogger log)
         {
             if (liveVol == null || outside.Count == 0 || outside.Count > SkipRecordRetryMaxOutside)
                 return false;
@@ -1496,7 +1455,7 @@ namespace Corpus
         // MftPathResolver.RootFileRef). The root record carries SI-timestamp
         // churn on every VSS cycle (masked in its stored digest) but index
         // changes are namespace changes — compared like any user record.
-        private static bool IsSysMaskedRecord(long r, HashSet<long> advisory) =>
+        private static bool IsSysMaskedRecord(long r, IReadOnlySet<long> advisory) =>
             (r < 16 && r != (long)MftPathResolver.RootFileRef) || advisory.Contains(r);
 
         // §12.8 post-stream backstop: manifests equal except within FRN<16
@@ -1816,7 +1775,7 @@ namespace Corpus
         // (from GarbageCollector.LiveDigestHex) lets pruned/crashed-orphan
         // chunks drop without packing; null packs everything (the next GC
         // sweeps orphans via its mark pass).
-        public (int Packed, int Deduped, int Dropped) OptimizeLanding(ISet<string>? liveHex = null)
+        public (int Packed, int Deduped, int Dropped) OptimizeLanding(IReadOnlySet<string>? liveHex = null)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (!Directory.Exists(_landingDir))
@@ -1835,38 +1794,10 @@ namespace Corpus
             {
                 var window = new EncodeWindow(pack, pending, _zstdLevel, pendingPaths);
                 foreach (var path in paths)
-                {
-                    var hex = Path.GetFileNameWithoutExtension(path);
-                    if (liveHex != null && !liveHex.Contains(hex))
-                    {
-                        File.Delete(path);
-                        dropped++;
-                        continue;
-                    }
-                    var data = File.ReadAllBytes(path);
-                    var digest = ChunkId.ComputeId(data, _key);
-                    if (!string.Equals(ChunkId.ToHex(digest), hex, StringComparison.Ordinal))
-                        throw new InvalidDataException($"landing chunk {path} failed digest check (torn write? re-image the snapshot)");
-                    if (_index.TryGet(digest, out _))
-                    {
-                        File.Delete(path);
-                        deduped++;
-                        continue;
-                    }
-                    window.Add(digest, data, path);
-                    packed++;
-                    if (pending.Count >= 500)
-                    {
-                        window.Drain();
-                        FlushOptimizeBatch(pending, pendingPaths);
-                    }
-                }
+                    FoldLandingChunk(path, liveHex, window, pending, pendingPaths, ref packed, ref deduped, ref dropped);
                 window.Drain();
                 FlushOptimizeBatch(pending, pendingPaths);
             }
-            // The fingerprint describes landed chunks; a fully-drained
-            // landing has none, so drop it (preserves the empty-landing
-            // invariant and avoids a stale resume claim on next capture).
             if (!Directory.EnumerateFiles(_landingDir, "*.chunk").Any())
             {
                 var fingerprint = Path.Combine(_landingDir, LandingFingerprintName);
@@ -1875,6 +1806,37 @@ namespace Corpus
             }
             _log.Info($"optimize: {packed} packed, {deduped} deduped, {dropped} dropped");
             return (packed, deduped, dropped);
+        }
+
+        private void FoldLandingChunk(
+            string path, IReadOnlySet<string>? liveHex, EncodeWindow window,
+            List<ChunkRow> pending, List<string> pendingPaths,
+            ref int packed, ref int deduped, ref int dropped)
+        {
+            var hex = Path.GetFileNameWithoutExtension(path);
+            if (liveHex != null && !liveHex.Contains(hex))
+            {
+                File.Delete(path);
+                dropped++;
+                return;
+            }
+            var data = File.ReadAllBytes(path);
+            var digest = ChunkId.ComputeId(data, _key);
+            if (!string.Equals(ChunkId.ToHex(digest), hex, StringComparison.Ordinal))
+                throw new InvalidDataException($"landing chunk {path} failed digest check (torn write? re-image the snapshot)");
+            if (_index.TryGet(digest, out _))
+            {
+                File.Delete(path);
+                deduped++;
+                return;
+            }
+            window.Add(digest, data, path);
+            packed++;
+            if (pending.Count >= 500)
+            {
+                window.Drain();
+                FlushOptimizeBatch(pending, pendingPaths);
+            }
         }
 
         private void FlushOptimizeBatch(List<ChunkRow> pending, List<string> paths)
@@ -1913,7 +1875,7 @@ namespace Corpus
             var manifest = GetManifest(generation);
             try
             {
-                using var output = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                using var output = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read, 4 * 1024 * 1024, FileOptions.SequentialScan);
                 ExportToStream(generation, output);
                 output.SetLength(manifest.VolumeLength);
             }
@@ -1962,6 +1924,101 @@ namespace Corpus
             _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to VHDX {outPath}");
         }
 
+        public void ExportVmdk(int generation, string outPath)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var manifest = GetManifest(generation);
+            try
+            {
+                var r = OvfExporter.ExportVmdk(outPath, manifest.VolumeLength, content => ExportToStream(generation, content));
+                _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to VMDK {outPath} ({r.FileBytes} bytes, {r.PopulatedBytes} populated)");
+            }
+            catch (Exception ex)
+            {
+                DeletePartialExport(outPath, ex);
+                throw;
+            }
+        }
+
+        public OvfExportResult ExportOvf(int generation, string outPath)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var manifest = GetManifest(generation);
+            var r = OvfExporter.ExportOvf(outPath, manifest.Name, manifest.VolumeLength, content => ExportToStream(generation, content));
+            _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to OVF {r.OvfPath} (+ {Path.GetFileName(r.VmdkPath)}, {Path.GetFileName(r.ManifestPath)})");
+            return r;
+        }
+
+        public OvfExportResult ExportOva(int generation, string outPath)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var manifest = GetManifest(generation);
+            try
+            {
+                var r = OvfExporter.ExportOva(outPath, manifest.Name, manifest.VolumeLength, content => ExportToStream(generation, content));
+                _log.Info($"exported snapshot {generation} ({manifest.Chunks.Count} chunks) to OVA {outPath}");
+                return r;
+            }
+            catch (Exception ex)
+            {
+                DeletePartialExport(outPath, ex);
+                throw;
+            }
+        }
+
+        public DiskLayout GetLayout(int layoutGen)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!Directory.Exists(_layoutsDir))
+                throw new InvalidDataException($"no layouts directory at {_layoutsDir}");
+            var prefix = $"{layoutGen:D6}-";
+            foreach (var path in Directory.EnumerateFiles(_layoutsDir, "*.json"))
+            {
+                if (Path.GetFileName(path).StartsWith(prefix, StringComparison.Ordinal))
+                    return LayoutStore.Load(path, _key);
+            }
+            throw new InvalidDataException($"disk layout gen {layoutGen} not found in {_layoutsDir}");
+        }
+
+        public void ExportDiskVmdk(int layoutGen, string outPath, bool skipRecovery = false)
+        {
+            var layout = GetLayout(layoutGen);
+            if (skipRecovery) DiskCapture.ApplyCaptureFilters(layout, skipRecovery: true, null, _log);
+            var capacity = OvfExporter.ComputeDiskCapacity(layout);
+            try
+            {
+                var r = OvfExporter.ExportVmdk(outPath, capacity, s => GptWriter.WriteWholeDisk(s, layout, capacity, (gen, dst) => ExportToStream(gen, dst)));
+                _log.Info($"exported disk layout {layoutGen} ({layout.Partitions.Count} partitions) to VMDK {outPath} ({r.FileBytes} bytes, {r.PopulatedBytes} populated)");
+            }
+            catch (Exception ex) { DeletePartialExport(outPath, ex); throw; }
+        }
+
+        public OvfExportResult ExportDiskOvf(int layoutGen, string outPath, bool skipRecovery = false)
+        {
+            var layout = GetLayout(layoutGen);
+            if (skipRecovery) DiskCapture.ApplyCaptureFilters(layout, skipRecovery: true, null, _log);
+            var capacity = OvfExporter.ComputeDiskCapacity(layout);
+            var r = OvfExporter.ExportOvf(outPath, $"disk{layout.DiskNumber}", capacity,
+                s => GptWriter.WriteWholeDisk(s, layout, capacity, (gen, dst) => ExportToStream(gen, dst)), uefi: true);
+            _log.Info($"exported disk layout {layoutGen} ({layout.Partitions.Count} partitions, UEFI/GPT) to OVF {r.OvfPath}");
+            return r;
+        }
+
+        public OvfExportResult ExportDiskOva(int layoutGen, string outPath, bool skipRecovery = false)
+        {
+            var layout = GetLayout(layoutGen);
+            if (skipRecovery) DiskCapture.ApplyCaptureFilters(layout, skipRecovery: true, null, _log);
+            var capacity = OvfExporter.ComputeDiskCapacity(layout);
+            try
+            {
+                var r = OvfExporter.ExportOva(outPath, $"disk{layout.DiskNumber}", capacity,
+                    s => GptWriter.WriteWholeDisk(s, layout, capacity, (gen, dst) => ExportToStream(gen, dst)), uefi: true);
+                _log.Info($"exported disk layout {layoutGen} ({layout.Partitions.Count} partitions, UEFI/GPT) to OVA {outPath}");
+                return r;
+            }
+            catch (Exception ex) { DeletePartialExport(outPath, ex); throw; }
+        }
+
         // Manifest read for restore preflight/verify (HMAC-checked).
         public SnapshotManifest GetManifest(int generation) => LoadGeneration(generation);
 
@@ -1985,50 +2042,87 @@ namespace Corpus
         private void WriteSnapshotToStream(SnapshotManifest manifest, Stream output, IProgress<long>? progress = null)
         {
             var reported = 0L;
+            var batchLimit = Math.Clamp(Environment.ProcessorCount, 2, 8);
+            var pending = new List<(string DigestHex, long Size, string? PackPath, long PackOffset, int StoredBytes)>(batchLimit);
             for (var ci = 0; ci < manifest.Chunks.Count; ci++)
             {
                 var entry = manifest.Chunks[ci];
                 if (entry.IsHole)
                 {
+                    FlushDecodeBatch(manifest, pending, output, ref reported, progress);
                     output.Seek(entry.Size, SeekOrigin.Current);
-                    reported += entry.Size; progress?.Report(reported); continue;
+                    reported += entry.Size; progress?.Report(reported);
+                    continue;
                 }
-                var digest = Convert.FromHexString(entry.DigestHex);
-                byte[] plain;
                 if (entry.BaseDigestHex != null)
                 {
-                    plain = ReadDeltaEntry(manifest.Generation, ci, entry, digest);
+                    FlushDecodeBatch(manifest, pending, output, ref reported, progress);
+                    var plain = ReadDeltaEntry(manifest.Generation, ci, entry, Convert.FromHexString(entry.DigestHex));
+                    WriteOrSeekChunk(plain, output, ref reported, progress);
+                    continue;
                 }
-                else if (_index.TryGet(digest, out var row))
+                var digest = Convert.FromHexString(entry.DigestHex);
+                if (_index.TryGet(digest, out var row))
                 {
-                    var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                    pending.Add((entry.DigestHex, entry.Size, Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes));
+                }
+                else
+                {
+                    pending.Add((entry.DigestHex, entry.Size, null, 0, 0));
+                }
+                if (pending.Count >= batchLimit)
+                    FlushDecodeBatch(manifest, pending, output, ref reported, progress);
+            }
+            FlushDecodeBatch(manifest, pending, output, ref reported, progress);
+        }
+
+        private void FlushDecodeBatch(
+            SnapshotManifest manifest,
+            List<(string DigestHex, long Size, string? PackPath, long PackOffset, int StoredBytes)> batch,
+            Stream output, ref long reported, IProgress<long>? progress)
+        {
+            if (batch.Count == 0) return;
+            var decoded = new byte[batch.Count][];
+            var allZero = new bool[batch.Count];
+            System.Threading.Tasks.Parallel.For(0, batch.Count, i =>
+            {
+                var item = batch[i];
+                byte[] plain;
+                if (item.PackPath != null)
+                {
+                    var blob = PackReader.ReadBlob(item.PackPath, item.PackOffset, item.StoredBytes);
                     plain = Compression.Decode(blob.Payload, blob.Codec);
                 }
-                else if (TryReadLanding(entry.DigestHex) is byte[] landed)
+                else if (TryReadLanding(item.DigestHex) is byte[] landed)
                 {
-                    // Pre-optimize landing read-through (raw plaintext).
-                    if (landed.Length != entry.Size)
-                        throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} landing size mismatch ({landed.Length} != {entry.Size})");
+                    if (landed.Length != item.Size)
+                        throw new InvalidDataException($"chunk {item.DigestHex} of snapshot {manifest.Generation} landing size mismatch ({landed.Length} != {item.Size})");
                     plain = landed;
                 }
                 else
                 {
-                    throw new InvalidDataException($"chunk {entry.DigestHex} of snapshot {manifest.Generation} missing from index");
+                    throw new InvalidDataException($"chunk {item.DigestHex} of snapshot {manifest.Generation} missing from index");
                 }
-                // Zero chunks decode (proving pack readability) but seek:
-                // same don't-care rule as holes — verify hashes them as
-                // data, so a dirty target fails strict here, not silent.
-                if (IsAllZero(plain))
-                {
-                    output.Seek(plain.Length, SeekOrigin.Current);
-                }
-                else
-                {
-                    output.Write(plain, 0, plain.Length);
-                }
+                decoded[i] = plain;
+                allZero[i] = IsAllZero(plain);
+            });
+            for (var i = 0; i < batch.Count; i++)
+            {
+                var plain = decoded[i];
+                if (allZero[i]) output.Seek(plain.Length, SeekOrigin.Current);
+                else output.Write(plain, 0, plain.Length);
                 reported += plain.Length;
                 progress?.Report(reported);
             }
+            batch.Clear();
+        }
+
+        private static void WriteOrSeekChunk(byte[] plain, Stream output, ref long reported, IProgress<long>? progress)
+        {
+            if (IsAllZero(plain)) output.Seek(plain.Length, SeekOrigin.Current);
+            else output.Write(plain, 0, plain.Length);
+            reported += plain.Length;
+            progress?.Report(reported);
         }
 
         // Full re-read: index → pack → decode → id compare. Never throws;
@@ -2046,84 +2140,8 @@ namespace Corpus
                 var logged = 0;
                 for (var i = 0; i < manifest.Chunks.Count; i++)
                 {
-                    var entry = manifest.Chunks[i];
-                    if (entry.IsHole)
-                    {
-                        if (entry.DigestHex != "" || entry.Size <= 0 || entry.Size > manifest.ChunkMib * 1024 * 1024)
-                        { failed = true; if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: corrupt hole entry"); }
-                        continue;
-                    }
-                    var digest = Convert.FromHexString(entry.DigestHex);
-                    if (entry.BaseDigestHex != null)
-                    {
-                        // Full re-read rule: verify reconstructs EVERY delta,
-                        // nobody samples. Resolver failures already name the
-                        // chunk (InvalidDataException); log verbatim.
-                        try
-                        {
-                            var deltaPlain = ReadDeltaEntry(generation, i, entry, digest);
-                            if (deltaPlain.Length != entry.Size
-                                || !CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(deltaPlain, _key), digest))
-                            {
-                                failed = true;
-                                if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: content mismatch");
-                            }
-                        }
-                        catch (InvalidDataException ex)
-                        {
-                            failed = true;
-                            if (logged++ < 5) _log.Error(ex.Message);
-                        }
-                        continue;
-                    }
-                    if (!_index.TryGet(digest, out var row))
-                    {
-                        // Pre-optimize landing read-through: plaintext chunk,
-                        // same key-bound digest check as packed data.
-                        var landed = TryReadLanding(entry.DigestHex);
-                        var ok = landed != null && landed.Length == entry.Size
-                            && CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(landed, _key), digest);
-                        if (ok)
-                            continue;
+                    if (!VerifyManifestEntry(generation, manifest.ChunkMib, i, manifest.Chunks[i], ref logged))
                         failed = true;
-                        if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: missing from index");
-                        continue;
-                    }
-                    byte[] plain;
-                    try
-                    {
-                        var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
-                        plain = Compression.Decode(blob.Payload, blob.Codec);
-                    }
-                    // Broad catch: zstd throws plain System.Exception on corrupt
-                    // frames, IO/pack faults throw their own — all mean failure.
-                    catch (Exception ex)
-                    {
-                        // ECC second chance: a repairable pack bitflip throws
-                        // on read or decode; one repair + full re-read before
-                        // calling the chunk unreadable. No sidecar or
-                        // unrecoverable keeps the original error, never a new one.
-                        var revived = TryEccSecondChance(row, entry, digest);
-                        if (revived == null)
-                        {
-                            failed = true;
-                            if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: unreadable ({ex.Message})");
-                            continue;
-                        }
-                        plain = revived;
-                    }
-                    var verified = plain.Length == entry.Size
-                        && CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key), digest);
-                    // Payload bitflips decode fine but fail the digest (the
-                    // ReadBlob repair only fires on read throws), so the
-                    // mismatch case gets its own repair + re-read here.
-                    if (!verified && TryEccSecondChance(row, entry, digest) != null)
-                        verified = true;
-                    if (!verified)
-                    {
-                        failed = true;
-                        if (logged++ < 5) _log.Error($"snapshot {generation} chunk {i}: content mismatch");
-                    }
                 }
                 var total = 0L;
                 foreach (var e in manifest.Chunks) total += e.Size;
@@ -2143,6 +2161,75 @@ namespace Corpus
                 _log.Error($"snapshot {generation} verify failed", ex);
                 return false;
             }
+        }
+
+        private bool VerifyManifestEntry(int generation, int chunkMib, int index, ManifestEntry entry, ref int logged)
+        {
+            if (entry.IsHole)
+            {
+                if (entry.DigestHex != "" || entry.Size <= 0 || entry.Size > chunkMib * 1024 * 1024)
+                {
+                    if (logged++ < 5) _log.Error($"snapshot {generation} chunk {index}: corrupt hole entry");
+                    return false;
+                }
+                return true;
+            }
+            var digest = Convert.FromHexString(entry.DigestHex);
+            if (entry.BaseDigestHex != null)
+            {
+                try
+                {
+                    var deltaPlain = ReadDeltaEntry(generation, index, entry, digest);
+                    if (deltaPlain.Length != entry.Size || !CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(deltaPlain, _key), digest))
+                    {
+                        if (logged++ < 5) _log.Error($"snapshot {generation} chunk {index}: content mismatch");
+                        return false;
+                    }
+                    return true;
+                }
+                catch (InvalidDataException ex)
+                {
+                    if (logged++ < 5) _log.Error(ex.Message);
+                    return false;
+                }
+            }
+            if (!_index.TryGet(digest, out var row))
+            {
+                var landed = TryReadLanding(entry.DigestHex);
+                if (landed != null && landed.Length == entry.Size && CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(landed, _key), digest))
+                    return true;
+                if (logged++ < 5) _log.Error($"snapshot {generation} chunk {index}: missing from index");
+                return false;
+            }
+            return VerifyPackedChunk(generation, index, entry, digest, row, ref logged);
+        }
+
+        // ECC second chance: repairable pack bitflips throw on read/decode or fail digest;
+        // attempt one sidecar repair + re-read before reporting unreadable/mismatch.
+        private bool VerifyPackedChunk(int generation, int index, ManifestEntry entry, byte[] digest, ChunkRow row, ref int logged)
+        {
+            byte[] plain;
+            try
+            {
+                var blob = PackReader.ReadBlob(Path.Combine(_packsDir, row.Pack), row.PackOffset, (int)row.StoredBytes);
+                plain = Compression.Decode(blob.Payload, blob.Codec);
+            }
+            catch (Exception ex)
+            {
+                var revived = TryEccSecondChance(row, entry, digest);
+                if (revived == null)
+                {
+                    if (logged++ < 5) _log.Error($"snapshot {generation} chunk {index}: unreadable ({ex.Message})");
+                    return false;
+                }
+                plain = revived;
+            }
+            var verified = plain.Length == entry.Size && CryptographicOperations.FixedTimeEquals(ChunkId.ComputeId(plain, _key), digest);
+            if (!verified && TryEccSecondChance(row, entry, digest) != null)
+                verified = true;
+            if (!verified && logged++ < 5)
+                _log.Error($"snapshot {generation} chunk {index}: content mismatch");
+            return verified;
         }
 
         // ECC second chance for Verify: repair the pack (sidecar-gated,
@@ -2168,7 +2255,7 @@ namespace Corpus
             }
         }
 
-        public List<(int Generation, string Name)> ListSnapshots()
+        public IReadOnlyList<(int Generation, string Name)> ListSnapshots()
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             return ManifestStore.List(_manifestsDir);

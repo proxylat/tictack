@@ -185,7 +185,7 @@ namespace Corpus
         // IBitLockerVolume: the manifest records the capture-time state via
         // the same `as`-pattern Store uses for the other optional providers.
         string? IBitLockerVolume.BitLockerState => _bitlocker?.CaptureState;
-        List<string>? IBitLockerVolume.BitLockerKeyIds => _bitlocker?.CaptureKeyIds;
+        IReadOnlyList<string>? IBitLockerVolume.BitLockerKeyIds => _bitlocker?.CaptureKeyIds;
     }
 
     // Segment-buffered read passthrough over a shadow device. Two jobs:

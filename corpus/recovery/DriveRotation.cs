@@ -23,7 +23,7 @@ namespace Corpus
     public sealed class RotationState
     {
         public int SchemaVersion { get; set; } = 1;
-        public List<RotationDrive> Drives { get; set; } = new();
+        public IList<RotationDrive> Drives { get; set; } = new List<RotationDrive>();
     }
 
     public sealed class DriveRotationStore

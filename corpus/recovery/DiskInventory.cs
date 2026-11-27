@@ -18,7 +18,7 @@ namespace Corpus
 
     public static class DiskInventory
     {
-        public static List<VolumeInfo> ListVolumes()
+        public static IReadOnlyList<VolumeInfo> ListVolumes()
         {
             var vols = new List<VolumeInfo>();
             foreach (var d in DriveInfo.GetDrives())
@@ -30,7 +30,7 @@ namespace Corpus
             return vols;
         }
 
-        public static List<DiskInfo> ListDisks()
+        public static IReadOnlyList<DiskInfo> ListDisks()
         {
             var disks = new List<DiskInfo>();
             if (!OperatingSystem.IsWindows())

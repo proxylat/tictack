@@ -845,7 +845,7 @@ public class SchedulerTests
             File.WriteAllBytes(Path.Combine(watchDir, "huge.bin"), new byte[2 * 1024 * 1024]);
 
             var deadline = DateTime.UtcNow.AddSeconds(10);
-            while (DateTime.UtcNow < deadline && !File.Exists(outList))
+            while (DateTime.UtcNow < deadline && (!File.Exists(outList) || !File.ReadAllText(outList).Contains("ABS:", StringComparison.Ordinal)))
                 await Task.Delay(50);
 
             Assert.True(File.Exists(outList), "Watch job should have written captured manifest");
@@ -1049,10 +1049,18 @@ public class SchedulerTests
             using (var store = new JobRunStore(Path.Combine(stateDir, "jobs.db")))
                 store.EnqueueWatchFiles("retry-job", watchDir, new[] { "f1.txt" });
 
-            // First invocation appends "1" and fails; second succeeds and creates okFile.
-            var cmd = OperatingSystem.IsWindows()
-                ? $"cmd /c \"if exist \\\"{attemptFile}\\\" (echo ok > \\\"{okFile}\\\") else (echo 1 > \\\"{attemptFile}\\\" & exit /b 1)\""
-                : $"sh -c 'if [ -f \"{attemptFile}\" ]; then touch \"{okFile}\"; else touch \"{attemptFile}\" && exit 1; fi'";
+            // First invocation creates attemptFile and fails; second succeeds and creates okFile.
+            string cmd;
+            if (OperatingSystem.IsWindows())
+            {
+                var bat = Path.Combine(root, "retry_test.bat");
+                File.WriteAllText(bat, $"@echo off\r\nif exist \"{attemptFile}\" (\r\n  echo ok > \"{okFile}\"\r\n  exit /b 0\r\n)\r\necho 1 > \"{attemptFile}\"\r\nexit /b 1\r\n");
+                cmd = $"cmd /c \"{bat}\"";
+            }
+            else
+            {
+                cmd = $"sh -c 'if [ -f \"{attemptFile}\" ]; then touch \"{okFile}\"; else touch \"{attemptFile}\" && exit 1; fi'";
+            }
 
             var cfg = new TicTackConfig
             {

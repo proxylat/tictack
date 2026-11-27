@@ -46,16 +46,16 @@ namespace Corpus
             return layout;
         }
 
-        internal static int DetectSectorSize(Stream fs)
+        internal static int DetectSectorSize(Stream fs, long diskSizeBytes)
         {
             var probe = new byte[8];
-            if (fs.Length >= 512 + 8)
+            if (diskSizeBytes >= 512 + 8)
             {
                 fs.Seek(512, SeekOrigin.Begin);
                 if (fs.Read(probe, 0, 8) == 8 && Encoding.ASCII.GetString(probe) == "EFI PART")
                     return 512;
             }
-            if (fs.Length >= 4096 + 8)
+            if (diskSizeBytes >= 4096 + 8)
             {
                 fs.Seek(4096, SeekOrigin.Begin);
                 if (fs.Read(probe, 0, 8) == 8 && Encoding.ASCII.GetString(probe) == "EFI PART")
@@ -66,7 +66,7 @@ namespace Corpus
 
         internal static DiskLayout ReadFromStream(Stream fs, int diskNumber, long diskSizeBytes, ILogger log)
         {
-            var sectorSize = DetectSectorSize(fs);
+            var sectorSize = DetectSectorSize(fs, diskSizeBytes);
             var mbr = new byte[sectorSize];
             fs.Seek(0, SeekOrigin.Begin);
             fs.ReadExactly(mbr, 0, sectorSize);
@@ -104,7 +104,7 @@ namespace Corpus
                 DiskGuid = diskGuid,
                 DiskSizeBytes = diskSizeBytes,
                 SectorSizeBytes = sectorSize,
-                Partitions = parts,
+                Partitions = new List<PartitionRecord>(parts),
             };
         }
 
@@ -150,7 +150,7 @@ namespace Corpus
         // slots are free space (omitted, not even skipped); MSR slots stay
         // in the layout as skipped-with-range; LDM refuses the whole disk
         // (block copy without LDM reassembly restores garbage).
-        public static List<PartitionRecord> ParseEntries(byte[] entriesBytes, int count, int sectorSize = SectorSize)
+        public static IReadOnlyList<PartitionRecord> ParseEntries(byte[] entriesBytes, int count, int sectorSize = SectorSize)
         {
             ArgumentNullException.ThrowIfNull(entriesBytes);
             if (count < 0 || entriesBytes.Length < count * EntrySize)
@@ -195,7 +195,7 @@ namespace Corpus
         // (basic-data spans NTFS/exFAT/BitLocker/raw), and CheckLayout + the
         // diskpart plan need the real answer. One 512B read per unknown
         // partition; unreadable stays "unknown", never throws.
-        private static void SniffFilesystems(string device, List<PartitionRecord> parts, int sectorSize, ILogger log)
+        private static void SniffFilesystems(string device, IList<PartitionRecord> parts, int sectorSize, ILogger log)
         {
             try
             {

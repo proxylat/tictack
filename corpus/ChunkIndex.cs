@@ -21,7 +21,7 @@ namespace Corpus
             _conn = SqliteBootstrap.Open(dbPath, SqliteSchema.Corpus);
         }
 
-        public void UpsertBatch(List<ChunkRow> rows)
+        public void UpsertBatch(IReadOnlyList<ChunkRow> rows)
         {
             if (rows.Count == 0) return;
             using var tx = _conn.BeginTransaction();
@@ -83,7 +83,7 @@ namespace Corpus
 
         // GC mark: single transaction, input walked in 500s (bounded
         // statement burst per inner loop, one commit for the whole batch).
-        public void MarkBatch(List<byte[]> digests)
+        public void MarkBatch(IReadOnlyList<byte[]> digests)
         {
             if (digests.Count == 0) return;
             using var tx = _conn.BeginTransaction();
@@ -102,7 +102,7 @@ namespace Corpus
             tx.Commit();
         }
 
-        public List<string> LivePacks()
+        public IReadOnlyList<string> LivePacks()
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = "SELECT DISTINCT pack FROM chunks WHERE mark = 1";

@@ -28,7 +28,7 @@ public sealed class MftVssVolumeTests
     private static VssBlockSource SeamVolume(IMftVolume fake) =>
         new("SNAPSHOT", GridClusters * Bpc, Bpc, _ => fake);
 
-    private static SnapshotManifest ParentWith(List<string> digests)
+    private static SnapshotManifest ParentWith(IReadOnlyList<string> digests)
     {
         var chunks = new List<ManifestEntry>();
         for (var i = 0; i < (int)GridClusters; i++)

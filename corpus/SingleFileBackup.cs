@@ -583,8 +583,8 @@ namespace Corpus
         // --zstd sidecar codec, locked by the §12.4 verdict: streaming +
         // LDM at windowLog 27 (stock-`zstd -d` compatible) + level 3.
         public const int ZstdLevel = 3;
-        public const int ZstdWindowLog = 27;
-        public const int ZstdFrameBytes = 64 * 1024 * 1024;
+        public const int ZstdWindowLog = 24;
+        public const int ZstdFrameBytes = 16 * 1024 * 1024;
 
         private const int VerifyBufferBytes = 1024 * 1024;
 
@@ -683,56 +683,58 @@ namespace Corpus
                     var (chunkStart, chunkLen) = RepairChunkFor(bad, source.Length);
                     if (!written.Any(w => chunkStart >= w.Start && chunkStart < w.Start + w.Length))
                         throw; // outside written data (hole/exempt): not repairable
-                    Thread.Sleep(5000); // let volsnap COW settle
-                    var first = new byte[chunkLen];
-                    var second = new byte[chunkLen];
-                    var imaged = new byte[chunkLen];
-                    using (var rs = source.OpenRead())
-                    {
-                        rs.Seek(chunkStart, SeekOrigin.Begin);
-                        if (ReadExactly(rs, first, chunkLen) != chunkLen)
-                            throw; // source won't yield the range: keep the failure
-                    }
-                    using (var rs = source.OpenRead())
-                    {
-                        rs.Seek(chunkStart, SeekOrigin.Begin);
-                        if (ReadExactly(rs, second, chunkLen) != chunkLen)
-                            throw; // source won't yield the range: keep the failure
-                    }
-                    using (var disk = new Disk(target, FileAccess.Read))
-                    {
-                        var content = disk.Content;
-                        content.Seek(chunkStart, SeekOrigin.Begin);
-                        if (ReadExactly(content, imaged, chunkLen) != chunkLen)
-                            throw; // image won't yield the range: keep the failure
-                    }
-                    if (!first.SequenceEqual(second))
-                    {
-                        log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): source re-reads disagree, transient read flake, resuming at {chunkStart}");
-                        resumeFrom = chunkStart;
-                        continue;
-                    }
-                    if (imaged.SequenceEqual(first))
-                    {
-                        log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): image matches settled source on re-poll, transient read flake, resuming at {chunkStart}");
-                        resumeFrom = chunkStart;
-                        continue;
-                    }
-                    if (exclRuns != null)
-                        CapturePolicy.ZeroExcludedRanges(first, chunkStart, exclRuns, exclBpc);
-                    // Writer handle is already disposed (verify runs after the
-                    // copy using-block): reopen read-write for the repair.
-                    using (var disk = new Disk(target, FileAccess.ReadWrite))
-                    {
-                        var content = disk.Content;
-                        content.Seek(chunkStart, SeekOrigin.Begin);
-                        content.Write(first, 0, chunkLen);
-                        content.Flush();
-                    }
-                    log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): rewrote {chunkLen} bytes from settled agreeing reads, resuming at {chunkStart}");
+                    if (!TryRepairMismatchChunk(target, source, bad, chunkStart, chunkLen, attempt, log, exclRuns, exclBpc))
+                        throw;
                     resumeFrom = chunkStart;
                 }
             }
+        }
+
+        private static bool TryRepairMismatchChunk(
+            string target, IBlockSource source, long bad, long chunkStart, int chunkLen, int attempt,
+            ILogger log, IReadOnlyList<(long StartLcn, long ClusterCount)>? exclRuns, long exclBpc)
+        {
+            Thread.Sleep(5000); // let volsnap COW settle
+            var first = new byte[chunkLen];
+            var second = new byte[chunkLen];
+            var imaged = new byte[chunkLen];
+            using (var rs = source.OpenRead())
+            {
+                rs.Seek(chunkStart, SeekOrigin.Begin);
+                if (ReadExactly(rs, first, chunkLen) != chunkLen) return false;
+            }
+            using (var rs = source.OpenRead())
+            {
+                rs.Seek(chunkStart, SeekOrigin.Begin);
+                if (ReadExactly(rs, second, chunkLen) != chunkLen) return false;
+            }
+            using (var disk = new Disk(target, FileAccess.Read))
+            {
+                var content = disk.Content;
+                content.Seek(chunkStart, SeekOrigin.Begin);
+                if (ReadExactly(content, imaged, chunkLen) != chunkLen) return false;
+            }
+            if (!first.SequenceEqual(second))
+            {
+                log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): source re-reads disagree, transient read flake, resuming at {chunkStart}");
+                return true;
+            }
+            if (imaged.SequenceEqual(first))
+            {
+                log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): image matches settled source on re-poll, transient read flake, resuming at {chunkStart}");
+                return true;
+            }
+            if (exclRuns != null)
+                CapturePolicy.ZeroExcludedRanges(first, chunkStart, exclRuns, exclBpc);
+            using (var disk = new Disk(target, FileAccess.ReadWrite))
+            {
+                var content = disk.Content;
+                content.Seek(chunkStart, SeekOrigin.Begin);
+                content.Write(first, 0, chunkLen);
+                content.Flush();
+            }
+            log.Warn($"verify mismatch at offset {bad} (attempt {attempt + 1}): rewrote {chunkLen} bytes from settled agreeing reads, resuming at {chunkStart}");
+            return true;
         }
 
         internal static (long Start, int Length) RepairChunkFor(long offset, long total)
@@ -1100,46 +1102,7 @@ namespace Corpus
             if (length == 0)
                 throw new SingleFileBackupException($"refusing to compress empty image {imagePath}");
             var partial = zst + ".partial";
-            var frames = new List<(long ZLen, long PLen)>();
-            byte[] hash;
-            using (var ctx = new Compressor(level))
-            {
-                ctx.SetParameter(ZSTD_cParameter.ZSTD_c_windowLog, ZstdWindowLog);
-                ctx.SetParameter(ZSTD_cParameter.ZSTD_c_enableLongDistanceMatching, 1);
-                ctx.SetParameter(ZSTD_cParameter.ZSTD_c_checksumFlag, 0);
-                using var input = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                using var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.Read);
-                using var sha = SHA256.Create();
-                var buf = new byte[ZstdFrameBytes];
-                while (true)
-                {
-                    var filled = 0;
-                    int n;
-                    while (filled < buf.Length && (n = input.Read(buf, filled, buf.Length - filled)) > 0)
-                        filled += n;
-                    if (filled == 0)
-                        break;
-                    sha.TransformBlock(buf, 0, filled, null, 0);
-                    // Bound-sized rent (64MiB frames must not park a second
-                    // bound-sized array per frame): exact bytes copied out.
-                    var bound = Compressor.GetCompressBound(filled);
-                    var tmp = ArrayPool<byte>.Shared.Rent(bound);
-                    try
-                    {
-                        if (!ctx.TryWrap(buf, 0, filled, tmp, 0, tmp.Length, out var w))
-                            throw new SingleFileBackupException($"zstd refused a {filled}-byte frame of {imagePath} (bound {bound}) — original kept");
-                        output.Write(tmp, 0, w);
-                        frames.Add((w, filled));
-                    }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(tmp);
-                    }
-                }
-                sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-                hash = sha.Hash!;
-                output.Flush(true);
-            }
+            var (frames, hash) = WriteCompressedFrames(imagePath, partial, level);
             // Deletion guard: decode every frame back and compare the hash
             // BEFORE the only verified copy is removed.
             VerifySidecarFrames(partial, frames, hash);
@@ -1149,30 +1112,147 @@ namespace Corpus
             return zst;
         }
 
+        private static (List<(long ZLen, long PLen)> Frames, byte[] Hash) WriteCompressedFrames(string imagePath, string partial, int level)
+        {
+            var frames = new List<(long ZLen, long PLen)>();
+            var workers = Math.Clamp(Environment.ProcessorCount, 2, 8);
+            var ctxs = new Compressor[workers];
+            try
+            {
+                for (var w = 0; w < workers; w++)
+                {
+                    ctxs[w] = new Compressor(level);
+                    ctxs[w].SetParameter(ZSTD_cParameter.ZSTD_c_windowLog, ZstdWindowLog);
+                    ctxs[w].SetParameter(ZSTD_cParameter.ZSTD_c_enableLongDistanceMatching, 1);
+                    ctxs[w].SetParameter(ZSTD_cParameter.ZSTD_c_checksumFlag, 0);
+                }
+                using var input = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 4 * 1024 * 1024, FileOptions.SequentialScan);
+                using var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.Read, 4 * 1024 * 1024, FileOptions.SequentialScan);
+                using var sha = SHA256.Create();
+                var batch = new List<(byte[] Buf, int Len)>(workers);
+                while (true)
+                {
+                    batch.Clear();
+                    for (var b = 0; b < workers; b++)
+                    {
+                        var buf = ArrayPool<byte>.Shared.Rent(ZstdFrameBytes);
+                        var filled = ReadFrameFull(input, buf, ZstdFrameBytes);
+                        if (filled == 0)
+                        {
+                            ArrayPool<byte>.Shared.Return(buf);
+                            break;
+                        }
+                        batch.Add((buf, filled));
+                    }
+                    if (batch.Count == 0) break;
+                    CompressAndWriteBatch(batch, ctxs, imagePath, sha, output, frames);
+                }
+                sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                output.Flush(true);
+                return (frames, sha.Hash!);
+            }
+            finally
+            {
+                for (var w = 0; w < workers; w++) ctxs[w]?.Dispose();
+            }
+        }
+
+        private static int ReadFrameFull(Stream input, byte[] buf, int maxLen)
+        {
+            var filled = 0;
+            int n;
+            while (filled < maxLen && (n = input.Read(buf, filled, maxLen - filled)) > 0)
+                filled += n;
+            return filled;
+        }
+
+        private static void CompressAndWriteBatch(
+            List<(byte[] Buf, int Len)> batch, Compressor[] ctxs, string imagePath,
+            SHA256 sha, Stream output, List<(long ZLen, long PLen)> frames)
+        {
+            var compBufs = new byte[batch.Count][];
+            var compLens = new int[batch.Count];
+            try
+            {
+                System.Threading.Tasks.Parallel.For(0, batch.Count, i =>
+                {
+                    var (buf, len) = batch[i];
+                    var bound = Compressor.GetCompressBound(len);
+                    var tmp = ArrayPool<byte>.Shared.Rent(bound);
+                    compBufs[i] = tmp;
+                    if (!ctxs[i].TryWrap(buf, 0, len, tmp, 0, tmp.Length, out var w))
+                        throw new SingleFileBackupException($"zstd refused a {len}-byte frame of {imagePath} (bound {bound}) — original kept");
+                    compLens[i] = w;
+                });
+                for (var i = 0; i < batch.Count; i++)
+                {
+                    sha.TransformBlock(batch[i].Buf, 0, batch[i].Len, null, 0);
+                    output.Write(compBufs[i], 0, compLens[i]);
+                    frames.Add((compLens[i], batch[i].Len));
+                }
+            }
+            finally
+            {
+                for (var i = 0; i < batch.Count; i++)
+                {
+                    if (compBufs[i] != null) ArrayPool<byte>.Shared.Return(compBufs[i]);
+                    ArrayPool<byte>.Shared.Return(batch[i].Buf);
+                }
+            }
+        }
+
         private static void VerifySidecarFrames(string partial, List<(long ZLen, long PLen)> frames, byte[] expectHash)
         {
-            using var input = new FileStream(partial, FileMode.Open, FileAccess.Read, FileShare.Read);
-            using var sha = SHA256.Create();
-            foreach (var (zlen, plen) in frames)
+            var workers = Math.Clamp(Environment.ProcessorCount, 2, 8);
+            var dctxs = new Decompressor[workers];
+            try
             {
-                var zbuf = new byte[zlen];
-                var filled = 0;
-                int n;
-                while (filled < zbuf.Length && (n = input.Read(zbuf, filled, zbuf.Length - filled)) > 0)
-                    filled += n;
-                if (filled != zbuf.Length)
-                    throw new SingleFileVerifyException(partial, "sidecar truncated mid-frame — original kept");
-                using var ms = new MemoryStream(zbuf, writable: false);
-                using var z = new DecompressionStream(ms, 128 * 1024, checkEndOfStream: true, leaveOpen: false);
-                using var plain = new MemoryStream((int)Math.Min(plen, int.MaxValue));
-                z.CopyTo(plain);
-                if (plain.Length != plen)
-                    throw new SingleFileVerifyException(partial, $"sidecar frame decoded to {plain.Length}, want {plen} — original kept");
-                sha.TransformBlock(plain.GetBuffer(), 0, (int)plain.Length, null, 0);
+                for (var w = 0; w < workers; w++) dctxs[w] = new Decompressor();
+                using var input = new FileStream(partial, FileMode.Open, FileAccess.Read, FileShare.Read, 4 * 1024 * 1024, FileOptions.SequentialScan);
+                using var sha = SHA256.Create();
+                for (var start = 0; start < frames.Count; start += workers)
+                {
+                    var count = Math.Min(workers, frames.Count - start);
+                    var zbufs = new byte[count][];
+                    for (var i = 0; i < count; i++)
+                    {
+                        var zlen = (int)frames[start + i].ZLen;
+                        var zbuf = ArrayPool<byte>.Shared.Rent(zlen);
+                        zbufs[i] = zbuf;
+                        if (ReadFrameFull(input, zbuf, zlen) != zlen)
+                            throw new SingleFileVerifyException(partial, "sidecar truncated mid-frame — original kept");
+                    }
+                    var plains = new byte[count][];
+                    try
+                    {
+                        System.Threading.Tasks.Parallel.For(0, count, i =>
+                        {
+                            var (zlen, plen) = frames[start + i];
+                            var pbuf = ArrayPool<byte>.Shared.Rent((int)plen);
+                            plains[i] = pbuf;
+                            if (!dctxs[i].TryUnwrap(zbufs[i].AsSpan(0, (int)zlen), pbuf.AsSpan(0, (int)plen), out var decoded) || decoded != plen)
+                                throw new SingleFileVerifyException(partial, $"sidecar frame decoded to {decoded}, want {plen} — original kept");
+                        });
+                        for (var i = 0; i < count; i++)
+                            sha.TransformBlock(plains[i], 0, (int)frames[start + i].PLen, null, 0);
+                    }
+                    finally
+                    {
+                        for (var i = 0; i < count; i++)
+                        {
+                            if (plains[i] != null) ArrayPool<byte>.Shared.Return(plains[i]);
+                            if (zbufs[i] != null) ArrayPool<byte>.Shared.Return(zbufs[i]);
+                        }
+                    }
+                }
+                sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                if (!CryptographicOperations.FixedTimeEquals(sha.Hash!, expectHash))
+                    throw new SingleFileVerifyException(partial, "sidecar decode hash mismatch — original kept");
             }
-            sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-            if (!CryptographicOperations.FixedTimeEquals(sha.Hash!, expectHash))
-                throw new SingleFileVerifyException(partial, "sidecar decode hash mismatch — original kept");
+            finally
+            {
+                for (var w = 0; w < workers; w++) dctxs[w]?.Dispose();
+            }
         }
 
         // LCN exclusion runs to sorted merged byte ranges (same skip

@@ -21,17 +21,23 @@ fi
 
 DOTNET="$(command -v dotnet || true)"
 if [ -z "$DOTNET" ]; then
-  DOTNET="$ROOT/.dotnet/dotnet"
-  export DOTNET_ROOT="$ROOT/.dotnet"
-  export DOTNET_CLI_TELEMETRY_OPTOUT=1
-  [ -x "$DOTNET" ] || { echo "ERROR: no dotnet found — install one or add the repo-local SDK."; exit 1; }
+  SUDO_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+  for cand in "$ROOT/.dotnet" "${SUDO_HOME:+$SUDO_HOME/.dotnet}" "$HOME/.dotnet"; do
+    if [ -n "$cand" ] && [ -x "$cand/dotnet" ]; then
+      DOTNET="$cand/dotnet"
+      export DOTNET_ROOT="$cand"
+      export DOTNET_CLI_TELEMETRY_OPTOUT=1
+      break
+    fi
+  done
+  [ -x "${DOTNET:-}" ] || { echo "ERROR: no dotnet found — install one or add the repo-local SDK."; exit 1; }
 fi
 
 if [ "$MODE" = "aot" ]; then
   command -v clang >/dev/null 2>&1 || { echo "ERROR: --aot needs clang (e.g. sudo apt install clang zlib1g-dev)."; exit 1; }
   [ -f /usr/include/zlib.h ] || { echo "ERROR: --aot needs zlib headers (e.g. sudo apt install zlib1g-dev)."; exit 1; }
   echo "Publishing NativeAOT..."
-  "$DOTNET" publish "$ROOT/src/TicTack.csproj" -p:PublishProfile=Aot -o "$DIR/"
+  "$DOTNET" publish "$ROOT/src/TicTack.csproj" -p:PublishProfile=Aot -r linux-x64 -o "$DIR/"
 elif [ "$MODE" = "jit" ]; then
   echo "Publishing JIT single-file (runtime bundled, compiles at startup)..."
   "$DOTNET" publish "$ROOT/src/TicTack.csproj" -c Release -r linux-x64 --self-contained true -o "$DIR/"
@@ -70,7 +76,16 @@ id -u "$SERVICE_NAME" >/dev/null 2>&1 || useradd --system --no-create-home --she
 usermod -aG systemd-journal "$SERVICE_NAME" || true
 
 mkdir -p "$TARGET_DIR"
-rsync -a --delete --exclude config.yaml --exclude 'tictack.service' "$DIR/" "$TARGET_DIR/"
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --delete --exclude config.yaml --exclude 'tictack.service' "$DIR/" "$TARGET_DIR/"
+else
+  find "$TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name 'config.yaml' -exec rm -rf {} +
+  for f in "$DIR"/*; do
+    base="$(basename "$f")"
+    [ "$base" = "config.yaml" ] || [ "$base" = "tictack.service" ] && continue
+    cp -a "$f" "$TARGET_DIR/"
+  done
+fi
 cp -n "$CFG" "$TARGET_DIR/config.yaml"
 chown -R "$SERVICE_NAME":"$SERVICE_NAME" "$TARGET_DIR"
 chmod 755 "$TARGET_DIR"
@@ -79,7 +94,8 @@ chmod 750 "$TARGET_DIR/TicTackSv"
 sed "s|{{TARGET_DIR}}|$TARGET_DIR|g" "$DIR/tictack.service" > "/etc/systemd/system/$SERVICE_NAME.service"
 
 systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
 systemctl status "$SERVICE_NAME" --no-pager
 echo "Installed. Config: $TARGET_DIR/config.yaml"
 echo "Logs: journalctl -u $SERVICE_NAME -f"

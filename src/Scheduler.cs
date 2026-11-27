@@ -742,6 +742,21 @@ namespace TicTack
             _timer = new Timer(RunDueJobs, null, 0, (int)TickFor(intervals).TotalMilliseconds);
             StartWatchers();
             ReplayPendingWatchFiles();
+            RunStartJobs();
+        }
+
+        private void RunStartJobs()
+        {
+            var now = DateTime.Now;
+            foreach (var job in _jobs)
+            {
+                if (!job.Config.RunOnStart) continue;
+                var watchPath = job.Kind == JobKind.Watch
+                    ? (job.WatchTargets.Count > 0 ? job.WatchTargets[0].WatchPath : job.Config.Source)
+                    : null;
+                _log.Info($"Job '{job.Config.Name}': running on startup (run_on_start: true)");
+                TryLaunch(job, now, watchPath);
+            }
         }
 
         private void ReplayPendingWatchFiles()
@@ -974,7 +989,7 @@ namespace TicTack
             {
                 tgt.PendingRelPaths.TryRemove(k, out _);
                 var abs = Path.Combine(tgt.WatchPath, k);
-                if (File.Exists(abs)) existing.Add(k);
+                if (File.Exists(abs) && ShouldIncludeWatchEvent(tgt, abs)) existing.Add(k);
             }
             return existing.ToArray();
         }

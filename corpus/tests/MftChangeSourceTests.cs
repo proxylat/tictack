@@ -33,7 +33,7 @@ public sealed class MftChangeSourceTests : IDisposable
         return records;
     }
 
-    private static SnapshotManifest ParentWith(List<string>? digests, List<ManifestEntry> chunks,
+    private static SnapshotManifest ParentWith(IReadOnlyList<string>? digests, List<ManifestEntry> chunks,
         long length, string? cursor = "usn:0000000000000001:0000000000000002") =>
         ManifestStore.Build(1, "parent", length, 1, 3, "key-1", "", chunks,
             changeCursor: cursor, mftChunkDigests: digests, mftRecordBytes: Bpr);

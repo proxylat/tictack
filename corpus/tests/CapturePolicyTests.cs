@@ -311,7 +311,7 @@ public sealed class CapturePolicyTests : IDisposable
         var guid = Guid.NewGuid().ToString("D").ToLowerInvariant();
         var log = new TestLogger();
         using var store = NewStore(log);
-        var clean = new FakeChangeSource((_, _, _) => new IncrementalPlan([], "fake:2"));
+        var clean = new FakeChangeSource((_, _, _) => new IncrementalPlan(new HashSet<long>(), "fake:2"));
         using (var s1 = new FileBlockSource(vol))
             store.ImageDisk(0, "disk0", new DiskImageOptions(),
                 new DiskCapturePlan("disk-guid", 1L << 40, 512, [Part(1, guid, vol, "refs", s1, null)]));

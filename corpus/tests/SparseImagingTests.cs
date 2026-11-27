@@ -341,10 +341,12 @@ public sealed class SparseImagingTests : IDisposable
         Assert.True(m.Chunks[1].IsHole);
         var key = ChunkId.EnsureKey(_storeRoot);
         var manDir = Path.Combine(_storeRoot, "manifests");
-        m.Chunks[1] = m.Chunks[1] with { DigestHex = new string('d', 64) };
+        var mutChunks = new List<ManifestEntry>(m.Chunks);
+        m.Chunks = mutChunks;
+        mutChunks[1] = mutChunks[1] with { DigestHex = new string('d', 64) };
         ManifestStore.Save(manDir, m, key);
         Assert.False(store.Verify(1));
-        m.Chunks[1] = m.Chunks[1] with { DigestHex = "", Size = (long)Mib + 1 };
+        mutChunks[1] = mutChunks[1] with { DigestHex = "", Size = (long)Mib + 1 };
         ManifestStore.Save(manDir, m, key);
         Assert.False(store.Verify(1));
     }

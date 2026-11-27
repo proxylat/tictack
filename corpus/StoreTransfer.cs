@@ -66,19 +66,46 @@ namespace Corpus
                 return new TransferResult(0, 0, 0, 0, 0);
             }
 
-            var manifests = new Dictionary<int, SnapshotManifest>();
+            var hexes = CollectManifestDigests(fromManifests, listed, toCopy, key);
+            var (packsCopied, packBytes, landingCount) = TransferChunksAndPacks(fromRoot, fromDb, toRoot, toDb, hexes, log);
+
+            var toManifests = Path.Combine(toRoot, "manifests");
+            Directory.CreateDirectory(toManifests);
+            foreach (var gen in toCopy)
+                File.Copy(ManifestPath(fromManifests, listed, gen), Path.Combine(toManifests, Path.GetFileName(ManifestPath(fromManifests, listed, gen))));
+            var layoutsCopied = CopyLayouts(Path.Combine(fromRoot, "layouts"), Path.Combine(toRoot, "layouts"));
+
+            log.Info($"transfer: {toCopy.Count} manifests, {packsCopied} packs ({packBytes} bytes), {landingCount} landing, {layoutsCopied} layouts");
+            return new TransferResult(toCopy.Count, packsCopied, packBytes, landingCount, layoutsCopied);
+        }
+
+        private static HashSet<string> CollectManifestDigests(
+            string fromManifests,
+            IReadOnlyList<(int Generation, string Name)> listed,
+            List<int> toCopy,
+            byte[] key)
+        {
             var hexes = new HashSet<string>(StringComparer.Ordinal);
             foreach (var gen in toCopy)
             {
                 var m = ManifestStore.Load(ManifestPath(fromManifests, listed, gen), key);
-                manifests[gen] = m;
                 foreach (var entry in m.Chunks)
                 {
                     if (!entry.IsHole && entry.DigestHex != "")
                         hexes.Add(entry.DigestHex);
                 }
             }
+            return hexes;
+        }
 
+        private static (int PacksCopied, long PackBytes, int LandingCount) TransferChunksAndPacks(
+            string fromRoot,
+            string fromDb,
+            string toRoot,
+            string toDb,
+            HashSet<string> hexes,
+            ILogger log)
+        {
             var fromPacks = Path.Combine(fromRoot, "packs");
             var toPacks = Path.Combine(toRoot, "packs");
             var fromLanding = Path.Combine(fromRoot, "landing");
@@ -87,53 +114,40 @@ namespace Corpus
             var neededPacks = new SortedSet<string>(StringComparer.Ordinal);
             var pending = new List<ChunkRow>();
             var landing = new List<string>();
-            int packsCopied;
-            long packBytes;
-            using (var srcIdx = new ChunkIndex(fromDb))
-            using (var dstIdx = new ChunkIndex(toDb))
+            using var srcIdx = new ChunkIndex(fromDb);
+            using var dstIdx = new ChunkIndex(toDb);
+            foreach (var hex in hexes)
             {
-                foreach (var hex in hexes)
+                var digest = Convert.FromHexString(hex);
+                if (dstIdx.TryGet(digest, out var dstRow) && File.Exists(Path.Combine(toPacks, dstRow.Pack)))
+                    continue;
+                if (srcIdx.TryGet(digest, out var srcRow))
                 {
-                    var digest = Convert.FromHexString(hex);
-                    if (dstIdx.TryGet(digest, out var dstRow) && File.Exists(Path.Combine(toPacks, dstRow.Pack)))
-                        continue;
-                    if (srcIdx.TryGet(digest, out var srcRow))
+                    neededPacks.Add(srcRow.Pack);
+                    pending.Add(srcRow);
+                    if (pending.Count >= IndexBatch)
                     {
-                        neededPacks.Add(srcRow.Pack);
-                        pending.Add(srcRow);
-                        if (pending.Count >= IndexBatch)
-                        {
-                            dstIdx.UpsertBatch(pending);
-                            pending.Clear();
-                        }
-                        continue;
+                        dstIdx.UpsertBatch(pending);
+                        pending.Clear();
                     }
-                    if (File.Exists(Path.Combine(fromLanding, hex + ".chunk")))
-                    {
-                        landing.Add(hex);
-                        continue;
-                    }
-                    throw new InvalidDataException($"chunk {hex} missing from source index {fromDb} (optimize the source store first?)");
+                    continue;
                 }
-                (packsCopied, packBytes) = CopyPacks(fromPacks, toPacks, neededPacks, log);
-                CopyLanding(fromLanding, toLanding, landing);
-                dstIdx.UpsertBatch(pending);
-                pending.Clear();
+                if (File.Exists(Path.Combine(fromLanding, hex + ".chunk")))
+                {
+                    landing.Add(hex);
+                    continue;
+                }
+                throw new InvalidDataException($"chunk {hex} missing from source index {fromDb} (optimize the source store first?)");
             }
-
-            var toManifests = Path.Combine(toRoot, "manifests");
-            Directory.CreateDirectory(toManifests);
-            foreach (var gen in toCopy)
-                File.Copy(ManifestPath(fromManifests, listed, gen), Path.Combine(toManifests, Path.GetFileName(ManifestPath(fromManifests, listed, gen))));
-            var layoutsCopied = CopyLayouts(Path.Combine(fromRoot, "layouts"), Path.Combine(toRoot, "layouts"));
-
-            log.Info($"transfer: {toCopy.Count} manifests, {packsCopied} packs ({packBytes} bytes), {landing.Count} landing, {layoutsCopied} layouts");
-            return new TransferResult(toCopy.Count, packsCopied, packBytes, landing.Count, layoutsCopied);
+            var (packsCopied, packBytes) = CopyPacks(fromPacks, toPacks, neededPacks, log);
+            CopyLanding(fromLanding, toLanding, landing);
+            dstIdx.UpsertBatch(pending);
+            return (packsCopied, packBytes, landing.Count);
         }
 
         // Selection: one snapshot, optionally with its ParentGeneration chain
         // (oldest first); empty selection = every source snapshot.
-        private static List<int> SelectGenerations(string fromManifests, List<(int Generation, string Name)> listed, TransferOptions opts, byte[] key)
+        private static List<int> SelectGenerations(string fromManifests, IReadOnlyList<(int Generation, string Name)> listed, TransferOptions opts, byte[] key)
         {
             var byGen = new Dictionary<int, string>();
             foreach (var (gen, snap) in listed)
@@ -191,7 +205,7 @@ namespace Corpus
             return skip;
         }
 
-        private static string ManifestPath(string manifestsDir, List<(int Generation, string Name)> listed, int gen)
+        private static string ManifestPath(string manifestsDir, IReadOnlyList<(int Generation, string Name)> listed, int gen)
         {
             foreach (var (g, snap) in listed)
             {

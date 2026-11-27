@@ -21,10 +21,11 @@ namespace Corpus
             if (targetDisk < 0)
                 throw new ArgumentOutOfRangeException(nameof(targetDisk), "target disk must be non-negative (got: " + targetDisk + ")");
             var sb = new StringBuilder();
-            sb.AppendLine($"rem Corpus bare-disk prep for GPT disk {layout.DiskGuid} ({layout.DiskSizeBytes} bytes) — REVIEW BEFORE RUNNING.");
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            sb.AppendLine(inv, $"rem Corpus bare-disk prep for GPT disk {layout.DiskGuid} ({layout.DiskSizeBytes} bytes) — REVIEW BEFORE RUNNING.");
             sb.AppendLine("rem Verify the disk number with Corpus.exe --list-disks first, then run: diskpart /s <thisfile>");
-            sb.AppendLine($"rem 'clean' ERASES disk {targetDisk}. Bare-disk prep stays a reviewed manual step unless --repair-boot applies it.");
-            sb.AppendLine($"select disk {targetDisk}");
+            sb.AppendLine(inv, $"rem 'clean' ERASES disk {targetDisk}. Bare-disk prep stays a reviewed manual step unless --repair-boot applies it.");
+            sb.AppendLine(inv, $"select disk {targetDisk}");
             sb.AppendLine("clean");
             sb.AppendLine("convert gpt");
             // diskpart auto-creates a 15MB front MSR on convert (proven
@@ -36,48 +37,44 @@ namespace Corpus
             sb.AppendLine("select partition 1");
             sb.AppendLine("delete partition override");
             foreach (var p in layout.Partitions)
+                AppendPartitionCommands(sb, inv, p, formatPartitions);
+            return sb.ToString();
+        }
+
+        // Diskpart only accepts MiB sizes / KiB offsets; non-aligned sources fail loud
+        // rather than silently shifting later partitions. Never emit `assign`: a mounted
+        // volume locks the disk against raw-sector writes (letters come post-verify).
+        private static void AppendPartitionCommands(StringBuilder sb, System.Globalization.CultureInfo inv, PartitionRecord p, bool formatPartitions)
+        {
+            if (p.LengthBytes % (1024L * 1024L) != 0)
+                throw new InvalidDataException($"partition {p.PartitionNumber}: length {p.LengthBytes} is not MiB-exact, cannot recreate via diskpart");
+            if (p.OffsetBytes % 1024L != 0)
+                throw new InvalidDataException($"partition {p.PartitionNumber}: offset {p.OffsetBytes} is not KiB-exact, cannot recreate via diskpart");
+            var sizeMb = Math.Max(1L, p.LengthBytes / (1024L * 1024L));
+            var offsetKb = p.OffsetBytes / 1024L;
+            // No `assign` anywhere: a mounted volume locks its disk against raw-sector writes.
+            sb.AppendLine(inv, $"rem partition {p.PartitionNumber} {p.Name} ({p.LengthBytes} bytes at offset {p.OffsetBytes})");
+            if (IsEsp(p))
             {
-                // Exact recreation: diskpart only speaks MiB sizes / KiB
-                // offsets. Non-aligned sources refuse loud rather than
-                // silently shifting every later partition (Windows always
-                // lays out aligned, so this fires only on foreign tools).
-                if (p.LengthBytes % (1024L * 1024L) != 0)
-                    throw new InvalidDataException($"partition {p.PartitionNumber}: length {p.LengthBytes} is not MiB-exact, cannot recreate via diskpart");
-                if (p.OffsetBytes % 1024L != 0)
-                    throw new InvalidDataException($"partition {p.PartitionNumber}: offset {p.OffsetBytes} is not KiB-exact, cannot recreate via diskpart");
-                var sizeMb = Math.Max(1L, p.LengthBytes / (1024L * 1024L));
-                var offsetKb = p.OffsetBytes / 1024L;
-                // No `assign` anywhere in this script, either variant: a
-                // mounted volume locks its disk against raw-sector writes
-                // (UnauthorizedAccessException on the first streamed byte —
-                // proven on-box). Letters come post-verify from
-                // LocateVolumes, which assigns only the ESP + OS it needs
-                // for bcdboot.
-                sb.AppendLine($"rem partition {p.PartitionNumber} {p.Name} ({p.LengthBytes} bytes at offset {p.OffsetBytes})");
-                if (IsEsp(p))
+                sb.AppendLine(inv, $"create partition efi size={sizeMb} offset={offsetKb}");
+                if (formatPartitions)
+                    sb.AppendLine("format fs=fat32 quick");
+            }
+            else if (IsMsr(p))
+            {
+                sb.AppendLine(inv, $"create partition msr size={sizeMb} offset={offsetKb}");
+            }
+            else
+            {
+                sb.AppendLine(inv, $"create partition primary size={sizeMb} offset={offsetKb}");
+                if (formatPartitions)
                 {
-                    sb.AppendLine($"create partition efi size={sizeMb} offset={offsetKb}");
-                    if (formatPartitions)
+                    if (string.Equals(p.Filesystem, "fat32", StringComparison.OrdinalIgnoreCase))
                         sb.AppendLine("format fs=fat32 quick");
-                }
-                else if (IsMsr(p))
-                {
-                    sb.AppendLine($"create partition msr size={sizeMb} offset={offsetKb}");
-                }
-                else
-                {
-                    sb.AppendLine($"create partition primary size={sizeMb} offset={offsetKb}");
-                    if (formatPartitions)
-                    {
-                        if (string.Equals(p.Filesystem, "fat32", StringComparison.OrdinalIgnoreCase))
-                            sb.AppendLine("format fs=fat32 quick");
-                        else if (!string.Equals(p.Filesystem, "none", StringComparison.OrdinalIgnoreCase))
-                            sb.AppendLine("format fs=ntfs quick");
-                    }
-                    // Filesystem "none" (raw, never MSR-skipped): created but unformatted.
+                    else if (!string.Equals(p.Filesystem, "none", StringComparison.OrdinalIgnoreCase))
+                        sb.AppendLine("format fs=ntfs quick");
                 }
             }
-            return sb.ToString();
         }
 
         private static bool IsEsp(PartitionRecord p) =>

@@ -60,7 +60,7 @@ namespace Corpus
         public string? ReagentcOutput;
         public string SystemRootValue = "";
         public string[] DriveRootsValue = [];
-        public readonly HashSet<string> ExistingFiles = new(StringComparer.OrdinalIgnoreCase);
+        public readonly ISet<string> ExistingFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         public string? ReadReagentcOutput() => ReagentcOutput;
         public string SystemRoot => SystemRootValue;

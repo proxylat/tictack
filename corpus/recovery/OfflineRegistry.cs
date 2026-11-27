@@ -43,7 +43,7 @@ namespace Corpus
     // Fake for Linux-green tests: records commands, replays queued results.
     public sealed class FakeRegistryRunner : IRegistryRunner
     {
-        public readonly List<string> Calls = new();
+        public readonly IList<string> Calls = new List<string>();
         public Func<string, RegistryResult>? Handler;
 
         public RegistryResult Run(string command)

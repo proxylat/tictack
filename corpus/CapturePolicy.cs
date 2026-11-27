@@ -42,10 +42,10 @@ namespace Corpus
 
         // Null configured = defaults. $LogFile is stripped even when explicitly
         // listed: it is never excludable.
-        public static IReadOnlyList<string> EffectiveSkip(IReadOnlyList<string>? configured)
+        public static IReadOnlyList<string> EffectiveSkip(IEnumerable<string>? configured)
         {
             var want = configured ?? DefaultExclusions;
-            var result = new List<string>(want.Count);
+            var result = want is IReadOnlyCollection<string> rc ? new List<string>(rc.Count) : new List<string>();
             foreach (var e in want)
             {
                 if (string.Equals(e, "$LogFile", StringComparison.OrdinalIgnoreCase)
@@ -97,7 +97,7 @@ namespace Corpus
         // [i*chunkBytes,...), not raw LCNs). StartLcn < 0 is the
         // retrieval-pointers sparse marker (item 2): no clusters, nothing to
         // dirty — skip, never compute a negative chunk index.
-        public static HashSet<long> DirtyChunksForRuns(IReadOnlyList<(long StartLcn, long ClusterCount)> runs, long bytesPerCluster, int chunkBytes)
+        public static IReadOnlySet<long> DirtyChunksForRuns(IReadOnlyList<(long StartLcn, long ClusterCount)> runs, long bytesPerCluster, int chunkBytes)
         {
             ArgumentNullException.ThrowIfNull(runs);
             var dirty = new HashSet<long>();
@@ -119,6 +119,11 @@ namespace Corpus
         public static void ZeroExcludedRanges(byte[] data, long chunkOffset, IReadOnlyList<(long StartLcn, long ClusterCount)> runs, long bytesPerCluster)
         {
             ArgumentNullException.ThrowIfNull(data);
+            ZeroExcludedRanges(data.AsSpan(), chunkOffset, runs, bytesPerCluster);
+        }
+
+        public static void ZeroExcludedRanges(Span<byte> data, long chunkOffset, IReadOnlyList<(long StartLcn, long ClusterCount)> runs, long bytesPerCluster)
+        {
             ArgumentNullException.ThrowIfNull(runs);
             var end = chunkOffset + data.Length;
             foreach (var (startLcn, count) in runs)
@@ -128,7 +133,7 @@ namespace Corpus
                 var start = Math.Max(startLcn * bytesPerCluster, chunkOffset);
                 var stop = Math.Min((startLcn + count) * bytesPerCluster, end);
                 if (start < stop)
-                    Array.Clear(data, (int)(start - chunkOffset), (int)(stop - start));
+                    data.Slice((int)(start - chunkOffset), (int)(stop - start)).Clear();
             }
         }
     }

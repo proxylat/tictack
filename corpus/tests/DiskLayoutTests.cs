@@ -180,7 +180,7 @@ public sealed class DiskLayoutTests : IDisposable
         {
             var layout1 = store.ImageDisk(0, "disk0", new DiskImageOptions(), BuildPlan(esp1, sys1, data1, null));
             Assert.Equal(3, layout1.Generation);
-            Assert.Equal(new[] { 1, 2, 3 }, layout1.Partitions.ConvertAll(p => p.SnapshotGeneration).ToArray());
+            Assert.Equal(new[] { 1, 2, 3 }, layout1.Partitions.Select(p => p.SnapshotGeneration).ToArray());
             Assert.Equal(DiskImager.PartitionKey(0, 1, espGuid), layout1.Partitions[0].PartitionKey);
             Assert.Equal(sysKey, layout1.Partitions[1].PartitionKey);
         }
@@ -203,7 +203,7 @@ public sealed class DiskLayoutTests : IDisposable
             BuildPlan(espCount, sysCount, dataCount, fake));
 
         Assert.Equal(6, layout2.Generation);
-        Assert.Equal(new[] { 4, 5, 6 }, layout2.Partitions.ConvertAll(p => p.SnapshotGeneration).ToArray());
+        Assert.Equal(new[] { 4, 5, 6 }, layout2.Partitions.Select(p => p.SnapshotGeneration).ToArray());
 
         var espChild = LoadGen(4);
         Assert.Equal(0, espChild.ParentGeneration); // FAT32: null cursor → full fallback

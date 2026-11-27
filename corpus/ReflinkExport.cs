@@ -66,39 +66,60 @@ namespace Corpus
 
         private static bool TryCloneCore(string sourcePath, string destPath, out string reason)
         {
-            if (!OperatingSystem.IsWindows())
-            {
-                reason = "host OS is not Windows (block clone is a Windows ReFS API)";
+            if (!ValidateReFSClonePair(sourcePath, destPath, out var srcFull, out var dstFull, out var srcVol, out var fs, out reason))
                 return false;
-            }
-            var srcFull = Path.GetFullPath(sourcePath);
-            var dstFull = Path.GetFullPath(destPath);
-            if (string.Equals(srcFull, dstFull, StringComparison.OrdinalIgnoreCase))
-            {
-                reason = "source and destination are the same file";
-                return false;
-            }
-            var srcVol = VolumeOf(srcFull);
-            var dstVol = VolumeOf(dstFull);
-            if (!string.Equals(srcVol, dstVol, StringComparison.OrdinalIgnoreCase))
-            {
-                reason = $"cross-volume clone ({srcVol} -> {dstVol}; block clone needs one volume)";
-                return false;
-            }
-            var fs = FilesystemOf(srcVol);
-            if (!string.Equals(fs, "ReFS", StringComparison.OrdinalIgnoreCase))
-            {
-                reason = $"filesystem is {fs}, not ReFS (block clone is ReFS-only)";
-                return false;
-            }
             var cluster = ClusterBytes(srcVol);
             var length = new FileInfo(srcFull).Length;
             using var src = new FileStream(srcFull, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var dst = new FileStream(dstFull, FileMode.Create, FileAccess.ReadWrite, FileShare.Read);
             dst.SetLength(length); // API contract: extend BEFORE cloning.
             var aligned = length - (length % cluster);
-            // The IOCTL takes a raw HANDLE: pin it across the loop (a bare
-            // DangerousGetHandle could race finalization between calls).
+            if (!CloneAlignedExtents(src, dst, srcVol, fs, cluster, length, aligned, out reason))
+                return false;
+            if (aligned < length)
+                CopySubClusterTail(src, dst, srcFull, aligned, length);
+            dst.Flush();
+            reason = "";
+            return true;
+        }
+
+        private static bool ValidateReFSClonePair(
+            string sourcePath, string destPath,
+            out string srcFull, out string dstFull, out string srcVol, out string fs, out string reason)
+        {
+            srcFull = ""; dstFull = ""; srcVol = ""; fs = "";
+            if (!OperatingSystem.IsWindows())
+            {
+                reason = "host OS is not Windows (block clone is a Windows ReFS API)";
+                return false;
+            }
+            srcFull = Path.GetFullPath(sourcePath);
+            dstFull = Path.GetFullPath(destPath);
+            if (string.Equals(srcFull, dstFull, StringComparison.OrdinalIgnoreCase))
+            {
+                reason = "source and destination are the same file";
+                return false;
+            }
+            srcVol = VolumeOf(srcFull);
+            var dstVol = VolumeOf(dstFull);
+            if (!string.Equals(srcVol, dstVol, StringComparison.OrdinalIgnoreCase))
+            {
+                reason = $"cross-volume clone ({srcVol} -> {dstVol}; block clone needs one volume)";
+                return false;
+            }
+            fs = FilesystemOf(srcVol);
+            if (!string.Equals(fs, "ReFS", StringComparison.OrdinalIgnoreCase))
+            {
+                reason = $"filesystem is {fs}, not ReFS (block clone is ReFS-only)";
+                return false;
+            }
+            reason = "";
+            return true;
+        }
+
+        private static bool CloneAlignedExtents(
+            FileStream src, FileStream dst, string srcVol, string fs, long cluster, long length, long aligned, out string reason)
+        {
             var srcHandle = src.SafeFileHandle;
             var addedRef = false;
             try
@@ -125,29 +146,28 @@ namespace Corpus
                     }
                     off += piece;
                 }
+                reason = "";
+                return true;
             }
             finally
             {
                 if (addedRef)
                     srcHandle.DangerousRelease();
             }
-            if (aligned < length)
-            {
-                // Sub-cluster tail: plain copy (at most cluster-1 bytes).
-                src.Seek(aligned, SeekOrigin.Begin);
-                dst.Seek(aligned, SeekOrigin.Begin);
-                var tail = new byte[length - aligned];
-                var filled = 0;
-                int n;
-                while (filled < tail.Length && (n = src.Read(tail, filled, tail.Length - filled)) > 0)
-                    filled += n;
-                if (filled != tail.Length)
-                    throw new IOException($"short tail read cloning '{srcFull}' ({filled} of {tail.Length})");
-                dst.Write(tail, 0, tail.Length);
-            }
-            dst.Flush();
-            reason = "";
-            return true;
+        }
+
+        private static void CopySubClusterTail(FileStream src, FileStream dst, string srcFull, long aligned, long length)
+        {
+            src.Seek(aligned, SeekOrigin.Begin);
+            dst.Seek(aligned, SeekOrigin.Begin);
+            var tail = new byte[length - aligned];
+            var filled = 0;
+            int n;
+            while (filled < tail.Length && (n = src.Read(tail, filled, tail.Length - filled)) > 0)
+                filled += n;
+            if (filled != tail.Length)
+                throw new IOException($"short tail read cloning '{srcFull}' ({filled} of {tail.Length})");
+            dst.Write(tail, 0, tail.Length);
         }
 
         private static string VolumeOf(string fullPath)
@@ -190,6 +210,28 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(outPath);
             ArgumentNullException.ThrowIfNull(cloneFromPath);
             ArgumentNullException.ThrowIfNull(log);
+            var (baseManifest, target) = LoadAndValidateCloneBase(store, generation, cloneFromPath);
+            if ((cloner ?? new BlockCloner()).TryClone(cloneFromPath, outPath, out var cloneReason))
+                log.Info($"cloned '{cloneFromPath}' -> '{outPath}' (block clone, zero bytes copied)");
+            else
+            {
+                log.Warn($"block clone unavailable ({cloneReason}); plain copy fallback for '{cloneFromPath}'");
+                File.Copy(cloneFromPath, outPath, true);
+            }
+            try
+            {
+                ApplyDirtyDiffAndVerify(store, generation, outPath, baseManifest, target, log);
+            }
+            catch (Exception ex)
+            {
+                DeletePartialExport(outPath, ex, log);
+                throw;
+            }
+            log.Info($"exported snapshot {generation} ({target.Chunks.Count} chunks) to VHDX {outPath} via clone-from gen {baseManifest.Generation}");
+        }
+
+        private static (SnapshotManifest Base, SnapshotManifest Target) LoadAndValidateCloneBase(Store store, int generation, string cloneFromPath)
+        {
             if (!File.Exists(cloneFromPath))
                 throw new FileNotFoundException("clone-from VHDX not found (explicit path, no guessing): " + cloneFromPath, cloneFromPath);
             var target = store.GetManifest(generation);
@@ -221,56 +263,47 @@ namespace Corpus
             {
                 throw new InvalidDataException($"--clone-from file '{cloneFromPath}' is not a readable VHDX: {ex.Message}", ex);
             }
-            if ((cloner ?? new BlockCloner()).TryClone(cloneFromPath, outPath, out var cloneReason))
+            return (baseManifest, target);
+        }
+
+        private static void ApplyDirtyDiffAndVerify(
+            Store store, int generation, string outPath, SnapshotManifest baseManifest, SnapshotManifest target, ILogger log)
+        {
+            var dirty = DiffDirtyChunks(baseManifest, target);
+            string? verifyError;
+            using (var disk = new Disk(outPath, FileAccess.ReadWrite))
             {
-                log.Info($"cloned '{cloneFromPath}' -> '{outPath}' (block clone, zero bytes copied)");
+                using (var filter = new DirtyRangeWriteFilter(disk.Content, target, dirty))
+                {
+                    store.ExportToStream(generation, filter);
+                    log.Info($"reflink export: {filter.WrittenBytes} dirty bytes written, {filter.SkippedBytes} clean bytes left COW-shared ({dirty.Count} dirty chunks)");
+                }
+                using (var verifier = new ContentVerifyStream(disk.Content))
+                {
+                    store.ExportToStream(generation, verifier);
+                    if (verifier.GapBytes > 0)
+                        log.Info($"{verifier.GapBytes} gap bytes left as cloned (don't-care free space)");
+                    verifyError = verifier.FailureMessage(outPath, generation);
+                }
             }
-            else
-            {
-                log.Warn($"block clone unavailable ({cloneReason}); plain copy fallback for '{cloneFromPath}'");
-                File.Copy(cloneFromPath, outPath, true);
-            }
+            if (verifyError != null)
+                throw new InvalidDataException(verifyError);
+        }
+
+        private static void DeletePartialExport(string outPath, Exception ex, ILogger log)
+        {
             try
             {
-                var dirty = DiffDirtyChunks(baseManifest, target);
-                string? verifyError;
-                using (var disk = new Disk(outPath, FileAccess.ReadWrite))
+                if (File.Exists(outPath))
                 {
-                    using (var filter = new DirtyRangeWriteFilter(disk.Content, target, dirty))
-                    {
-                        store.ExportToStream(generation, filter);
-                        log.Info($"reflink export: {filter.WrittenBytes} dirty bytes written, {filter.SkippedBytes} clean bytes left COW-shared ({dirty.Count} dirty chunks)");
-                    }
-                    using (var verifier = new ContentVerifyStream(disk.Content))
-                    {
-                        store.ExportToStream(generation, verifier);
-                        if (verifier.GapBytes > 0)
-                            log.Info($"{verifier.GapBytes} gap bytes left as cloned (don't-care free space)");
-                        verifyError = verifier.FailureMessage(outPath, generation);
-                    }
+                    File.Delete(outPath);
+                    log.Warn($"deleted partial reflink export '{outPath}' after failure: {ex.Message}");
                 }
-                if (verifyError != null)
-                    throw new InvalidDataException(verifyError);
             }
-            catch (Exception ex)
+            catch (Exception cleanEx)
             {
-                // Never leave a corrupt/partial VHDX masquerading as gen N
-                // (dest is ours — plain ExportVhdx overwrites it too).
-                try
-                {
-                    if (File.Exists(outPath))
-                    {
-                        File.Delete(outPath);
-                        log.Warn($"deleted partial reflink export '{outPath}' after failure: {ex.Message}");
-                    }
-                }
-                catch (Exception cleanEx)
-                {
-                    log.Warn($"could not delete failed reflink export '{outPath}': {cleanEx.Message}");
-                }
-                throw;
+                log.Warn($"could not delete failed reflink export '{outPath}': {cleanEx.Message}");
             }
-            log.Info($"exported snapshot {generation} ({target.Chunks.Count} chunks) to VHDX {outPath} via clone-from gen {baseManifest.Generation}");
         }
 
         internal static List<int> DiffDirtyChunks(SnapshotManifest baseManifest, SnapshotManifest target)

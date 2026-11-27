@@ -303,15 +303,19 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(recordsVol);
             if (groupBytes <= 0) throw new ArgumentOutOfRangeException(nameof(groupBytes));
             var per = Math.Max(1, groupBytes / groupsVol.BytesPerRecord);
-            var groups = new List<string>();
+            var bitmap = TryReadMftBitmap(recordsVol, log);
+            var groups = ComputeGroupDigests(groupsVol, per);
             var records = new List<string>();
-            // Liveness source: the $MFT $BITMAP when readable (stable
-            // through the shadow), else null → per-slot byte fallback.
-            // Read from the RECORDS view: on the live view the bitmap is an
-            // allocated stream like any other (same stable read class §7's
-            // hole-skip relies on). One read for the whole pass, never per
-            // record; any fault → null (fail-safe: unknown is never
-            // unallocated).
+            for (var rec = 0L; rec < recordsVol.RecordCount; rec++)
+            {
+                var bytes = ReadStableRecordBytes(recordsVol, (ulong)rec);
+                records.Add(ClassifySkipRecord(bytes, rec, BitmapAllocated(bitmap, rec)));
+            }
+            return (groups, records);
+        }
+
+        private static byte[]? TryReadMftBitmap(IMftVolume recordsVol, ILogger? log)
+        {
             byte[]? bitmap = null;
             string? bitmapNote = null;
             try
@@ -335,6 +339,12 @@ namespace Corpus
                 else
                     log.Info($"mft-bitmap: null ({bitmapNote})");
             }
+            return bitmap;
+        }
+
+        private static List<string> ComputeGroupDigests(IMftVolume groupsVol, int per)
+        {
+            var groups = new List<string>();
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             var inGroup = 0;
             for (var rec = 0L; rec < groupsVol.RecordCount; rec++)
@@ -350,24 +360,10 @@ namespace Corpus
             }
             if (inGroup > 0)
                 groups.Add(Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant());
-            for (var rec = 0L; rec < recordsVol.RecordCount; rec++)
-            {
-                var bytes = ReadStableRecordBytes(recordsVol, (ulong)rec);
-                // Skip input is live-only: dead/empty slots carry no
-                // restorable data and their shadow-view bytes are unstable,
-                // so they are excluded here (sentinel, never hashed) and
-                // Gate1 never compares them. FRN 5
-                // (root: architectural, cf. MftPathResolver.RootFileRef)
-                // additionally masks SI timestamps: a VSS cycle bumps the
-                // root mtime whenever SVI gains/loses children, while index
-                // changes (namespace) must still trip the gate.
-                var entry = ClassifySkipRecord(bytes, rec, BitmapAllocated(bitmap, rec)); // skip input: LSN/USA/tails/SI-timestamps-insensitive; groups above stay raw
-                records.Add(entry);
-            }
-            return (groups, records);
+            return groups;
         }
 
-        public static List<string> ComputeGroups(IMftVolume vol, int groupBytes) =>
+        public static IReadOnlyList<string> ComputeGroups(IMftVolume vol, int groupBytes) =>
             ComputeGroupsAndRecords(vol, groupBytes).Groups;
 
         // Capture-time per-record stabilization (B6R: 6/6 vetoes on FRN 38
@@ -397,7 +393,7 @@ namespace Corpus
 
         // Changed group indexes. Growth (new files) dirties the extra groups;
         // shrink means reformat-level surgery → null (full re-read).
-        public static List<int>? DiffGroups(IReadOnlyList<string> parent, IReadOnlyList<string> current)
+        public static IReadOnlyList<int>? DiffGroups(IReadOnlyList<string> parent, IReadOnlyList<string> current)
         {
             ArgumentNullException.ThrowIfNull(parent);
             ArgumentNullException.ThrowIfNull(current);
@@ -561,7 +557,7 @@ namespace Corpus
         // membership: a dead container holds no file, so nothing to mask.
         // VSS diff/container FRNs reuse stale dead slots across cycles
         // (B6K rec56): the membership is per-cycle geometry, never pinned.
-        private static int? AddAdvisory(IMftVolume vol, HashSet<ulong> refs,
+        private static int? AddAdvisory(IMftVolume vol, IReadOnlySet<ulong> refs,
             List<(long StartLcn, long ClusterCount)> runs, HashSet<long> advisory, List<string> dropped, ILogger log)
         {
             var ok = 0;
@@ -665,37 +661,10 @@ namespace Corpus
                 log.Info("full image (MFT record size changed, reformat?)");
                 return null;
             }
-            (List<string> Groups, List<string> Records) current;
-            // §9 design B: the RECORD pass reads the LIVE volume (stable
-            // user-record bytes), while groups + every extent below stay on
-            // the frozen shadow (capture truth — bulk bytes come from there).
-            // Residual TOCTOU: the live read happens ms after the snapshot
-            // froze, so a write landing in that gap is live-visible but
-            // shadow-absent — the plan then misses it and the gate may skip
-            // this run. The write is picked up by the NEXT run (deferred,
-            // never lost): its live bytes still differ from the stored
-            // live-view digests, so the next record gate refuses and the gen
-            // records them. Convergence: ≤1 transitional gen.
-            IMftVolume? live = null;
-            try
-            {
-                live = (vol as ILiveMftVolumeProvider)?.TryOpenLiveMft(log);
-                try
-                {
-                    current = MftDigest.ComputeGroupsAndRecords(vol, live ?? vol, chunkBytes, log);
-                }
-                catch (InvalidDataException ex)
-                {
-                    log.Info($"full image (MFT unreadable: {ex.Message})");
-                    return null;
-                }
-            }
-            finally
-            {
-                if (live != null && !ReferenceEquals(live, vol))
-                    live.Dispose();
-            }
-            var changed = MftDigest.DiffGroups(parent.MftChunkDigests ?? new List<string>(), current.Groups);
+            var current = ComputeLiveMft(vol, chunkBytes, log);
+            if (current == null)
+                return null;
+            var changed = MftDigest.DiffGroups(parent.MftChunkDigests ?? new List<string>(), current.Value.Groups);
             if (changed == null)
             {
                 log.Info("full image (MFT shrank, reformat?)");
@@ -703,6 +672,39 @@ namespace Corpus
             }
             var dirty = new HashSet<long>();
             var per = Math.Max(1, chunkBytes / vol.BytesPerRecord);
+            if (!CollectChangedGroupChunks(vol, changed, per, chunkBytes, dirty, log))
+                return null;
+            if (!CollectSystemFileChunks(vol, chunkBytes, dirty, log))
+                return null;
+            return (dirty, current.Value.Groups, current.Value.Records);
+        }
+
+        // §9 design B: RECORD pass reads the LIVE volume (stable user-record bytes),
+        // while groups + extents stay on the frozen shadow. Residual TOCTOU writes
+        // landing ms after freeze are deferred to the next run (converges in <=1 gen).
+        private static (List<string> Groups, List<string> Records)? ComputeLiveMft(IMftVolume vol, int chunkBytes, ILogger log)
+        {
+            IMftVolume? live = null;
+            try
+            {
+                live = (vol as ILiveMftVolumeProvider)?.TryOpenLiveMft(log);
+                return MftDigest.ComputeGroupsAndRecords(vol, live ?? vol, chunkBytes, log);
+            }
+            catch (InvalidDataException ex)
+            {
+                log.Info($"full image (MFT unreadable: {ex.Message})");
+                return null;
+            }
+            finally
+            {
+                if (live != null && !ReferenceEquals(live, vol))
+                    live.Dispose();
+            }
+        }
+
+        private static bool CollectChangedGroupChunks(
+            IMftVolume vol, IReadOnlyList<int> changed, int per, int chunkBytes, HashSet<long> dirty, ILogger log)
+        {
             foreach (var g in changed)
             {
                 var first = (long)g * per;
@@ -710,74 +712,41 @@ namespace Corpus
                 for (var rec = first; rec < past; rec++)
                 {
                     byte[] bytes;
-                    try
-                    {
-                        bytes = vol.GetRecordBytes((ulong)rec);
-                    }
-                    catch (InvalidDataException ex)
-                    {
-                        log.Info($"full image (MFT record {rec} unreadable: {ex.Message})");
-                        return null;
-                    }
+                    try { bytes = vol.GetRecordBytes((ulong)rec); }
+                    catch (InvalidDataException ex) { log.Info($"full image (MFT record {rec} unreadable: {ex.Message})"); return false; }
                     if (bytes.Length < 48)
                     {
                         log.Info($"full image (MFT record {rec} truncated)");
-                        return null;
+                        return false;
                     }
-                    // Scan FRN carries the record's own seq (no enumeration
-                    // here): live records verify, dead slots filter, exactly
-                    // like the USN path's reuse checks.
                     var fileRef = ((ulong)BitConverter.ToUInt16(bytes, 0x10) << 48) | (ulong)rec;
                     List<(long StartLcn, long ClusterCount)>? runs;
-                    try
-                    {
-                        runs = MftExtentReader.ParseRecordExtents(bytes, fileRef,
-                            vol.BytesPerCluster, vol.BytesPerRecord, vol.MftRuns);
-                    }
-                    catch (InvalidDataException ex)
-                    {
-                        log.Info($"full image (MFT record {rec} unparseable: {ex.Message})");
-                        return null;
-                    }
-                    if (runs == null)
-                        continue; // dead slot → bitmap net covers the freed clusters
+                    try { runs = MftExtentReader.ParseRecordExtents(bytes, fileRef, vol.BytesPerCluster, vol.BytesPerRecord, vol.MftRuns); }
+                    catch (InvalidDataException ex) { log.Info($"full image (MFT record {rec} unparseable: {ex.Message})"); return false; }
+                    if (runs == null) continue;
                     foreach (var c in CapturePolicy.DirtyChunksForRuns(runs, vol.BytesPerCluster, chunkBytes))
                         dirty.Add(c);
                 }
             }
-            // NTFS self-metadata ($MFT/$LogFile/$Bitmap/...): their CONTENT
-            // mutates without changing their own record bytes, so group
-            // digests can't see it — always re-capture FRNs 0..15 (same
-            // policy as the USN path, same synthetic-seq bypass).
+            return true;
+        }
+
+        private static bool CollectSystemFileChunks(IMftVolume vol, int chunkBytes, HashSet<long> dirty, ILogger log)
+        {
+            // NTFS self-metadata ($MFT/$LogFile/$Bitmap/...): always re-capture FRNs 0..15.
             for (var sys = 0UL; sys < 16 && (long)sys < vol.RecordCount; sys++)
             {
                 byte[] bytes;
-                try
-                {
-                    bytes = vol.GetRecordBytes(sys);
-                }
-                catch (InvalidDataException ex)
-                {
-                    log.Info($"full image (MFT record for system file {sys} unreadable: {ex.Message})");
-                    return null;
-                }
+                try { bytes = vol.GetRecordBytes(sys); }
+                catch (InvalidDataException ex) { log.Info($"full image (MFT record for system file {sys} unreadable: {ex.Message})"); return false; }
                 List<(long StartLcn, long ClusterCount)>? sysRuns;
-                try
-                {
-                    sysRuns = MftExtentReader.ParseRecordExtents(bytes, sys,
-                        vol.BytesPerCluster, vol.BytesPerRecord, vol.MftRuns, skipSequenceCheck: true);
-                }
-                catch (InvalidDataException ex)
-                {
-                    log.Info($"full image (MFT record for system file {sys} unreadable: {ex.Message})");
-                    return null;
-                }
-                if (sysRuns == null)
-                    continue;
+                try { sysRuns = MftExtentReader.ParseRecordExtents(bytes, sys, vol.BytesPerCluster, vol.BytesPerRecord, vol.MftRuns, skipSequenceCheck: true); }
+                catch (InvalidDataException ex) { log.Info($"full image (MFT record for system file {sys} unreadable: {ex.Message})"); return false; }
+                if (sysRuns == null) continue;
                 foreach (var c in CapturePolicy.DirtyChunksForRuns(sysRuns, vol.BytesPerCluster, chunkBytes))
                     dirty.Add(c);
             }
-            return (dirty, current.Groups, current.Records);
+            return true;
         }
     }
 
@@ -838,7 +807,7 @@ namespace Corpus
             }
         }
 
-        private static HashSet<long>? HoleFlipNet(SnapshotManifest parent, IBlockSource source, long bytesPerCluster, int chunkBytes)
+        private static IReadOnlySet<long>? HoleFlipNet(SnapshotManifest parent, IBlockSource source, long bytesPerCluster, int chunkBytes)
         {
             IReadOnlyList<(long Start, long Count)> runs;
             if (source is ISparseBlockSource sparse)

@@ -32,7 +32,7 @@ public sealed class MftDigestTests
         new(records: records ?? StandardRecords(), recordCount: recordCount,
             length: GridClusters * Bpc, faultOnRecord: fault);
 
-    private static SnapshotManifest ParentWith(List<string> digests, int recordBytes = Bpr,
+    private static SnapshotManifest ParentWith(IReadOnlyList<string> digests, int recordBytes = Bpr,
         int grid = (int)GridClusters, string cursor = "usn:0000000000000001:0000000000000002")
     {
         var chunks = new List<ManifestEntry>();

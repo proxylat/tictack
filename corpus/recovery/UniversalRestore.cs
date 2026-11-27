@@ -107,7 +107,7 @@ namespace Corpus
     // Fake for Linux-green tests: records injections, never shells out.
     public sealed class FakeDriverInjector : IDriverInjector
     {
-        public readonly List<(string Image, string Driver)> Calls = new();
+        public readonly IList<(string Image, string Driver)> Calls = new List<(string Image, string Driver)>();
 
         public void Inject(string offlineWindowsDir, string driverDir) =>
             Calls.Add((offlineWindowsDir, driverDir));
@@ -148,7 +148,7 @@ namespace Corpus
     // Fake for Linux-green tests: records stagings, never touches disk.
     public sealed class FakeFirstBootStager : IFirstBootStager
     {
-        public readonly List<(string Image, string Driver, string Category)> Calls = new();
+        public readonly IList<(string Image, string Driver, string Category)> Calls = new List<(string Image, string Driver, string Category)>();
 
         public void Stage(string offlineWindowsDir, string driverDir, string category) =>
             Calls.Add((offlineWindowsDir, driverDir, category));

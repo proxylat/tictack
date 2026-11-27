@@ -16,485 +16,36 @@ namespace Corpus
     // restore a snapshot to a disk/file, list disks, validate config.
     static class Program
     {
+        private sealed class CliArgs
+        {
+            public string CfgPath = "";
+            public string? Verb, Volume, Name, SnapshotArg, OutPath, Device, ParentArg;
+            public bool Incremental, ForceFull, Chain, Initialize, AllowBootDisk, SkipVerify, DryRun, Confirm, Inline, RepairBoot;
+            public string? AdkDir, IncludeStore, DbPath, StagingDir, UsbDrive, IsoPath, PayloadDir, Target, StoreFlag, IndexFlag;
+            public string? DiskArg, LayoutArg, PartitionsArg, OnlyVolumesArg, FromFlag, ToFlag, ConfirmToken;
+            public readonly List<string> Drivers = new();
+            public readonly List<string> CliExcludes = new();
+            public int ChainGen;
+            public string? WindowsDir, NicDir, GpuDir, Firmware, VhdxFlag, VmNameFlag, BootTimeoutFlag, BootMemoryFlag;
+            public string? ToVhdx, ToWim, ToEsd, ToVmdk, ToOvf, ToOva, VhdxWriter, BudgetBytes, ExtractPaths, CloneFrom, RetryLockFlag, SplitSwm;
+            public bool Zstd, Append, BufferedIo, SkipIfUnchanged, OptimizeVhd, Recompress, TrimResetBase, TrimNoHibernate, Commit, Discard, SkipRecovery;
+            public readonly List<string> TrimFeatures = new();
+            public readonly List<string> TrimPackages = new();
+            public readonly List<string> LangPacks = new();
+            public readonly List<string> RemoveKbs = new();
+            public string? WimPath, MountDir, CompressFlag, SwmPath, UnattendFile, RegHive, RegKey, RegName, RegType, RegData, VolumesArg;
+            public int? KeepDaily, KeepWeekly, KeepMonthly, KeepYearly;
+        }
+
         static int Main(string[] args)
         {
             var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var cfgPath = Path.Combine(baseDir, "config_corpus.yaml");
-            string? verb = null;
-            string? volume = null;
-            string? name = null;
-            string? snapshotArg = null;
-            string? outPath = null;
-            string? device = null;
-            var incremental = false;
-            string? parentArg = null;
-            var forceFull = false;
-            var chain = false;
-            string? adkDir = null;
-            string? includeStore = null;
-            string? dbPath = null;
-            var drivers = new List<string>();
-            string? stagingDir = null;
-            string? usbDrive = null;
-            string? isoPath = null;
-            var initialize = false;
-            string? payloadDir = null;
-            string? target = null;
-            string? storeFlag = null;
-            string? indexFlag = null;
-            string? diskArg = null;
-            string? layoutArg = null;
-            string? partitionsArg = null;
-            string? fromFlag = null;
-            string? toFlag = null;
-            var cliExcludes = new List<string>();
-            int chainGen = 0;
-            string? confirmToken = null;
-            var allowBootDisk = false;
-            var skipVerify = false;
-            var dryRun = false;
-            var confirm = false;
-            var inline = false;
-            var repairBoot = false;
-            string? windowsDir = null;
-            string? nicDir = null;
-            string? gpuDir = null;
-            string? firmware = null;
-            string? vhdxFlag = null;
-            string? vmNameFlag = null;
-            string? bootTimeoutFlag = null;
-            string? bootMemoryFlag = null;
-            string? toVhdx = null;
-            string? toWim = null;
-            string? toEsd = null;
-            var zstd = false;
-            string? vhdxWriter = null;
-            string? budgetBytes = null;
-            string? extractPaths = null;
-            string? cloneFrom = null;
-            string? retryLockFlag = null;
-            var append = false;
-            var bufferedIo = false;
-            var skipIfUnchanged = false;
-            string? splitSwm = null;
-            var optimizeVhd = false;
-            var recompress = false;
-            var trimResetBase = false;
-            var trimFeatures = new List<string>();
-            var trimPackages = new List<string>();
-            var trimNoHibernate = false;
-            string? wimPath = null;
-            string? mountDir = null;
-            var commit = false;
-            var discard = false;
-            string? compressFlag = null;
-            string? swmPath = null;
-            string? unattendFile = null;
-            var langPacks = new List<string>();
-            string? regHive = null;
-            string? regKey = null;
-            string? regName = null;
-            string? regType = null;
-            string? regData = null;
-            var removeKbs = new List<string>();
-            string? volumesArg = null;
-            int? keepDaily = null, keepWeekly = null, keepMonthly = null, keepYearly = null;
+            var cli = new CliArgs { CfgPath = Path.Combine(baseDir, "config_corpus.yaml") };
+            var parseRc = ParseCliArgs(args, cli);
+            if (parseRc.HasValue)
+                return parseRc.Value;
 
-            for (int i = 0; i < args.Length; i++)
-            {
-                switch (args[i].ToLowerInvariant())
-                {
-                    case "--config":
-                        if (i + 1 < args.Length) cfgPath = args[++i];
-                        break;
-                    case "--help":
-                    case "-h":
-                    case "-?":
-                        PrintHelp();
-                        return 0;
-                    case "--version":
-                    case "-v":
-                        PrintVersion();
-                        return 0;
-                    case "--validate":
-                        verb = "validate";
-                        break;
-                    case "--image":
-                        verb = "image";
-                        break;
-                    case "--disk-layout":
-                        verb = "disk-layout";
-                        break;
-                    case "--restore-disk":
-                        verb = "restore-disk";
-                        break;
-                    case "--export":
-                        verb = "export";
-                        break;
-                    case "--export-vhdx":
-                        verb = "export-vhdx";
-                        break;
-                    case "--verify":
-                        verb = "verify";
-                        break;
-                    case "--deep-verify":
-                        verb = "deep-verify";
-                        break;
-                    case "--mount-snapshot":
-                        verb = "mount-snapshot";
-                        break;
-                    case "--list-snapshots":
-                        verb = "list-snapshots";
-                        break;
-                    case "--list-volumes":
-                        verb = "list-volumes";
-                        break;
-                    case "--gc":
-                        verb = "gc";
-                        break;
-                    case "--service":
-                        verb = "service";
-                        break;
-                    case "--locate-winre":
-                        verb = "locate-winre";
-                        break;
-                    case "--prepare-universal":
-                        verb = "prepare-universal";
-                        break;
-                    case "--check-boot-mode":
-                        verb = "check-boot-mode";
-                        break;
-                    case "--check-repair":
-                        verb = "check-repair";
-                        break;
-                    case "--boot-verify":
-                        verb = "boot-verify";
-                        break;
-                    case "--vhdx":
-                        if (i + 1 < args.Length) vhdxFlag = args[++i];
-                        break;
-                    case "--vm-name":
-                        if (i + 1 < args.Length) vmNameFlag = args[++i];
-                        break;
-                    case "--timeout-seconds":
-                        if (i + 1 < args.Length) bootTimeoutFlag = args[++i];
-                        break;
-                    case "--memory-mb":
-                        if (i + 1 < args.Length) bootMemoryFlag = args[++i];
-                        break;
-                    case "--repair-boot":
-                        repairBoot = true;
-                        break;
-                    case "--windows-dir":
-                        if (i + 1 < args.Length) windowsDir = args[++i];
-                        break;
-                    case "--nic-dir":
-                        if (i + 1 < args.Length) nicDir = args[++i];
-                        break;
-                    case "--gpu-dir":
-                        if (i + 1 < args.Length) gpuDir = args[++i];
-                        break;
-                    case "--firmware":
-                        if (i + 1 < args.Length) firmware = args[++i];
-                        break;
-                    case "--confirm":
-                        confirm = true;
-                        break;
-                    case "--inline":
-                        inline = true;
-                        break;
-                    case "--vss-list":
-                        verb = "vss-list";
-                        break;
-                    case "--vss-snap":
-                        verb = "vss-snap";
-                        break;
-                    case "--vss-read":
-                        verb = "vss-read";
-                        break;
-                    case "--vss-dump":
-                        verb = "vss-dump";
-                        break;
-                    case "--bitmap-stats":
-                        verb = "bitmap-stats";
-                        break;
-                    case "--bitmap-dump":
-                        verb = "bitmap-dump";
-                        break;
-                    case "--device":
-                        if (i + 1 < args.Length) device = args[++i];
-                        break;
-                    case "--volume":
-                        if (i + 1 < args.Length) volume = args[++i];
-                        break;
-                    case "--name":
-                        if (i + 1 < args.Length) name = args[++i];
-                        break;
-                    case "--snapshot":
-                        if (i + 1 < args.Length) snapshotArg = args[++i];
-                        break;
-                    case "--out":
-                        if (i + 1 < args.Length) outPath = args[++i];
-                        break;
-                    case "--incremental":
-                        incremental = true;
-                        break;
-                    case "--parent":
-                        if (i + 1 < args.Length) parentArg = args[++i];
-                        break;
-                    case "--full":
-                        forceFull = true;
-                        break;
-                    case "--chain":
-                        // Bare (--verify --chain) walks parent links; with a
-                        // generation (--copy --chain <gen>) it selects that
-                        // snapshot plus its ancestors.
-                        if (i + 1 < args.Length && int.TryParse(args[i + 1], out var cg) && cg > 0)
-                        {
-                            chain = true;
-                            chainGen = cg;
-                            i++;
-                        }
-                        else
-                        {
-                            chain = true;
-                        }
-                        break;
-                    case "--copy":
-                        verb = "copy";
-                        break;
-                    case "--sync":
-                        verb = "sync";
-                        break;
-                    case "--from":
-                        if (i + 1 < args.Length) fromFlag = args[++i];
-                        break;
-                    case "--to":
-                        if (i + 1 < args.Length) toFlag = args[++i];
-                        break;
-                    case "--exclude":
-                        if (i + 1 < args.Length) cliExcludes.Add(args[++i]);
-                        break;
-                    case "--build-media":
-                        verb = "build-media";
-                        break;
-                    case "--restore":
-                        verb = "restore";
-                        break;
-                    case "--list-disks":
-                        verb = "list-disks";
-                        break;
-                    case "--adk":
-                        if (i + 1 < args.Length) adkDir = args[++i];
-                        break;
-                    case "--include-store":
-                        if (i + 1 < args.Length) includeStore = args[++i];
-                        break;
-                    case "--db":
-                        if (i + 1 < args.Length) dbPath = args[++i];
-                        break;
-                    case "--driver":
-                        if (i + 1 < args.Length) drivers.Add(args[++i]);
-                        break;
-                    case "--staging-dir":
-                        if (i + 1 < args.Length) stagingDir = args[++i];
-                        break;
-                    case "--usb":
-                        if (i + 1 < args.Length) usbDrive = args[++i];
-                        break;
-                    case "--iso":
-                        if (i + 1 < args.Length) isoPath = args[++i];
-                        break;
-                    case "--initialize":
-                        initialize = true;
-                        break;
-                    case "--payload":
-                        if (i + 1 < args.Length) payloadDir = args[++i];
-                        break;
-                    case "--target":
-                        if (i + 1 < args.Length) target = args[++i];
-                        break;
-                    case "--disk":
-                        if (i + 1 < args.Length) diskArg = args[++i];
-                        break;
-                    case "--layout":
-                        if (i + 1 < args.Length) layoutArg = args[++i];
-                        break;
-                    case "--partitions":
-                        if (i + 1 < args.Length) partitionsArg = args[++i];
-                        break;
-                    case "--store":
-                        if (i + 1 < args.Length) storeFlag = args[++i];
-                        break;
-                    case "--index":
-                        if (i + 1 < args.Length) indexFlag = args[++i];
-                        break;
-                    case "--confirm-type":
-                        if (i + 1 < args.Length) confirmToken = args[++i];
-                        break;
-                    case "--allow-boot-disk":
-                        allowBootDisk = true;
-                        break;
-                    case "--skip-verify":
-                        skipVerify = true;
-                        break;
-                    case "--to-vhdx":
-                        if (i + 1 < args.Length) toVhdx = args[++i];
-                        break;
-                    case "--to-wim":
-                        if (i + 1 < args.Length) toWim = args[++i];
-                        break;
-                    case "--to-esd":
-                        if (i + 1 < args.Length) toEsd = args[++i];
-                        break;
-                    case "--zstd":
-                        zstd = true;
-                        break;
-                    case "--vhdx-writer":
-                        // TEMPORARY (§12.1 phase 1): A/B spike selector, dies
-                        // with the loser the day the verdict lands.
-                        if (i + 1 < args.Length) vhdxWriter = args[++i];
-                        break;
-                    case "--optimize-to-fit":
-                        verb = "optimize-to-fit";
-                        break;
-                    case "--bytes":
-                        if (i + 1 < args.Length) budgetBytes = args[++i];
-                        break;
-                    case "--extract":
-                        verb = "extract";
-                        break;
-                    case "--paths":
-                        if (i + 1 < args.Length) extractPaths = args[++i];
-                        break;
-                    case "--clone-from":
-                        if (i + 1 < args.Length) cloneFrom = args[++i];
-                        break;
-                    case "--retry-lock":
-                        if (i + 1 < args.Length) retryLockFlag = args[++i];
-                        break;
-                    case "--append":
-                        append = true;
-                        break;
-                    case "--buffered-io":
-                        bufferedIo = true;
-                        break;
-                    case "--skip-if-unchanged":
-                        skipIfUnchanged = true;
-                        break;
-                    case "--split-swm":
-                        if (i + 1 < args.Length) splitSwm = args[++i];
-                        break;
-                    case "--optimize-vhd":
-                        optimizeVhd = true;
-                        break;
-                    case "--optimize-wim":
-                        verb = "optimize-wim";
-                        break;
-                    case "--recompress":
-                        recompress = true;
-                        break;
-                    case "--record-compact":
-                        verb = "record-compact";
-                        break;
-                    case "--trim-resetbase":
-                        trimResetBase = true;
-                        break;
-                    case "--trim-disable-feature":
-                        if (i + 1 < args.Length) trimFeatures.Add(args[++i]);
-                        break;
-                    case "--trim-remove-package":
-                        if (i + 1 < args.Length) trimPackages.Add(args[++i]);
-                        break;
-                    case "--trim-no-hibernate":
-                        trimNoHibernate = true;
-                        break;
-                    case "--convert":
-                        verb = "convert";
-                        break;
-                    case "--merge-swm":
-                        verb = "merge-swm";
-                        break;
-                    case "--wim-info":
-                        verb = "wim-info";
-                        break;
-                    case "--mount":
-                        verb = "mount";
-                        break;
-                    case "--unmount":
-                        verb = "unmount";
-                        break;
-                    case "--apply":
-                        verb = "apply";
-                        break;
-                    case "--wim":
-                        if (i + 1 < args.Length) wimPath = args[++i];
-                        break;
-                    case "--mount-dir":
-                        if (i + 1 < args.Length) mountDir = args[++i];
-                        break;
-                    case "--commit":
-                        commit = true;
-                        break;
-                    case "--discard":
-                        discard = true;
-                        break;
-                    case "--compress":
-                        if (i + 1 < args.Length) compressFlag = args[++i];
-                        break;
-                    case "--swm":
-                        if (i + 1 < args.Length) swmPath = args[++i];
-                        break;
-                    case "--unattend":
-                        if (i + 1 < args.Length) unattendFile = args[++i];
-                        break;
-                    case "--lang-pack":
-                        if (i + 1 < args.Length) langPacks.Add(args[++i]);
-                        break;
-                    case "--reg-hive":
-                        if (i + 1 < args.Length) regHive = args[++i];
-                        break;
-                    case "--reg-key":
-                        if (i + 1 < args.Length) regKey = args[++i];
-                        break;
-                    case "--reg-name":
-                        if (i + 1 < args.Length) regName = args[++i];
-                        break;
-                    case "--reg-type":
-                        if (i + 1 < args.Length) regType = args[++i];
-                        break;
-                    case "--reg-data":
-                        if (i + 1 < args.Length) regData = args[++i];
-                        break;
-                    case "--remove-kb":
-                        if (i + 1 < args.Length) removeKbs.Add(args[++i]);
-                        break;
-                    case "--dry-run":
-                        dryRun = true;
-                        break;
-                    case "--volumes":
-                        if (i + 1 < args.Length) volumesArg = args[++i];
-                        break;
-                    case "--keep-daily":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out var kd)) keepDaily = kd;
-                        break;
-                    case "--keep-weekly":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out var kw)) keepWeekly = kw;
-                        break;
-                    case "--keep-monthly":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out var km)) keepMonthly = km;
-                        break;
-                    case "--keep-yearly":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out var ky)) keepYearly = ky;
-                        break;
-                    default:
-                        Console.Error.WriteLine("Unknown argument: " + args[i]);
-                        PrintHelp();
-                        return 1;
-                }
-            }
-
-            if (verb == null)
+            if (cli.Verb == null)
             {
                 PrintHelp();
                 return 1;
@@ -503,327 +54,634 @@ namespace Corpus
             CorpusConfig? cfg;
             try
             {
-                cfg = CorpusConfig.Load(cfgPath);
+                cfg = CorpusConfig.Load(cli.CfgPath);
             }
             catch (YamlDotNet.Core.YamlException ex)
             {
-                // User error, not a crash: plain message on stderr, no stack
-                // trace, no core dump (same shape as TicTack's config gate).
-                Console.Error.WriteLine("Invalid config " + cfgPath + ": " + ex.Message);
+                Console.Error.WriteLine("Invalid config " + cli.CfgPath + ": " + ex.Message);
                 return 1;
             }
-            var backupDir = CorpusConfig.ResolveLogBackupDir(cfg, toVhdx, toWim, toEsd, cfg != null ? CorpusConfig.StateRoot(cfg) : baseDir);
+            var backupDir = CorpusConfig.ResolveLogBackupDir(cfg, cli.ToVhdx, cli.ToWim, cli.ToEsd, cfg != null ? CorpusConfig.StateRoot(cfg) : baseDir);
             var log = CreateLogger(cfg, baseDir, backupDir);
-            ProcessHardening.Apply(log);
-            if (!ConfigGuard.CheckConfigFile(cfgPath, log, cfg?.StrictConfigPerms ?? false))
+            if (!ApplyStartupGuards(cfg, cli, backupDir, log))
                 return 1;
-            if (cfg != null)
-            {
-                if (cfg.EcoQos)
-                    ProcessHardening.ApplyEcoQos(log);
-                ChunkId.ConfigureOverride(cfg.KeyPath, cfg.KeyEnv);
-                if (!ConfigGuard.CheckSecretFile(cfg.KeyPath, log, cfg.StrictConfigPerms))
-                    return 1;
-                if (cfg.DestinationProtect && !string.IsNullOrEmpty(cfg.StorePath))
-                    DestinationGuard.Enforce(cfg.StorePath, log);
-            }
-            var backupTarget = CorpusConfig.LogBackupTargetDir(cfg, toVhdx, toWim, toEsd);
-            if (!string.IsNullOrEmpty(backupTarget) && !string.Equals(backupDir, backupTarget, StringComparison.OrdinalIgnoreCase))
-                log.Warn("Log backup dir " + backupTarget + " not writable; using " + backupDir + " instead.");
             try
             {
-                // Probes are config-free diagnostics: they run before the
-                // store-config gate so a bare exe can check VSS health.
-                switch (verb)
-                {
-                    case "vss-list":
-                        return VssList(baseDir);
-                    case "list-disks":
-                        return RunListDisks(log);
-                    case "list-volumes":
-                        return RunListVolumes(log);
-                    case "disk-layout":
-                        return RunDiskLayout(diskArg, log);
-                    case "vss-snap":
-                    case "vss-read":
-                    case "vss-dump":
-                    case "bitmap-stats":
-                        var probeVol = ProbeVolume(volume, log);
-                        if (probeVol == null) return 1;
-                        return RunProbe(verb, probeVol, log);
-                    case "bitmap-dump":
-                        return RunBitmapDump(volume, device, outPath, log);
-                    case "locate-winre":
-                        return RunLocateWinre(log);
-                    case "prepare-universal":
-                        return RunPrepareUniversal(windowsDir, drivers, nicDir, gpuDir, dryRun, trimResetBase, trimFeatures, trimPackages, trimNoHibernate, unattendFile, langPacks, regHive, regKey, regName, regType, regData, removeKbs, log);
-                    case "convert":
-                        return RunConvert(wimPath, toFlag, indexFlag, compressFlag, log);
-                    case "merge-swm":
-                        return RunMergeSwm(swmPath, toFlag, log);
-                    case "wim-info":
-                        return RunWimInfo(wimPath, log);
-                    case "mount":
-                        return RunMount(wimPath, indexFlag, mountDir, log);
-                    case "unmount":
-                        return RunUnmount(mountDir, commit, discard, log);
-                    case "apply":
-                        return RunApply(wimPath, indexFlag, target, log);
-                    case "optimize-wim":
-                        return RunOptimizeWim(wimPath, recompress, log);
-                    case "check-boot-mode":
-                        return RunCheckBootMode(diskArg, firmware, log);
-                    case "check-repair":
-                        return RunCheckRepair(diskArg, log);
-                    case "boot-verify":
-                        return RunBootVerify(vhdxFlag, vmNameFlag, bootTimeoutFlag, bootMemoryFlag, log);
-                    default:
-                        break;
-                }
-
-                if (cfg == null)
-                {
-                    if (!File.Exists(cfgPath))
-                        log.Error("config not found: " + cfgPath + " (copy config_corpus.yaml.example to config_corpus.yaml beside Corpus.exe, or pass --config <path>)");
-                    else
-                        log.Error("config invalid (empty?): " + cfgPath);
+                var probeRc = DispatchConfigFreeVerb(cli.Verb, cli, baseDir, log);
+                if (probeRc.HasValue)
+                    return probeRc.Value;
+                if (!ValidateStoreConfig(cfg, cli, log))
                     return 1;
-                }
-                // Explicit --store overrides the baked config (recovery media
-                // ships store_path '' by design; the operator points at the
-                // store). Must precede Validate + index resolution below.
-                if (!string.IsNullOrEmpty(storeFlag))
-                    cfg.StorePath = storeFlag;
-                if (!CorpusConfig.Validate(cfg, log))
-                    return 1;
-                if (confirm && verb != "gc")
-                {
-                    log.Error("--confirm is only valid with --gc");
-                    return 1;
-                }
-
-                switch (verb)
-                {
-                    case "validate":
-                        log.Info("store: " + cfg.StorePath);
-                        log.Info("state root: " + CorpusConfig.StateRoot(cfg));
-                        VssHealth.ReportServiceStates(log);
-                        log.Info("chunk: " + cfg.ChunkMib + " MiB, zstd level " + cfg.Compression.Level);
-                        log.Info("exclusions: " + string.Join(", ", CapturePolicy.EffectiveSkip(cfg.Exclude)));
-                        log.Info("Corpus config valid");
-                        return 0;
-                    case "image":
-                        // §12.1 single-file backup rides --image but stores
-                        // no snapshot: --volume only, never --name/--disk.
-                        if (toVhdx != null || toWim != null || toEsd != null)
-                            return RunSingleFile(cfg, volume, name, diskArg, toVhdx, toWim, toEsd, zstd, vhdxWriter, append, incremental, parentArg, forceFull, inline, cliExcludes, log, !bufferedIo, skipIfUnchanged, splitSwm, optimizeVhd);
-                        // §12.9 writer lock: store captures serialize on the
-                        // store root (storeless single-file above takes no
-                        // lock). Contention/timeout throw loud via the outer
-                        // handler naming the holder. Braced block: using-var is
-                        // illegal directly in a switch section (CS8647).
-                        {
-                            // First capture initializes the store: the lock
-                            // file lives inside it, so the dir must exist.
-                            Directory.CreateDirectory(cfg.StorePath);
-                            using var imageStoreLock = StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log);
-                        // Whole-disk target rides the same verb: --volume and
-                        // --disk are mutually exclusive (RunImageDisk refuses
-                        // the combo, never merges).
-                        if (!string.IsNullOrEmpty(diskArg))
-                            return RunImageDisk(cfg, diskArg, volume, name, incremental, parentArg, forceFull, cliExcludes, log, !bufferedIo, skipIfUnchanged);
-                        if (!string.IsNullOrEmpty(volumesArg))
-                            return RunConsistencyGroup(cfg, volumesArg, name ?? "cg", cliExcludes, log, !bufferedIo, skipIfUnchanged);
-                        if (string.IsNullOrEmpty(volume) || string.IsNullOrEmpty(name))
-                        {
-                            log.Error("--image requires --volume <path> --name <snapshot> (or --disk <N> --name <snapshot>)");
-                            return 1;
-                        }
-                        if (!inline)
-                        {
-                            // Default: fast landing capture (always full).
-                            // Classic packed capture (+ incrementals) via --inline.
-                            if (incremental || parentArg != null || forceFull)
-                            {
-                                log.Error("--incremental/--parent/--full need --inline (fast capture is always full)");
-                                return 1;
-                            }
-                            using (var store = CreateStore(cfg, log))
-                            using (var source = OpenSource(volume, log, !bufferedIo, cfg))
-                            {
-                                var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
-                                var m = excl == null
-                                    ? store.ImageFast(source, name, skipIfUnchanged: skipIfUnchanged)
-                                    : store.ImageFast(source, name, new ImageOptions(Exclusions: excl), skipIfUnchanged);
-                                log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks (landing, optimize pending)");
-                            }
-                            return 0;
-                        }
-                        if (incremental && parentArg != null)
-                        {
-                            log.Error("--incremental and --parent are mutually exclusive");
-                            return 1;
-                        }
-                        var parentGen = 0;
-                        if (parentArg != null && !TryParent(parentArg, log, out parentGen))
-                            return 1;
-                        using (var store = CreateStore(cfg, log))
-                        using (var source = OpenSource(volume, log, !bufferedIo, cfg))
-                        {
-                            // MFT-digest default (USN hint inside for
-                            // pre-digest parents and non-MFT sources).
-                            var m = store.Image(source, name, new ImageOptions(ParentGeneration: parentGen, Incremental: incremental, ForceFull: forceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, source, volume, cliExcludes, log)), skipIfUnchanged);
-                            log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
-                        }
-                        return 0;
-                        }
-                    case "export":
-                        if (!TrySnapshot(snapshotArg, log, out var exportGen) || string.IsNullOrEmpty(outPath))
-                        {
-                            log.Error("--export requires --snapshot <gen> --out <path>");
-                            return 1;
-                        }
-                        using (var store = CreateStore(cfg, log))
-                            store.Export(exportGen, outPath);
-                        return 0;
-                    case "export-vhdx":
-                        if (!TrySnapshot(snapshotArg, log, out var vhdxGen) || string.IsNullOrEmpty(outPath))
-                        {
-                            log.Error("--export-vhdx requires --snapshot <gen> --out <path>");
-                            return 1;
-                        }
-                        // §12.5 reflink fast path: clone the previous export,
-                        // overwrite dirty-vs-gen-N-1 ranges only. Base is
-                        // always gen N-1 (manifest-compared); the file only
-                        // needs matching VHDX capacity.
-                        if (cloneFrom != null)
-                        {
-                            if (cloneFrom.StartsWith("--", StringComparison.Ordinal))
-                            {
-                                log.Error("bare --clone-from refuses (missing <base.vhdx>, got flag: " + cloneFrom + ")");
-                                return 1;
-                            }
-                            using (var store = CreateStore(cfg, log))
-                                ReflinkExport.ExportVhdxFromClone(store, vhdxGen, outPath, cloneFrom, log);
-                            return 0;
-                        }
-                        using (var store = CreateStore(cfg, log))
-                            store.ExportVhdx(vhdxGen, outPath);
-                        return 0;
-                    case "verify":
-                        if (!TrySnapshot(snapshotArg, log, out var verifyGen))
-                        {
-                            log.Error("--verify requires --snapshot <gen>");
-                            return 1;
-                        }
-                        using (var store = CreateStore(cfg, log))
-                            return store.Verify(verifyGen, chain) ? 0 : 1;
-                    case "deep-verify":
-                        if (!TrySnapshot(snapshotArg, log, out var deepGen))
-                        {
-                            log.Error("--deep-verify requires --snapshot <gen>");
-                            return 1;
-                        }
-                        return RunDeepVerify(cfg, baseDir, deepGen, log);
-                    case "mount-snapshot":
-                        if (!TrySnapshot(snapshotArg, log, out var mountGen))
-                        {
-                            log.Error("--mount-snapshot requires --snapshot <gen>");
-                            return 1;
-                        }
-                        return RunMountSnapshot(cfg, baseDir, mountGen, null, log);
-                    case "list-snapshots":
-                        using (var store = CreateStore(cfg, log))
-                        {
-                            foreach (var (gen, snap) in store.ListSnapshots())
-                                Console.WriteLine(gen + " " + snap);
-                        }
-                        return 0;
-                    case "build-media":
-                        MediaBuilder.Build(new MediaBuildOptions(adkDir, includeStore, dbPath, drivers.ToArray(), stagingDir, usbDrive, isoPath, initialize, payloadDir), log);
-                        return 0;
-                    case "restore":
-                        return RunRestore(cfg, baseDir, snapshotArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, log);
-                    case "restore-disk":
-                        return RunRestoreDisk(cfg, baseDir, layoutArg, partitionsArg, target, storeFlag, indexFlag, confirmToken, allowBootDisk, skipVerify, dryRun, repairBoot, log);
-                    case "gc":
-                        using (StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log))
-                            return RunGc(cfg, dryRun, confirm, log, keepDaily, keepWeekly, keepMonthly, keepYearly);
-                    case "service":
-                        return RunService(cfg, log);
-                    case "copy":
-                    case "sync":
-                        return RunTransfer(cfg, verb, fromFlag, toFlag, snapshotArg, chain, chainGen, log);
-                    case "optimize-to-fit":
-                        long? budget = null;
-                        if (budgetBytes != null)
-                        {
-                            if (!long.TryParse(budgetBytes, out var b) || b <= 0)
-                            {
-                                log.Error("invalid --bytes (want a positive byte count, got: " + budgetBytes + ")");
-                                return 1;
-                            }
-                            budget = b;
-                        }
-                        var optimizer = new StoreOptimizer(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, cfg.Compression.Level, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
-                        using (StoreLock.Acquire(cfg.StorePath, retryLockFlag == null ? null : StoreLock.ParseRetryTimeout(retryLockFlag), log))
-                            optimizer.Optimize(budget);
-                        return 0;
-                    case "extract":
-                        if (!TrySnapshot(snapshotArg, log, out var extractGen) || string.IsNullOrEmpty(extractPaths) || string.IsNullOrEmpty(outPath))
-                        {
-                            log.Error("--extract requires --snapshot <gen> --paths <a,b> --out <dir>");
-                            return 1;
-                        }
-                        // No Trim: NTFS names can hold spaces.
-                        var index = EnsureWritableIndex(Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), log);
-                        var summary = SelectiveExtract.Extract(cfg.StorePath, index, extractGen, extractPaths.Split(','), outPath, log, new ZstdDeltaCodec(cfg.Compression.Level));
-                        log.Info($"extracted {summary.Files} files + {summary.Directories} dirs ({summary.Bytes} bytes, {summary.Skipped} skipped) from snapshot {extractGen}");
-                        return 0;
-                    case "record-compact":
-                        // §12.14 Compact OS: record-only. Queries the live (or
-                        // offline --windows-dir) OS state and files it beside
-                        // the snapshot manifest. Restore writes blocks, never
-                        // DISM-applies, so there is no apply step to attach.
-                        if (!TrySnapshot(snapshotArg, log, out var compactGen))
-                        {
-                            log.Error("--record-compact requires --snapshot <gen> [--windows-dir <offline>]");
-                            return 1;
-                        }
-                        if (!OperatingSystem.IsWindows())
-                        {
-                            log.Error("--record-compact needs Windows (compact.exe query)");
-                            return 1;
-                        }
-                        var state = CompactQuery.Query(new CompactQuery.ProcessCompactRunner(), windowsDir);
-                        CompactStateRecord.Write(cfg.StorePath, compactGen, state, log);
-                        return 0;
-                    default:
-                        return 1;
-                }
+                return DispatchStoreVerb(cli.Verb, cli, cfg!, baseDir, log);
             }
             catch (StoredSkippedException)
             {
-                // §12.8: Store already logged the exact skip line at INFO;
-                // exit 0 without logging again (else it appears twice).
                 return 0;
             }
             catch (StoreLockException ex)
             {
-                // Operator error (bad duration, contended store), not a
-                // crash: plain message, no stack (house error shape).
                 log.Error(ex.Message);
                 return 1;
             }
             catch (Exception ex)
             {
-                log.Error("corpus " + verb + " failed", ex);
+                log.Error("corpus " + cli.Verb + " failed", ex);
                 return 1;
             }
             finally
             {
                 (log as IDisposable)?.Dispose();
             }
+        }
+
+        private static int? ParseCliArgs(string[] args, CliArgs cli)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                var flag = args[i].ToLowerInvariant();
+                if (flag is "--help" or "-h" or "-?") { PrintHelp(); return 0; }
+                if (flag is "--version" or "-v") { PrintVersion(); return 0; }
+                if (TryParseVerbFlag(flag, cli)) continue;
+                if (TryParseBoolOrSpecialFlag(flag, args, ref i, cli)) continue;
+                if (TryParseValueFlag(flag, args, ref i, cli)) continue;
+                if (TryParseServicingFlag(flag, args, ref i, cli)) continue;
+                Console.Error.WriteLine("Unknown argument: " + args[i]);
+                PrintHelp();
+                return 1;
+            }
+            return null;
+        }
+
+        private static bool TryParseVerbFlag(string flag, CliArgs cli)
+        {
+            var verb = flag switch
+            {
+                "--validate" => "validate", "--image" => "image", "--disk-layout" => "disk-layout",
+                "--restore-disk" => "restore-disk", "--export" => "export", "--export-vhdx" => "export-vhdx",
+                "--export-vmdk" => "export-vmdk", "--export-ovf" => "export-ovf", "--export-ova" => "export-ova",
+                "--verify" => "verify", "--deep-verify" => "deep-verify", "--mount-snapshot" => "mount-snapshot",
+                "--list-snapshots" => "list-snapshots", "--list-volumes" => "list-volumes", "--gc" => "gc",
+                "--service" => "service", "--locate-winre" => "locate-winre", "--prepare-universal" => "prepare-universal",
+                "--check-boot-mode" => "check-boot-mode", "--check-repair" => "check-repair", "--boot-verify" => "boot-verify",
+                "--vss-list" => "vss-list", "--vss-snap" => "vss-snap", "--vss-read" => "vss-read",
+                "--vss-dump" => "vss-dump", "--bitmap-stats" => "bitmap-stats", "--bitmap-dump" => "bitmap-dump",
+                "--copy" => "copy", "--sync" => "sync", "--build-media" => "build-media",
+                "--restore" => "restore", "--list-disks" => "list-disks", "--optimize-to-fit" => "optimize-to-fit",
+                "--extract" => "extract", "--optimize-wim" => "optimize-wim", "--record-compact" => "record-compact",
+                "--convert" => "convert", "--merge-swm" => "merge-swm", "--wim-info" => "wim-info",
+                "--mount" => "mount", "--unmount" => "unmount", "--apply" => "apply",
+                _ => null,
+            };
+            if (verb == null) return false;
+            cli.Verb = verb;
+            return true;
+        }
+
+        private static readonly Dictionary<string, Action<CliArgs>> BoolFlags = new(StringComparer.Ordinal)
+        {
+            ["--repair-boot"] = c => c.RepairBoot = true,
+            ["--confirm"] = c => c.Confirm = true,
+            ["--inline"] = c => c.Inline = true,
+            ["--incremental"] = c => c.Incremental = true,
+            ["--full"] = c => c.ForceFull = true,
+            ["--initialize"] = c => c.Initialize = true,
+            ["--allow-boot-disk"] = c => c.AllowBootDisk = true,
+            ["--skip-verify"] = c => c.SkipVerify = true,
+            ["--zstd"] = c => c.Zstd = true,
+            ["--append"] = c => c.Append = true,
+            ["--buffered-io"] = c => c.BufferedIo = true,
+            ["--skip-if-unchanged"] = c => c.SkipIfUnchanged = true,
+            ["--optimize-vhd"] = c => c.OptimizeVhd = true,
+            ["--recompress"] = c => c.Recompress = true,
+            ["--trim-resetbase"] = c => c.TrimResetBase = true,
+            ["--trim-no-hibernate"] = c => c.TrimNoHibernate = true,
+            ["--commit"] = c => c.Commit = true,
+            ["--discard"] = c => c.Discard = true,
+            ["--dry-run"] = c => c.DryRun = true,
+            ["--skip-recovery"] = c => c.SkipRecovery = true,
+        };
+
+        private static bool TryParseBoolOrSpecialFlag(string flag, string[] args, ref int i, CliArgs cli)
+        {
+            if (BoolFlags.TryGetValue(flag, out var act)) { act(cli); return true; }
+            if (flag != "--chain") return false;
+            if (i + 1 < args.Length && int.TryParse(args[i + 1], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var cg) && cg > 0)
+            {
+                cli.Chain = true;
+                cli.ChainGen = cg;
+                i++;
+            }
+            else
+                cli.Chain = true;
+            return true;
+        }
+
+        private static readonly Dictionary<string, Action<CliArgs, string>> ValueFlags = new(StringComparer.Ordinal)
+        {
+            ["--config"] = (c, v) => c.CfgPath = v,
+            ["--device"] = (c, v) => c.Device = v,
+            ["--volume"] = (c, v) => c.Volume = v,
+            ["--volumes"] = (c, v) => c.VolumesArg = v,
+            ["--name"] = (c, v) => c.Name = v,
+            ["--snapshot"] = (c, v) => c.SnapshotArg = v,
+            ["--out"] = (c, v) => c.OutPath = v,
+            ["--parent"] = (c, v) => c.ParentArg = v,
+            ["--from"] = (c, v) => c.FromFlag = v,
+            ["--to"] = (c, v) => c.ToFlag = v,
+            ["--exclude"] = (c, v) => c.CliExcludes.Add(v),
+            ["--target"] = (c, v) => c.Target = v,
+            ["--disk"] = (c, v) => c.DiskArg = v,
+            ["--layout"] = (c, v) => c.LayoutArg = v,
+            ["--partitions"] = (c, v) => c.PartitionsArg = v,
+            ["--only-volumes"] = (c, v) => c.OnlyVolumesArg = v,
+            ["--store"] = (c, v) => c.StoreFlag = v,
+            ["--index"] = (c, v) => c.IndexFlag = v,
+            ["--confirm-type"] = (c, v) => c.ConfirmToken = v,
+            ["--to-vhdx"] = (c, v) => c.ToVhdx = v,
+            ["--to-wim"] = (c, v) => c.ToWim = v,
+            ["--to-esd"] = (c, v) => c.ToEsd = v,
+            ["--to-vmdk"] = (c, v) => c.ToVmdk = v,
+            ["--to-ovf"] = (c, v) => c.ToOvf = v,
+            ["--to-ova"] = (c, v) => c.ToOva = v,
+            ["--vhdx-writer"] = (c, v) => c.VhdxWriter = v,
+            ["--bytes"] = (c, v) => c.BudgetBytes = v,
+            ["--paths"] = (c, v) => c.ExtractPaths = v,
+            ["--clone-from"] = (c, v) => c.CloneFrom = v,
+            ["--retry-lock"] = (c, v) => c.RetryLockFlag = v,
+            ["--split-swm"] = (c, v) => c.SplitSwm = v,
+            ["--keep-daily"] = (c, v) => { if (int.TryParse(v, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n)) c.KeepDaily = n; },
+            ["--keep-weekly"] = (c, v) => { if (int.TryParse(v, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n)) c.KeepWeekly = n; },
+            ["--keep-monthly"] = (c, v) => { if (int.TryParse(v, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n)) c.KeepMonthly = n; },
+            ["--keep-yearly"] = (c, v) => { if (int.TryParse(v, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n)) c.KeepYearly = n; },
+        };
+
+        private static bool TryParseValueFlag(string flag, string[] args, ref int i, CliArgs cli)
+        {
+            if (!ValueFlags.TryGetValue(flag, out var act)) return false;
+            if (i + 1 < args.Length) act(cli, args[++i]);
+            return true;
+        }
+
+        private static readonly Dictionary<string, Action<CliArgs, string>> ServicingFlags = new(StringComparer.Ordinal)
+        {
+            ["--vhdx"] = (c, v) => c.VhdxFlag = v,
+            ["--vm-name"] = (c, v) => c.VmNameFlag = v,
+            ["--timeout-seconds"] = (c, v) => c.BootTimeoutFlag = v,
+            ["--memory-mb"] = (c, v) => c.BootMemoryFlag = v,
+            ["--windows-dir"] = (c, v) => c.WindowsDir = v,
+            ["--nic-dir"] = (c, v) => c.NicDir = v,
+            ["--gpu-dir"] = (c, v) => c.GpuDir = v,
+            ["--firmware"] = (c, v) => c.Firmware = v,
+            ["--adk"] = (c, v) => c.AdkDir = v,
+            ["--include-store"] = (c, v) => c.IncludeStore = v,
+            ["--db"] = (c, v) => c.DbPath = v,
+            ["--driver"] = (c, v) => c.Drivers.Add(v),
+            ["--staging-dir"] = (c, v) => c.StagingDir = v,
+            ["--usb"] = (c, v) => c.UsbDrive = v,
+            ["--iso"] = (c, v) => c.IsoPath = v,
+            ["--payload"] = (c, v) => c.PayloadDir = v,
+            ["--trim-disable-feature"] = (c, v) => c.TrimFeatures.Add(v),
+            ["--trim-remove-package"] = (c, v) => c.TrimPackages.Add(v),
+            ["--wim"] = (c, v) => c.WimPath = v,
+            ["--mount-dir"] = (c, v) => c.MountDir = v,
+            ["--compress"] = (c, v) => c.CompressFlag = v,
+            ["--swm"] = (c, v) => c.SwmPath = v,
+            ["--unattend"] = (c, v) => c.UnattendFile = v,
+            ["--lang-pack"] = (c, v) => c.LangPacks.Add(v),
+            ["--reg-hive"] = (c, v) => c.RegHive = v,
+            ["--reg-key"] = (c, v) => c.RegKey = v,
+            ["--reg-name"] = (c, v) => c.RegName = v,
+            ["--reg-type"] = (c, v) => c.RegType = v,
+            ["--reg-data"] = (c, v) => c.RegData = v,
+            ["--remove-kb"] = (c, v) => c.RemoveKbs.Add(v),
+        };
+
+        private static bool TryParseServicingFlag(string flag, string[] args, ref int i, CliArgs cli)
+        {
+            if (!ServicingFlags.TryGetValue(flag, out var act)) return false;
+            if (i + 1 < args.Length) act(cli, args[++i]);
+            return true;
+        }
+
+        private static bool ApplyStartupGuards(CorpusConfig? cfg, CliArgs cli, string? backupDir, ILogger log)
+        {
+            ProcessHardening.Apply(log);
+            if (!ConfigGuard.CheckConfigFile(cli.CfgPath, log, cfg?.StrictConfigPerms ?? false))
+                return false;
+            if (cfg != null)
+            {
+                if (cfg.EcoQos)
+                    ProcessHardening.ApplyEcoQos(log);
+                ChunkId.ConfigureOverride(cfg.KeyPath, cfg.KeyEnv);
+                if (!ConfigGuard.CheckSecretFile(cfg.KeyPath, log, cfg.StrictConfigPerms))
+                    return false;
+                if (cfg.DestinationProtect && !string.IsNullOrEmpty(cfg.StorePath))
+                    DestinationGuard.Enforce(cfg.StorePath, log);
+            }
+            var backupTarget = CorpusConfig.LogBackupTargetDir(cfg, cli.ToVhdx, cli.ToWim, cli.ToEsd);
+            if (!string.IsNullOrEmpty(backupTarget) && !string.Equals(backupDir, backupTarget, StringComparison.OrdinalIgnoreCase))
+                log.Warn("Log backup dir " + backupTarget + " not writable; using " + backupDir + " instead.");
+            return true;
+        }
+
+        private static int? DispatchConfigFreeVerb(string verb, CliArgs cli, string baseDir, ILogger log)
+        {
+            switch (verb)
+            {
+                case "vss-list": return VssList(baseDir);
+                case "list-disks": return RunListDisks(log);
+                case "list-volumes": return RunListVolumes(log);
+                case "disk-layout": return RunDiskLayout(cli.DiskArg, log);
+                case "vss-snap":
+                case "vss-read":
+                case "vss-dump":
+                case "bitmap-stats":
+                    var probeVol = ProbeVolume(cli.Volume, log);
+                    return probeVol == null ? 1 : RunProbe(verb, probeVol, log);
+                case "bitmap-dump": return RunBitmapDump(cli.Volume, cli.Device, cli.OutPath, log);
+                case "locate-winre": return RunLocateWinre(log);
+                case "prepare-universal": return RunPrepareUniversal(cli.WindowsDir, cli.Drivers, cli.NicDir, cli.GpuDir, cli.DryRun, cli.TrimResetBase, cli.TrimFeatures, cli.TrimPackages, cli.TrimNoHibernate, cli.UnattendFile, cli.LangPacks, cli.RegHive, cli.RegKey, cli.RegName, cli.RegType, cli.RegData, cli.RemoveKbs, log);
+                case "convert": return RunConvert(cli.WimPath, cli.ToFlag, cli.IndexFlag, cli.CompressFlag, log);
+                case "merge-swm": return RunMergeSwm(cli.SwmPath, cli.ToFlag, log);
+                case "wim-info": return RunWimInfo(cli.WimPath, log);
+                case "mount": return RunMount(cli.WimPath, cli.IndexFlag, cli.MountDir, log);
+                case "unmount": return RunUnmount(cli.MountDir, cli.Commit, cli.Discard, log);
+                case "apply": return RunApply(cli.WimPath, cli.IndexFlag, cli.Target, log);
+                case "optimize-wim": return RunOptimizeWim(cli.WimPath, cli.Recompress, log);
+                case "check-boot-mode": return RunCheckBootMode(cli.DiskArg, cli.Firmware, log);
+                case "check-repair": return RunCheckRepair(cli.DiskArg, log);
+                case "boot-verify": return RunBootVerify(cli.VhdxFlag, cli.VmNameFlag, cli.BootTimeoutFlag, cli.BootMemoryFlag, log);
+                default: return null;
+            }
+        }
+
+        private static bool ValidateStoreConfig(CorpusConfig? cfg, CliArgs cli, ILogger log)
+        {
+            if (cfg == null)
+            {
+                if (!File.Exists(cli.CfgPath))
+                    log.Error("config not found: " + cli.CfgPath + " (copy config_corpus.yaml.example to config_corpus.yaml beside Corpus.exe, or pass --config <path>)");
+                else
+                    log.Error("config invalid (empty?): " + cli.CfgPath);
+                return false;
+            }
+            if (!string.IsNullOrEmpty(cli.StoreFlag))
+                cfg.StorePath = cli.StoreFlag;
+            if (!CorpusConfig.Validate(cfg, log))
+                return false;
+            if (cli.Confirm && cli.Verb != "gc")
+            {
+                log.Error("--confirm is only valid with --gc");
+                return false;
+            }
+            return true;
+        }
+
+        private static int DispatchStoreVerb(string verb, CliArgs cli, CorpusConfig cfg, string baseDir, ILogger log)
+        {
+            switch (verb)
+            {
+                case "validate":
+                    log.Info("store: " + cfg.StorePath);
+                    log.Info("state root: " + CorpusConfig.StateRoot(cfg));
+                    VssHealth.ReportServiceStates(log);
+                    log.Info("chunk: " + cfg.ChunkMib + " MiB, zstd level " + cfg.Compression.Level);
+                    log.Info("exclusions: " + string.Join(", ", CapturePolicy.EffectiveSkip(cfg.Exclude)));
+                    log.Info("Corpus config valid");
+                    return 0;
+                case "image":
+                    return RunImageVerb(cfg, cli, log);
+                case "export":
+                case "export-vhdx":
+                case "export-vmdk":
+                case "export-ovf":
+                case "export-ova":
+                case "verify":
+                case "deep-verify":
+                case "mount-snapshot":
+                case "list-snapshots":
+                    return RunSnapshotStoreVerb(verb, cfg, cli, baseDir, log);
+                case "build-media":
+                    MediaBuilder.Build(new MediaBuildOptions(cli.AdkDir, cli.IncludeStore, cli.DbPath, cli.Drivers.ToArray(), cli.StagingDir, cli.UsbDrive, cli.IsoPath, cli.Initialize, cli.PayloadDir), log);
+                    return 0;
+                case "restore":
+                    return RunRestore(cfg, baseDir, cli.SnapshotArg, cli.Target, cli.StoreFlag, cli.IndexFlag, cli.ConfirmToken, cli.AllowBootDisk, cli.SkipVerify, cli.DryRun, log);
+                case "restore-disk":
+                    return RunRestoreDisk(cfg, baseDir, cli.LayoutArg, cli.PartitionsArg, cli.Target, cli.StoreFlag, cli.IndexFlag, cli.ConfirmToken, cli.AllowBootDisk, cli.SkipVerify, cli.DryRun, cli.RepairBoot, log);
+                case "gc":
+                    using (StoreLock.Acquire(cfg.StorePath, cli.RetryLockFlag == null ? null : StoreLock.ParseRetryTimeout(cli.RetryLockFlag), log))
+                        return RunGc(cfg, cli.DryRun, cli.Confirm, log, cli.KeepDaily, cli.KeepWeekly, cli.KeepMonthly, cli.KeepYearly);
+                case "service":
+                    return RunService(cfg, log);
+                case "copy":
+                case "sync":
+                    return RunTransfer(cfg, verb, cli.FromFlag, cli.ToFlag, cli.SnapshotArg, cli.Chain, cli.ChainGen, log);
+                case "optimize-to-fit":
+                    return RunOptimizeToFit(cfg, cli, log);
+                case "extract":
+                    return RunExtractVerb(cfg, cli, log);
+                case "record-compact":
+                    return RunRecordCompact(cfg, cli, log);
+                default:
+                    return 1;
+            }
+        }
+
+        private static int RunImageVerb(CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            if (cli.ToVmdk != null || cli.ToOvf != null || cli.ToOva != null)
+                return RunDirectOvfImage(cfg, cli, log);
+            if (cli.ToVhdx != null || cli.ToWim != null || cli.ToEsd != null)
+                return RunSingleFile(cfg, cli.Volume, cli.Name, cli.DiskArg, cli.ToVhdx, cli.ToWim, cli.ToEsd, cli.Zstd, cli.VhdxWriter, cli.Append, cli.Incremental, cli.ParentArg, cli.ForceFull, cli.Inline, cli.CliExcludes, log, !cli.BufferedIo, cli.SkipIfUnchanged, cli.SplitSwm, cli.OptimizeVhd);
+            Directory.CreateDirectory(cfg.StorePath);
+            using var imageStoreLock = StoreLock.Acquire(cfg.StorePath, cli.RetryLockFlag == null ? null : StoreLock.ParseRetryTimeout(cli.RetryLockFlag), log);
+            if (!string.IsNullOrEmpty(cli.DiskArg))
+                return RunImageDisk(cfg, cli.DiskArg, cli.Volume, cli.Name, cli.Incremental, cli.ParentArg, cli.ForceFull, cli.CliExcludes, log, !cli.BufferedIo, cli.SkipIfUnchanged);
+            if (!string.IsNullOrEmpty(cli.VolumesArg))
+                return RunConsistencyGroup(cfg, cli.VolumesArg, cli.Name ?? "cg", cli.CliExcludes, log, !cli.BufferedIo, cli.SkipIfUnchanged);
+            if (string.IsNullOrEmpty(cli.Volume) || string.IsNullOrEmpty(cli.Name))
+            {
+                log.Error("--image requires --volume <path> --name <snapshot> (or --disk <N> --name <snapshot>)");
+                return 1;
+            }
+            if (!cli.Inline)
+            {
+                if (cli.Incremental || cli.ParentArg != null || cli.ForceFull)
+                {
+                    log.Error("--incremental/--parent/--full need --inline (fast capture is always full)");
+                    return 1;
+                }
+                using var store = CreateStore(cfg, log);
+                using var source = OpenSource(cli.Volume, log, !cli.BufferedIo, cfg);
+                var excl = ResolveImageExclusions(cfg, source, cli.Volume, cli.CliExcludes, log);
+                var m = excl == null
+                    ? store.ImageFast(source, cli.Name, skipIfUnchanged: cli.SkipIfUnchanged)
+                    : store.ImageFast(source, cli.Name, new ImageOptions(Exclusions: excl), cli.SkipIfUnchanged);
+                log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks (landing, optimize pending)");
+                return 0;
+            }
+            if (cli.Incremental && cli.ParentArg != null)
+            {
+                log.Error("--incremental and --parent are mutually exclusive");
+                return 1;
+            }
+            var parentGen = 0;
+            if (cli.ParentArg != null && !TryParent(cli.ParentArg, log, out parentGen))
+                return 1;
+            using (var store = CreateStore(cfg, log))
+            using (var source = OpenSource(cli.Volume, log, !cli.BufferedIo, cfg))
+            {
+                var m = store.Image(source, cli.Name, new ImageOptions(ParentGeneration: parentGen, Incremental: cli.Incremental, ForceFull: cli.ForceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, source, cli.Volume, cli.CliExcludes, log)), cli.SkipIfUnchanged);
+                log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
+            }
+            return 0;
+        }
+
+        private static int RunSnapshotStoreVerb(string verb, CorpusConfig cfg, CliArgs cli, string baseDir, ILogger log)
+        {
+            switch (verb)
+            {
+                case "export":
+                    if (!TrySnapshot(cli.SnapshotArg, log, out var exportGen) || string.IsNullOrEmpty(cli.OutPath))
+                    {
+                        log.Error("--export requires --snapshot <gen> --out <path>");
+                        return 1;
+                    }
+                    using (var store = CreateStore(cfg, log))
+                        store.Export(exportGen, cli.OutPath);
+                    return 0;
+                case "export-vhdx":
+                    if (!TrySnapshot(cli.SnapshotArg, log, out var vhdxGen) || string.IsNullOrEmpty(cli.OutPath))
+                    {
+                        log.Error("--export-vhdx requires --snapshot <gen> --out <path>");
+                        return 1;
+                    }
+                    if (cli.CloneFrom != null)
+                    {
+                        if (cli.CloneFrom.StartsWith("--", StringComparison.Ordinal))
+                        {
+                            log.Error("bare --clone-from refuses (missing <base.vhdx>, got flag: " + cli.CloneFrom + ")");
+                            return 1;
+                        }
+                        using (var store = CreateStore(cfg, log))
+                            ReflinkExport.ExportVhdxFromClone(store, vhdxGen, cli.OutPath, cli.CloneFrom, log);
+                        return 0;
+                    }
+                    using (var store = CreateStore(cfg, log))
+                        store.ExportVhdx(vhdxGen, cli.OutPath);
+                    return 0;
+                case "export-vmdk":
+                case "export-ovf":
+                case "export-ova":
+                    return RunOvfFamilyExport(verb, cfg, cli, log);
+                case "verify":
+                    if (!TrySnapshot(cli.SnapshotArg, log, out var verifyGen)) { log.Error("--verify requires --snapshot <gen>"); return 1; }
+                    using (var store = CreateStore(cfg, log))
+                        return store.Verify(verifyGen, cli.Chain) ? 0 : 1;
+                case "deep-verify":
+                    if (!TrySnapshot(cli.SnapshotArg, log, out var deepGen)) { log.Error("--deep-verify requires --snapshot <gen>"); return 1; }
+                    return RunDeepVerify(cfg, baseDir, deepGen, log);
+                case "mount-snapshot":
+                    if (!TrySnapshot(cli.SnapshotArg, log, out var mountGen)) { log.Error("--mount-snapshot requires --snapshot <gen>"); return 1; }
+                    return RunMountSnapshot(cfg, baseDir, mountGen, null, log);
+                case "list-snapshots":
+                    using (var store = CreateStore(cfg, log))
+                    {
+                        foreach (var (gen, snap) in store.ListSnapshots())
+                            Console.WriteLine(gen + " " + snap);
+                    }
+                    return 0;
+                default:
+                    return 1;
+            }
+        }
+
+        private static int RunOvfFamilyExport(string verb, CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            if (string.IsNullOrEmpty(cli.OutPath))
+            {
+                log.Error($"--{verb} requires (--snapshot <gen> | --layout <gen>) --out <path>");
+                return 1;
+            }
+            using var store = CreateStore(cfg, log);
+            if (!string.IsNullOrEmpty(cli.LayoutArg))
+            {
+                if (!int.TryParse(cli.LayoutArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var layoutGen) || layoutGen <= 0)
+                {
+                    log.Error("invalid --layout (want a positive layout generation, got: " + cli.LayoutArg + ")");
+                    return 1;
+                }
+                return RunOvfExportTarget(verb, cli.OutPath, cli.Zstd, cfg.Compression.Level, log,
+                    () => store.ExportDiskVmdk(layoutGen, cli.OutPath, cli.SkipRecovery),
+                    () => store.ExportDiskOvf(layoutGen, cli.OutPath, cli.SkipRecovery),
+                    () => store.ExportDiskOva(layoutGen, cli.OutPath, cli.SkipRecovery));
+            }
+            if (!TrySnapshot(cli.SnapshotArg, log, out var gen))
+            {
+                log.Error($"--{verb} requires (--snapshot <gen> | --layout <gen>) --out <path>");
+                return 1;
+            }
+            return RunOvfExportTarget(verb, cli.OutPath, cli.Zstd, cfg.Compression.Level, log,
+                () => store.ExportVmdk(gen, cli.OutPath),
+                () => store.ExportOvf(gen, cli.OutPath),
+                () => store.ExportOva(gen, cli.OutPath));
+        }
+
+        // Direct storeless --image (--disk <N> | --volume <X:>) --to-vmdk|--to-ovf|--to-ova:
+        // bypasses the chunk store completely and streams straight from VSS into VMDK/OVF/OVA.
+        private static int RunDirectOvfImage(CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            var kinds = (cli.ToVmdk != null ? 1 : 0) + (cli.ToOvf != null ? 1 : 0) + (cli.ToOva != null ? 1 : 0);
+            if (kinds != 1) { log.Error("--to-vmdk/--to-ovf/--to-ova are mutually exclusive (exactly one)"); return 1; }
+            var (format, outPath) = cli.ToVmdk != null ? ("vmdk", cli.ToVmdk)
+                : cli.ToOvf != null ? ("ovf", cli.ToOvf) : ("ova", cli.ToOva!);
+            if (outPath.StartsWith("--", StringComparison.Ordinal))
+            {
+                log.Error($"bare --to-{format} refuses (missing <file|dir>, got flag: {outPath})");
+                return 1;
+            }
+            if (!string.IsNullOrEmpty(cli.DiskArg) && !string.IsNullOrEmpty(cli.Volume))
+            {
+                log.Error("--disk and --volume are mutually exclusive");
+                return 1;
+            }
+            if (!string.IsNullOrEmpty(cli.DiskArg))
+                return RunDirectDiskOvf(cfg, cli, format, outPath, log);
+            if (string.IsNullOrEmpty(cli.Volume))
+            {
+                log.Error($"--image --to-{format} requires --disk <N> or --volume <path|X:>");
+                return 1;
+            }
+            using var source = OpenSource(cli.Volume, log, !cli.BufferedIo, cfg);
+            var excl = ResolveImageExclusions(cfg, source, cli.Volume, cli.CliExcludes, log);
+            var vmName = Path.GetFileNameWithoutExtension(outPath);
+            var res = format switch
+            {
+                "vmdk" => new OvfExportResult("", outPath, "", OvfExporter.AlignedCapacity(source.Length), 0, OvfExporter.ExportVmdk(outPath, source.Length, s => OvfExporter.StreamBlockSource(source, s, 0, excl)).FileBytes),
+                "ovf" => OvfExporter.ExportOvf(outPath, vmName, source.Length, s => OvfExporter.StreamBlockSource(source, s, 0, excl)),
+                _ => OvfExporter.ExportOva(outPath, vmName, source.Length, s => OvfExporter.StreamBlockSource(source, s, 0, excl)),
+            };
+            if (cli.Zstd)
+                SingleFileBackup.CompressSidecar(format == "ovf" ? res.VmdkPath : outPath, log, cfg.Compression.Level);
+            log.Info($"direct {format.ToUpperInvariant()} export of {cli.Volume} -> {outPath} complete");
+            return 0;
+        }
+
+        private static int RunDirectDiskOvf(CorpusConfig cfg, CliArgs cli, string format, string outPath, ILogger log)
+        {
+            if (!int.TryParse(cli.DiskArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var diskNumber) || diskNumber < 0)
+            {
+                log.Error("invalid --disk (want a non-negative disk number, got: " + cli.DiskArg + ")");
+                return 1;
+            }
+            HashSet<int>? includeParts = null;
+            if (!string.IsNullOrEmpty(cli.PartitionsArg))
+            {
+                includeParts = new HashSet<int>();
+                foreach (var tok in cli.PartitionsArg.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (!int.TryParse(tok.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n) || n <= 0)
+                    {
+                        log.Error("invalid --partitions entry: " + tok);
+                        return 1;
+                    }
+                    includeParts.Add(n);
+                }
+            }
+            HashSet<string>? onlyVolumes = null;
+            if (!string.IsNullOrEmpty(cli.OnlyVolumesArg))
+            {
+                onlyVolumes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var tok in cli.OnlyVolumesArg.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var norm = DiskCapture.NormalizeDrive(tok);
+                    if (string.IsNullOrEmpty(norm))
+                    {
+                        log.Error("invalid --only-volumes entry: " + tok);
+                        return 1;
+                    }
+                    onlyVolumes.Add(norm);
+                }
+            }
+            var excludes = Store.MergeExclusionNames(cfg.Exclude, cli.CliExcludes);
+            var plan = DiskCapture.BuildPlan(diskNumber, log, !cli.BufferedIo, cfg.StrictVssWriters, cli.SkipRecovery, includeParts, onlyVolumes);
+            var vmName = Path.GetFileNameWithoutExtension(outPath);
+            var res = OvfExporter.ExportDiskPlanDirect(format, outPath, vmName, plan, excludes, log);
+            if (cli.Zstd)
+                SingleFileBackup.CompressSidecar(format == "ovf" ? res.VmdkPath : outPath, log, cfg.Compression.Level);
+            log.Info($"direct bootable {format.ToUpperInvariant()} (UEFI/GPT) of disk {diskNumber} -> {outPath} complete ({res.VmdkBytes} VMDK bytes, {res.PopulatedBytes} populated)");
+            return 0;
+        }
+
+        private static int RunOvfExportTarget(
+            string verb, string outPath, bool zstd, int zstdLevel, ILogger log,
+            Action exportVmdk, Func<OvfExportResult> exportOvf, Action exportOva)
+        {
+            switch (verb)
+            {
+                case "export-vmdk":
+                    exportVmdk();
+                    if (zstd) SingleFileBackup.CompressSidecar(outPath, log, zstdLevel);
+                    return 0;
+                case "export-ovf":
+                    var ovf = exportOvf();
+                    if (zstd) SingleFileBackup.CompressSidecar(ovf.VmdkPath, log, zstdLevel);
+                    return 0;
+                case "export-ova":
+                    exportOva();
+                    if (zstd) SingleFileBackup.CompressSidecar(outPath, log, zstdLevel);
+                    return 0;
+                default:
+                    return 1;
+            }
+        }
+
+        private static int RunOptimizeToFit(CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            long? budget = null;
+            if (cli.BudgetBytes != null)
+            {
+                if (!long.TryParse(cli.BudgetBytes, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var b) || b <= 0)
+                {
+                    log.Error("invalid --bytes (want a positive byte count, got: " + cli.BudgetBytes + ")");
+                    return 1;
+                }
+                budget = b;
+            }
+            var optimizer = new StoreOptimizer(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, cfg.Compression.Level, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
+            using (StoreLock.Acquire(cfg.StorePath, cli.RetryLockFlag == null ? null : StoreLock.ParseRetryTimeout(cli.RetryLockFlag), log))
+                optimizer.Optimize(budget);
+            return 0;
+        }
+
+        private static int RunExtractVerb(CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            if (!TrySnapshot(cli.SnapshotArg, log, out var extractGen) || string.IsNullOrEmpty(cli.ExtractPaths) || string.IsNullOrEmpty(cli.OutPath))
+            {
+                log.Error("--extract requires --snapshot <gen> --paths <a,b> --out <dir>");
+                return 1;
+            }
+            var index = EnsureWritableIndex(Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), log);
+            var summary = SelectiveExtract.Extract(cfg.StorePath, index, extractGen, cli.ExtractPaths.Split(','), cli.OutPath, log, new ZstdDeltaCodec(cfg.Compression.Level));
+            log.Info($"extracted {summary.Files} files + {summary.Directories} dirs ({summary.Bytes} bytes, {summary.Skipped} skipped) from snapshot {extractGen}");
+            return 0;
+        }
+
+        private static int RunRecordCompact(CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            if (!TrySnapshot(cli.SnapshotArg, log, out var compactGen))
+            {
+                log.Error("--record-compact requires --snapshot <gen> [--windows-dir <offline>]");
+                return 1;
+            }
+            if (!OperatingSystem.IsWindows())
+            {
+                log.Error("--record-compact needs Windows (compact.exe query)");
+                return 1;
+            }
+            var state = CompactQuery.Query(new CompactQuery.ProcessCompactRunner(), cli.WindowsDir);
+            CompactStateRecord.Write(cfg.StorePath, compactGen, state, log);
+            return 0;
         }
 
         private static ILogger CreateLogger(CorpusConfig? cfg, string baseDir, string? backupDir)
@@ -897,7 +755,7 @@ namespace Corpus
         // live GPT read, capture nothing, JSON to stdout. Linux → exit 1.
         private static int RunDiskLayout(string? diskArg, ILogger log)
         {
-            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var diskNumber) || diskNumber < 0)
             {
                 log.Error("--disk-layout requires --disk <N> (non-negative disk number, got: " + diskArg + ")");
                 return 1;
@@ -1010,7 +868,7 @@ namespace Corpus
                 log.Error("--incremental and --parent are mutually exclusive");
                 return 1;
             }
-            if (!int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            if (!int.TryParse(diskArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var diskNumber) || diskNumber < 0)
             {
                 log.Error("invalid --disk (want a non-negative disk number, got: " + diskArg + ")");
                 return 1;
@@ -1046,7 +904,7 @@ namespace Corpus
                 log.Error("--restore-disk requires --layout <gen> --target <disk#|\\\\.\\PhysicalDriveN|file>");
                 return 1;
             }
-            if (!int.TryParse(layoutArg, out var layoutGen) || layoutGen <= 0)
+            if (!int.TryParse(layoutArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var layoutGen) || layoutGen <= 0)
             {
                 log.Error("invalid --layout (want a positive layout generation number, got: " + layoutArg + ")");
                 return 1;
@@ -1057,7 +915,7 @@ namespace Corpus
                 partitions = new List<int>();
                 foreach (var piece in partitionsArg.Split(','))
                 {
-                    if (!int.TryParse(piece.Trim(), out var n) || n <= 0)
+                    if (!int.TryParse(piece.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n) || n <= 0)
                     {
                         log.Error("invalid --partitions (want comma-separated partition numbers, got: " + partitionsArg + ")");
                         return 1;
@@ -1117,13 +975,13 @@ namespace Corpus
             else
             {
                 if (chainGen > 0 && !string.IsNullOrEmpty(snapshotArg)
-                    && (!int.TryParse(snapshotArg, out var sg) || sg != chainGen))
+                    && (!int.TryParse(snapshotArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var sg) || sg != chainGen))
                 {
                     log.Error("--snapshot and --chain name different generations (pass one)");
                     return 1;
                 }
                 var gen = chainGen;
-                if (gen <= 0 && (!int.TryParse(snapshotArg, out gen) || gen <= 0))
+                if (gen <= 0 && (!int.TryParse(snapshotArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out gen) || gen <= 0))
                 {
                     log.Error("--copy requires --snapshot <gen> or --chain <gen>");
                     return 1;
@@ -1165,229 +1023,138 @@ namespace Corpus
         // and --disk are refused, never merged.
         private static int RunSingleFile(CorpusConfig cfg, string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd, bool zstd, string? vhdxWriter, bool append, bool incremental, string? parentArg, bool forceFull, bool inline, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false, string? splitSwm = null, bool optimizeVhd = false)
         {
-            var kinds = 0;
-            if (toVhdx != null) kinds++;
-            if (toWim != null) kinds++;
-            if (toEsd != null) kinds++;
-            if (kinds != 1)
-            {
-                log.Error("--to-vhdx/--to-wim/--to-esd are mutually exclusive (exactly one)");
+            if (!ValidateSingleFileFlags(volume, name, diskArg, toVhdx, toWim, toEsd, zstd, vhdxWriter, append, incremental, parentArg, forceFull, inline, skipIfUnchanged, splitSwm, optimizeVhd, log, out var splitMb))
                 return 1;
-            }
-            // Bare flag swallowed the next flag as its value — refuse, never
-            // write a file literally named "--zstd".
+            if (append)
+                return RunSingleFileAppendWim(cfg, volume!, toWim!, splitMb, cliExcludes, log);
+            if (toVhdx != null)
+                return RunSingleFileVhdx(cfg, volume!, toVhdx, zstd, vhdxWriter, parentArg, cliExcludes, useUnbuffered, optimizeVhd, log);
+            return RunSingleFileWimOrEsd(cfg, volume!, toWim, toEsd, splitMb, cliExcludes, log);
+        }
+
+        private static bool ValidateSingleFileFlags(
+            string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd,
+            bool zstd, string? vhdxWriter, bool append, bool incremental, string? parentArg, bool forceFull,
+            bool inline, bool skipIfUnchanged, string? splitSwm, bool optimizeVhd, ILogger log, out int splitMb)
+        {
+            splitMb = 0;
+            if (!ValidateSingleFileTarget(volume, name, diskArg, toVhdx, toWim, toEsd, incremental, forceFull, inline, skipIfUnchanged, log))
+                return false;
+            return ValidateSingleFileOptions(toVhdx, toWim, zstd, vhdxWriter, append, parentArg, splitSwm, optimizeVhd, log, out splitMb);
+        }
+
+        private static bool ValidateSingleFileTarget(
+            string? volume, string? name, string? diskArg, string? toVhdx, string? toWim, string? toEsd,
+            bool incremental, bool forceFull, bool inline, bool skipIfUnchanged, ILogger log)
+        {
+            var kinds = (toVhdx != null ? 1 : 0) + (toWim != null ? 1 : 0) + (toEsd != null ? 1 : 0);
+            if (kinds != 1) { log.Error("--to-vhdx/--to-wim/--to-esd are mutually exclusive (exactly one)"); return false; }
             foreach (var t in new[] { toVhdx, toWim, toEsd })
             {
-                if (t != null && t.StartsWith("--", StringComparison.Ordinal))
-                {
-                    log.Error("bare --to-vhdx/--to-wim/--to-esd refuses (missing <file|dir>, got flag: " + t + ")");
-                    return 1;
-                }
+                if (t != null && t.StartsWith("--", StringComparison.Ordinal)) { log.Error("bare --to-vhdx/--to-wim/--to-esd refuses (missing <file|dir>, got flag: " + t + ")"); return false; }
             }
-            if (string.IsNullOrEmpty(volume))
-            {
-                log.Error("--image --to-vhdx/--to-wim/--to-esd requires --volume <path|X:>");
-                return 1;
-            }
-            if (!string.IsNullOrEmpty(diskArg))
-            {
-                log.Error("--to-vhdx/--to-wim/--to-esd cannot combine with --disk");
-                return 1;
-            }
-            if (!string.IsNullOrEmpty(name))
-            {
-                log.Error("--to-vhdx/--to-wim/--to-esd store no snapshot, --name is refused (drop it)");
-                return 1;
-            }
-            if (incremental || forceFull || inline)
-            {
-                log.Error("--to-vhdx/--to-wim/--to-esd take no --inline/--incremental/--full (store concepts)");
-                return 1;
-            }
-            // Storeless outputs write no gen: nothing to compare, so the
-            // flag is refused rather than silently ignored.
-            if (skipIfUnchanged)
-            {
-                log.Error("--skip-if-unchanged needs a store capture (--image/--disk without --to-*)");
-                return 1;
-            }
-            if (parentArg != null && toVhdx == null)
-            {
-                log.Error("--parent <base.vhdx> needs --to-vhdx (differencing child of a full VHDX)");
-                return 1;
-            }
-            if (zstd && toVhdx == null)
-            {
-                log.Error("--zstd needs --to-vhdx (WIM/ESD are already compressed)");
-                return 1;
-            }
-            if (vhdxWriter != null && toVhdx == null)
-            {
-                log.Error("--vhdx-writer needs --to-vhdx");
-                return 1;
-            }
-            // §12.29 Optimize-VHD compacts a full VHDX only — the
-            // differencing child's blocks fall through to the parent, so
-            // compacting it is refused (unprobed interaction), never silent.
-            if (optimizeVhd && toVhdx == null)
-            {
-                log.Error("--optimize-vhd needs --to-vhdx (full VHDX post-step)");
-                return 1;
-            }
-            if (optimizeVhd && parentArg != null)
-            {
-                log.Error("--optimize-vhd refuses a --parent differencing child (compact the full parent instead)");
-                return 1;
-            }
-            // Fail fast off-Windows: Compact would run the whole backup
-            // first, then throw. Same message shape as the runner's.
-            if (optimizeVhd && !OperatingSystem.IsWindows())
-            {
-                log.Error("--optimize-vhd needs Windows (Hyper-V Optimize-VHD)");
-                return 1;
-            }
-            // §12.14 SWM split: chop a --to-wim into FAT32-sized parts.
-            // WIM-only by Corpus policy (DISM itself splits ESD fine,
-            // proven 2026-10-17 — same posture as --append).
-            int splitMb = 0;
+            if (string.IsNullOrEmpty(volume)) { log.Error("--image --to-vhdx/--to-wim/--to-esd requires --volume <path|X:>"); return false; }
+            if (!string.IsNullOrEmpty(diskArg)) { log.Error("--to-vhdx/--to-wim/--to-esd cannot combine with --disk"); return false; }
+            if (!string.IsNullOrEmpty(name)) { log.Error("--to-vhdx/--to-wim/--to-esd store no snapshot, --name is refused (drop it)"); return false; }
+            if (incremental || forceFull || inline) { log.Error("--to-vhdx/--to-wim/--to-esd take no --inline/--incremental/--full (store concepts)"); return false; }
+            if (skipIfUnchanged) { log.Error("--skip-if-unchanged needs a store capture (--image/--disk without --to-*)"); return false; }
+            return true;
+        }
+
+        private static bool ValidateSingleFileOptions(
+            string? toVhdx, string? toWim, bool zstd, string? vhdxWriter, bool append, string? parentArg,
+            string? splitSwm, bool optimizeVhd, ILogger log, out int splitMb)
+        {
+            splitMb = 0;
+            if (parentArg != null && toVhdx == null) { log.Error("--parent <base.vhdx> needs --to-vhdx (differencing child of a full VHDX)"); return false; }
+            if (zstd && toVhdx == null) { log.Error("--zstd needs --to-vhdx (WIM/ESD are already compressed)"); return false; }
+            if (vhdxWriter != null && toVhdx == null) { log.Error("--vhdx-writer needs --to-vhdx"); return false; }
+            if (optimizeVhd && toVhdx == null) { log.Error("--optimize-vhd needs --to-vhdx (full VHDX post-step)"); return false; }
+            if (optimizeVhd && parentArg != null) { log.Error("--optimize-vhd refuses a --parent differencing child (compact the full parent instead)"); return false; }
+            if (optimizeVhd && !OperatingSystem.IsWindows()) { log.Error("--optimize-vhd needs Windows (Hyper-V Optimize-VHD)"); return false; }
+            if (append && toWim == null) { log.Error("--append needs --to-wim <base.wim> (new image index in an existing WIM)"); return false; }
             if (splitSwm != null)
             {
-                if (splitSwm.StartsWith("--", StringComparison.Ordinal))
-                {
-                    log.Error("bare --split-swm refuses (missing <sizeMb>, got flag: " + splitSwm + ")");
-                    return 1;
-                }
-                if (toWim == null)
-                {
-                    log.Error("--split-swm needs --to-wim <base.wim> (Corpus policy: no ESD split; DISM itself splits ESD fine)");
-                    return 1;
-                }
-                if (!int.TryParse(splitSwm, out splitMb) || splitMb <= 0)
-                {
-                    log.Error("invalid --split-swm (want a positive part size in MB, got: " + splitSwm + ")");
-                    return 1;
-                }
+                if (splitSwm.StartsWith("--", StringComparison.Ordinal)) { log.Error("bare --split-swm refuses (missing <sizeMb>, got flag: " + splitSwm + ")"); return false; }
+                if (toWim == null) { log.Error("--split-swm needs --to-wim <base.wim> (Corpus policy: no ESD split; DISM itself splits ESD fine)"); return false; }
+                if (!int.TryParse(splitSwm, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out splitMb) || splitMb <= 0)
+                { log.Error("invalid --split-swm (want a positive part size in MB, got: " + splitSwm + ")"); return false; }
             }
-            // §12.11 WIM-append: this volume's state as a new image index
-            // in the existing base WIM. Gen = current index count + 1
-            // (one redundant Get-WimInfo; captures dwarf it).
-            if (append)
+            return true;
+        }
+
+        private static int RunSingleFileAppendWim(CorpusConfig cfg, string volume, string toWim, int splitMb, List<string> cliExcludes, ILogger log)
+        {
+            using var source = OpenSource(volume, log, cfg: cfg);
+            var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
+            if (snap == null)
             {
-                if (toWim == null)
-                {
-                    log.Error("--append needs --to-wim <base.wim> (new image index in an existing WIM)");
-                    return 1;
-                }
-                using (var source = OpenSource(volume, log, cfg: cfg))
-                {
-                    var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
-                    if (snap == null)
-                    {
-                        log.Error("--to-wim --append need --volume <drive:> (a live volume, not a file: " + volume + ")");
-                        return 1;
-                    }
-                    var snapDir = snap.EndsWith('\\') ? snap : snap + "\\";
-                    var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
-                    var dism = new DismRunner();
-                    var info = dism.Run("/Get-WimInfo /WimFile:" + ProcessRunner.QuoteArg(toWim));
-                    if (info.ExitCode != 0)
-                    {
-                        log.Error($"--append: cannot read indexes of {toWim} (exit {info.ExitCode}: {info.Stderr})");
-                        return 1;
-                    }
-                    SingleFileBackup.AppendWim(snapDir, toWim, SingleFileBackup.CountImageIndexes(info.Stdout) + 1, merged, dism, log);
-                    if (splitMb > 0)
-                        SplitWimFile(toWim, splitMb, log);
-                }
+                log.Error("--to-wim --append need --volume <drive:> (a live volume, not a file: " + volume + ")");
+                return 1;
+            }
+            var snapDir = snap.EndsWith('\\') ? snap : snap + "\\";
+            var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
+            var dism = new DismRunner();
+            var info = dism.Run("/Get-WimInfo /WimFile:" + ProcessRunner.QuoteArg(toWim));
+            if (info.ExitCode != 0)
+            {
+                log.Error($"--append: cannot read indexes of {toWim} (exit {info.ExitCode}: {info.Stderr})");
+                return 1;
+            }
+            SingleFileBackup.AppendWim(snapDir, toWim, SingleFileBackup.CountImageIndexes(info.Stdout) + 1, merged, dism, log);
+            if (splitMb > 0)
+                SplitWimFile(toWim, splitMb, log);
+            return 0;
+        }
+
+        private static int RunSingleFileVhdx(CorpusConfig cfg, string volume, string toVhdx, bool zstd, string? vhdxWriter, string? parentArg, List<string> cliExcludes, bool useUnbuffered, bool optimizeVhd, ILogger log)
+        {
+            VhdxWriterKind kind;
+            try { kind = ExtentSinkFactory.ParseKind(vhdxWriter); }
+            catch (SingleFileBackupException ex) { log.Error(ex.Message); return 1; }
+            if (parentArg != null)
+            {
+                if (parentArg.StartsWith("--", StringComparison.Ordinal)) { log.Error("bare --parent refuses (missing <base.vhdx>, got flag: " + parentArg + ")"); return 1; }
+                if (kind != VhdxWriterKind.DiscUtils) { log.Error("--parent <base.vhdx> needs the DiscUtils writer (differencing create is a DiscUtils path)"); return 1; }
+                using var source = OpenSource(volume, log, useUnbuffered, cfg);
+                var explicitExcl = Store.ExplicitExclusionNames(cfg.Exclude, cliExcludes);
+                if (explicitExcl.Count > 0) { log.Error("--parent cannot combine with exclusions (baked into the full parent at creation; got: " + string.Join(", ", explicitExcl) + ")"); return 1; }
+                var chunkBytes = cfg.ChunkMib * 1024 * 1024;
+                var dirty = DifferencingVhdx.ComputeDirtyVsParent(source, parentArg, chunkBytes, log);
+                var child = DifferencingVhdx.CreateDiff(source, volume, toVhdx, parentArg, dirty, chunkBytes, log);
+                if (zstd) SingleFileBackup.CompressSidecar(child, log, cfg.Compression.Level);
                 return 0;
             }
-            if (toVhdx != null)
+            using (var source = OpenSource(volume, log, useUnbuffered, cfg))
             {
-                VhdxWriterKind kind;
-                try
-                {
-                    kind = ExtentSinkFactory.ParseKind(vhdxWriter);
-                }
-                catch (SingleFileBackupException ex)
-                {
-                    log.Error(ex.Message);
-                    return 1;
-                }
-                // §12.6 differencing child: the parent VHDX is the baseline
-                // (storeless single-file has no manifest to plan against), so
-                // dirty = chunks where the live source differs from the
-                // parent on the store chunk grid. Exclusions bake into the
-                // full parent at creation — re-specifying them here is
-                // refused, never silently reinterpreted.
-                if (parentArg != null)
-                {
-                    if (parentArg.StartsWith("--", StringComparison.Ordinal))
-                    {
-                        log.Error("bare --parent refuses (missing <base.vhdx>, got flag: " + parentArg + ")");
-                        return 1;
-                    }
-                    if (kind != VhdxWriterKind.DiscUtils)
-                    {
-                        log.Error("--parent <base.vhdx> needs the DiscUtils writer (differencing create is a DiscUtils path)");
-                        return 1;
-                    }
-                    using (var source = OpenSource(volume, log, useUnbuffered, cfg))
-                    {
-                        // The diff is a block compare: exclusions bake into a
-                        // full parent at creation and mean nothing here, so
-                        // EXPLICIT exclusions refuse (absent key and explicit
-                        // `exclude: []` both pass — identical).
-                        var explicitExcl = Store.ExplicitExclusionNames(cfg.Exclude, cliExcludes);
-                        if (explicitExcl.Count > 0)
-                        {
-                            log.Error("--parent cannot combine with exclusions (baked into the full parent at creation; got: " + string.Join(", ", explicitExcl) + ")");
-                            return 1;
-                        }
-                        var chunkBytes = cfg.ChunkMib * 1024 * 1024;
-                        var dirty = DifferencingVhdx.ComputeDirtyVsParent(source, parentArg, chunkBytes, log);
-                        var child = DifferencingVhdx.CreateDiff(source, volume, toVhdx, parentArg, dirty, chunkBytes, log);
-                        if (zstd)
-                            SingleFileBackup.CompressSidecar(child, log, cfg.Compression.Level);
-                    }
-                    return 0;
-                }
-                using (var source = OpenSource(volume, log, useUnbuffered, cfg))
-                {
-                    var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
-                    var path = SingleFileBackup.BackupVhdx(source, volume, toVhdx, kind, excl, log);
-                    // Order: verify (inside BackupVhdx) → compact → zstd.
-                    // The sidecar hashes and deletes the original, so
-                    // compacting after it compacts nothing.
-                    if (optimizeVhd)
-                        OptimizeVhd.Compact(path, new PowershellOptimizeRunner(), log);
-                    if (zstd)
-                        SingleFileBackup.CompressSidecar(path, log, cfg.Compression.Level);
-                }
-                return 0;
+                var excl = ResolveImageExclusions(cfg, source, volume, cliExcludes, log);
+                var path = SingleFileBackup.BackupVhdx(source, volume, toVhdx, kind, excl, log);
+                if (optimizeVhd) OptimizeVhd.Compact(path, new PowershellOptimizeRunner(), log);
+                if (zstd) SingleFileBackup.CompressSidecar(path, log, cfg.Compression.Level);
             }
-            // WIM/ESD capture from the VSS snapshot dir — a live volume, not
-            // a file. Trailing backslash: the shadow device object is only a
-            // valid directory path in root form.
-            using (var source = OpenSource(volume, log, cfg: cfg))
+            return 0;
+        }
+
+        private static int RunSingleFileWimOrEsd(CorpusConfig cfg, string volume, string? toWim, string? toEsd, int splitMb, List<string> cliExcludes, ILogger log)
+        {
+            using var source = OpenSource(volume, log, cfg: cfg);
+            var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
+            if (snap == null)
             {
-                var snap = (source as IVolumeHandleProvider)?.SnapshotDevicePath;
-                if (snap == null)
-                {
-                    log.Error("--to-wim/--to-esd need --volume <drive:> (a live volume, not a file: " + volume + ")");
-                    return 1;
-                }
-                var snapDir = snap.EndsWith('\\') ? snap : snap + "\\";
-                var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
-                var dism = new DismRunner();
-                if (toWim != null)
-                {
-                    var wimPath = SingleFileBackup.BackupWim(snapDir, volume, toWim, merged, dism, log);
-                    if (splitMb > 0)
-                        SplitWimFile(wimPath, splitMb, log);
-                }
-                else
-                    SingleFileBackup.BackupEsd(snapDir, volume, toEsd, merged, dism, log);
+                log.Error("--to-wim/--to-esd need --volume <drive:> (a live volume, not a file: " + volume + ")");
+                return 1;
             }
+            var snapDir = snap.EndsWith('\\') ? snap : snap + "\\";
+            var merged = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
+            var dism = new DismRunner();
+            if (toWim != null)
+            {
+                var wimPath = SingleFileBackup.BackupWim(snapDir, volume, toWim, merged, dism, log);
+                if (splitMb > 0)
+                    SplitWimFile(wimPath, splitMb, log);
+            }
+            else
+                SingleFileBackup.BackupEsd(snapDir, volume, toEsd, merged, dism, log);
             return 0;
         }
 
@@ -1555,7 +1322,7 @@ namespace Corpus
             int? index = null;
             if (!string.IsNullOrEmpty(indexFlag))
             {
-                if (!int.TryParse(indexFlag, out var n) || n < 1)
+                if (!int.TryParse(indexFlag, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n) || n < 1)
                 {
                     log.Error("invalid --index (want a positive image number, got: " + indexFlag + ")");
                     return 1;
@@ -1631,7 +1398,7 @@ namespace Corpus
                 log.Error("--mount requires --wim <image> --index <N> --mount-dir <empty dir> (bare flag refuses)");
                 return 1;
             }
-            if (string.IsNullOrEmpty(indexFlag) || !int.TryParse(indexFlag, out var index) || index < 1)
+            if (string.IsNullOrEmpty(indexFlag) || !int.TryParse(indexFlag, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var index) || index < 1)
             {
                 log.Error("--mount requires --index <N> (positive image number, got: " + indexFlag + ")");
                 return 1;
@@ -1672,7 +1439,7 @@ namespace Corpus
             int? index = null;
             if (!string.IsNullOrEmpty(indexFlag))
             {
-                if (!int.TryParse(indexFlag, out var n) || n < 1)
+                if (!int.TryParse(indexFlag, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n) || n < 1)
                 {
                     log.Error("invalid --index (want a positive image number, got: " + indexFlag + ")");
                     return 1;
@@ -1746,7 +1513,7 @@ namespace Corpus
         // explicit (no guessing the target box); layout is captured live.
         private static int RunCheckBootMode(string? diskArg, string? firmware, ILogger log)
         {
-            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var diskNumber) || diskNumber < 0)
             {
                 log.Error("--check-boot-mode requires --disk <N> (non-negative disk number, got: " + diskArg + ")");
                 return 1;
@@ -1771,7 +1538,7 @@ namespace Corpus
         // live box. Exit 1 names the blocker (ESP floor, MSR, style).
         private static int RunCheckRepair(string? diskArg, ILogger log)
         {
-            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, out var diskNumber) || diskNumber < 0)
+            if (string.IsNullOrEmpty(diskArg) || !int.TryParse(diskArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var diskNumber) || diskNumber < 0)
             {
                 log.Error("--check-repair requires --disk <N> (non-negative disk number, got: " + diskArg + ")");
                 return 1;
@@ -1804,13 +1571,13 @@ namespace Corpus
                 return 1;
             }
             var timeout = 300;
-            if (!string.IsNullOrEmpty(timeoutFlag) && (!int.TryParse(timeoutFlag, out timeout) || timeout <= 0))
+            if (!string.IsNullOrEmpty(timeoutFlag) && (!int.TryParse(timeoutFlag, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out timeout) || timeout <= 0))
             {
                 log.Error("--timeout-seconds must be a positive integer (got: " + timeoutFlag + ")");
                 return 1;
             }
             var memoryMb = 2048;
-            if (!string.IsNullOrEmpty(memoryFlag) && (!int.TryParse(memoryFlag, out memoryMb) || memoryMb <= 0))
+            if (!string.IsNullOrEmpty(memoryFlag) && (!int.TryParse(memoryFlag, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out memoryMb) || memoryMb <= 0))
             {
                 log.Error("--memory-mb must be a positive integer (got: " + memoryFlag + ")");
                 return 1;
@@ -1936,68 +1703,63 @@ namespace Corpus
 
         private static int RunProbe(string verb, string volume, ILogger log)
         {
-            // Probes never Complete: AbortBackup is the honest teardown for
-            // reads that capture nothing (see VssSnapshot).
             switch (verb)
             {
                 case "vss-snap":
                     using (var s = VssSnapshot.Create(volume, log))
                         log.Info("device: " + s.DeviceObject);
                     return 0;
-                case "vss-read":
-                    using (var s = VssSnapshot.Create(volume, log))
-                    {
-                        var dev = s.DeviceObject.TrimEnd('\\');
-                        using var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                        // True device length (not MaxValue): the segment
-                        // reader sizes fills from it, and an overlong Length
-                        // would overread past EOF into a short-read throw.
-                        // Callback unobserved (probes never Complete).
-                        using var fs = new VssReadStream(raw, VssBlockSource.DeviceLength(volume, dev), () => { });
-                        var buf = new byte[64 * 1024];
-                        var filled = 0;
-                        int n;
-                        while (filled < buf.Length && (n = fs.Read(buf, filled, buf.Length - filled)) > 0)
-                            filled += n;
-                        using var sha = SHA256.Create();
-                        log.Info($"read {filled} bytes: sha256={Convert.ToHexString(sha.ComputeHash(buf, 0, filled))} head={Convert.ToHexString(buf, 0, Math.Min(8, filled))}");
-                    }
-                    return 0;
-                case "vss-dump":
-                    // Transport-vs-isolation probe: ONE snapshot, read TWICE
-                    // end to end (same chunker shape as imaging). Differing
-                    // hashes = unreliable snapshot reads; matching hashes
-                    // that differ from live = VSS isolation failure.
-                    using (var s = VssSnapshot.Create(volume, log))
-                    {
-                        var dev = s.DeviceObject.TrimEnd('\\');
-                        var vlen = VssBlockSource.DeviceLength(volume, dev);
-                        string h1, h2;
-                        using (var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                        using (var fs = new VssReadStream(raw, vlen, () => { }))
-                            h1 = HashStream(fs);
-                        using (var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                        using (var fs = new VssReadStream(raw, vlen, () => { }))
-                            h2 = HashStream(fs);
-                        log.Info($"vss-dump {volume} pass1={h1} pass2={h2} stable={h1 == h2}");
-                    }
-                    return 0;
-                case "bitmap-stats":
-                    using (var s = VssSnapshot.Create(volume, log))
-                    {
-                        var bpc = VolumeBitmap.BytesPerCluster(volume + "\\");
-                        var total = VolumeBitmap.TotalBytes(volume + "\\");
-                        var runs = VolumeBitmap.ReadRuns(s.DeviceObject.TrimEnd('\\'), total / bpc);
-                        long used = 0;
-                        foreach (var r in runs) used += r.Count;
-                        log.Info($"{volume} {used}/{total / bpc} clusters used ({used * bpc}/{total} bytes) in {runs.Count} runs");
-                        for (var i = 0; i < Math.Min(5, runs.Count); i++)
-                            log.Info($"  run {i}: LCN {runs[i].Start} +{runs[i].Count}");
-                    }
-                    return 0;
-                default:
-                    return 1;
+                case "vss-read": return ProbeVssRead(volume, log);
+                case "vss-dump": return ProbeVssDump(volume, log);
+                case "bitmap-stats": return ProbeBitmapStats(volume, log);
+                default: return 1;
             }
+        }
+
+        private static int ProbeVssRead(string volume, ILogger log)
+        {
+            using var s = VssSnapshot.Create(volume, log);
+            var dev = s.DeviceObject.TrimEnd('\\');
+            using var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var fs = new VssReadStream(raw, VssBlockSource.DeviceLength(volume, dev), () => { });
+            var buf = new byte[64 * 1024];
+            var filled = 0;
+            int n;
+            while (filled < buf.Length && (n = fs.Read(buf, filled, buf.Length - filled)) > 0)
+                filled += n;
+            using var sha = SHA256.Create();
+            log.Info($"read {filled} bytes: sha256={Convert.ToHexString(sha.ComputeHash(buf, 0, filled))} head={Convert.ToHexString(buf, 0, Math.Min(8, filled))}");
+            return 0;
+        }
+
+        private static int ProbeVssDump(string volume, ILogger log)
+        {
+            using var s = VssSnapshot.Create(volume, log);
+            var dev = s.DeviceObject.TrimEnd('\\');
+            var vlen = VssBlockSource.DeviceLength(volume, dev);
+            string h1, h2;
+            using (var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var fs = new VssReadStream(raw, vlen, () => { }))
+                h1 = HashStream(fs);
+            using (var raw = new FileStream(dev, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var fs = new VssReadStream(raw, vlen, () => { }))
+                h2 = HashStream(fs);
+            log.Info($"vss-dump {volume} pass1={h1} pass2={h2} stable={h1 == h2}");
+            return 0;
+        }
+
+        private static int ProbeBitmapStats(string volume, ILogger log)
+        {
+            using var s = VssSnapshot.Create(volume, log);
+            var bpc = VolumeBitmap.BytesPerCluster(volume + "\\");
+            var total = VolumeBitmap.TotalBytes(volume + "\\");
+            var runs = VolumeBitmap.ReadRuns(s.DeviceObject.TrimEnd('\\'), total / bpc);
+            long used = 0;
+            foreach (var r in runs) used += r.Count;
+            log.Info($"{volume} {used}/{total / bpc} clusters used ({used * bpc}/{total} bytes) in {runs.Count} runs");
+            for (var i = 0; i < Math.Min(5, runs.Count); i++)
+                log.Info($"  run {i}: LCN {runs[i].Start} +{runs[i].Count}");
+            return 0;
         }
 
         // Runs dump for harness-side masked compares. --volume gives geometry
@@ -2014,7 +1776,7 @@ namespace Corpus
             if (vol == null) return 1;
             var bpc = VolumeBitmap.BytesPerCluster(vol + "\\");
             var total = VolumeBitmap.TotalBytes(vol + "\\");
-            List<(long Start, long Count)> runs;
+            IReadOnlyList<(long Start, long Count)> runs;
             if (!string.IsNullOrEmpty(device))
             {
                 runs = VolumeBitmap.ReadRuns(device, total / bpc);
@@ -2043,7 +1805,7 @@ namespace Corpus
         private static bool TrySnapshot(string? arg, ILogger log, out int generation)
         {
             generation = 0;
-            if (string.IsNullOrEmpty(arg) || !int.TryParse(arg, out generation) || generation <= 0)
+            if (string.IsNullOrEmpty(arg) || !int.TryParse(arg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out generation) || generation <= 0)
             {
                 log.Error("invalid --snapshot (want a positive generation number, got: " + arg + ")");
                 return false;
@@ -2054,7 +1816,7 @@ namespace Corpus
         private static bool TryParent(string? arg, ILogger log, out int generation)
         {
             generation = 0;
-            if (string.IsNullOrEmpty(arg) || !int.TryParse(arg, out generation) || generation <= 0)
+            if (string.IsNullOrEmpty(arg) || !int.TryParse(arg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out generation) || generation <= 0)
             {
                 log.Error("invalid --parent (want a positive generation number, got: " + arg + ")");
                 return false;
@@ -2069,88 +1831,98 @@ namespace Corpus
             Console.WriteLine("Corpus " + (info ?? asm.GetName().Version?.ToString() ?? "unknown"));
         }
 
+        private static readonly string[] HelpLines =
+        {
+            "Corpus — system imaging",
+            "",
+            "  --image --volume <path|X:> --name <snap>   Fast landing capture (default, always full; run --gc/optimize to fold)",
+            "      --inline [--incremental | --parent <gen>] [--full]   Classic packed capture instead of landing",
+            "  --image --volumes <C:,D:> --name <snap>   Atomic multi-volume VSS consistency group capture",
+            "  --image --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)",
+            "  --export --snapshot <gen> --out <path>  Export a snapshot to a file",
+            "  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX",
+            "  --export-vmdk (--snapshot <gen> | --layout <gen>) --out <file.vmdk> [--skip-recovery] [--zstd]  Export to streamOptimized VMDK",
+            "  --export-ovf (--snapshot <gen> | --layout <gen>) --out <file.ovf|dir> [--skip-recovery] [--zstd]  Export to OVF + VMDK + SHA-256 .mf",
+            "  --export-ova (--snapshot <gen> | --layout <gen>) --out <file.ova> [--skip-recovery] [--zstd]  Export to single-file OVA (UEFI/GPT with --layout)",
+            "  --image (--disk <N> | --volume <X:>) --to-vmdk|--to-ovf|--to-ova <path> [--skip-recovery] [--only-volumes C:] [--partitions 1,3] [--exclude <p>]... [--zstd]  Direct storeless VMDK/OVF/OVA export (bypasses chunk store)",
+            "      --clone-from <base.vhdx>  Reflink export: clone base (gen N-1 contents) + overwrite dirty ranges only (same-volume COW, else plain-copy WRN)",
+            "  --image --volume <path|X:> --to-vhdx <file|dir> [--zstd] [--vhdx-writer <discutils|virtdisk>]  Single-file VHDX backup, no store (writer flag is temporary: A/B spike, loser deleted same day)",
+            "      --skip-if-unchanged  Exit 0 with no new gen when the source matches the latest snapshot (volume+disk; --force-full wins; storeless --to-* refuses)",
+            "      --buffered-io  Opt out of unbuffered (O_DIRECT/NO_BUFFERING) extent reads for weird drivers (bulk capture only)",
+            "      --parent <base.vhdx>  Differencing child holding dirty-vs-parent chunks only (depth 1, parent immutable while the child lives; no --exclude)",
+            "  --image --volume <X:> --to-wim <file|dir> | --to-esd <file|dir>  Single-file WIM/ESD via inbox DISM from the VSS snapshot (Windows, elevated)",
+            "  Imaging requires: VSS + EventSystem services and volsnap driver running, swprv service enabled ('corpus --validate' reports them)",
+            "      --to-wim <base.wim> --append  New image index in an existing WIM (gen = count+1; ESD/solid refused)",
+            "  --retry-lock <90|10m|2h>  Wait up to the duration for a contended store lock (writers: image/gc/optimize-to-fit; default fails loud naming the holder)",
+            "  --optimize-to-fit [--bytes N]  Compact the chunk store in place (+ prune oldest gens to N bytes via GC)",
+            "  --extract --snapshot <gen> --paths <a,b> --out <dir>  Pull files/folders out of a snapshot (no ADS/ACL/EFS — WRN names path+reason each)",
+            "  --vss-list                   Relay 'vssadmin list writers' (Windows)",
+            "  --vss-snap --volume <X:>     Create+delete a VSS snapshot probe (Windows, elevated)",
+            "  --vss-read --volume <X:>     Read a 64 KiB extent via snapshot probe (Windows, elevated)",
+            "  --vss-dump --volume <X:>     Hash one snapshot twice (read-stability probe)",
+            "  --bitmap-stats --volume <X:> Used-cluster stats over a snapshot (Windows, elevated)",
+            "  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)",
+            "  --verify --snapshot <gen> [--chain]              Verify a snapshot (exit 1 on failure; --chain also walks parent links to genesis, a gap fails loud even if the target alone verifies)",
+            "  --deep-verify --snapshot <gen>                   Re-read deep_verify_percent of chunks from packs, hash-compare (exit 1 on mismatch; percent 0 = no-op)",
+            "  --mount-snapshot --snapshot <gen>                Materialize a snapshot read-only under temp (Ctrl+C to unmount)",
+            "  --list-snapshots                     List snapshots (\"gen name\" lines)",
+            "  --gc [--dry-run | --confirm] [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--keep-yearly N]",
+            "      Garbage-collect pruned snapshots (manual; --service runs this on schedule)",
+            "      retention: keep_last/keep_within_days/keep_daily/keep_weekly/keep_monthly/keep_yearly/pin from config; exports outside the store are untouched",
+            "      retention pool is shared between volume and disk snapshots (use two stores for isolation)",
+            "  --service                              Run scheduled GC (gc_daily_at) + landing optimize (optimize_every) until Ctrl+C",
+            "  --locate-winre                         Print winre.wim source+path (reagentc/known-path/partition-scan; exit 1 when absent)",
+            "  --restore-disk ... --repair-boot       Recreate layout + reinstall bootloader after restore (default: print manual steps)",
+            "  --prepare-universal --windows-dir <offline> --driver <dir>... [--nic-dir <d>] [--gpu-dir <d>] [--dry-run]",
+            "      Offline storage-driver inject (DISM) + NIC/GPU first-boot staging into a restored tree",
+            "      [--trim-resetbase] [--trim-disable-feature <name>]... [--trim-remove-package <id>]... [--trim-no-hibernate]",
+            "      Footprint trim = REMOVAL (ResetBase is irreversible; feature/package lists are caller-named, never builtin; hibernate stages to SetupComplete.cmd for first boot)",
+            "      [--unattend <file>] [--lang-pack <cab>]... [--remove-kb <KB|identity-fragment>]... [--reg-hive <f> --reg-key <k> --reg-name <n> --reg-type <t> --reg-data <d>]",
+            "      Servicing order: drivers, first-boot staging, lang packs, unattend, trim, KB removal, registry; KB guard refuses the live OS",
+            "  --convert --wim <src> --to <dest> [--index N] [--compress max|recovery]  Convert WIM<->ESD or re-export single-index (.esd implies recovery; multi-image source requires --index)",
+            "  --merge-swm --swm <first.swm> --to <dest.wim>  Reunite a split set (join needs ALL parts)",
+            "  --wim-info --wim <image>  Human-readable dossier: indexes, sizes, languages",
+            "  --mount --wim <image> --index <N> --mount-dir <empty dir>  Read/write servicing mount (our marker; never over non-empty dir)",
+            "  --unmount --mount-dir <dir> --commit | --discard  Commit or throw away servicing (exactly one; foreign mounts refused)",
+            "  --apply --wim <image> [--index N] --target <D:>  Apply image to partition + bcdboot, no WinPE boot needed (refuses the live-OS volume; /CheckIntegrity covers the WIM, not the disk write)",
+            "  --image --volume <X:> --to-wim <file|dir> --split-swm <sizeMb>  Split the WIM into FAT32-sized .swm parts (DISM on Windows, wimlib on Linux; Corpus policy: no ESD split)",
+            "  --optimize-wim --wim <file> [--recompress]  Dedupe (+ optional recompress) a WIM in place via wimlib optimize (no DISM equivalent; Windows refuses naming wimlib)",
+            "  --image --volume <path|X:> --to-vhdx <file|dir> [--optimize-vhd]  Compact the VHDX post-verify via Optimize-VHD Mode Full (Windows Hyper-V module; refuses differencing children)",
+            "  --record-compact --snapshot <gen> [--windows-dir <offline>]  Record Compact OS state beside the snapshot manifest (record-only; Windows queries live)",
+            "  --check-boot-mode --disk <N> --firmware <UEFI|BIOS>  Refuse GPT-on-BIOS / MBR-on-UEFI with the conversion path",
+            "  --check-repair --disk <N>  Live-layout repair checks + diskpart/bcdboot plan (read-only, exit 1 names the blocker)",
+            "  --boot-verify --vhdx <path> [--vm-name <n>] [--timeout-seconds <s>] [--memory-mb <mb>]  Boot a VHDX in Hyper-V, poll heartbeat to healthy (defaults 300s, 2048MB)",
+            "  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)",
+            "      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]",
+            "      [--payload <dir>]  Skip re-publish (ADK box without the SDK: publish dir)",
+            "  --list-disks                           List physical disks (Windows; empty on Linux)",
+            "  --list-volumes                         List ready volumes (\"name filesystem bytes\" lines)",
+            "  --disk-layout --disk <N>  Print DiskLayout JSON to stdout, capture nothing (Windows, elevated)",
+            "  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]",
+            "  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]",
+            "      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run] [--partitions <1,3,4>]  Restore every non-skipped extent at its recorded offset",
+            "      --partitions restores a subset (MSR auto-included, structural); target may be smaller than the source disk",
+            "  --restore --snapshot <gen> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]",
+            "      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore a snapshot",
+            "  --copy --from <store> --to <store> (--snapshot <gen> | --chain <gen>) [--chain]  Copy one snapshot, missing packs only (--chain includes ancestors)",
+            "  --sync --from <store> --to <store>  Copy every snapshot the dest lacks, missing packs only (same id.key, or an empty dest)",
+            "  --exclude <path|pattern>  (repeatable, volume captures only) merged over config exclude, recorded in the manifest ($LogFile never excludable)",
+            "  --validate             Check config_corpus.yaml and exit",
+            "  --config <path>        Config file (default: config_corpus.yaml beside the exe)",
+            "  --version              Print version and exit",
+            "  --help                 This text",
+            "",
+            "  incrementals reuse the parent's clean chunks without re-reading; any doubt → full re-image",
+            "  per-pack encryption is an external shell hook (encrypt: in config), never builtin crypto",
+            "  restore streams chunk-by-chunk, then re-reads the whole target to verify:",
+            "    wall time is ~2x sequential device speed; --confirm-type is required always",
+            "    (even --dry-run); a refused run names the want-TOKEN to re-run with",
+        };
+
         static void PrintHelp()
         {
-            Console.WriteLine("Corpus — system imaging");
-            Console.WriteLine();
-            Console.WriteLine("  --image --volume <path|X:> --name <snap>   Fast landing capture (default, always full; run --gc/optimize to fold)");
-            Console.WriteLine("      --inline [--incremental | --parent <gen>] [--full]   Classic packed capture instead of landing");
-            Console.WriteLine("  --image --volumes <C:,D:> --name <snap>   Atomic multi-volume VSS consistency group capture");
-            Console.WriteLine("  --image --disk <N> --name <snap> [--incremental | --parent <layoutGen>] [--full]  Image every non-skipped partition of PhysicalDriveN (elevated Windows)");
-            Console.WriteLine("  --export --snapshot <gen> --out <path>  Export a snapshot to a file");
-            Console.WriteLine("  --export-vhdx --snapshot <gen> --out <path>  Export a snapshot to dynamic VHDX");
-            Console.WriteLine("      --clone-from <base.vhdx>  Reflink export: clone base (gen N-1 contents) + overwrite dirty ranges only (same-volume COW, else plain-copy WRN)");
-            Console.WriteLine("  --image --volume <path|X:> --to-vhdx <file|dir> [--zstd] [--vhdx-writer <discutils|virtdisk>]  Single-file VHDX backup, no store (writer flag is temporary: A/B spike, loser deleted same day)");
-            Console.WriteLine("      --skip-if-unchanged  Exit 0 with no new gen when the source matches the latest snapshot (volume+disk; --force-full wins; storeless --to-* refuses)");
-            Console.WriteLine("      --buffered-io  Opt out of unbuffered (O_DIRECT/NO_BUFFERING) extent reads for weird drivers (bulk capture only)");
-            Console.WriteLine("      --parent <base.vhdx>  Differencing child holding dirty-vs-parent chunks only (depth 1, parent immutable while the child lives; no --exclude)");
-            Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> | --to-esd <file|dir>  Single-file WIM/ESD via inbox DISM from the VSS snapshot (Windows, elevated)");
-            Console.WriteLine("  Imaging requires: VSS + EventSystem services and volsnap driver running, swprv service enabled ('corpus --validate' reports them)");
-            Console.WriteLine("      --to-wim <base.wim> --append  New image index in an existing WIM (gen = count+1; ESD/solid refused)");
-            Console.WriteLine("  --retry-lock <90|10m|2h>  Wait up to the duration for a contended store lock (writers: image/gc/optimize-to-fit; default fails loud naming the holder)");
-            Console.WriteLine("  --optimize-to-fit [--bytes N]  Compact the chunk store in place (+ prune oldest gens to N bytes via GC)");
-            Console.WriteLine("  --extract --snapshot <gen> --paths <a,b> --out <dir>  Pull files/folders out of a snapshot (no ADS/ACL/EFS — WRN names path+reason each)");
-            Console.WriteLine("  --vss-list                   Relay 'vssadmin list writers' (Windows)");
-            Console.WriteLine("  --vss-snap --volume <X:>     Create+delete a VSS snapshot probe (Windows, elevated)");
-            Console.WriteLine("  --vss-read --volume <X:>     Read a 64 KiB extent via snapshot probe (Windows, elevated)");
-            Console.WriteLine("  --vss-dump --volume <X:>     Hash one snapshot twice (read-stability probe)");
-            Console.WriteLine("  --bitmap-stats --volume <X:> Used-cluster stats over a snapshot (Windows, elevated)");
-            Console.WriteLine("  --bitmap-dump --volume <X:> [--device <dev>] --out <file>  Dump allocated runs (Windows, elevated)");
-            Console.WriteLine("  --verify --snapshot <gen> [--chain]              Verify a snapshot (exit 1 on failure; --chain also walks parent links to genesis, a gap fails loud even if the target alone verifies)");
-            Console.WriteLine("  --deep-verify --snapshot <gen>                   Re-read deep_verify_percent of chunks from packs, hash-compare (exit 1 on mismatch; percent 0 = no-op)");
-            Console.WriteLine("  --mount-snapshot --snapshot <gen>                Materialize a snapshot read-only under temp (Ctrl+C to unmount)");
-            Console.WriteLine("  --list-snapshots                     List snapshots (\"gen name\" lines)");
-            Console.WriteLine("  --gc [--dry-run | --confirm] [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--keep-yearly N]");
-            Console.WriteLine("      Garbage-collect pruned snapshots (manual; --service runs this on schedule)");
-            Console.WriteLine("      retention: keep_last/keep_within_days/keep_daily/keep_weekly/keep_monthly/keep_yearly/pin from config; exports outside the store are untouched");
-            Console.WriteLine("      retention pool is shared between volume and disk snapshots (use two stores for isolation)");
-            Console.WriteLine("  --service                              Run scheduled GC (gc_daily_at) + landing optimize (optimize_every) until Ctrl+C");
-            Console.WriteLine("  --locate-winre                         Print winre.wim source+path (reagentc/known-path/partition-scan; exit 1 when absent)");
-            Console.WriteLine("  --restore-disk ... --repair-boot       Recreate layout + reinstall bootloader after restore (default: print manual steps)");
-            Console.WriteLine("  --prepare-universal --windows-dir <offline> --driver <dir>... [--nic-dir <d>] [--gpu-dir <d>] [--dry-run]");
-            Console.WriteLine("      Offline storage-driver inject (DISM) + NIC/GPU first-boot staging into a restored tree");
-            Console.WriteLine("      [--trim-resetbase] [--trim-disable-feature <name>]... [--trim-remove-package <id>]... [--trim-no-hibernate]");
-            Console.WriteLine("      Footprint trim = REMOVAL (ResetBase is irreversible; feature/package lists are caller-named, never builtin; hibernate stages to SetupComplete.cmd for first boot)");
-            Console.WriteLine("      [--unattend <file>] [--lang-pack <cab>]... [--remove-kb <KB|identity-fragment>]... [--reg-hive <f> --reg-key <k> --reg-name <n> --reg-type <t> --reg-data <d>]");
-            Console.WriteLine("      Servicing order: drivers, first-boot staging, lang packs, unattend, trim, KB removal, registry; KB guard refuses the live OS");
-            Console.WriteLine("  --convert --wim <src> --to <dest> [--index N] [--compress max|recovery]  Convert WIM<->ESD or re-export single-index (.esd implies recovery; multi-image source requires --index)");
-            Console.WriteLine("  --merge-swm --swm <first.swm> --to <dest.wim>  Reunite a split set (join needs ALL parts)");
-            Console.WriteLine("  --wim-info --wim <image>  Human-readable dossier: indexes, sizes, languages");
-            Console.WriteLine("  --mount --wim <image> --index <N> --mount-dir <empty dir>  Read/write servicing mount (our marker; never over non-empty dir)");
-            Console.WriteLine("  --unmount --mount-dir <dir> --commit | --discard  Commit or throw away servicing (exactly one; foreign mounts refused)");
-            Console.WriteLine("  --apply --wim <image> [--index N] --target <D:>  Apply image to partition + bcdboot, no WinPE boot needed (refuses the live-OS volume; /CheckIntegrity covers the WIM, not the disk write)");
-            Console.WriteLine("  --image --volume <X:> --to-wim <file|dir> --split-swm <sizeMb>  Split the WIM into FAT32-sized .swm parts (DISM on Windows, wimlib on Linux; Corpus policy: no ESD split)");
-            Console.WriteLine("  --optimize-wim --wim <file> [--recompress]  Dedupe (+ optional recompress) a WIM in place via wimlib optimize (no DISM equivalent; Windows refuses naming wimlib)");
-            Console.WriteLine("  --image --volume <path|X:> --to-vhdx <file|dir> [--optimize-vhd]  Compact the VHDX post-verify via Optimize-VHD Mode Full (Windows Hyper-V module; refuses differencing children)");
-            Console.WriteLine("  --record-compact --snapshot <gen> [--windows-dir <offline>]  Record Compact OS state beside the snapshot manifest (record-only; Windows queries live)");
-            Console.WriteLine("  --check-boot-mode --disk <N> --firmware <UEFI|BIOS>  Refuse GPT-on-BIOS / MBR-on-UEFI with the conversion path");
-            Console.WriteLine("  --check-repair --disk <N>  Live-layout repair checks + diskpart/bcdboot plan (read-only, exit 1 names the blocker)");
-            Console.WriteLine("  --boot-verify --vhdx <path> [--vm-name <n>] [--timeout-seconds <s>] [--memory-mb <mb>]  Boot a VHDX in Hyper-V, poll heartbeat to healthy (defaults 300s, 2048MB)");
-            Console.WriteLine("  --build-media --staging-dir <dir> | --usb <drive> | --iso <file>  Build WinPE recovery media (exactly one sink)");
-            Console.WriteLine("      [--adk <dir>] [--include-store <store>] [--db <db>] [--driver <infdir>]... [--initialize]");
-            Console.WriteLine("      [--payload <dir>]  Skip re-publish (ADK box without the SDK: publish dir)");
-            Console.WriteLine("  --list-disks                           List physical disks (Windows; empty on Linux)");
-            Console.WriteLine("  --list-volumes                         List ready volumes (\"name filesystem bytes\" lines)");
-            Console.WriteLine("  --disk-layout --disk <N>  Print DiskLayout JSON to stdout, capture nothing (Windows, elevated)");
-            Console.WriteLine("  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
-            Console.WriteLine("  --restore-disk --layout <D> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
-            Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run] [--partitions <1,3,4>]  Restore every non-skipped extent at its recorded offset");
-            Console.WriteLine("      --partitions restores a subset (MSR auto-included, structural); target may be smaller than the source disk");
-            Console.WriteLine("  --restore --snapshot <gen> --target <disk#|\\\\.\\PhysicalDriveN|file> [--store <p>] [--index <p>]");
-            Console.WriteLine("      --confirm-type <TOKEN> [--allow-boot-disk] [--skip-verify] [--dry-run]  Restore a snapshot");
-            Console.WriteLine("  --copy --from <store> --to <store> (--snapshot <gen> | --chain <gen>) [--chain]  Copy one snapshot, missing packs only (--chain includes ancestors)");
-            Console.WriteLine("  --sync --from <store> --to <store>  Copy every snapshot the dest lacks, missing packs only (same id.key, or an empty dest)");
-            Console.WriteLine("  --exclude <path|pattern>  (repeatable, volume captures only) merged over config exclude, recorded in the manifest ($LogFile never excludable)");
-            Console.WriteLine("  --validate             Check config_corpus.yaml and exit");
-            Console.WriteLine("  --config <path>        Config file (default: config_corpus.yaml beside the exe)");
-            Console.WriteLine("  --version              Print version and exit");
-            Console.WriteLine("  --help                 This text");
-            Console.WriteLine();
-            Console.WriteLine("  incrementals reuse the parent's clean chunks without re-reading; any doubt → full re-image");
-            Console.WriteLine("  per-pack encryption is an external shell hook (encrypt: in config), never builtin crypto");
-            Console.WriteLine("  restore streams chunk-by-chunk, then re-reads the whole target to verify:");
-            Console.WriteLine("    wall time is ~2x sequential device speed; --confirm-type is required always");
-            Console.WriteLine("    (even --dry-run); a refused run names the want-TOKEN to re-run with");
+            foreach (var line in HelpLines)
+                Console.WriteLine(line);
         }
     }
 }

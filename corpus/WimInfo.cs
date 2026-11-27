@@ -57,7 +57,7 @@ namespace Corpus
                 if (IsField(t, "Index", out var indexValue))
                 {
                     var n = indexValue.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-                    images.Add(new WimImageEntry(int.TryParse(n, out var parsed) ? parsed : images.Count + 1, "", null));
+                    images.Add(new WimImageEntry(int.TryParse(n, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : images.Count + 1, "", null));
                 }
                 else if (images.Count > 0 && IsField(t, "Name", out var name))
                 {
@@ -66,7 +66,7 @@ namespace Corpus
                 else if (images.Count > 0 && (IsField(t, "Total Bytes", out var total) || IsField(t, "Size", out total)))
                 {
                     var token = total.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Replace(",", "", StringComparison.Ordinal);
-                    if (long.TryParse(token, out var size))
+                    if (long.TryParse(token, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var size))
                         images[^1] = images[^1] with { SizeBytes = size };
                 }
                 if (IsField(t, "Languages", out var langs) || IsField(t, "Language", out langs))

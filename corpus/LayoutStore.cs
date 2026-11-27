@@ -42,7 +42,7 @@ namespace Corpus
         public long DiskSizeBytes { get; set; }
         public int SectorSizeBytes { get; set; } = 512;
         public string Style { get; set; } = "gpt";
-        public List<PartitionRecord> Partitions { get; set; } = new();
+        public IList<PartitionRecord> Partitions { get; set; } = new List<PartitionRecord>();
         public string Hmac { get; set; } = "";
     }
 

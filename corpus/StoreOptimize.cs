@@ -357,7 +357,7 @@ namespace Corpus
             foreach (var path in manifestPaths)
             {
                 var file = Path.GetFileName(path);
-                if (file.Length > 7 && file[6] == '-' && int.TryParse(file.AsSpan(0, 6), out var gen))
+                if (file.Length > 7 && file[6] == '-' && int.TryParse(file.AsSpan(0, 6), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var gen))
                     gens.Add(gen);
                 else
                     throw new InvalidDataException($"optimize-to-fit: cannot parse generation from manifest path '{path}'");
@@ -389,7 +389,7 @@ namespace Corpus
                 if (_retention.KeepWithinDays > 0 && names.TryGetValue(gen, out var snap))
                 {
                     var manifest = ManifestStore.Load(Path.Combine(_manifestsDir, $"{gen:D6}-{snap}.json"), key);
-                    if (!DateTime.TryParse(manifest.CreatedUtc, out var created))
+                    if (!DateTime.TryParse(manifest.CreatedUtc, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var created))
                         reasons.Add("retained (unparseable date)");
                     else if ((now - created.ToUniversalTime()).TotalDays <= _retention.KeepWithinDays)
                         reasons.Add($"within keep_within_days={_retention.KeepWithinDays}");

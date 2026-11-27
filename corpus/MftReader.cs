@@ -237,7 +237,7 @@ namespace Corpus
             return cut < 0 ? name : name.Substring(0, cut);
         }
 
-        public static HashSet<ulong> Resolve(IReadOnlyList<string> names, IReadOnlyList<MftEnumEntry> entries)
+        public static IReadOnlySet<ulong> Resolve(IReadOnlyList<string> names, IReadOnlyList<MftEnumEntry> entries)
         {
             ArgumentNullException.ThrowIfNull(names);
             ArgumentNullException.ThrowIfNull(entries);

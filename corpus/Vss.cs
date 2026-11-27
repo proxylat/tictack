@@ -245,27 +245,12 @@ namespace Corpus
 
         public static VssSnapshot Create(string drive, ILogger log, bool strictWriters = true, Action? preFreeze = null, Action? postThaw = null)
         {
-            ArgumentNullException.ThrowIfNull(drive);
+            ValidateDriveAndPreflight(drive);
             ArgumentNullException.ThrowIfNull(log);
-            if (!OperatingSystem.IsWindows())
-                throw new PlatformNotSupportedException("VSS capture needs Windows (volume: " + drive + ")");
-            if (drive.Length != 2 || drive[1] != ':' || !char.IsAsciiLetter(drive[0]))
-                throw new ArgumentException("want a drive letter like \"T:\" (got: " + drive + ")", nameof(drive));
-            if (!IsElevated())
-                throw new InvalidOperationException("VSS capture needs elevation — run Corpus.exe elevated.");
-            // Diff-area preflight, cheap rung: volume-proportional floor with
-            // documented-minimum clamps (see DiffFloor — a fixed floor bans
-            // small volumes outright, and half-the-volume bans full ones).
-            var driveInfo = new DriveInfo(drive);
-            var headroom = DiffFloor.RequiredHeadroomBytes(driveInfo.TotalSize);
-            if (driveInfo.AvailableFreeSpace < headroom)
-                throw new InvalidOperationException($"volume {drive} has {driveInfo.AvailableFreeSpace} bytes free — VSS needs {headroom} bytes headroom for the diff area.");
-
             // COM security FIRST, before any COM activity: the VSS writer
             // fan-out (Prepare/Do) demands PKT_PRIVACY, and .NET's default
             // process blanket is weaker — arriving too late surfaces as
-            // VSS_E_BAD_STATE, not access-denied. CoInitializeSecurity wins
-            // exactly once per process; anything but S_OK here is fatal.
+            // VSS_E_BAD_STATE, not access-denied.
             var secHr = VssApi.CoInitializeSecurity(IntPtr.Zero, -1, IntPtr.Zero, IntPtr.Zero, 6u, 3u, IntPtr.Zero, 0u, IntPtr.Zero);
             if (secHr < 0)
                 throw new IOException($"CoInitializeSecurity failed (0x{secHr:X8}) — VSS writer calls cannot authenticate", Marshal.GetExceptionForHR(secHr));
@@ -274,45 +259,14 @@ namespace Corpus
             try
             {
                 Hr(com.InitializeForBackup(null), "InitializeForBackup");
-                // No SetContext: default IS VSS_CTX_BACKUP (AlphaShadow skips
-                // it too for the Backup context — explicit call avoided).
-                // Component mode, bootable, full: matches the proven
-                // AlphaShadow/vshadow requester shape select-for-select.
                 Hr(com.SetBackupState(true, true, VssBackupType.Full, false), "SetBackupState");
                 Hr(com.GatherWriterMetadata(out var gm), "GatherWriterMetadata");
                 RunAsync(gm, "GatherWriterMetadata");
-                var selected = new List<(Guid Instance, Guid Writer, int Type, string? Path, string Name)>();
-                Hr(com.GetWriterMetadataCount(out var writers), "GetWriterMetadataCount");
-                log.Info($"VSS: {writers} writers");
-                for (uint i = 0; i < writers; i++)
-                {
-                    Hr(com.GetWriterMetadata(i, out var instance, out var meta), "GetWriterMetadata");
-                    try
-                    {
-                        Hr(meta.GetIdentity(out _, out var writerId, out var name, out _, out _), "GetIdentity");
-                        Hr(meta.SaveAsXML(out var xml), "SaveAsXML");
-                        var added = 0;
-                        foreach (var (type, path, cname) in ParseComponents(xml))
-                        {
-                            var hr = com.AddComponent(instance, writerId, type, path, cname);
-                            log.Info($"VSS add {name}/{cname} type={type} path={path ?? "<root>"} -> 0x{hr:X8}");
-                            Hr(hr, "AddComponent");
-                            selected.Add((instance, writerId, type, path, cname));
-                            added++;
-                        }
-                        log.Info($"VSS writer: {name} ({added} components)");
-                    }
-                    finally
-                    {
-                        VssApi.Release(meta);
-                    }
-                }
+                var selected = SelectAllWriterComponents(com, log);
                 Hr(com.StartSnapshotSet(out var setId), "StartSnapshotSet");
                 Hr(com.AddToSnapshotSet(drive + "\\", Guid.Empty, out var snapId), "AddToSnapshotSet");
                 log.Info($"VSS set={setId} snap={snapId}");
-                // Prepare AFTER the set exists with its volumes: AlphaShadow
-                // order (Prepare-before-Start answers VSS_E_BAD_STATE —
-                // Prepare validates set existence).
+                // Prepare AFTER the set exists with its volumes: Prepare validates set existence.
                 Hr(com.PrepareForBackup(out var pf), "PrepareForBackup");
                 RunAsync(pf, "PrepareForBackup");
                 VssWriterVerifier.Verify(com, log, strictWriters);
@@ -327,24 +281,7 @@ namespace Corpus
                     postThaw?.Invoke();
                 }
                 VssWriterVerifier.Verify(com, log, strictWriters);
-                Hr(com.GetSnapshotProperties(snapId, out var prop), "GetSnapshotProperties");
-                string device;
-                try
-                {
-                    device = Marshal.PtrToStringUni(prop.SnapshotDeviceObject)
-                        ?? throw new IOException("snapshot device object came back null");
-                }
-                finally
-                {
-                    VssApi.VssFreeSnapshotProperties(ref prop);
-                }
-                if (prop.Status != (int)VssSnapshotState.Created)
-                    throw new IOException($"snapshot {snapId} landed in state {prop.Status}, want Created(12)");
-                // NO_WRITERS bit (0x10) must be CLEAR — a set bit means the
-                // snapshot silently degraded to crash-consistent. Fail loud.
-                if ((prop.SnapshotAttributes & 0x10) != 0)
-                    throw new IOException($"snapshot {snapId} came back writerless (attributes 0x{prop.SnapshotAttributes:X8}) — writers did not participate");
-                log.Info($"VSS snapshot of {drive} at {device} (attributes 0x{prop.SnapshotAttributes:X8}, writers involved)");
+                var device = ReadValidatedSnapshotDevice(com, snapId, drive, log);
                 return new VssSnapshot(com, setId, snapId, device, selected, log);
             }
             catch
@@ -353,6 +290,75 @@ namespace Corpus
                 VssApi.Release(com);
                 throw;
             }
+        }
+
+        private static void ValidateDriveAndPreflight(string drive)
+        {
+            ArgumentNullException.ThrowIfNull(drive);
+            if (!OperatingSystem.IsWindows())
+                throw new PlatformNotSupportedException("VSS capture needs Windows (volume: " + drive + ")");
+            if (drive.Length != 2 || drive[1] != ':' || !char.IsAsciiLetter(drive[0]))
+                throw new ArgumentException("want a drive letter like \"T:\" (got: " + drive + ")", nameof(drive));
+            if (!IsElevated())
+                throw new InvalidOperationException("VSS capture needs elevation — run Corpus.exe elevated.");
+            var driveInfo = new DriveInfo(drive);
+            var headroom = DiffFloor.RequiredHeadroomBytes(driveInfo.TotalSize);
+            if (driveInfo.AvailableFreeSpace < headroom)
+                throw new InvalidOperationException($"volume {drive} has {driveInfo.AvailableFreeSpace} bytes free — VSS needs {headroom} bytes headroom for the diff area.");
+        }
+
+        private static List<(Guid Instance, Guid Writer, int Type, string? Path, string Name)> SelectAllWriterComponents(IVssBackupComponents com, ILogger log)
+        {
+            var selected = new List<(Guid Instance, Guid Writer, int Type, string? Path, string Name)>();
+            Hr(com.GetWriterMetadataCount(out var writers), "GetWriterMetadataCount");
+            log.Info($"VSS: {writers} writers");
+            for (uint i = 0; i < writers; i++)
+            {
+                Hr(com.GetWriterMetadata(i, out var instance, out var meta), "GetWriterMetadata");
+                try
+                {
+                    Hr(meta.GetIdentity(out _, out var writerId, out var name, out _, out _), "GetIdentity");
+                    Hr(meta.SaveAsXML(out var xml), "SaveAsXML");
+                    var added = 0;
+                    foreach (var (type, path, cname) in ParseComponents(xml))
+                    {
+                        var hr = com.AddComponent(instance, writerId, type, path, cname);
+                        log.Info($"VSS add {name}/{cname} type={type} path={path ?? "<root>"} -> 0x{hr:X8}");
+                        Hr(hr, "AddComponent");
+                        selected.Add((instance, writerId, type, path, cname));
+                        added++;
+                    }
+                    log.Info($"VSS writer: {name} ({added} components)");
+                }
+                finally
+                {
+                    VssApi.Release(meta);
+                }
+            }
+            return selected;
+        }
+
+        // NO_WRITERS bit (0x10) must be clear: a set bit means VSS silently degraded to crash-consistent.
+        private static string ReadValidatedSnapshotDevice(IVssBackupComponents com, Guid snapId, string drive, ILogger log)
+        {
+            Hr(com.GetSnapshotProperties(snapId, out var prop), "GetSnapshotProperties");
+            string device;
+            try
+            {
+                device = Marshal.PtrToStringUni(prop.SnapshotDeviceObject)
+                    ?? throw new IOException("snapshot device object came back null");
+            }
+            finally
+            {
+                VssApi.VssFreeSnapshotProperties(ref prop);
+            }
+            if (prop.Status != (int)VssSnapshotState.Created)
+                throw new IOException($"snapshot {snapId} landed in state {prop.Status}, want Created(12)");
+            // NO_WRITERS bit (0x10) must be CLEAR — a set bit means the snapshot degraded to crash-consistent.
+            if ((prop.SnapshotAttributes & 0x10) != 0)
+                throw new IOException($"snapshot {snapId} came back writerless (attributes 0x{prop.SnapshotAttributes:X8}) — writers did not participate");
+            log.Info($"VSS snapshot of {drive} at {device} (attributes 0x{prop.SnapshotAttributes:X8}, writers involved)");
+            return device;
         }
 
         public void Complete()

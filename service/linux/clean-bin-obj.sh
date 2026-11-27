@@ -6,5 +6,4 @@ rm -rf "$DIR/../../benchmarks/bin" "$DIR/../../benchmarks/obj" \
   "$DIR/../../corpus/tests/bin" "$DIR/../../corpus/tests/obj" \
   "$DIR/../../src/bin" "$DIR/../../src/obj" \
   "$DIR/../../tests/bin" "$DIR/../../tests/obj" \
-  "$DIR/../../tests/CrashWorker/bin" "$DIR/../../tests/CrashWorker/obj" \
-  /var/lib/tictack
+  "$DIR/../../tests/CrashWorker/bin" "$DIR/../../tests/CrashWorker/obj"

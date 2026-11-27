@@ -60,7 +60,7 @@ namespace Corpus
         // Runs dump for harness-side masked compares (see --bitmap-dump):
         // header comment + "startLcn clusterCount" lines. Pure file write,
         // Linux-testable; the text shape is the harness contract.
-        public static void WriteRuns(string path, long bytesPerCluster, long totalClusters, List<(long Start, long Count)> runs)
+        public static void WriteRuns(string path, long bytesPerCluster, long totalClusters, IReadOnlyList<(long Start, long Count)> runs)
         {
             using var w = new StreamWriter(path, false, System.Text.Encoding.ASCII);
             w.WriteLine($"# bpc={bytesPerCluster} totalClusters={totalClusters} runs={runs.Count}");
@@ -73,7 +73,7 @@ namespace Corpus
         // either way re-capture. Catches freed-cluster reuse the MFT scan
         // skips (a dead slot has no live record to digest). Null on grid
         // drift → full re-read (defensive; Store gates the grid already).
-        public static HashSet<long>? HoleFlipChunks(IReadOnlyList<ManifestEntry> parentChunks,
+        public static IReadOnlySet<long>? HoleFlipChunks(IReadOnlyList<ManifestEntry> parentChunks,
             IReadOnlyList<(long Start, long Count)> currentRuns, long bytesPerCluster, long volumeLength, int chunkBytes)
         {
             ArgumentNullException.ThrowIfNull(parentChunks);
@@ -91,7 +91,7 @@ namespace Corpus
         }
 
         // Merged allocated runs as (startLcn, clusterCount), ascending.
-        public static List<(long Start, long Count)> ReadRuns(string devicePath, long totalClusters)
+        public static IReadOnlyList<(long Start, long Count)> ReadRuns(string devicePath, long totalClusters)
         {
             if (!OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("volume bitmap needs Windows");
@@ -130,7 +130,7 @@ namespace Corpus
 
         // Pure bit→run parser: buf holds bitmap bytes for validBits clusters
         // starting at startLcn, LSB-first per NTFS.
-        public static List<(long Start, long Count)> ParseRuns(long startLcn, byte[] buf, int validBits)
+        public static IReadOnlyList<(long Start, long Count)> ParseRuns(long startLcn, byte[] buf, int validBits)
         {
             var runs = new List<(long, long)>();
             AppendRuns(runs, startLcn, buf, 0, buf.Length, validBits);

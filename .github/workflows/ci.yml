@@ -172,7 +172,9 @@ jobs:
           dotnet-version: 10.0.x
       - name: Publish NativeAOT
         run: |
-          dotnet publish src/TicTack.csproj -p:PublishProfile=Aot -o service/win
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $asmVer = ($tag -split '-')[0]
+          dotnet publish src/TicTack.csproj -p:PublishProfile=Aot -p:Version=$tag -p:FileVersion=$asmVer -p:AssemblyVersion=$asmVer -p:InformationalVersion=$tag -p:IncludeSourceRevisionInInformationalVersion=false -o service/win
           Remove-Item service/win/*.dll, service/win/*.runtimeconfig.json, service/win/*.deps.json, service/win/*.pdb -Exclude e_sqlite3.dll -ErrorAction SilentlyContinue
       - name: Stage config and stamp version
         run: |
@@ -209,7 +211,9 @@ jobs:
           dotnet-version: 10.0.x
       - name: Publish self-contained JIT
         run: |
-          dotnet publish corpus/Corpus.csproj -c Release -r win-x64 --self-contained /p:PublishSingleFile=true -o corpus/win
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $asmVer = ($tag -split '-')[0]
+          dotnet publish corpus/Corpus.csproj -c Release -r win-x64 --self-contained /p:PublishSingleFile=true -p:Version=$tag -p:FileVersion=$asmVer -p:AssemblyVersion=$asmVer -p:InformationalVersion=$tag -p:IncludeSourceRevisionInInformationalVersion=false -o corpus/win
           Remove-Item corpus/win/*.dll, corpus/win/*.runtimeconfig.json, corpus/win/*.deps.json, corpus/win/*.pdb -Exclude e_sqlite3.dll -ErrorAction SilentlyContinue
       - name: Stage config
         run: |

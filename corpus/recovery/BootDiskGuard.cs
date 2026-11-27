@@ -70,7 +70,7 @@ namespace Corpus
             var i = display.LastIndexOf(marker, StringComparison.OrdinalIgnoreCase);
             if (i < 0)
                 return false;
-            return int.TryParse(display.AsSpan(i + marker.Length).Trim(), out number);
+            return int.TryParse(display.AsSpan(i + marker.Length).Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out number);
         }
 
         private static string Sanitize(string name)

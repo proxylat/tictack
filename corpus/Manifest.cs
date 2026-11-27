@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -61,12 +62,12 @@ namespace Corpus
         // Item 4: exclusion names whose extents were zeroed at capture. Null =
         // none (omitted → old/dense JSON byte-identical).
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public List<string>? SkippedExclusions { get; set; }
+        public IReadOnlyList<string>? SkippedExclusions { get; set; }
         // Item 13: MFT group digests (SHA-256 hex per image-chunk-sized band
         // of the $MFT stream) + the record size that shaped them. Null/0 on
         // old manifests → digest path abstains to the USN hint.
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public List<string>? MftChunkDigests { get; set; }
+        public IReadOnlyList<string>? MftChunkDigests { get; set; }
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public int MftRecordBytes { get; set; }
         // Item 13b (§9 skip): per-record MFT digests (SkipRecordDigest hex per
@@ -82,7 +83,7 @@ namespace Corpus
         // Pre-skip-digest gens compare unequal (raw vs masked) and refuse once
         // to the backstop — fail to skip, never wrong-skip — then self-heal.
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public List<string>? MftRecordDigests { get; set; }
+        public IReadOnlyList<string>? MftRecordDigests { get; set; }
         // Record-digest liveness version (MftDigest.SkipRecordVersion): 0 =
         // pre-liveness gens (empty/dead slots hashed — unstable under VSS
         // shadow views) or no digests; 1 = live-only slots but LSN/USA-only
@@ -105,8 +106,8 @@ namespace Corpus
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? BitLockerState { get; set; }
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public List<string>? BitLockerKeyIds { get; set; }
-        public List<ManifestEntry> Chunks { get; set; } = new();
+        public IReadOnlyList<string>? BitLockerKeyIds { get; set; }
+        public IReadOnlyList<ManifestEntry> Chunks { get; set; } = new List<ManifestEntry>();
         public string Hmac { get; set; } = "";
     }
 
@@ -116,13 +117,13 @@ namespace Corpus
     // is detectable.
     public static class ManifestStore
     {
-        public static SnapshotManifest Build(int generation, string name, long volumeLength, int chunkMib, int compressionLevel, string keyId, string prevDigest, List<ManifestEntry> chunks,
+        public static SnapshotManifest Build(int generation, string name, long volumeLength, int chunkMib, int compressionLevel, string keyId, string prevDigest, IReadOnlyList<ManifestEntry> chunks,
             int parentGeneration = 0, string? changeCursor = null,
             string? partitionKey = null, int diskNumber = 0, int partitionNumber = 0,
-            string? layoutFingerprint = null, List<string>? skippedExclusions = null,
-            List<string>? mftChunkDigests = null, int mftRecordBytes = 0,
-            string? bitLockerState = null, List<string>? bitLockerKeyIds = null,
-            List<string>? mftRecordDigests = null,
+            string? layoutFingerprint = null, IReadOnlyList<string>? skippedExclusions = null,
+            IReadOnlyList<string>? mftChunkDigests = null, int mftRecordBytes = 0,
+            string? bitLockerState = null, IReadOnlyList<string>? bitLockerKeyIds = null,
+            IReadOnlyList<string>? mftRecordDigests = null,
             string? chunker = null)
         {
             return new SnapshotManifest
@@ -194,20 +195,20 @@ namespace Corpus
             foreach (var path in Directory.EnumerateFiles(manifestsDir, "*.json"))
             {
                 var name = Path.GetFileName(path);
-                if (name.Length > 7 && name[6] == '-' && int.TryParse(name.AsSpan(0, 6), out var gen) && gen > max)
+                if (name.Length > 7 && name[6] == '-' && int.TryParse(name.AsSpan(0, 6), NumberStyles.Integer, CultureInfo.InvariantCulture, out var gen) && gen > max)
                     max = gen;
             }
             return max + 1;
         }
 
-        public static List<(int Generation, string Name)> List(string manifestsDir)
+        public static IReadOnlyList<(int Generation, string Name)> List(string manifestsDir)
         {
             var result = new List<(int Generation, string Name)>();
             if (!Directory.Exists(manifestsDir)) return result;
             foreach (var path in Directory.EnumerateFiles(manifestsDir, "*.json"))
             {
                 var name = Path.GetFileName(path);
-                if (name.Length > 7 && name[6] == '-' && int.TryParse(name.AsSpan(0, 6), out var gen))
+                if (name.Length > 7 && name[6] == '-' && int.TryParse(name.AsSpan(0, 6), NumberStyles.Integer, CultureInfo.InvariantCulture, out var gen))
                     result.Add((gen, name.Substring(7, name.Length - 7 - 5)));
             }
             result.Sort((a, b) => a.Generation.CompareTo(b.Generation));

@@ -146,7 +146,7 @@ namespace Corpus
     // Fake for Linux-green tests: records calls, canned health.
     public sealed class FakeHyperVRunner : IHyperVRunner
     {
-        public readonly List<string> Calls = new();
+        public readonly IList<string> Calls = new List<string>();
         public string Health = "heartbeat OkApplicationsHealthy";
         public bool FailBoot;
         public bool FailHealth;

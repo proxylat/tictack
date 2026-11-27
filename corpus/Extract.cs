@@ -1000,12 +1000,7 @@ namespace Corpus
                 var vcnOff = (int)(pos % _bpc);
                 if (!TryMap(vcn, out var lcn, out var runEnd) || lcn < 0)
                 {
-                    if (extStart >= 0)
-                    {
-                        _vol.PrefetchRange(extStart, extLen);
-                        extStart = -1;
-                        extLen = 0;
-                    }
+                    FlushExtent(ref extStart, ref extLen);
                     var skip = Math.Min(remaining, (long)_bpc - vcnOff);
                     pos += skip;
                     remaining -= skip;
@@ -1015,37 +1010,32 @@ namespace Corpus
                 var volOff = lcn * _bpc + vcnOff;
                 if (volOff < 0 || want <= 0)
                 {
-                    if (extStart >= 0)
-                    {
-                        _vol.PrefetchRange(extStart, extLen);
-                        extStart = -1;
-                        extLen = 0;
-                    }
+                    FlushExtent(ref extStart, ref extLen);
                     var step = Math.Min(remaining, (long)_bpc - vcnOff);
                     pos += step;
                     remaining -= step;
                     continue;
                 }
-                if (extStart < 0)
-                {
-                    extStart = volOff;
-                    extLen = want;
-                }
-                else if (volOff == extStart + extLen)
-                {
-                    extLen += want;
-                }
-                else
-                {
-                    _vol.PrefetchRange(extStart, extLen);
-                    extStart = volOff;
-                    extLen = want;
-                }
+                AccumulateExtent(ref extStart, ref extLen, volOff, want);
                 pos += want;
                 remaining -= want;
             }
-            if (extStart >= 0)
-                _vol.PrefetchRange(extStart, extLen);
+            FlushExtent(ref extStart, ref extLen);
+        }
+
+        private void FlushExtent(ref long extStart, ref long extLen)
+        {
+            if (extStart < 0) return;
+            _vol.PrefetchRange(extStart, extLen);
+            extStart = -1;
+            extLen = 0;
+        }
+
+        private void AccumulateExtent(ref long extStart, ref long extLen, long volOff, long want)
+        {
+            if (extStart < 0) { extStart = volOff; extLen = want; }
+            else if (volOff == extStart + extLen) extLen += want;
+            else { _vol.PrefetchRange(extStart, extLen); extStart = volOff; extLen = want; }
         }
 
         internal bool HasSparseRuns => _runs.Any(r => r.Lcn < 0);
@@ -1272,48 +1262,25 @@ namespace Corpus
             long fnCreated = 0, fnWritten = 0, fnAccessed = 0;
             foreach (var (off, len) in spans)
             {
-                switch (BitConverter.ToUInt32(record, off))
+                var type = BitConverter.ToUInt32(record, off);
+                if (type == AttrStandardInformation && !haveSi)
                 {
-                    case AttrStandardInformation:
-                        if (!haveSi)
-                        {
-                            if (!TryResidentValue(record, off, len, out var siOff, out var siLen) || siLen < 32)
-                                return null;
-                            haveSi = true;
-                            parsed.CreatedUtc = FileTime(BitConverter.ToInt64(record, siOff));
-                            parsed.WrittenUtc = FileTime(BitConverter.ToInt64(record, siOff + 8));
-                            parsed.AccessedUtc = FileTime(BitConverter.ToInt64(record, siOff + 24));
-                            if (siLen >= 36 && (BitConverter.ToUInt32(record, siOff + 32) & SiEncrypted) != 0)
-                                parsed.IsEfs = true;
-                        }
-                        break;
-                    case AttrAttributeList:
-                        parsed.HasAttrList = true;
-                        break;
-                    case AttrReparsePoint:
-                        parsed.IsReparse = true;
-                        break;
-                    case AttrLoggedUtilityStream:
-                        parsed.IsEfs = true;
-                        break;
-                    case AttrFileName:
-                        if (!haveFn)
-                        {
-                            if (!TryFileName(record, off, len, out _, out _, out _, out _, out var fnOff))
-                                return null;
-                            haveFn = true;
-                            fnCreated = BitConverter.ToInt64(record, fnOff + 8);
-                            fnWritten = BitConverter.ToInt64(record, fnOff + 16);
-                            fnAccessed = BitConverter.ToInt64(record, fnOff + 32);
-                        }
-                        break;
-                    case AttrData:
-                        if (!TryData(record, off, len, parsed))
-                            return null;
-                        break;
-                    default:
-                        break; // unknown attribute: skip (forward compatibility)
+                    if (!ApplyStandardInfo(record, off, len, parsed)) return null;
+                    haveSi = true;
                 }
+                else if (type == AttrAttributeList) parsed.HasAttrList = true;
+                else if (type == AttrReparsePoint) parsed.IsReparse = true;
+                else if (type == AttrLoggedUtilityStream) parsed.IsEfs = true;
+                else if (type == AttrFileName && !haveFn)
+                {
+                    if (!TryFileName(record, off, len, out _, out _, out _, out _, out var fnOff)) return null;
+                    haveFn = true;
+                    fnCreated = BitConverter.ToInt64(record, fnOff + 8);
+                    fnWritten = BitConverter.ToInt64(record, fnOff + 16);
+                    fnAccessed = BitConverter.ToInt64(record, fnOff + 32);
+                }
+                else if (type == AttrData && !TryData(record, off, len, parsed))
+                    return null;
             }
             if (!haveSi && haveFn)
             {
@@ -1322,6 +1289,18 @@ namespace Corpus
                 parsed.AccessedUtc = FileTime(fnAccessed);
             }
             return parsed;
+        }
+
+        private static bool ApplyStandardInfo(byte[] record, int off, int len, ParsedFile parsed)
+        {
+            if (!TryResidentValue(record, off, len, out var siOff, out var siLen) || siLen < 32)
+                return false;
+            parsed.CreatedUtc = FileTime(BitConverter.ToInt64(record, siOff));
+            parsed.WrittenUtc = FileTime(BitConverter.ToInt64(record, siOff + 8));
+            parsed.AccessedUtc = FileTime(BitConverter.ToInt64(record, siOff + 24));
+            if (siLen >= 36 && (BitConverter.ToUInt32(record, siOff + 32) & SiEncrypted) != 0)
+                parsed.IsEfs = true;
+            return true;
         }
 
         // NTFS data-run varint decode with VCN tracking: [lenBytes:offBytes]
@@ -1386,18 +1365,26 @@ namespace Corpus
             }
             if (parsed.HasData)
                 return false; // second unnamed $DATA: corrupt, fail loud rather than pick one silently
-            if (record[off + 8] == 0)
-            {
-                if (!TryResidentValue(record, off, len, out var valueOff, out var valueLen))
-                    return false;
-                var bytes = new byte[valueLen];
-                Buffer.BlockCopy(record, valueOff, bytes, 0, (int)valueLen);
-                parsed.ResidentData = bytes;
-                parsed.DataSize = valueLen;
-                parsed.DataInitSize = valueLen;
-                parsed.HasData = true;
-                return true;
-            }
+            return record[off + 8] == 0
+                ? TryResidentData(record, off, len, parsed)
+                : TryNonResidentData(record, off, len, parsed);
+        }
+
+        private static bool TryResidentData(byte[] record, int off, int len, ParsedFile parsed)
+        {
+            if (!TryResidentValue(record, off, len, out var valueOff, out var valueLen))
+                return false;
+            var bytes = new byte[valueLen];
+            Buffer.BlockCopy(record, valueOff, bytes, 0, (int)valueLen);
+            parsed.ResidentData = bytes;
+            parsed.DataSize = valueLen;
+            parsed.DataInitSize = valueLen;
+            parsed.HasData = true;
+            return true;
+        }
+
+        private static bool TryNonResidentData(byte[] record, int off, int len, ParsedFile parsed)
+        {
             if (len < 64)
                 return false;
             var startVcn = (long)BitConverter.ToUInt64(record, off + 16);

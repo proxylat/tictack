@@ -33,7 +33,7 @@ public sealed class VolumeBitmapTests
     [Fact]
     public void AppendRuns_ContiguousAcrossWindows_Merges()
     {
-        var runs = VolumeBitmap.ParseRuns(0, new byte[] { 0xFF }, 8);
+        var runs = VolumeBitmap.ParseRuns(0, new byte[] { 0xFF }, 8).ToList();
         VolumeBitmap.AppendRuns(runs, 8, new byte[] { 0x01, 0x00 }, 0, 2, 16);
         Assert.Equal([(0L, 9L)], runs);
     }
@@ -41,7 +41,7 @@ public sealed class VolumeBitmapTests
     [Fact]
     public void AppendRuns_GapAtBoundary_StaysSplit()
     {
-        var runs = VolumeBitmap.ParseRuns(0, new byte[] { 0xFF }, 8);
+        var runs = VolumeBitmap.ParseRuns(0, new byte[] { 0xFF }, 8).ToList();
         VolumeBitmap.AppendRuns(runs, 8, new byte[] { 0x02 }, 0, 1, 8);
         Assert.Equal([(0L, 8L), (9L, 1L)], runs);
     }

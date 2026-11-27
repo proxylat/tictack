@@ -162,6 +162,31 @@ namespace Corpus
         private static bool LocateAndFix(byte[] code, int n, int realLen)
         {
             var p = n - DataWidth;
+            var synd = ComputeSyndromes(code, n, p);
+            var (loc, l) = FindErrorLocator(synd, p);
+            if (l == 0 || 2 * l > p)
+                return false;
+            var positions = ChienSearch(loc, n, l);
+            if (positions == null)
+                return false;
+            var xs = new byte[l];
+            for (var j = 0; j < l; j++)
+                xs[j] = Exp[(n - 1 - positions[j]) % 255];
+            var mags = SolveVandermonde(xs, synd, l);
+            if (mags == null || !VerifySyndromes(synd, xs, mags, p, l))
+                return false;
+            for (var j = 0; j < l; j++)
+            {
+                var pos = positions[j];
+                if (pos >= realLen && pos < DataWidth)
+                    return false; // zero-pad region: the count lied
+                code[pos] ^= mags[j];
+            }
+            return true;
+        }
+
+        private static byte[] ComputeSyndromes(byte[] code, int n, int p)
+        {
             var synd = new byte[p];
             for (var i = 0; i < p; i++)
             {
@@ -173,12 +198,16 @@ namespace Corpus
                 }
                 synd[i] = acc;
             }
+            return synd;
+        }
+
+        private static (byte[] Loc, int Degree) FindErrorLocator(byte[] synd, int p)
+        {
             // Berlekamp-Massey -> error locator (loc[0] = 1).
             var loc = new byte[p + 1];
             var prev = new byte[p + 1];
             loc[0] = 1;
             prev[0] = 1;
-            var locCap = p + 1;
             var l = 0;
             var m = 1;
             byte b = 1;
@@ -187,18 +216,11 @@ namespace Corpus
                 byte d = synd[k];
                 for (var i = 1; i <= l; i++)
                     d ^= Mul(loc[i], synd[k - i]);
-                if (d == 0)
-                {
-                    m++;
-                    continue;
-                }
+                if (d == 0) { m++; continue; }
                 var t = (byte[])loc.Clone();
                 var coef = Mul(d, Inv(b));
-                if (prev.Length + m > locCap)
-                {
-                    locCap = prev.Length + m;
-                    Array.Resize(ref loc, locCap);
-                }
+                if (prev.Length + m > loc.Length)
+                    Array.Resize(ref loc, prev.Length + m);
                 for (var i = 0; i < prev.Length; i++)
                 {
                     if (prev[i] != 0)
@@ -216,8 +238,11 @@ namespace Corpus
                     m++;
                 }
             }
-            if (l == 0 || 2 * l > p)
-                return false;
+            return (loc, l);
+        }
+
+        private static int[]? ChienSearch(byte[] loc, int n, int l)
+        {
             // Chien: X = a^(n-1-j); error at j iff locator(X^-1) == 0.
             var positions = new int[l];
             var found = 0;
@@ -235,16 +260,11 @@ namespace Corpus
                 if (acc == 0)
                     positions[found++] = j;
             }
-            if (found != l)
-                return false;
-            // Magnitudes via Vandermonde (first L syndromes), confirmed
-            // against ALL syndromes before touching a single byte.
-            var xs = new byte[l];
-            for (var j = 0; j < l; j++)
-                xs[j] = Exp[(n - 1 - positions[j]) % 255];
-            var mags = SolveVandermonde(xs, synd, l);
-            if (mags == null)
-                return false;
+            return found == l ? positions : null;
+        }
+
+        private static bool VerifySyndromes(byte[] synd, byte[] xs, byte[] mags, int p, int l)
+        {
             for (var i = 0; i < p; i++)
             {
                 byte acc = 0;
@@ -255,13 +275,6 @@ namespace Corpus
                 }
                 if (acc != synd[i])
                     return false;
-            }
-            for (var j = 0; j < l; j++)
-            {
-                var pos = positions[j];
-                if (pos >= realLen && pos < DataWidth)
-                    return false; // zero-pad region: the count lied
-                code[pos] ^= mags[j];
             }
             return true;
         }

@@ -391,6 +391,7 @@ namespace TicTack
         public bool? ShowTerminal { get; set; }
         public bool? Sandbox { get; set; }
         public bool Watch { get; set; }
+        public bool RunOnStart { get; set; }
         public string? Source { get; set; }
         public bool? Inherit { get; set; }
         public double? DebounceSeconds { get; set; }

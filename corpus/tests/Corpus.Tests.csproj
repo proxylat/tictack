@@ -79,6 +79,7 @@
     <Compile Include="../StoreOptimize.cs" Link="corpus/StoreOptimize.cs" />
     <Compile Include="../StoreTransfer.cs" Link="corpus/StoreTransfer.cs" />
     <Compile Include="../Vhdx.cs" Link="corpus/Vhdx.cs" />
+    <Compile Include="../OvfVmdk.cs" Link="corpus/OvfVmdk.cs" />
     <Compile Include="../Vss.cs" Link="corpus/Vss.cs" />
     <Compile Include="../BitLocker.cs" Link="corpus/BitLocker.cs" />
     <Compile Include="../DiffFloor.cs" Link="corpus/DiffFloor.cs" />

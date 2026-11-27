@@ -25,7 +25,7 @@ The repository ships two dependency-light binaries — `TicTackSv.exe` and `Corp
 1. **File synchronization (`TicTackSv`):** Runs as a Windows service, a `systemd` unit, or directly from the CLI. It watches your user folders and mirrors changes to a backup drive with version history and deletion archiving.
 2. **Low-latency remote sync (`TicTackSv` `remote_sync:`):** Pulls live changes from remote machines or VMs over encrypted `TTRM` v1 TCP (TLS 1.2/1.3 + mutual PSK) with an OS-sandboxed `--remote-agent` and push change stream.
 3. **Third-party automations (`TicTackSv` `jobs:` & `external_drives:`):** Puts your whole backup stack on autopilot — one engine schedules, sandboxes, and monitors tools like `Corpus.exe`, `restic`, and `rclone`, so local mirroring, disk imaging, and offsite cloud backups run themselves.
-4. **System image and volume backup (`Corpus.exe`):** Standalone Windows 10/11 block-level imager that captures live NTFS volumes and 512e/4Kn physical disks via VSS into an incremental, deduplicated chunk store or dynamic VHDX and WIM images.
+4. **System image and volume backup (`Corpus.exe`):** Standalone Windows 10/11 block-level imager that captures live NTFS volumes and 512e/4Kn physical disks via VSS into an incremental, deduplicated chunk store or directly into dynamic VHDX, WIM/ESD, and bootable UEFI/GPT streamOptimized VMDK, OVF (+ `.mf`), and OVA images (`--to-ova` / `--export-ova`, with `--skip-recovery` and `--zstd`).
 
 I built it because I could not find a tool that stayed idle when it had nothing to do while still matching the safety guards and feature set of closed-source backup suites.
 

@@ -65,46 +65,7 @@ namespace Corpus
                     var build = AdkBuild(adk);
                     if (build < MediaLayout.AdksMinBuild)
                         throw new InvalidDataException($"ADK build {build} is below the floor {MediaLayout.AdksMinBuild} — install the Windows 11 24H2+ ADK + WinPE add-on");
-                    // copype refuses an existing destination: reserve the temp
-                    // NAME without creating it (CreateTempSubdirectory would
-                    // make copype fail every time).
-                    var peWork = Path.Combine(Path.GetTempPath(), "corpus-pe-" + Guid.NewGuid().ToString("N"));
-                    try
-                    {
-                        RunCopype(adk, peWork, log);
-                        // One WIM mount serves drivers + the startnet hook:
-                        // startnet.cmd lives INSIDE boot.wim (no Windows dir
-                        // exists at the copype media root).
-                        var wim = Path.Combine(peWork, "media", "sources", "boot.wim");
-                        var mount = MountBootWim(wim, peWork, log);
-                        try
-                        {
-                            foreach (var driver in opts.Drivers ?? [])
-                                AddDriverToMount(mount, driver, log);
-                            AppendStartnetHook(Path.Combine(mount, "Windows", "System32", "startnet.cmd"));
-                        }
-                        catch
-                        {
-                            // A failed image must never commit: best-effort
-                            // discard, then the original error propagates.
-                            UnmountBootWim(mount, peWork, commit: false, log);
-                            throw;
-                        }
-                        UnmountBootWim(mount, peWork, commit: true, log);
-                        CopyDir(stageDir, Path.Combine(peWork, "media"));
-                        // Record the real ADK build (staging bakes 0: no ADK there).
-                        var mediaDir = Path.Combine(peWork, "media");
-                        var infoPath = Path.Combine(mediaDir, "Corpus", "media-info.json");
-                        (MediaInfo.Load(infoPath) with { AdkBuild = build }).Save(infoPath);
-                        if (opts.IsoPath != null)
-                            RunOscdimg(adk, mediaDir, opts.IsoPath, log);
-                        else
-                            WriteUsb(mediaDir, opts.UsbDrive!, opts.Initialize, log);
-                    }
-                    finally
-                    {
-                        DeleteTree(peWork);
-                    }
+                    BuildWinPeMedia(adk, build, stageDir, opts, log);
                 }
                 finally
                 {
@@ -116,6 +77,43 @@ namespace Corpus
                 // A handed-in --payload dir is the caller's: never delete it.
                 if (ownPublish)
                     DeleteTree(publishDir);
+            }
+        }
+
+        private static void BuildWinPeMedia(string adk, int build, string stageDir, MediaBuildOptions opts, ILogger log)
+        {
+            // copype refuses an existing destination: reserve the temp NAME without creating it.
+            var peWork = Path.Combine(Path.GetTempPath(), "corpus-pe-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                RunCopype(adk, peWork, log);
+                // One WIM mount serves drivers + startnet.cmd inside boot.wim.
+                var wim = Path.Combine(peWork, "media", "sources", "boot.wim");
+                var mount = MountBootWim(wim, peWork, log);
+                try
+                {
+                    foreach (var driver in opts.Drivers ?? [])
+                        AddDriverToMount(mount, driver, log);
+                    AppendStartnetHook(Path.Combine(mount, "Windows", "System32", "startnet.cmd"));
+                }
+                catch
+                {
+                    UnmountBootWim(mount, peWork, commit: false, log);
+                    throw;
+                }
+                UnmountBootWim(mount, peWork, commit: true, log);
+                var mediaDir = Path.Combine(peWork, "media");
+                CopyDir(stageDir, mediaDir);
+                var infoPath = Path.Combine(mediaDir, "Corpus", "media-info.json");
+                (MediaInfo.Load(infoPath) with { AdkBuild = build }).Save(infoPath);
+                if (opts.IsoPath != null)
+                    RunOscdimg(adk, mediaDir, opts.IsoPath, log);
+                else
+                    WriteUsb(mediaDir, opts.UsbDrive!, opts.Initialize, log);
+            }
+            finally
+            {
+                DeleteTree(peWork);
             }
         }
 
@@ -232,7 +230,7 @@ namespace Corpus
                 foreach (var path in Directory.EnumerateFiles(manifests, "*.json"))
                 {
                     var name = Path.GetFileName(path);
-                    if (name.Length > 7 && name[6] == '-' && int.TryParse(name.AsSpan(0, 6), out var gen))
+                    if (name.Length > 7 && name[6] == '-' && int.TryParse(name.AsSpan(0, 6), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var gen))
                         gens.Add(gen);
                 }
             }
@@ -529,7 +527,7 @@ namespace Corpus
         {
             var r = ProcessRunner.RunAsync($"powershell -NoProfile -Command \"(Get-Partition -DriveLetter {letter}).DiskNumber\"",
                 Path.GetTempPath(), redirect: true, timeoutMs: 60000).GetAwaiter().GetResult();
-            if (r.TimedOut || r.ExitCode != 0 || !int.TryParse(r.Stdout.Trim(), out var disk))
+            if (r.TimedOut || r.ExitCode != 0 || !int.TryParse(r.Stdout.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var disk))
                 throw new InvalidDataException($"cannot map {letter}:\\ to a disk (needs an existing partition): {Tail(r.Stderr + r.Stdout)}");
             return disk;
         }

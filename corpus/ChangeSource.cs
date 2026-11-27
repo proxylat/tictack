@@ -18,9 +18,9 @@ namespace Corpus
         ILayoutFingerprintProvider? Layout = null,   // item 1-minimal guard seam (null = abstain)
         IExclusionResolver? Exclusions = null);      // item 4 zero-ranges seam (null = none)
 
-    public sealed record IncrementalPlan(HashSet<long> DirtyChunks, string NewCursor,
-        List<string>? NewMftDigests = null, int NewMftRecordBytes = 0,
-        List<string>? NewMftRecordDigests = null);
+    public sealed record IncrementalPlan(IReadOnlySet<long> DirtyChunks, string NewCursor,
+        IReadOnlyList<string>? NewMftDigests = null, int NewMftRecordBytes = 0,
+        IReadOnlyList<string>? NewMftRecordDigests = null);
 
     public interface IChangeSource
     {
@@ -131,94 +131,102 @@ namespace Corpus
             using (volStream)
             {
                 var handle = volStream.SafeFileHandle;
-                var journal = QueryJournal(handle, device);
-                if (journal == null)
-                {
-                    log.Info($"USN journal unavailable on {device}, full image (query failed)");
+                var validated = ValidateJournalAndGeometry(handle, device, cursor.Value, log);
+                if (validated == null)
                     return null;
-                }
-                var (journalId, firstUsn, tipNow) = journal.Value;
-                if (journalId != cursor.Value.JournalId)
-                {
-                    log.Info($"USN journal id changed on {device}, full image (reformat?)");
-                    return null;
-                }
-                if (cursor.Value.NextUsn < firstUsn)
-                {
-                    log.Info($"USN cursor evicted on {device}, full image (journal wrapped)");
-                    return null;
-                }
-                if (cursor.Value.NextUsn > tipNow)
-                {
-                    log.Info($"USN cursor past journal tip on {device}, full image (volume rolled back?)");
-                    return null;
-                }
-                var geo = QueryVolumeData(handle, device);
-                if (geo == null || geo.Value.BytesPerCluster <= 0 || geo.Value.BytesPerRecord <= 0 || geo.Value.BytesPerRecord > 1024 * 1024)
-                {
-                    log.Info($"USN volume data unreadable on {device}, full image");
-                    return null;
-                }
+                var (journalId, firstUsn, tipNow, geo) = validated.Value;
                 var read = ReadChangedFileIds(handle, journalId, firstUsn, cursor.Value.NextUsn, tipNow, device, log);
                 if (read == null)
                     return null;
                 var (fileIds, tipUsn) = read.Value;
-                List<(long StartLcn, long ClusterCount)> mftRuns;
-                try
-                {
-                    mftRuns = MftExtentReader.GetMftRuns(handle, geo.Value.BytesPerRecord);
-                }
-                catch (InvalidDataException ex)
-                {
-                    log.Info($"full image ($MFT runs unreadable on {device}: {ex.Message})");
+                var dirty = CollectDirtyChunks(handle, device, geo, fileIds, chunkBytes, log);
+                if (dirty == null)
                     return null;
-                }
-                var dirty = new HashSet<long>();
-                var bpc = (long)geo.Value.BytesPerCluster;
-                foreach (var id in fileIds)
-                {
-                    List<(long StartLcn, long ClusterCount)>? runs;
-                    try
-                    {
-                        runs = MftExtentReader.GetDataRuns(handle, id, geo.Value.BytesPerCluster, geo.Value.BytesPerRecord, mftRuns);
-                    }
-                    catch (InvalidDataException ex)
-                    {
-                        log.Info($"full image (MFT record for changed file {id:X16} unreadable: {ex.Message})");
-                        return null;
-                    }
-                    if (runs == null)
-                        continue; // deleted/reused id → skip: its clusters' rewrites carry their own USN records
-                    AddRunChunks(dirty, runs, bpc, chunkBytes);
-                }
-                // NTFS self-metadata ($MFT/$LogFile/$Bitmap/...) has no
-                // reliable USN coverage of its own writes, yet every file
-                // write mutates it: always re-capture FRNs 0..15 (MFT zone +
-                // log + bitmap + boot + secure + upcase + $Extend dir).
-                // Synthetic FRNs carry seq 0 (live records never do), so the
-                // sequence check is bypassed — magic + in-use still filter
-                // unused reserved slots. $UsnJrnl itself (under $Extend,
-                // FRN varies) stays one interval stale by design — advisory
-                // file, and a post-restore cursor past its EOF falls back
-                // to full re-read via the tip check above.
-                for (var sys = 0UL; sys < 16; sys++)
-                {
-                    List<(long StartLcn, long ClusterCount)>? sysRuns;
-                    try
-                    {
-                        sysRuns = MftExtentReader.GetDataRuns(handle, sys, geo.Value.BytesPerCluster, geo.Value.BytesPerRecord, mftRuns, skipSequenceCheck: true);
-                    }
-                    catch (InvalidDataException ex)
-                    {
-                        log.Info($"full image (MFT record for system file {sys} unreadable: {ex.Message})");
-                        return null;
-                    }
-                    if (sysRuns == null)
-                        continue; // reserved/unused slot → skip
-                    AddRunChunks(dirty, sysRuns, bpc, chunkBytes);
-                }
                 return new IncrementalPlan(dirty, FormatCursor(journalId, tipUsn));
             }
+        }
+
+        private static (long JournalId, long FirstUsn, long TipNow, (int BytesPerCluster, int BytesPerRecord, long MftValidDataLength) Geo)? ValidateJournalAndGeometry(
+            SafeFileHandle handle, string device, (long JournalId, long NextUsn) cursor, ILogger log)
+        {
+            var journal = QueryJournal(handle, device);
+            if (journal == null)
+            {
+                log.Info($"USN journal unavailable on {device}, full image (query failed)");
+                return null;
+            }
+            var (journalId, firstUsn, tipNow) = journal.Value;
+            if (journalId != cursor.JournalId) { log.Info($"USN journal id changed on {device}, full image (reformat?)"); return null; }
+            if (cursor.NextUsn < firstUsn) { log.Info($"USN cursor evicted on {device}, full image (journal wrapped)"); return null; }
+            if (cursor.NextUsn > tipNow) { log.Info($"USN cursor past journal tip on {device}, full image (volume rolled back?)"); return null; }
+            var geo = QueryVolumeData(handle, device);
+            if (geo == null || geo.Value.BytesPerCluster <= 0 || geo.Value.BytesPerRecord <= 0 || geo.Value.BytesPerRecord > 1024 * 1024)
+            {
+                log.Info($"USN volume data unreadable on {device}, full image");
+                return null;
+            }
+            return (journalId, firstUsn, tipNow, geo.Value);
+        }
+
+        private static HashSet<long>? CollectDirtyChunks(
+            SafeFileHandle handle,
+            string device,
+            (int BytesPerCluster, int BytesPerRecord, long MftValidDataLength) geo,
+            IReadOnlyCollection<ulong> fileIds,
+            int chunkBytes,
+            ILogger log)
+        {
+            List<(long StartLcn, long ClusterCount)> mftRuns;
+            try
+            {
+                mftRuns = MftExtentReader.GetMftRuns(handle, geo.BytesPerRecord);
+            }
+            catch (InvalidDataException ex)
+            {
+                log.Info($"full image ($MFT runs unreadable on {device}: {ex.Message})");
+                return null;
+            }
+            var dirty = new HashSet<long>();
+            var bpc = (long)geo.BytesPerCluster;
+            foreach (var id in fileIds)
+            {
+                if (!AddFileRunChunks(handle, id, geo, mftRuns, dirty, bpc, chunkBytes, skipSequenceCheck: false, $"changed file {id:X16}", log))
+                    return null;
+            }
+            // NTFS self-metadata ($MFT/$LogFile/$Bitmap/...) has no reliable USN coverage: always re-capture FRNs 0..15.
+            for (var sys = 0UL; sys < 16; sys++)
+            {
+                if (!AddFileRunChunks(handle, sys, geo, mftRuns, dirty, bpc, chunkBytes, skipSequenceCheck: true, $"system file {sys}", log))
+                    return null;
+            }
+            return dirty;
+        }
+
+        private static bool AddFileRunChunks(
+            SafeFileHandle handle,
+            ulong fileId,
+            (int BytesPerCluster, int BytesPerRecord, long MftValidDataLength) geo,
+            List<(long StartLcn, long ClusterCount)> mftRuns,
+            HashSet<long> dirty,
+            long bpc,
+            int chunkBytes,
+            bool skipSequenceCheck,
+            string label,
+            ILogger log)
+        {
+            List<(long StartLcn, long ClusterCount)>? runs;
+            try
+            {
+                runs = MftExtentReader.GetDataRuns(handle, fileId, geo.BytesPerCluster, geo.BytesPerRecord, mftRuns, skipSequenceCheck);
+            }
+            catch (InvalidDataException ex)
+            {
+                log.Info($"full image (MFT record for {label} unreadable: {ex.Message})");
+                return false;
+            }
+            if (runs != null)
+                AddRunChunks(dirty, runs, bpc, chunkBytes);
+            return true;
         }
 
         // Expected unavailability → null (full re-read), never throw;
@@ -500,50 +508,58 @@ namespace Corpus
                 if (mftRecord[off + 9] != 0)
                     continue; // named stream, not the record bitmap
                 if (mftRecord[off + 8] == 0)
-                {
-                    if (len < 22)
-                        throw new InvalidDataException("MFT resident bitmap attribute truncated");
-                    var contentLen = BitConverter.ToUInt32(mftRecord, off + 16);
-                    var contentOff = BitConverter.ToUInt16(mftRecord, off + 20);
-                    if (contentLen > len || (long)off + contentOff + contentLen > mftRecord.Length)
-                        throw new InvalidDataException("MFT resident bitmap content outside attribute");
-                    var resident = new byte[contentLen];
-                    Buffer.BlockCopy(mftRecord, off + contentOff, resident, 0, (int)contentLen);
-                    return resident;
-                }
+                    return ReadResidentMftBitmap(mftRecord, off, len);
                 if (len < 64)
                     throw new InvalidDataException("MFT non-resident bitmap attribute truncated");
                 if (BitConverter.ToInt64(mftRecord, off + 16) != 0)
                     return null; // lowest VCN != 0: unsupported shape → unknown
-                var runOff = BitConverter.ToUInt16(mftRecord, off + 32);
-                if (runOff >= len)
-                    throw new InvalidDataException("MFT bitmap run offset outside attribute");
-                var dataSize = BitConverter.ToInt64(mftRecord, off + 48);
-                if (dataSize < 0)
-                    throw new InvalidDataException("MFT bitmap data size invalid");
-                var want = Math.Min(dataSize, maxBytes);
-                var runs = DecodeDataRuns(mftRecord.AsSpan(off + runOff, (int)len - runOff));
-                var out_ = new byte[want];
-                var done = 0L;
-                foreach (var (start, count) in runs)
-                {
-                    for (var i = 0L; i < count && done < want; i++)
-                    {
-                        var cluster = readCluster(start + i);
-                        if (cluster.Length != bytesPerCluster)
-                            throw new InvalidDataException("MFT bitmap cluster size mismatch");
-                        var take = (int)Math.Min((long)bytesPerCluster, want - done);
-                        Buffer.BlockCopy(cluster, 0, out_, (int)done, take);
-                        done += take;
-                    }
-                    if (done >= want)
-                        break;
-                }
-                if (done < want)
-                    throw new InvalidDataException("MFT bitmap runs shorter than data size");
-                return out_;
+                return ReadNonResidentMftBitmap(mftRecord, off, len, readCluster, bytesPerCluster, maxBytes);
             }
             return null; // no $BITMAP → unknown, never unallocated
+        }
+
+        private static byte[] ReadResidentMftBitmap(byte[] mftRecord, int off, uint len)
+        {
+            if (len < 22)
+                throw new InvalidDataException("MFT resident bitmap attribute truncated");
+            var contentLen = BitConverter.ToUInt32(mftRecord, off + 16);
+            var contentOff = BitConverter.ToUInt16(mftRecord, off + 20);
+            if (contentLen > len || (long)off + contentOff + contentLen > mftRecord.Length)
+                throw new InvalidDataException("MFT resident bitmap content outside attribute");
+            var resident = new byte[contentLen];
+            Buffer.BlockCopy(mftRecord, off + contentOff, resident, 0, (int)contentLen);
+            return resident;
+        }
+
+        private static byte[] ReadNonResidentMftBitmap(byte[] mftRecord, int off, uint len, Func<long, byte[]> readCluster, int bytesPerCluster, long maxBytes)
+        {
+            var runOff = BitConverter.ToUInt16(mftRecord, off + 32);
+            if (runOff >= len)
+                throw new InvalidDataException("MFT bitmap run offset outside attribute");
+            var dataSize = BitConverter.ToInt64(mftRecord, off + 48);
+            if (dataSize < 0)
+                throw new InvalidDataException("MFT bitmap data size invalid");
+            var want = Math.Min(dataSize, maxBytes);
+            var runs = DecodeDataRuns(mftRecord.AsSpan(off + runOff, (int)len - runOff));
+            var out_ = new byte[want];
+            var done = 0L;
+            foreach (var (start, count) in runs)
+            {
+                for (var i = 0L; i < count && done < want; i++)
+                {
+                    var cluster = readCluster(start + i);
+                    if (cluster.Length != bytesPerCluster)
+                        throw new InvalidDataException("MFT bitmap cluster size mismatch");
+                    var take = (int)Math.Min((long)bytesPerCluster, want - done);
+                    Buffer.BlockCopy(cluster, 0, out_, (int)done, take);
+                    done += take;
+                }
+                if (done >= want)
+                    break;
+            }
+            if (done < want)
+                throw new InvalidDataException("MFT bitmap runs shorter than data size");
+            return out_;
         }
 
         private static List<(int Offset, uint Length)> AttributeSpans(byte[] record)

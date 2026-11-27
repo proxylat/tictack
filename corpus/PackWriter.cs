@@ -237,7 +237,7 @@ namespace Corpus
         }
 
         // Reads the CPK1 trailing index of a sealed pack without touching blob payloads.
-        public static List<(byte[] Digest, long Offset, int Stored, int Plain)> ReadIndex(string packPath)
+        public static IReadOnlyList<(byte[] Digest, long Offset, int Stored, int Plain)> ReadIndex(string packPath)
         {
             using var stream = new FileStream(packPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             if (stream.Length < 16)

@@ -120,18 +120,71 @@ namespace TicTack
                 }
                 else if (OperatingSystem.IsLinux())
                 {
-                    var psi = new ProcessStartInfo { FileName = "notify-send", UseShellExecute = false, CreateNoWindow = true };
-                    psi.ArgumentList.Add("--app-name=TicTack");
-                    if (_timeoutSeconds == 0)
-                        psi.ArgumentList.Add("--urgency=critical");
-                    else
-                        psi.ArgumentList.Add("--expire-time=" + (_timeoutSeconds * 1000).ToString(CultureInfo.InvariantCulture));
-                    psi.ArgumentList.Add(title);
-                    psi.ArgumentList.Add(message);
-                    using var proc = Process.Start(psi);
+                    SendLinuxNotification(title, message);
                 }
             }
             catch { }
+        }
+
+        private static void SendLinuxNotification(string title, string message)
+        {
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DBUS_SESSION_BUS_ADDRESS")))
+            {
+                StartNotifySend(null, null, title, message);
+                return;
+            }
+            // Root systemd services lack DBUS_SESSION_BUS_ADDRESS: deliver via each active desktop user's session bus.
+            if (!Directory.Exists("/run/user")) return;
+            foreach (var dir in Directory.EnumerateDirectories("/run/user"))
+            {
+                var uidStr = Path.GetFileName(dir);
+                if (!int.TryParse(uidStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var uid) || uid < 1000)
+                    continue;
+                var bus = Path.Combine(dir, "bus");
+                if (!File.Exists(bus)) continue;
+                var user = LookupLinuxUser(uid);
+                if (user != null)
+                    StartNotifySend(user, "unix:path=" + bus, title, message);
+            }
+        }
+
+        private static void StartNotifySend(string? runAsUser, string? dbusAddr, string title, string message)
+        {
+            var psi = new ProcessStartInfo { UseShellExecute = false, CreateNoWindow = true };
+            if (runAsUser != null && dbusAddr != null)
+            {
+                psi.FileName = "runuser";
+                psi.ArgumentList.Add("-u");
+                psi.ArgumentList.Add(runAsUser);
+                psi.ArgumentList.Add("--");
+                psi.ArgumentList.Add("env");
+                psi.ArgumentList.Add("DBUS_SESSION_BUS_ADDRESS=" + dbusAddr);
+                psi.ArgumentList.Add("notify-send");
+            }
+            else
+            {
+                psi.FileName = "notify-send";
+            }
+            psi.ArgumentList.Add("--app-name=TicTack");
+            if (_timeoutSeconds == 0)
+                psi.ArgumentList.Add("--urgency=critical");
+            else
+                psi.ArgumentList.Add("--expire-time=" + (_timeoutSeconds * 1000).ToString(CultureInfo.InvariantCulture));
+            psi.ArgumentList.Add(title);
+            psi.ArgumentList.Add(message);
+            using var proc = Process.Start(psi);
+        }
+
+        private static string? LookupLinuxUser(int uid)
+        {
+            var uidText = uid.ToString(CultureInfo.InvariantCulture);
+            foreach (var line in File.ReadLines("/etc/passwd"))
+            {
+                var parts = line.Split(':');
+                if (parts.Length >= 3 && string.Equals(parts[2], uidText, StringComparison.Ordinal))
+                    return parts[0];
+            }
+            return null;
         }
 
         internal static string EscapeXml(string s) =>
@@ -142,15 +195,49 @@ namespace TicTack
                 .Replace("\"", "&quot;", StringComparison.Ordinal)
                 .Replace("'", "&apos;", StringComparison.Ordinal);
 
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenSCManagerW(string? lpMachineName, string? lpDatabaseName, uint dwDesiredAccess);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenServiceW(IntPtr hSCManager, string lpServiceName, uint dwDesiredAccess);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryServiceStatus(IntPtr hService, out ServiceStatus lpServiceStatus);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseServiceHandle(IntPtr hSCObject);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ServiceStatus
+        {
+            public uint dwServiceType;
+            public uint dwCurrentState;
+            public uint dwControlsAccepted;
+            public uint dwWin32ExitCode;
+            public uint dwServiceSpecificExitCode;
+            public uint dwCheckPoint;
+            public uint dwWaitHint;
+        }
+
         private static bool IsWpnServiceRunning()
         {
             if (!OperatingSystem.IsWindows()) return false;
+            var scm = OpenSCManagerW(null, null, 0x0001); // SC_MANAGER_CONNECT
+            if (scm == IntPtr.Zero) return false;
             try
             {
-                using var sc = new System.ServiceProcess.ServiceController("WpnService");
-                return sc.Status == System.ServiceProcess.ServiceControllerStatus.Running;
+                var svc = OpenServiceW(scm, "WpnService", 0x0004); // SERVICE_QUERY_STATUS
+                if (svc == IntPtr.Zero) return false;
+                try
+                {
+                    return QueryServiceStatus(svc, out var st) && st.dwCurrentState == 4; // SERVICE_RUNNING
+                }
+                finally { CloseServiceHandle(svc); }
             }
             catch { return false; }
+            finally { CloseServiceHandle(scm); }
         }
 
         private static bool TrySendWindowsToast(string title, string message, int timeoutSeconds)

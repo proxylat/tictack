@@ -260,7 +260,7 @@ public sealed class BitLockerTests : IDisposable
     private sealed class BitLockerFileSource : IBlockSource, IBitLockerVolume
     {
         private readonly FileBlockSource _inner;
-        public BitLockerFileSource(string path, string state, List<string>? keyIds)
+        public BitLockerFileSource(string path, string state, IReadOnlyList<string>? keyIds)
         {
             _inner = new FileBlockSource(path);
             BitLockerState = state;
@@ -268,7 +268,7 @@ public sealed class BitLockerTests : IDisposable
         }
         public long Length => _inner.Length;
         public string? BitLockerState { get; }
-        public List<string>? BitLockerKeyIds { get; }
+        public IReadOnlyList<string>? BitLockerKeyIds { get; }
         public Stream OpenRead() => _inner.OpenRead();
         public void Dispose() => _inner.Dispose();
     }

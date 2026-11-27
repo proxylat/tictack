@@ -28,7 +28,7 @@ namespace Corpus
         {
             ArgumentNullException.ThrowIfNull(vhdxPath);
             ArgumentNullException.ThrowIfNull(writeContent);
-            using var file = new FileStream(vhdxPath, FileMode.Create, FileAccess.ReadWrite, FileShare.Read);
+            using var file = new FileStream(vhdxPath, FileMode.Create, FileAccess.ReadWrite, FileShare.Read, 4 * 1024 * 1024, FileOptions.SequentialScan);
             using var disk = Disk.InitializeDynamic(file, Ownership.None, AlignedCapacity(volumeLength));
             writeContent(disk.Content);
         }

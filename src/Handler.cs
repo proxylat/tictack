@@ -521,9 +521,12 @@ namespace TicTack
 
         internal static (string FsType, string MountPoint, string Source)? ParseMountFs(string path, string[] mountInfoLines)
         {
-            string full;
-            try { full = Path.GetFullPath(path).TrimEnd('/'); }
-            catch { return null; }
+            string full = path.StartsWith('/') ? path.TrimEnd('/') : string.Empty;
+            if (string.IsNullOrEmpty(full) && !path.StartsWith('/'))
+            {
+                try { full = Path.GetFullPath(path).Replace('\\', '/').TrimEnd('/'); }
+                catch { return null; }
+            }
             if (string.IsNullOrEmpty(full)) full = "/";
 
             (string FsType, string MountPoint, string Source)? best = null;

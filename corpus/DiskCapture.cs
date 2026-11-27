@@ -32,21 +32,48 @@ namespace Corpus
             => BuildPlan(diskNumber, log, useUnbuffered: true);
 
         // §12.12 seam: --buffered-io passes false (default ON).
-        public static DiskCapturePlan BuildPlan(int diskNumber, ILogger log, bool useUnbuffered)
+        public static DiskCapturePlan BuildPlan(
+            int diskNumber, ILogger log, bool useUnbuffered,
+            bool strictWriters = true, bool skipRecovery = false,
+            IReadOnlySet<int>? includePartitions = null, IReadOnlySet<string>? onlyVolumes = null)
         {
             ArgumentNullException.ThrowIfNull(log);
             if (!OperatingSystem.IsWindows())
                 throw new InvalidOperationException($"disk {diskNumber}: live disk capture needs Windows (elevated GPT+VSS path; Linux disk verbs exit 1)");
             var layout = PartitionTable.ReadDisk(diskNumber, log);
+            ApplyCaptureFilters(layout, skipRecovery, includePartitions, log);
             return BuildPlanCore(
                 diskNumber,
                 layout,
                 TryFindVolume,
                 ManageBdeBitLocker.Instance,
-                (volumes, statics, l) => VssSnapshotSet.Create(volumes, l, statics),
+                (volumes, statics, l) => VssSnapshotSet.Create(volumes, l, statics, strictWriters),
                 (lifetime, volume, device, _, scope) => new DiskSnapshotSource(lifetime, volume, device, scope, useUnbuffered),
                 (lifetime, record, scope) => new LiveCaptureSource(lifetime, new EspLiveSource(diskNumber, record.OffsetBytes, record.LengthBytes, useUnbuffered), scope),
-                log);
+                log,
+                onlyVolumes);
+        }
+
+        internal static void ApplyCaptureFilters(DiskLayout layout, bool skipRecovery, IReadOnlySet<int>? includePartitions, ILogger log)
+        {
+            foreach (var rec in layout.Partitions)
+            {
+                if (rec.Skipped)
+                    continue;
+                if (skipRecovery && IsRecovery(rec))
+                {
+                    rec.Skipped = true;
+                    rec.SkipReason = "recovery-skipped";
+                    log.Info($"disk {layout.DiskNumber} partition {rec.PartitionNumber} ({rec.Name}): skipped (--skip-recovery)");
+                    continue;
+                }
+                if (includePartitions != null && includePartitions.Count > 0 && !includePartitions.Contains(rec.PartitionNumber))
+                {
+                    rec.Skipped = true;
+                    rec.SkipReason = "excluded-partition";
+                    log.Info($"disk {layout.DiskNumber} partition {rec.PartitionNumber} ({rec.Name}): skipped (--partitions)");
+                }
+            }
         }
 
         // Testable core: identical planning, injected seams. Resolution runs
@@ -61,7 +88,8 @@ namespace Corpus
             Func<IReadOnlyList<string>, IReadOnlySet<string>, ILogger, IDiskSnapshotSet> createSet,
             Func<DiskCaptureLifetime, string, string, PartitionRecord, BitLockerCaptureScope, IBlockSource> openData,
             Func<DiskCaptureLifetime, PartitionRecord, BitLockerCaptureScope?, IBlockSource> openLive,
-            ILogger log)
+            ILogger log,
+            IReadOnlySet<string>? onlyVolumes = null)
         {
             ArgumentNullException.ThrowIfNull(layout);
             ArgumentNullException.ThrowIfNull(findVolume);
@@ -72,45 +100,7 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(log);
             if (layout.Partitions.Count == 0)
                 throw new InvalidDataException($"disk {diskNumber}: no partitions to capture");
-            var dataVol = new Dictionary<int, string>();
-            var staticVol = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var liveVol = new Dictionary<int, string?>();
-            var skipped = 0;
-            foreach (var rec in layout.Partitions)
-            {
-                if (rec.Skipped)
-                {
-                    skipped++;
-                    continue;
-                }
-                var volume = findVolume(diskNumber, rec.OffsetBytes, rec.LengthBytes);
-                if (IsLiveRead(rec))
-                {
-                    liveVol[rec.PartitionNumber] = volume;
-                }
-                else
-                {
-                    if (volume == null)
-                        throw new InvalidDataException($"disk {diskNumber} partition {rec.PartitionNumber} ({rec.Name}) has no drive letter, mount point, or volume path — assign one (diskpart/mountvol) so VSS can snapshot it, then retry");
-                    dataVol[rec.PartitionNumber] = volume;
-                    // Recovery partitions are known-static (nothing writes
-                    // outside Update/reagentc): they clear the diff preflight
-                    // on the small tier instead of the size tier, so a
-                    // space-tight Recovery stops vetoing whole-disk capture.
-                    if (IsRecovery(rec))
-                        staticVol.Add(volume);
-                }
-            }
-            // Two partitions resolving to one volume means misattribution
-            // (same bytes imaged under two keys) — fail loud, never double-image.
-            var allVolumes = new List<string>(dataVol.Values);
-            foreach (var v in liveVol.Values)
-            {
-                if (v != null)
-                    allVolumes.Add(v);
-            }
-            if (new HashSet<string>(allVolumes, StringComparer.OrdinalIgnoreCase).Count != allVolumes.Count)
-                throw new InvalidDataException($"disk {diskNumber}: two partitions resolve to the same volume — refusing to double-image");
+            var (dataVol, staticVol, liveVol, allVolumes, skipped) = ResolvePartitionVolumes(diskNumber, layout, findVolume, onlyVolumes, log);
             log.Info($"disk {diskNumber}: snapshotting {dataVol.Count} volumes in one set ({liveVol.Count} live-read, {skipped} skipped)");
             var scopes = new List<BitLockerCaptureScope>();
             var byVolume = new Dictionary<string, BitLockerCaptureScope>(StringComparer.OrdinalIgnoreCase);
@@ -131,57 +121,121 @@ namespace Corpus
                         devices[kv.Key] = set.DeviceFor(kv.Value);
                 }
                 var lifetime = new DiskCaptureLifetime(set, scopes, new List<string>(dataVol.Values));
-                var created = new List<IBlockSource>();
-                try
-                {
-                    var inputs = new List<PartitionImageInput>(layout.Partitions.Count);
-                    foreach (var rec in layout.Partitions)
-                    {
-                        if (rec.Skipped)
-                        {
-                            inputs.Add(new PartitionImageInput(
-                                rec.PartitionNumber, rec.Name, rec.TypeGuid, rec.UniqueGuid,
-                                rec.FirstLba, rec.LastLba, rec.OffsetBytes, rec.LengthBytes,
-                                rec.Filesystem, true, rec.SkipReason ?? "skipped", null, null));
-                            continue;
-                        }
-                        if (liveVol.TryGetValue(rec.PartitionNumber, out var live))
-                        {
-                            var scope = live == null ? null : byVolume[live];
-                            var src = openLive(lifetime, rec, scope);
-                            created.Add(src);
-                            inputs.Add(new PartitionImageInput(
-                                rec.PartitionNumber, rec.Name, rec.TypeGuid, rec.UniqueGuid,
-                                rec.FirstLba, rec.LastLba, rec.OffsetBytes, rec.LengthBytes,
-                                rec.Filesystem, false, null, src, null));
-                        }
-                        else
-                        {
-                            var volume = dataVol[rec.PartitionNumber];
-                            var src = openData(lifetime, volume, devices[rec.PartitionNumber], rec, byVolume[volume]);
-                            created.Add(src);
-                            inputs.Add(new PartitionImageInput(
-                                rec.PartitionNumber, rec.Name, rec.TypeGuid, rec.UniqueGuid,
-                                rec.FirstLba, rec.LastLba, rec.OffsetBytes, rec.LengthBytes,
-                                rec.Filesystem, false, null, src,
-                                IsNtfs(rec) ? new MftDigestChangeSource() : null));
-                        }
-                    }
-                    return new DiskCapturePlan(layout.DiskGuid, layout.DiskSizeBytes, layout.SectorSizeBytes, inputs);
-                }
-                catch
-                {
-                    foreach (var c in created)
-                        c.Dispose();
-                    lifetime.Dispose();
-                    throw;
-                }
+                var inputs = BuildPartitionInputs(layout, liveVol, dataVol, devices, byVolume, lifetime, openData, openLive);
+                return new DiskCapturePlan(layout.DiskGuid, layout.DiskSizeBytes, layout.SectorSizeBytes, inputs);
             }
             catch
             {
                 set?.Dispose();
                 foreach (var s in scopes)
                     s.Dispose();
+                throw;
+            }
+        }
+
+        internal static string NormalizeDrive(string vol)
+        {
+            var s = vol.Trim().TrimEnd('\\', '/');
+            if (s.Length == 1 && char.IsLetter(s[0]))
+                return char.ToUpperInvariant(s[0]) + ":";
+            return s.ToUpperInvariant();
+        }
+
+        private static (Dictionary<int, string> DataVol, HashSet<string> StaticVol, Dictionary<int, string?> LiveVol, List<string> AllVolumes, int Skipped)
+            ResolvePartitionVolumes(int diskNumber, DiskLayout layout, Func<int, long, long, string?> findVolume, IReadOnlySet<string>? onlyVolumes, ILogger log)
+        {
+            var dataVol = new Dictionary<int, string>();
+            var staticVol = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var liveVol = new Dictionary<int, string?>();
+            var skipped = 0;
+            foreach (var rec in layout.Partitions)
+            {
+                if (rec.Skipped) { skipped++; continue; }
+                var volume = findVolume(diskNumber, rec.OffsetBytes, rec.LengthBytes);
+                if (IsLiveRead(rec))
+                {
+                    liveVol[rec.PartitionNumber] = volume;
+                    continue;
+                }
+                if (onlyVolumes != null && onlyVolumes.Count > 0)
+                {
+                    if (volume == null || !onlyVolumes.Contains(NormalizeDrive(volume)))
+                    {
+                        rec.Skipped = true;
+                        rec.SkipReason = "excluded-volume";
+                        skipped++;
+                        log.Info($"disk {diskNumber} partition {rec.PartitionNumber} ({rec.Name}): skipped (--only-volumes)");
+                        continue;
+                    }
+                }
+                if (volume == null)
+                    throw new InvalidDataException($"disk {diskNumber} partition {rec.PartitionNumber} ({rec.Name}) has no drive letter, mount point, or volume path — assign one (diskpart/mountvol) so VSS can snapshot it, then retry");
+                dataVol[rec.PartitionNumber] = volume;
+                if (IsRecovery(rec))
+                    staticVol.Add(volume);
+            }
+            var allVolumes = new List<string>(dataVol.Values);
+            foreach (var v in liveVol.Values)
+            {
+                if (v != null)
+                    allVolumes.Add(v);
+            }
+            if (new HashSet<string>(allVolumes, StringComparer.OrdinalIgnoreCase).Count != allVolumes.Count)
+                throw new InvalidDataException($"disk {diskNumber}: two partitions resolve to the same volume — refusing to double-image");
+            return (dataVol, staticVol, liveVol, allVolumes, skipped);
+        }
+
+        private static List<PartitionImageInput> BuildPartitionInputs(
+            DiskLayout layout,
+            Dictionary<int, string?> liveVol,
+            Dictionary<int, string> dataVol,
+            Dictionary<int, string> devices,
+            Dictionary<string, BitLockerCaptureScope> byVolume,
+            DiskCaptureLifetime lifetime,
+            Func<DiskCaptureLifetime, string, string, PartitionRecord, BitLockerCaptureScope, IBlockSource> openData,
+            Func<DiskCaptureLifetime, PartitionRecord, BitLockerCaptureScope?, IBlockSource> openLive)
+        {
+            var created = new List<IBlockSource>();
+            try
+            {
+                var inputs = new List<PartitionImageInput>(layout.Partitions.Count);
+                foreach (var rec in layout.Partitions)
+                {
+                    if (rec.Skipped)
+                    {
+                        inputs.Add(new PartitionImageInput(
+                            rec.PartitionNumber, rec.Name, rec.TypeGuid, rec.UniqueGuid,
+                            rec.FirstLba, rec.LastLba, rec.OffsetBytes, rec.LengthBytes,
+                            rec.Filesystem, true, rec.SkipReason ?? "skipped", null, null));
+                        continue;
+                    }
+                    if (liveVol.TryGetValue(rec.PartitionNumber, out var live))
+                    {
+                        var src = openLive(lifetime, rec, live == null ? null : byVolume[live]);
+                        created.Add(src);
+                        inputs.Add(new PartitionImageInput(
+                            rec.PartitionNumber, rec.Name, rec.TypeGuid, rec.UniqueGuid,
+                            rec.FirstLba, rec.LastLba, rec.OffsetBytes, rec.LengthBytes,
+                            rec.Filesystem, false, null, src, null));
+                    }
+                    else
+                    {
+                        var volume = dataVol[rec.PartitionNumber];
+                        var src = openData(lifetime, volume, devices[rec.PartitionNumber], rec, byVolume[volume]);
+                        created.Add(src);
+                        inputs.Add(new PartitionImageInput(
+                            rec.PartitionNumber, rec.Name, rec.TypeGuid, rec.UniqueGuid,
+                            rec.FirstLba, rec.LastLba, rec.OffsetBytes, rec.LengthBytes,
+                            rec.Filesystem, false, null, src,
+                            IsNtfs(rec) ? new MftDigestChangeSource() : null));
+                    }
+                }
+                return inputs;
+            }
+            catch
+            {
+                foreach (var c in created)
+                    c.Dispose();
                 throw;
             }
         }
@@ -483,42 +537,9 @@ namespace Corpus
                 throw new PlatformNotSupportedException("VSS disk capture needs Windows");
             if (volumes.Count == 0)
                 throw new ArgumentException("need at least one volume to snapshot", nameof(volumes));
-            var roots = new List<string>(volumes.Count);
-            foreach (var v in volumes)
-            {
-                if (string.IsNullOrEmpty(v))
-                    throw new ArgumentException("volume paths must be non-empty", nameof(volumes));
-                roots.Add(v.TrimEnd('\\') + "\\");
-            }
-            // Normalize the static set into root form (trailing backslash,
-            // case-insensitive) so membership matches the preflight roots.
-            HashSet<string>? statics = null;
-            if (knownStaticVolumes != null)
-            {
-                statics = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var v in knownStaticVolumes)
-                {
-                    if (!string.IsNullOrEmpty(v))
-                        statics.Add(v.TrimEnd('\\') + "\\");
-                }
-            }
-            // Diff-area preflight per volume (same floor VssSnapshot.Create
-            // enforces; GetDiskFreeSpaceExW reports the same bytes DriveInfo
-            // would and also accepts volume GUID paths).
-            foreach (var root in roots)
-            {
-                if (!GetDiskFreeSpaceExW(root, out var free, out var total, out _))
-                    throw new IOException($"GetDiskFreeSpaceExW({root}) failed: {Marshal.GetLastWin32Error()}");
-                var isStatic = statics != null && statics.Contains(root);
-                var headroom = DiffFloor.RequiredHeadroomBytes((long)total, isStatic);
-                if (isStatic)
-                    log.Info($"volume {root} is known-static: diff preflight on the small tier ({headroom} bytes)");
-                if ((long)free < headroom)
-                    throw new InvalidOperationException($"volume {root} has {free} bytes free — VSS needs {headroom} bytes headroom for the diff area.");
-            }
+            var roots = NormalizeAndPreflightVolumes(volumes, knownStaticVolumes, log);
 
-            // COM security FIRST, before any COM activity (same rationale as
-            // VssSnapshot.Create — arriving late surfaces as VSS_E_BAD_STATE).
+            // COM security FIRST, before any COM activity.
             var secHr = VssApi.CoInitializeSecurity(IntPtr.Zero, -1, IntPtr.Zero, IntPtr.Zero, 6u, 3u, IntPtr.Zero, 0u, IntPtr.Zero);
             if (secHr < 0)
                 throw new IOException($"CoInitializeSecurity failed (0x{secHr:X8}) — VSS writer calls cannot authenticate", Marshal.GetExceptionForHR(secHr));
@@ -527,36 +548,10 @@ namespace Corpus
             try
             {
                 Hr(com.InitializeForBackup(null), "InitializeForBackup");
-                // No SetContext: default IS VSS_CTX_BACKUP (same as VssSnapshot).
                 Hr(com.SetBackupState(true, true, VssBackupType.Full, false), "SetBackupState");
                 Hr(com.GatherWriterMetadata(out var gm), "GatherWriterMetadata");
                 RunAsync(gm, "GatherWriterMetadata");
-                var selected = new List<(Guid Instance, Guid Writer, int Type, string? Path, string Name)>();
-                Hr(com.GetWriterMetadataCount(out var writers), "GetWriterMetadataCount");
-                log.Info($"VSS: {writers} writers");
-                for (uint i = 0; i < writers; i++)
-                {
-                    Hr(com.GetWriterMetadata(i, out var instance, out var meta), "GetWriterMetadata");
-                    try
-                    {
-                        Hr(meta.GetIdentity(out _, out var writerId, out var name, out _, out _), "GetIdentity");
-                        Hr(meta.SaveAsXML(out var xml), "SaveAsXML");
-                        var added = 0;
-                        foreach (var (type, path, cname) in ParseComponents(xml))
-                        {
-                            var hr = com.AddComponent(instance, writerId, type, path, cname);
-                            log.Info($"VSS add {name}/{cname} type={type} path={path ?? "<root>"} -> 0x{hr:X8}");
-                            Hr(hr, "AddComponent");
-                            selected.Add((instance, writerId, type, path, cname));
-                            added++;
-                        }
-                        log.Info($"VSS writer: {name} ({added} components)");
-                    }
-                    finally
-                    {
-                        VssApi.Release(meta);
-                    }
-                }
+                var selected = SelectWriterComponents(com, log);
                 Hr(com.StartSnapshotSet(out var setId), "StartSnapshotSet");
                 var snapIds = new List<(string Root, Guid SnapId)>();
                 foreach (var root in roots)
@@ -565,8 +560,6 @@ namespace Corpus
                     snapIds.Add((root, snapId));
                 }
                 log.Info($"VSS set={setId} ({snapIds.Count} volumes)");
-                // Prepare AFTER the set exists with its volumes (same ordering
-                // constraint as VssSnapshot — Prepare validates set existence).
                 Hr(com.PrepareForBackup(out var pf), "PrepareForBackup");
                 RunAsync(pf, "PrepareForBackup");
                 VssWriterVerifier.Verify(com, log, strictWriters);
@@ -581,29 +574,7 @@ namespace Corpus
                     postThaw?.Invoke();
                 }
                 VssWriterVerifier.Verify(com, log, strictWriters);
-                var devices = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                for (var i = 0; i < snapIds.Count; i++)
-                {
-                    var (root, snapId) = snapIds[i];
-                    Hr(com.GetSnapshotProperties(snapId, out var prop), "GetSnapshotProperties");
-                    string device;
-                    try
-                    {
-                        device = Marshal.PtrToStringUni(prop.SnapshotDeviceObject)
-                            ?? throw new IOException("snapshot device object came back null");
-                    }
-                    finally
-                    {
-                        VssApi.VssFreeSnapshotProperties(ref prop);
-                    }
-                    if (prop.Status != (int)VssSnapshotState.Created)
-                        throw new IOException($"snapshot {snapId} landed in state {prop.Status}, want Created(12)");
-                    // NO_WRITERS bit (0x10) must be CLEAR — same loud check.
-                    if ((prop.SnapshotAttributes & 0x10) != 0)
-                        throw new IOException($"snapshot {snapId} came back writerless (attributes 0x{prop.SnapshotAttributes:X8}) — writers did not participate");
-                    devices[volumes[i]] = device;
-                    log.Info($"VSS snapshot of {root} at {device} (attributes 0x{prop.SnapshotAttributes:X8}, writers involved)");
-                }
+                var devices = ReadSnapshotDevices(com, volumes, snapIds, log);
                 return new VssSnapshotSet(com, devices, selected, log);
             }
             catch (Exception ex)
@@ -613,6 +584,98 @@ namespace Corpus
                 VssApi.Release(com);
                 throw;
             }
+        }
+
+        private static List<string> NormalizeAndPreflightVolumes(IReadOnlyList<string> volumes, IReadOnlySet<string>? knownStaticVolumes, ILogger log)
+        {
+            var roots = new List<string>(volumes.Count);
+            foreach (var v in volumes)
+            {
+                if (string.IsNullOrEmpty(v))
+                    throw new ArgumentException("volume paths must be non-empty", nameof(volumes));
+                roots.Add(v.TrimEnd('\\') + "\\");
+            }
+            HashSet<string>? statics = null;
+            if (knownStaticVolumes != null)
+            {
+                statics = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var v in knownStaticVolumes)
+                {
+                    if (!string.IsNullOrEmpty(v))
+                        statics.Add(v.TrimEnd('\\') + "\\");
+                }
+            }
+            foreach (var root in roots)
+            {
+                if (!GetDiskFreeSpaceExW(root, out var free, out var total, out _))
+                    throw new IOException($"GetDiskFreeSpaceExW({root}) failed: {Marshal.GetLastWin32Error()}");
+                var isStatic = statics != null && statics.Contains(root);
+                var headroom = DiffFloor.RequiredHeadroomBytes((long)total, isStatic);
+                if (isStatic)
+                    log.Info($"volume {root} is known-static: diff preflight on the small tier ({headroom} bytes)");
+                if ((long)free < headroom)
+                    throw new InvalidOperationException($"volume {root} has {free} bytes free — VSS needs {headroom} bytes headroom for the diff area.");
+            }
+            return roots;
+        }
+
+        private static List<(Guid Instance, Guid Writer, int Type, string? Path, string Name)> SelectWriterComponents(IVssBackupComponents com, ILogger log)
+        {
+            var selected = new List<(Guid Instance, Guid Writer, int Type, string? Path, string Name)>();
+            Hr(com.GetWriterMetadataCount(out var writers), "GetWriterMetadataCount");
+            log.Info($"VSS: {writers} writers");
+            for (uint i = 0; i < writers; i++)
+            {
+                Hr(com.GetWriterMetadata(i, out var instance, out var meta), "GetWriterMetadata");
+                try
+                {
+                    Hr(meta.GetIdentity(out _, out var writerId, out var name, out _, out _), "GetIdentity");
+                    Hr(meta.SaveAsXML(out var xml), "SaveAsXML");
+                    var added = 0;
+                    foreach (var (type, path, cname) in ParseComponents(xml))
+                    {
+                        var hr = com.AddComponent(instance, writerId, type, path, cname);
+                        log.Info($"VSS add {name}/{cname} type={type} path={path ?? "<root>"} -> 0x{hr:X8}");
+                        Hr(hr, "AddComponent");
+                        selected.Add((instance, writerId, type, path, cname));
+                        added++;
+                    }
+                    log.Info($"VSS writer: {name} ({added} components)");
+                }
+                finally
+                {
+                    VssApi.Release(meta);
+                }
+            }
+            return selected;
+        }
+
+        private static Dictionary<string, string> ReadSnapshotDevices(
+            IVssBackupComponents com, IReadOnlyList<string> volumes, List<(string Root, Guid SnapId)> snapIds, ILogger log)
+        {
+            var devices = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < snapIds.Count; i++)
+            {
+                var (root, snapId) = snapIds[i];
+                Hr(com.GetSnapshotProperties(snapId, out var prop), "GetSnapshotProperties");
+                string device;
+                try
+                {
+                    device = Marshal.PtrToStringUni(prop.SnapshotDeviceObject)
+                        ?? throw new IOException("snapshot device object came back null");
+                }
+                finally
+                {
+                    VssApi.VssFreeSnapshotProperties(ref prop);
+                }
+                if (prop.Status != (int)VssSnapshotState.Created)
+                    throw new IOException($"snapshot {snapId} landed in state {prop.Status}, want Created(12)");
+                if ((prop.SnapshotAttributes & 0x10) != 0)
+                    throw new IOException($"snapshot {snapId} came back writerless (attributes 0x{prop.SnapshotAttributes:X8}) — writers did not participate");
+                devices[volumes[i]] = device;
+                log.Info($"VSS snapshot of {root} at {device} (attributes 0x{prop.SnapshotAttributes:X8}, writers involved)");
+            }
+            return devices;
         }
 
         public string DeviceFor(string volume)
@@ -827,7 +890,7 @@ namespace Corpus
         }
 
         string? IBitLockerVolume.BitLockerState => _bitlocker.CaptureState;
-        List<string>? IBitLockerVolume.BitLockerKeyIds => _bitlocker.CaptureKeyIds;
+        IReadOnlyList<string>? IBitLockerVolume.BitLockerKeyIds => _bitlocker.CaptureKeyIds;
     }
 
     // Live-read partition (ESP / FAT data: VSS cannot snapshot FAT) with the
@@ -868,6 +931,6 @@ namespace Corpus
         }
 
         string? IBitLockerVolume.BitLockerState => _bitlocker?.CaptureState;
-        List<string>? IBitLockerVolume.BitLockerKeyIds => _bitlocker?.CaptureKeyIds;
+        IReadOnlyList<string>? IBitLockerVolume.BitLockerKeyIds => _bitlocker?.CaptureKeyIds;
     }
 }

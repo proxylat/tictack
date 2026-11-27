@@ -197,7 +197,7 @@ namespace Corpus
     // Fake for Linux-green tests: records calls, never shells out.
     public sealed class FakeBootRepairRunner : IBootRepairRunner
     {
-        public readonly List<string> Calls = new();
+        public readonly IList<string> Calls = new List<string>();
         public string Firmware = "UEFI";
         public string WindowsDir = "D:\\Windows";
         public string EspDir = "S:";
