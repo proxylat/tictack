@@ -505,27 +505,47 @@ namespace Corpus
 
         private void RunGc(DateTime now)
         {
-            var gc = new GarbageCollector(_storeRoot, _dbPath, _retention, _log, _wormMode);
-            var plan = gc.Plan();
-            if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0 && plan.DropLayouts.Count == 0)
-                _log.Info("scheduled gc: nothing to collect");
-            else
-                gc.Execute(plan);
-            WriteStamp(_gcStamp, now);
+            StoreLock? storeLock;
+            try { storeLock = StoreLock.Acquire(_storeRoot, TimeSpan.Zero, _log); }
+            catch (StoreLockException)
+            {
+                _log.Info("scheduled gc deferred: store is locked by another operation");
+                return;
+            }
+            using (storeLock)
+            {
+                var gc = new GarbageCollector(_storeRoot, _dbPath, _retention, _log, _wormMode);
+                var plan = gc.Plan();
+                if (plan.DropManifests.Count == 0 && plan.DropPacks.Count == 0 && plan.DropLayouts.Count == 0)
+                    _log.Info("scheduled gc: nothing to collect");
+                else
+                    gc.Execute(plan);
+                WriteStamp(_gcStamp, now);
+            }
         }
 
         private void RunOptimize(DateTime now)
         {
-            var gc = new GarbageCollector(_storeRoot, _dbPath, _retention, _log);
-            using var store = new Store(_storeRoot, _dbPath, _chunkMib, _zstdLevel, _log, _encryptHook);
-            if (store.PendingLandingCount() == 0)
+            StoreLock? storeLock;
+            try { storeLock = StoreLock.Acquire(_storeRoot, TimeSpan.Zero, _log); }
+            catch (StoreLockException)
             {
-                WriteStamp(_optStamp, now);
+                _log.Info("scheduled optimize deferred: store is locked by another operation");
                 return;
             }
-            var (packed, deduped, dropped) = store.OptimizeLanding(new HashSet<string>(gc.LiveDigestHex(), StringComparer.OrdinalIgnoreCase));
-            _log.Info($"scheduled optimize: {packed} packed, {deduped} deduped, {dropped} dropped");
-            WriteStamp(_optStamp, now);
+            using (storeLock)
+            {
+                var gc = new GarbageCollector(_storeRoot, _dbPath, _retention, _log, _wormMode);
+                using var store = new Store(_storeRoot, _dbPath, _chunkMib, _zstdLevel, _log, _encryptHook) { WormMode = _wormMode };
+                if (store.PendingLandingCount() == 0)
+                {
+                    WriteStamp(_optStamp, now);
+                    return;
+                }
+                var (packed, deduped, dropped) = store.OptimizeLanding(new HashSet<string>(gc.LiveDigestHex(), StringComparer.OrdinalIgnoreCase));
+                _log.Info($"scheduled optimize: {packed} packed, {deduped} deduped, {dropped} dropped");
+                WriteStamp(_optStamp, now);
+            }
         }
 
         public void Stop()

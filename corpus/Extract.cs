@@ -377,27 +377,45 @@ namespace Corpus
                 }
                 if (parsed.HasAttrList)
                 {
-                    _skipped++;
-                    _log.Warn($"extract: skipped '{src}' (multi-record file with attribute list not supported)");
-                    return;
-                }
-                if (parsed.IsCompressed)
-                {
-                    _skipped++;
-                    _log.Warn($"extract: skipped '{src}' (compressed file not supported)");
-                    return;
+                    var extRuns = MftAttributeList.CollectExtents(
+                        _mft.ReadRecord(rec), (ulong)rec, _geo.BytesPerCluster,
+                        fr => _mft.ReadRecord((long)(fr & 0xFFFF_FFFF_FFFF)),
+                        null, 0x80u);
+                    if (extRuns.Count == 0)
+                    {
+                        _skipped++;
+                        _log.Warn($"extract: skipped '{src}' (multi-record file with attribute list not supported)");
+                        return;
+                    }
+                    var vcn = parsed.DataRuns is { Count: > 0 } dr ? dr[^1].VcnStart + dr[^1].Count : 0L;
+                    parsed.DataRuns ??= new List<MftRun>();
+                    foreach (var (s, c) in extRuns) { parsed.DataRuns.Add(new MftRun(vcn, s, c)); vcn += c; }
+                    parsed.HasData = true;
                 }
                 WarnAds(parsed, src);
                 if (!parsed.HasData)
                     throw new ExtractCorruptException(_generation, $"file '{src}' has no $DATA");
+                if (!WriteFilePayload(parsed, outPath, src))
+                    return;
+                _files++;
+                _bytes += parsed.DataSize;
+                SetTimes(outPath, parsed, src);
+            }
+
+            private bool WriteFilePayload(ParsedFile parsed, string outPath, string src)
+            {
+                var skipCompressed = false;
                 try
                 {
-                    // File seeds ("docs\big.bin") carry no ancestor entries;
-                    // their parents are created plain (no MFT timestamps).
                     Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);
                     using var output = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.Read);
                     if (parsed.ResidentData != null)
                         output.Write(parsed.ResidentData, 0, parsed.ResidentData.Length);
+                    else if (parsed.IsCompressed)
+                    {
+                        try { WriteCompressedRuns(output, parsed, src); }
+                        catch (InvalidDataException) { skipCompressed = true; }
+                    }
                     else
                         WriteRuns(output, parsed, src);
                 }
@@ -405,9 +423,11 @@ namespace Corpus
                 {
                     throw new ExtractRefusedException($"extract: cannot write '{outPath}' ({ex.Message})", outPath);
                 }
-                _files++;
-                _bytes += parsed.DataSize;
-                SetTimes(outPath, parsed, src);
+                if (!skipCompressed) return true;
+                try { File.Delete(outPath); } catch { }
+                _skipped++;
+                _log.Warn($"extract: skipped '{src}' (compressed file not supported/unreadable)");
+                return false;
             }
 
             private void WarnAds(ParsedFile parsed, string src)
@@ -416,6 +436,36 @@ namespace Corpus
                 {
                     _skipped++;
                     _log.Warn($"extract: skipped ADS '{src}:{ads}' (alternate data streams not restored)");
+                }
+            }
+
+            private void WriteCompressedRuns(FileStream output, ParsedFile parsed, string src)
+            {
+                var stream = new MftRunStream(parsed.DataRuns!, _vol, _geo.BytesPerCluster, _generation, src);
+                var cuBytes = 16 * _geo.BytesPerCluster;
+                var rawBuf = new byte[cuBytes];
+                var decBuf = new byte[cuBytes];
+                var total = 0L;
+                while (total < parsed.DataSize)
+                {
+                    var unitLen = (int)Math.Min(cuBytes, parsed.DataSize - total);
+                    var runBytes = stream.ReadRawUnit(total, rawBuf, cuBytes);
+                    if (runBytes <= 0)
+                    {
+                        Array.Clear(decBuf, 0, unitLen);
+                        output.Write(decBuf, 0, unitLen);
+                    }
+                    else if (runBytes >= cuBytes)
+                    {
+                        output.Write(rawBuf, 0, unitLen);
+                    }
+                    else
+                    {
+                        var wrote = Lznt1.Decompress(rawBuf.AsSpan(0, runBytes), decBuf.AsSpan(0, unitLen));
+                        if (wrote < unitLen) Array.Clear(decBuf, wrote, unitLen - wrote);
+                        output.Write(decBuf, 0, unitLen);
+                    }
+                    total += unitLen;
                 }
             }
 
@@ -568,6 +618,7 @@ namespace Corpus
         private readonly string _landingDir;
         private readonly int _chunkBytes;
         private readonly ChunkIndex _index;
+        private readonly byte[] _key;
         // §12.7 seam: null = no delta codec wired (old behavior; delta reads
         // refuse loud). The winning codec plugs in here post-spike.
         private readonly IDeltaCodec? _deltaCodec;
@@ -600,10 +651,11 @@ namespace Corpus
                     _starts[i + 1] = _starts[i] + manifest.Chunks[i].Size;
             }
             _index = new ChunkIndex(dbPath);
+            _key = ChunkId.EnsureKey(storeRoot);
             _deltaCodec = deltaCodec;
             // ChunkId key is store-local; the id key binds digests, so the
             // resolver needs it for the reconstruction hash-check.
-            _deltaReader = deltaCodec != null ? new DeltaChunkReader(_index, _packsDir, _landingDir, ChunkId.EnsureKey(storeRoot), deltaCodec) : null;
+            _deltaReader = deltaCodec != null ? new DeltaChunkReader(_index, _packsDir, _landingDir, _key, deltaCodec) : null;
         }
 
         // Volume offset → chunk index/offset. Fixed snapshots divide the
@@ -750,7 +802,8 @@ namespace Corpus
                 }
                 for (var i = 0; i < blobs.Length; i++)
                 {
-                    if (plains[i] == null || plains[i].Length != blobs[i].Size)
+                    if (plains[i] == null || plains[i].Length != blobs[i].Size
+                        || !string.Equals(ChunkId.ToHex(ChunkId.ComputeId(plains[i], _key)), blobs[i].Digest, StringComparison.OrdinalIgnoreCase))
                         throw new InvalidDataException($"snapshot {_generation} chunk {missing[i]}: content mismatch");
                 }
             }
@@ -771,7 +824,7 @@ namespace Corpus
         private byte[] CheckSize((string Digest, byte[] Payload, byte Codec, long Size) b, long index)
         {
             var plain = Compression.Decode(b.Payload, b.Codec);
-            if (plain.Length != b.Size)
+            if (plain.Length != b.Size || !string.Equals(ChunkId.ToHex(ChunkId.ComputeId(plain, _key)), b.Digest, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException($"snapshot {_generation} chunk {index}: content mismatch");
             return plain;
         }
@@ -781,7 +834,7 @@ namespace Corpus
             var entry = _manifest.Chunks[(int)index];
             var (payload, codec) = FetchPayload(index, entry);
             var plain = Compression.Decode(payload, codec);
-            if (plain.Length != entry.Size)
+            if (plain.Length != entry.Size || !string.Equals(ChunkId.ToHex(ChunkId.ComputeId(plain, _key)), entry.DigestHex, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException($"snapshot {_generation} chunk {index}: content mismatch");
             return plain;
         }
@@ -938,6 +991,26 @@ namespace Corpus
                 StartVcn = 0;
                 EndVcn = -1;
             }
+        }
+
+        // Reads the non-sparse clusters of one 16-cluster NTFS compression unit,
+        // returning the number of compressed bytes read (0 = all-sparse hole).
+        public int ReadRawUnit(long unitByteOffset, byte[] buffer, int unitBytes)
+        {
+            var startVcn = unitByteOffset / _bpc;
+            var endVcn = startVcn + (unitBytes / _bpc) - 1;
+            var outOff = 0;
+            for (var vcn = startVcn; vcn <= endVcn; vcn++)
+            {
+                if (!TryMap(vcn, out var lcn, out _) || lcn < 0)
+                    break;
+                var volOff = lcn * _bpc;
+                if (volOff < 0 || volOff + _bpc > _vol.Length)
+                    throw new ExtractCorruptException(_generation, $"file '{_context}' references compressed data outside volume");
+                _vol.Read(volOff, buffer, outOff, _bpc);
+                outOff += _bpc;
+            }
+            return outOff;
         }
 
         public void Read(long byteOffset, byte[] buffer, int bufOffset, int count, bool zeroUnmapped)

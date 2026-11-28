@@ -16,14 +16,18 @@ namespace Corpus
         void ApplyLayout(string diskpartScript);
         (string WindowsDir, string EspDir) LocateVolumes(DiskLayout layout, int targetDisk);
         void InstallBootloader(string windowsDir, string espDir);
+        void InstallBootloader(string windowsDir, string bootDir, bool isMbr) => InstallBootloader(windowsDir, bootDir);
         string FirmwareType();
         void CheckBootFiles(string espDir);
+        void CheckBootFiles(string bootDir, bool isMbr) => CheckBootFiles(bootDir);
+        void CleanupVolumes() { }
     }
 
     // Real path: Windows-gated, every method throws off Windows.
     public sealed class WindowsBootRepairRunner : IBootRepairRunner
     {
         private readonly ILogger _log;
+        private readonly List<char> _assignedLetters = new();
 
         public WindowsBootRepairRunner(ILogger log)
         {
@@ -73,14 +77,25 @@ namespace Corpus
                 throw new ArgumentOutOfRangeException(nameof(targetDisk), "target disk must be non-negative (got: " + targetDisk + ")");
             PartitionRecord? esp = null;
             var osCandidates = new List<PartitionRecord>();
+            var isMbr = string.Equals(layout.Style, "mbr", StringComparison.OrdinalIgnoreCase);
             foreach (var p in layout.Partitions)
             {
                 if (p.Skipped)
                     continue;
-                if (esp == null && string.Equals(p.Filesystem, "fat32", StringComparison.OrdinalIgnoreCase))
+                if (!isMbr && esp == null && string.Equals(p.Filesystem, "fat32", StringComparison.OrdinalIgnoreCase))
                     esp = p;
                 if (string.Equals(p.Filesystem, "ntfs", StringComparison.OrdinalIgnoreCase))
                     osCandidates.Add(p);
+            }
+            if (isMbr)
+            {
+                foreach (var os in osCandidates)
+                {
+                    var letter = ResolveLetter(targetDisk, os, assign: false) ?? ResolveLetter(targetDisk, os, assign: true);
+                    if (letter != null && Directory.Exists(letter + "\\Windows\\System32"))
+                        return (letter + "\\Windows", letter);
+                }
+                throw new InvalidDataException($"no Windows install on MBR target disk {targetDisk} (checked {osCandidates.Count} NTFS partition(s))");
             }
             if (esp == null)
                 throw new InvalidDataException($"no FAT32 ESP in the layout for target disk {targetDisk}");
@@ -138,8 +153,22 @@ namespace Corpus
                 throw new InvalidDataException($"mountvol {letter}: failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
             found = DiskCapture.TryFindVolume(targetDisk, rec.OffsetBytes, rec.LengthBytes);
             if (found != null && found.Length == 2 && found[1] == ':' && char.IsAsciiLetter(found[0]))
+            {
+                _assignedLetters.Add(char.ToUpperInvariant(found[0]));
                 return found;
+            }
             throw new InvalidDataException($"mountvol {letter}: reported success but target disk {targetDisk} partition {rec.PartitionNumber} still has no letter");
+        }
+
+        public void CleanupVolumes()
+        {
+            if (!OperatingSystem.IsWindows()) return;
+            foreach (var letter in _assignedLetters)
+            {
+                try { ProcessRunner.RunAsync($"mountvol {letter}: /D", Path.GetTempPath(), redirect: true, timeoutMs: 15000).GetAwaiter().GetResult(); }
+                catch (Exception ex) { _log.Warn($"mountvol {letter}: /D cleanup failed: {ex.Message}"); }
+            }
+            _assignedLetters.Clear();
         }
 
         // Free-letter scan, Z down to C (A/B are floppy legacy): descending
@@ -154,15 +183,25 @@ namespace Corpus
             return null;
         }
 
-        public void InstallBootloader(string windowsDir, string espDir)
+        public void InstallBootloader(string windowsDir, string espDir) =>
+            InstallBootloader(windowsDir, espDir, isMbr: false);
+
+        public void InstallBootloader(string windowsDir, string bootDir, bool isMbr)
         {
             RequireWindows();
             ArgumentNullException.ThrowIfNull(windowsDir);
-            ArgumentNullException.ThrowIfNull(espDir);
-            _log.Info($"installing bootloader: bcdboot {windowsDir} /s {espDir} /f UEFI");
-            var r = ProcessRunner.RunAsync($"bcdboot \"{windowsDir}\" /s {espDir} /f UEFI", Path.GetTempPath(), redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
+            ArgumentNullException.ThrowIfNull(bootDir);
+            var fw = isMbr ? "BIOS" : "UEFI";
+            _log.Info($"installing bootloader: bcdboot {windowsDir} /s {bootDir} /f {fw}");
+            var r = ProcessRunner.RunAsync($"bcdboot \"{windowsDir}\" /s {bootDir} /f {fw}", Path.GetTempPath(), redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
             if (r.TimedOut || r.ExitCode != 0)
                 throw new InvalidDataException($"bcdboot failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
+            if (isMbr)
+            {
+                var bs = ProcessRunner.RunAsync($"bootsect /nt60 {bootDir} /mbr", Path.GetTempPath(), redirect: true, timeoutMs: 60000).GetAwaiter().GetResult();
+                if (bs.TimedOut || bs.ExitCode != 0)
+                    throw new InvalidDataException($"bootsect /nt60 {bootDir} /mbr failed (exit {bs.ExitCode}): {Tail(bs.Stderr + bs.Stdout)}");
+            }
         }
 
         public string FirmwareType()
@@ -181,11 +220,15 @@ namespace Corpus
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern uint GetFirmwareEnvironmentVariable(string lpName, string lpGuid, byte[] pBuffer, uint nSize);
 
-        public void CheckBootFiles(string espDir)
+        public void CheckBootFiles(string espDir) => CheckBootFiles(espDir, isMbr: false);
+
+        public void CheckBootFiles(string bootDir, bool isMbr)
         {
             RequireWindows();
-            ArgumentNullException.ThrowIfNull(espDir);
-            var bcd = Path.Combine(espDir, "EFI", "Microsoft", "Boot", "BCD");
+            ArgumentNullException.ThrowIfNull(bootDir);
+            var bcd = isMbr
+                ? Path.Combine(bootDir, "Boot", "BCD")
+                : Path.Combine(bootDir, "EFI", "Microsoft", "Boot", "BCD");
             if (!File.Exists(bcd))
                 throw new InvalidDataException($"bcdboot reported success but {bcd} is missing (do not boot this target)");
         }
@@ -274,8 +317,9 @@ namespace Corpus
             }
             try
             {
+                var isMbr = string.Equals(layout.Style, "mbr", StringComparison.OrdinalIgnoreCase);
                 var firmware = runner.FirmwareType();
-                if (!string.Equals(firmware, "UEFI", StringComparison.OrdinalIgnoreCase))
+                if (!isMbr && !string.Equals(firmware, "UEFI", StringComparison.OrdinalIgnoreCase))
                 {
                     log.Error($"refusing boot repair: firmware is {firmware}, layout is GPT (Legacy+GPT is unbootable; the MBR2GPT path is a staged follow-up)");
                     return 1;
@@ -304,11 +348,12 @@ namespace Corpus
                 throw new ArgumentOutOfRangeException(nameof(targetDisk), "target disk must be non-negative (got: " + targetDisk + ")");
             try
             {
+                var isMbr = string.Equals(layout.Style, "mbr", StringComparison.OrdinalIgnoreCase);
                 var (win, esp) = runner.LocateVolumes(layout, targetDisk);
-                log.Info($"boot repair: OS at {win}, ESP at {esp} (target disk {targetDisk})");
-                runner.InstallBootloader(win, esp);
+                log.Info($"boot repair: OS at {win}, boot at {esp} (target disk {targetDisk})");
+                runner.InstallBootloader(win, esp, isMbr);
                 log.Info("boot repair: bootloader reinstalled");
-                runner.CheckBootFiles(esp);
+                runner.CheckBootFiles(esp, isMbr);
                 log.Info("boot repair: boot files verified");
                 return 0;
             }
@@ -316,6 +361,10 @@ namespace Corpus
             {
                 log.Error("boot repair failed", ex);
                 return 1;
+            }
+            finally
+            {
+                runner.CleanupVolumes();
             }
         }
 
@@ -331,9 +380,16 @@ namespace Corpus
         // Pure layout gate, shared by Repair and the dry-run path.
         internal static string? CheckLayout(DiskLayout layout)
         {
+            if (string.Equals(layout.Style, "mbr", StringComparison.OrdinalIgnoreCase))
+            {
+                var hasNtfs = false;
+                foreach (var p in layout.Partitions)
+                    if (!p.Skipped && string.Equals(p.Filesystem, "ntfs", StringComparison.OrdinalIgnoreCase)) hasNtfs = true;
+                return hasNtfs ? null : "refusing boot repair: no NTFS OS partition in the MBR layout";
+            }
             if (!string.Equals(layout.Style, "gpt", StringComparison.OrdinalIgnoreCase))
-                return $"refusing boot repair: layout style is {layout.Style} (GPT only; MBR repair is a staged follow-up)";
-            var floor = layout.SectorSizeBytes == 4096 ? 300L * 1024 * 1024 : 200L * 1024 * 1024;
+                return $"refusing boot repair: layout style is {layout.Style} (supported: gpt, mbr)";
+            var floor = layout.SectorSizeBytes == 4096 ? 260L * 1024 * 1024 : 100L * 1024 * 1024;
             var esp = null as PartitionRecord;
             var os = null as PartitionRecord;
             var msr = false;

@@ -80,6 +80,7 @@ retention:
 # stored unencrypted. Runs per sealed pack, never per chunk; a hook failure
 # fails the job loud and deletes the plaintext pack.
 #encrypt: 'age -r AGE-RECIPIENT -o "{output}" "{input}"'
+#decrypt: 'age -d -i /path/to/key.txt -o "{output}" "{input}"'
 
 # Scheduled GC/optimize cadence (service host only; manual --gc is unchanged).
 #gc_daily_at: '02:00'

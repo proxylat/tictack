@@ -45,6 +45,7 @@ namespace Corpus
                         : $"pack encrypt hook produced no output file: {outputPath}");
             }
             File.Move(outputPath, sealedPackPath, overwrite: true);
+            AtomicFile.SyncParentDir(sealedPackPath);
         }
 
         private static void Cleanup(string sealedPackPath, string outputPath)
@@ -52,6 +53,58 @@ namespace Corpus
             // Best-effort: the throw is the signal, not the cleanup.
             try { File.Delete(outputPath); } catch { }
             try { File.Delete(sealedPackPath); } catch { }
+        }
+    }
+
+    // Session-scoped decrypted pack cache for encrypted stores (`decrypt:`).
+    // Decrypts each pack once into a private temp dir and wipes it on Dispose.
+    public sealed class PackReadCache : IDisposable
+    {
+        private readonly string? _decryptCommand;
+        private readonly string? _tempDir;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _cache = new(StringComparer.Ordinal);
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, object> _locks = new(StringComparer.Ordinal);
+
+        public PackReadCache(string? decryptCommand)
+        {
+            _decryptCommand = string.IsNullOrWhiteSpace(decryptCommand) ? null : decryptCommand;
+            if (_decryptCommand != null)
+            {
+                _tempDir = Path.Combine(Path.GetTempPath(), "corpus-dec-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(_tempDir);
+            }
+        }
+
+        public string Resolve(string packPath)
+        {
+            if (_decryptCommand == null || _tempDir == null)
+                return packPath;
+            var full = Path.GetFullPath(packPath);
+            if (_cache.TryGetValue(full, out var cached) && File.Exists(cached))
+                return cached;
+            var gate = _locks.GetOrAdd(full, _ => new object());
+            lock (gate)
+            {
+                if (_cache.TryGetValue(full, out cached) && File.Exists(cached))
+                    return cached;
+                var outPath = Path.Combine(_tempDir, Guid.NewGuid().ToString("N") + ".pack");
+                var cmd = _decryptCommand.Replace("{input}", full).Replace("{output}", outPath);
+                var dir = Path.GetDirectoryName(full) ?? _tempDir;
+                var (exit, _, stderr, timedOut) = ProcessRunner.RunAsync(cmd, dir, redirect: true).GetAwaiter().GetResult();
+                if (timedOut || exit != 0 || !File.Exists(outPath))
+                {
+                    try { File.Delete(outPath); } catch { }
+                    throw new InvalidDataException($"pack decrypt hook failed (exit {exit}): {stderr.Trim()}");
+                }
+                _cache[full] = outPath;
+                return outPath;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_tempDir == null) return;
+            try { if (Directory.Exists(_tempDir)) Directory.Delete(_tempDir, recursive: true); } catch { }
         }
     }
 }

@@ -276,6 +276,7 @@ namespace Corpus
                 using (var filter = new DirtyRangeWriteFilter(disk.Content, target, dirty))
                 {
                     store.ExportToStream(generation, filter);
+                    ZeroClearedDirtyHoles(disk.Content, baseManifest, target, dirty);
                     log.Info($"reflink export: {filter.WrittenBytes} dirty bytes written, {filter.SkippedBytes} clean bytes left COW-shared ({dirty.Count} dirty chunks)");
                 }
                 using (var verifier = new ContentVerifyStream(disk.Content))
@@ -288,6 +289,28 @@ namespace Corpus
             }
             if (verifyError != null)
                 throw new InvalidDataException(verifyError);
+        }
+
+        private static void ZeroClearedDirtyHoles(Stream content, SnapshotManifest baseManifest, SnapshotManifest target, List<int> dirty)
+        {
+            var chunkBytes = (long)target.ChunkMib * 1024L * 1024L;
+            byte[]? zeros = null;
+            foreach (var idx in dirty)
+            {
+                if (!target.Chunks[idx].IsHole || baseManifest.Chunks[idx].IsHole)
+                    continue;
+                var size = target.Chunks[idx].Size;
+                if (size <= 0) continue;
+                zeros ??= new byte[(int)Math.Min(chunkBytes, 1024L * 1024L)];
+                content.Seek(idx * chunkBytes, SeekOrigin.Begin);
+                var left = size;
+                while (left > 0)
+                {
+                    var take = (int)Math.Min(left, zeros.Length);
+                    content.Write(zeros, 0, take);
+                    left -= take;
+                }
+            }
         }
 
         private static void DeletePartialExport(string outPath, Exception ex, ILogger log)

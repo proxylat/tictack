@@ -68,7 +68,10 @@
     <Compile Include="../Hardening.cs" Link="corpus/Hardening.cs" />
     <Compile Include="../ChangeSource.cs" Link="corpus/ChangeSource.cs" />
     <Compile Include="../MftReader.cs" Link="corpus/MftReader.cs" />
+    <Compile Include="../MftAttributeList.cs" Link="corpus/MftAttributeList.cs" />
     <Compile Include="../MftDigest.cs" Link="corpus/MftDigest.cs" />
+    <Compile Include="../Lznt1.cs" Link="corpus/Lznt1.cs" />
+    <Compile Include="../NbdServer.cs" Link="corpus/NbdServer.cs" />
     <Compile Include="../CapturePolicy.cs" Link="corpus/CapturePolicy.cs" />
     <Compile Include="../Manifest.cs" Link="corpus/Manifest.cs" />
     <Compile Include="../LayoutStore.cs" Link="corpus/LayoutStore.cs" />

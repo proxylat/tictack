@@ -86,23 +86,28 @@ namespace Corpus
             if (SamePath(firstPartPath, destPath))
                 throw new WimConvertRefusedException("--merge-swm", firstPartPath, "source and destination are the same file — refusing to merge onto itself");
 
-            string args;
             if (runner.Backend == WimBackendKind.Wimlib)
             {
-                args = $"join {ProcessRunner.QuoteArg(destPath)} {string.Join(" ", parts.Select(ProcessRunner.QuoteArg))}";
+                var args = $"join {ProcessRunner.QuoteArg(destPath)} {string.Join(" ", parts.Select(ProcessRunner.QuoteArg))}";
+                var r = runner.Run(args);
+                if (r.ExitCode != 0)
+                    throw new WimBackendException(firstPartPath, args, r);
             }
             else
             {
                 var dir = Path.GetDirectoryName(firstPartPath);
                 var pattern = (string.IsNullOrEmpty(dir) ? "" : dir + Path.DirectorySeparatorChar)
                     + Path.GetFileNameWithoutExtension(firstPartPath) + "*" + Path.GetExtension(firstPartPath);
-                args = $"/Export-Image /SourceImageFile:{ProcessRunner.QuoteArg(firstPartPath)} /SWMFile:{ProcessRunner.QuoteArg(pattern)} /SourceIndex:1 /DestinationImageFile:{ProcessRunner.QuoteArg(destPath)}";
+                var info = runner.Run($"/Get-WimInfo /WimFile:{ProcessRunner.QuoteArg(firstPartPath)}");
+                var count = info.ExitCode == 0 ? Math.Max(1, SingleFileBackup.CountImageIndexes(info.Stdout)) : 1;
+                for (var idx = 1; idx <= count; idx++)
+                {
+                    var args = $"/Export-Image /SourceImageFile:{ProcessRunner.QuoteArg(firstPartPath)} /SWMFile:{ProcessRunner.QuoteArg(pattern)} /SourceIndex:{idx} /DestinationImageFile:{ProcessRunner.QuoteArg(destPath)}";
+                    var r = runner.Run(args);
+                    if (r.ExitCode != 0)
+                        throw new SingleFileDismException(firstPartPath, args, r);
+                }
             }
-            var r = runner.Run(args);
-            if (r.ExitCode != 0)
-                throw runner.Backend == WimBackendKind.Wimlib
-                    ? new WimBackendException(firstPartPath, args, r)
-                    : new SingleFileDismException(firstPartPath, args, r);
             log.Info($"merged {parts.Count} part(s) from {firstPartPath} into {destPath}");
             return destPath;
         }

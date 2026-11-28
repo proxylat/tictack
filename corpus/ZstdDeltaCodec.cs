@@ -28,9 +28,10 @@ namespace Corpus
     //   read path next to the hash check. No cache: consecutive chunks
     //   never share a base, so a cache would only add bookkeeping.
     // - Buffers are rented (ArrayPool), never parked per chunk.
-    public sealed class ZstdDeltaCodec : IDeltaCodec
+    public sealed class ZstdDeltaCodec : IDeltaCodec, IDisposable
     {
         public byte CodecId => 2;
+        private const int MaxWindowBytes = 1 << 23;
 
         private readonly int _level;
         private readonly ThreadLocal<Compressor> _encoders;
@@ -39,8 +40,22 @@ namespace Corpus
         public ZstdDeltaCodec(int level = 3)
         {
             _level = level;
-            _encoders = new ThreadLocal<Compressor>(NewEncoder);
-            _decoders = new ThreadLocal<Decompressor>(() => new Decompressor());
+            _encoders = new ThreadLocal<Compressor>(NewEncoder, trackAllValues: true);
+            _decoders = new ThreadLocal<Decompressor>(() => new Decompressor(), trackAllValues: true);
+        }
+
+        public void Dispose()
+        {
+            if (_encoders.IsValueCreated || _encoders.Values.Count > 0)
+            {
+                foreach (var c in _encoders.Values) c.Dispose();
+            }
+            if (_decoders.IsValueCreated || _decoders.Values.Count > 0)
+            {
+                foreach (var d in _decoders.Values) d.Dispose();
+            }
+            _encoders.Dispose();
+            _decoders.Dispose();
         }
 
         private Compressor NewEncoder()
@@ -62,7 +77,7 @@ namespace Corpus
             patch = Array.Empty<byte>();
             try
             {
-                if (baseWhole.Length == 0 || current.Length == 0)
+                if (baseWhole.Length == 0 || current.Length == 0 || baseWhole.Length > MaxWindowBytes)
                     return false;
                 var enc = _encoders.Value!;
                 enc.LoadDictionary(baseWhole);

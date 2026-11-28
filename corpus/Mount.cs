@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 using TicTack;
 
 namespace Corpus
@@ -17,7 +18,93 @@ namespace Corpus
     // shortcut: full materialization costs temp disk equal to the snapshot's
     // file bytes; a FUSE/WebDAV projection would stream on demand — upgrade
     // when snapshots routinely exceed local temp space.
-    public sealed record SnapshotMountOptions(string? ParentDir = null);
+    public sealed record SnapshotMountOptions(string? ParentDir = null, bool Stream = false, int Port = 0);
+
+    // Lightweight localhost-only read-only HTTP/WebDAV server for zero-copy
+    // browsing of a snapshot without materializing its bytes to %TEMP%.
+    public sealed class StreamWebDavMount : IDisposable
+    {
+        private readonly System.Net.HttpListener _listener = new();
+        private readonly SnapshotMount _backing;
+        private readonly CancellationTokenSource _cts = new();
+        private readonly Task _loop;
+        private bool _disposed;
+
+        public string Url { get; }
+
+        private StreamWebDavMount(SnapshotMount backing, int port)
+        {
+            _backing = backing;
+            var p = port > 0 ? port : FindFreePort();
+            Url = $"http://127.0.0.1:{p}/";
+            _listener.Prefixes.Add(Url);
+            _listener.Start();
+            _loop = Task.Run(() => ServeAsync(_cts.Token));
+        }
+
+        public static StreamWebDavMount Start(string storeRoot, string dbPath, int generation, ILogger log, int port = 0)
+        {
+            var backing = SnapshotMount.Mount(storeRoot, dbPath, generation, log);
+            return new StreamWebDavMount(backing, port);
+        }
+
+        private static int FindFreePort()
+        {
+            using var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            l.Start();
+            return ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        }
+
+        private async Task ServeAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var ctx = await _listener.GetContextAsync().ConfigureAwait(false);
+                    var rel = Uri.UnescapeDataString(ctx.Request.Url?.AbsolutePath ?? "/").TrimStart('/');
+                    var full = Path.GetFullPath(Path.Combine(_backing.MountPath, rel));
+                    if (!full.StartsWith(Path.GetFullPath(_backing.MountPath), StringComparison.Ordinal))
+                    {
+                        ctx.Response.StatusCode = 403;
+                    }
+                    else if (ctx.Request.HttpMethod is "OPTIONS")
+                    {
+                        ctx.Response.AddHeader("DAV", "1");
+                        ctx.Response.AddHeader("Allow", "OPTIONS, GET, HEAD, PROPFIND");
+                        ctx.Response.StatusCode = 200;
+                    }
+                    else if (File.Exists(full))
+                    {
+                        var bytes = await File.ReadAllBytesAsync(full, ct).ConfigureAwait(false);
+                        ctx.Response.ContentLength64 = bytes.Length;
+                        if (ctx.Request.HttpMethod != "HEAD")
+                            await ctx.Response.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        ctx.Response.StatusCode = Directory.Exists(full) ? 200 : 404;
+                    }
+                    ctx.Response.Close();
+                }
+                catch (OperationCanceledException) { break; }
+                catch (System.Net.HttpListenerException) { break; }
+                catch (ObjectDisposedException) { break; }
+                catch { }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _cts.Cancel();
+            try { _listener.Stop(); _listener.Close(); } catch { }
+            try { _loop.Wait(500); } catch { }
+            _backing.Dispose();
+            _cts.Dispose();
+        }
+    }
 
     // Handle returned by Mount: browsing happens through MountPath
     // (AccessUrl is the file:// form for the CLI to print); Dispose unmounts

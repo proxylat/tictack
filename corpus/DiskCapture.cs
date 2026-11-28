@@ -777,7 +777,7 @@ namespace Corpus
     // bitmap runs, lazy MFT, USN planning from the frozen device) but the VSS
     // set + BitLocker scope live in the shared DiskCaptureLifetime, not per
     // source — one set freezes the whole disk.
-    internal sealed class DiskSnapshotSource : ISparseBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume, ILiveMftVolumeProvider
+    internal sealed class DiskSnapshotSource : ISparseBlockSource, ICompletableBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume, ILiveMftVolumeProvider
     {
         private readonly DiskCaptureLifetime _lifetime;
         private readonly string _volume;
@@ -879,6 +879,8 @@ namespace Corpus
             var raw = ExtentStreams.OpenExtentRead(_device, _useUnbuffered);
             return new VssReadStream(raw, Length, () => _lifetime.ReportFullRead(_volume));
         }
+
+        public void MarkCompleted() => _lifetime.ReportFullRead(_volume);
 
         public void Dispose()
         {

@@ -350,10 +350,12 @@ namespace Corpus
             WriteSidecarData(packPath, data, RsCodec.EncodeFile(data, parityCount), parityCount);
         }
 
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, object> RepairLocks = new(StringComparer.OrdinalIgnoreCase);
+
         private static void WriteSidecarData(string packPath, byte[] data, byte[] parity, int parityCount)
         {
             var path = SidecarPath(packPath);
-            var tmp = path + ".tmp";
+            var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             using (var stream = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 Span<byte> header = stackalloc byte[20];
@@ -370,6 +372,7 @@ namespace Corpus
                 stream.Flush(true);
             }
             File.Move(tmp, path, true);
+            AtomicFile.SyncParentDir(path);
         }
 
         // True = the pack now reads clean (repaired, or already clean).
@@ -377,48 +380,53 @@ namespace Corpus
         // caller's original error stays the signal, never the repair.
         public static bool TryRepairPack(string packPath)
         {
-            try
+            var gate = RepairLocks.GetOrAdd(Path.GetFullPath(packPath), _ => new object());
+            lock (gate)
             {
-                var path = SidecarPath(packPath);
-                if (!File.Exists(path))
-                    return false;
-                var raw = File.ReadAllBytes(path);
-                if (raw.Length < 20 || raw[0] != (byte)'R' || raw[1] != (byte)'S' || raw[2] != (byte)'E' || raw[3] != (byte)'1')
-                    return false;
-                var span = raw.AsSpan();
-                if (BinaryPrimitives.ReadInt32LittleEndian(span.Slice(4)) != RsCodec.DataWidth)
-                    return false;
-                var parityCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(8));
-                var dataLength = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(12));
-                if (parityCount < 2 || parityCount > RsCodec.MaxParity || dataLength < 0)
-                    return false;
-                if (raw.Length != 20 + RsCodec.StripeCount(dataLength) * parityCount)
-                    return false;
-                var data = File.ReadAllBytes(packPath);
-                if (data.Length != dataLength)
-                    return false;
-                var parity = new byte[raw.Length - 20];
-                Buffer.BlockCopy(raw, 20, parity, 0, parity.Length);
-                var repaired = RsCodec.TryRepair(data, parity, parityCount);
-                if (repaired < 0)
-                    return false;
-                if (repaired == 0)
-                    return true;
-                var tmp = packPath + ".rsfix.tmp";
-                using (var stream = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                try
                 {
-                    stream.Write(data, 0, data.Length);
-                    stream.Flush(true);
+                    var path = SidecarPath(packPath);
+                    if (!File.Exists(path))
+                        return false;
+                    var raw = File.ReadAllBytes(path);
+                    if (raw.Length < 20 || raw[0] != (byte)'R' || raw[1] != (byte)'S' || raw[2] != (byte)'E' || raw[3] != (byte)'1')
+                        return false;
+                    var span = raw.AsSpan();
+                    if (BinaryPrimitives.ReadInt32LittleEndian(span.Slice(4)) != RsCodec.DataWidth)
+                        return false;
+                    var parityCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(8));
+                    var dataLength = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(12));
+                    if (parityCount < 2 || parityCount > RsCodec.MaxParity || dataLength < 0)
+                        return false;
+                    if (raw.Length != 20 + RsCodec.StripeCount(dataLength) * parityCount)
+                        return false;
+                    var data = File.ReadAllBytes(packPath);
+                    if (data.Length != dataLength)
+                        return false;
+                    var parity = new byte[raw.Length - 20];
+                    Buffer.BlockCopy(raw, 20, parity, 0, parity.Length);
+                    var repaired = RsCodec.TryRepair(data, parity, parityCount);
+                    if (repaired < 0)
+                        return false;
+                    if (repaired == 0)
+                        return true;
+                    var tmp = packPath + "." + Guid.NewGuid().ToString("N") + ".rsfix.tmp";
+                    using (var stream = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        stream.Write(data, 0, data.Length);
+                        stream.Flush(true);
+                    }
+                    File.Move(tmp, packPath, true);
+                    AtomicFile.SyncParentDir(packPath);
+                    // Parity self-heals: recompute over the fixed bytes so a
+                    // sidecar bitflip cannot doom the next repair.
+                    WriteSidecarData(packPath, data, RsCodec.EncodeFile(data, parityCount), parityCount);
+                    return true;
                 }
-                File.Move(tmp, packPath, true);
-                // Parity self-heals: recompute over the fixed bytes so a
-                // sidecar bitflip cannot doom the next repair.
-                WriteSidecarData(packPath, data, RsCodec.EncodeFile(data, parityCount), parityCount);
-                return true;
-            }
-            catch (Exception)
-            {
-                return false;
+                catch (Exception)
+                {
+                    return false;
+                }
             }
         }
     }

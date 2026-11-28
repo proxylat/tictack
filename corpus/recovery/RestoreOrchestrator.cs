@@ -34,7 +34,8 @@ namespace Corpus
         // all). Skipped-structural partitions (MSR) auto-include in the
         // layout recreate — they carry no bytes. Lets a 176GB disk's OS
         // partitions restore to a 70GB target without touching data.
-        IReadOnlyList<int>? Partitions = null);
+        IReadOnlyList<int>? Partitions = null,
+        bool ShrinkToFit = false);
 
     // PE restore orchestration: preflight -> safety gate -> stream -> full
     // verify. Returns 0/1 matching the Verify exit posture. Never mints
@@ -291,6 +292,28 @@ namespace Corpus
             var need = 0L;
             foreach (var p in extents)
                 need = Math.Max(need, p.OffsetBytes + p.LengthBytes);
+            if (target.Capacity < need && opts.ShrinkToFit && extents.Count > 0)
+            {
+                var last = extents[^1];
+                if (string.Equals(last.Filesystem, "ntfs", StringComparison.OrdinalIgnoreCase) && last.SnapshotGeneration > 0)
+                {
+                    var mf = _store.GetManifest(last.SnapshotGeneration);
+                    var usedEnd = ComputeUsedEndBytes(mf);
+                    var minTotal = last.OffsetBytes + usedEnd + 33L * 512L;
+                    if (minTotal <= target.Capacity)
+                    {
+                        var newLen = ((target.Capacity - 33L * 512L - last.OffsetBytes) / (1024L * 1024L)) * (1024L * 1024L);
+                        _log.Info($"shrink-to-fit: shrinking partition {last.PartitionNumber} from {last.LengthBytes} to {newLen} bytes (used {usedEnd} bytes)");
+                        last.LengthBytes = newLen;
+                        need = last.OffsetBytes + newLen;
+                    }
+                    else
+                    {
+                        _log.Error($"refusing shrink-to-fit: allocated clusters reach {minTotal} bytes, target holds {target.Capacity} bytes (use WIM --apply for cross-size restore)");
+                        return false;
+                    }
+                }
+            }
             if (target.Capacity < need)
             {
                 _log.Error($"refusing disk restore: target {target.DisplayName} holds {target.Capacity} bytes, layout {opts.LayoutGen} needs {need} (no bytes written)");
@@ -299,6 +322,17 @@ namespace Corpus
             if (RefuseLockedBitLocker(target))
                 return false;
             return ConfirmAndGateTarget(target, opts.ConfirmToken, opts.AllowBootDisk, "disk restore");
+        }
+
+        private static long ComputeUsedEndBytes(SnapshotManifest mf)
+        {
+            var chunkBytes = (long)mf.ChunkMib * 1024L * 1024L;
+            var lastIdx = -1;
+            for (var i = 0; i < mf.Chunks.Count; i++)
+            {
+                if (!mf.Chunks[i].IsHole) lastIdx = i;
+            }
+            return lastIdx < 0 ? 1024L * 1024L : Math.Min(mf.VolumeLength, (lastIdx + 1) * chunkBytes);
         }
 
         private DiskLayout? FilterLayoutPartitions(DiskLayout layout, DiskRestoreOptions opts)

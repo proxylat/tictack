@@ -10,7 +10,7 @@ namespace Corpus
     // the shadow. Completion-aware: the read wrapper reports a full-length
     // read so writers get BackupComplete on success, AbortBackup on any
     // short or failed read (probes must never Complete — see VssSnapshot).
-    public sealed class VssBlockSource : ISparseBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume, ILiveMftVolumeProvider
+    public sealed class VssBlockSource : ISparseBlockSource, ICompletableBlockSource, IVolumeHandleProvider, IMftVolume, IBitLockerVolume, ILiveMftVolumeProvider
     {
         private readonly VssSnapshot? _snap;
         private readonly BitLockerCaptureScope? _bitlocker;
@@ -169,6 +169,8 @@ namespace Corpus
             var raw = ExtentStreams.OpenExtentRead(_device, _useUnbuffered);
             return new VssReadStream(raw, Length, () => _fullyRead = true);
         }
+
+        public void MarkCompleted() => _fullyRead = true;
 
         public void Dispose()
         {

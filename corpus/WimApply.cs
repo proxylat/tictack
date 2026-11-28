@@ -72,13 +72,19 @@ namespace Corpus
             _log = log;
         }
 
-        public void Install(string windowsDir)
+        public void Install(string windowsDir) => Install(windowsDir, espDrive: null);
+
+        public void Install(string windowsDir, string? espDrive)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(windowsDir);
             if (!OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("bcdboot needs Windows.");
-            _log.Info($"installing bootloader: bcdboot {windowsDir}");
-            var r = ProcessRunner.RunAsync($"bcdboot \"{windowsDir}\"", Path.GetTempPath(), redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
+            var espArgs = string.IsNullOrWhiteSpace(espDrive)
+                ? ""
+                : $" /s {espDrive.TrimEnd(':', '\\')}: /f UEFI";
+            var cmd = $"bcdboot \"{windowsDir}\"{espArgs}";
+            _log.Info($"installing bootloader: {cmd}");
+            var r = ProcessRunner.RunAsync(cmd, Path.GetTempPath(), redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
             if (r.TimedOut || r.ExitCode != 0)
                 throw new WimApplyBootException(windowsDir, r.ExitCode, $"bcdboot failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {(r.Stderr + r.Stdout).TrimEnd()}");
         }

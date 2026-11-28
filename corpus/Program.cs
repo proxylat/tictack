@@ -20,14 +20,14 @@ namespace Corpus
         {
             public string CfgPath = "";
             public string? Verb, Volume, Name, SnapshotArg, OutPath, Device, ParentArg;
-            public bool Incremental, ForceFull, Chain, Initialize, AllowBootDisk, SkipVerify, DryRun, Confirm, Inline, RepairBoot;
+            public bool Incremental, Differential, VerifyBlocks, ForceFull, Chain, Initialize, AllowBootDisk, SkipVerify, DryRun, Confirm, Inline, RepairBoot, SkipFsCheck, ShrinkToFit, Stream;
             public string? AdkDir, IncludeStore, DbPath, StagingDir, UsbDrive, IsoPath, PayloadDir, Target, StoreFlag, IndexFlag;
             public string? DiskArg, LayoutArg, PartitionsArg, OnlyVolumesArg, FromFlag, ToFlag, ConfirmToken;
             public readonly List<string> Drivers = new();
             public readonly List<string> CliExcludes = new();
-            public int ChainGen;
+            public int ChainGen, NbdPort, BootGen;
             public string? WindowsDir, NicDir, GpuDir, Firmware, VhdxFlag, VmNameFlag, BootTimeoutFlag, BootMemoryFlag;
-            public string? ToVhdx, ToWim, ToEsd, ToVmdk, ToOvf, ToOva, VhdxWriter, BudgetBytes, ExtractPaths, CloneFrom, RetryLockFlag, SplitSwm;
+            public string? ToVhdx, ToWim, ToEsd, ToVmdk, ToOvf, ToOva, VhdxWriter, Controller, BudgetBytes, ExtractPaths, CloneFrom, RetryLockFlag, SplitSwm;
             public bool Zstd, Append, BufferedIo, SkipIfUnchanged, OptimizeVhd, Recompress, TrimResetBase, TrimNoHibernate, Commit, Discard, SkipRecovery;
             public readonly List<string> TrimFeatures = new();
             public readonly List<string> TrimPackages = new();
@@ -120,6 +120,7 @@ namespace Corpus
                 "--restore-disk" => "restore-disk", "--export" => "export", "--export-vhdx" => "export-vhdx",
                 "--export-vmdk" => "export-vmdk", "--export-ovf" => "export-ovf", "--export-ova" => "export-ova",
                 "--verify" => "verify", "--deep-verify" => "deep-verify", "--mount-snapshot" => "mount-snapshot",
+                "--serve-nbd" => "serve-nbd",
                 "--list-snapshots" => "list-snapshots", "--list-volumes" => "list-volumes", "--gc" => "gc",
                 "--service" => "service", "--locate-winre" => "locate-winre", "--prepare-universal" => "prepare-universal",
                 "--check-boot-mode" => "check-boot-mode", "--check-repair" => "check-repair", "--boot-verify" => "boot-verify",
@@ -143,6 +144,8 @@ namespace Corpus
             ["--confirm"] = c => c.Confirm = true,
             ["--inline"] = c => c.Inline = true,
             ["--incremental"] = c => c.Incremental = true,
+            ["--differential"] = c => c.Differential = true,
+            ["--verify-blocks"] = c => c.VerifyBlocks = true,
             ["--full"] = c => c.ForceFull = true,
             ["--initialize"] = c => c.Initialize = true,
             ["--allow-boot-disk"] = c => c.AllowBootDisk = true,
@@ -159,6 +162,9 @@ namespace Corpus
             ["--discard"] = c => c.Discard = true,
             ["--dry-run"] = c => c.DryRun = true,
             ["--skip-recovery"] = c => c.SkipRecovery = true,
+            ["--skip-fs-check"] = c => c.SkipFsCheck = true,
+            ["--shrink-to-fit"] = c => c.ShrinkToFit = true,
+            ["--stream"] = c => c.Stream = true,
         };
 
         private static bool TryParseBoolOrSpecialFlag(string flag, string[] args, ref int i, CliArgs cli)
@@ -204,6 +210,9 @@ namespace Corpus
             ["--to-ovf"] = (c, v) => c.ToOvf = v,
             ["--to-ova"] = (c, v) => c.ToOva = v,
             ["--vhdx-writer"] = (c, v) => c.VhdxWriter = v,
+            ["--controller"] = (c, v) => c.Controller = v,
+            ["--port"] = (c, v) => { if (int.TryParse(v, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var p)) c.NbdPort = p; },
+            ["--generation"] = (c, v) => { if (int.TryParse(v, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var g)) c.BootGen = g; },
             ["--bytes"] = (c, v) => c.BudgetBytes = v,
             ["--paths"] = (c, v) => c.ExtractPaths = v,
             ["--clone-from"] = (c, v) => c.CloneFrom = v,
@@ -396,7 +405,7 @@ namespace Corpus
             Directory.CreateDirectory(cfg.StorePath);
             using var imageStoreLock = StoreLock.Acquire(cfg.StorePath, cli.RetryLockFlag == null ? null : StoreLock.ParseRetryTimeout(cli.RetryLockFlag), log);
             if (!string.IsNullOrEmpty(cli.DiskArg))
-                return RunImageDisk(cfg, cli.DiskArg, cli.Volume, cli.Name, cli.Incremental, cli.ParentArg, cli.ForceFull, cli.CliExcludes, log, !cli.BufferedIo, cli.SkipIfUnchanged);
+                return RunImageDisk(cfg, cli.DiskArg, cli.Volume, cli.Name, cli.Incremental, cli.ParentArg, cli.ForceFull, cli.CliExcludes, log, !cli.BufferedIo, cli.SkipIfUnchanged, cli.Differential, cli.VerifyBlocks, cli.OnlyVolumesArg, cli.SkipRecovery);
             if (!string.IsNullOrEmpty(cli.VolumesArg))
                 return RunConsistencyGroup(cfg, cli.VolumesArg, cli.Name ?? "cg", cli.CliExcludes, log, !cli.BufferedIo, cli.SkipIfUnchanged);
             if (string.IsNullOrEmpty(cli.Volume) || string.IsNullOrEmpty(cli.Name))
@@ -431,7 +440,7 @@ namespace Corpus
             using (var store = CreateStore(cfg, log))
             using (var source = OpenSource(cli.Volume, log, !cli.BufferedIo, cfg))
             {
-                var m = store.Image(source, cli.Name, new ImageOptions(ParentGeneration: parentGen, Incremental: cli.Incremental, ForceFull: cli.ForceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, source, cli.Volume, cli.CliExcludes, log)), cli.SkipIfUnchanged);
+                var m = store.Image(source, cli.Name, new ImageOptions(ParentGeneration: parentGen, Incremental: cli.Incremental, ForceFull: cli.ForceFull, ChangeSource: new MftDigestChangeSource(), Exclusions: ResolveImageExclusions(cfg, source, cli.Volume, cli.CliExcludes, log), Differential: cli.Differential, VerifyBlocks: cli.VerifyBlocks), cli.SkipIfUnchanged);
                 log.Info($"snapshot {m.Generation:D6}-{m.Name}: {m.Chunks.Count} chunks");
             }
             return 0;
@@ -451,25 +460,7 @@ namespace Corpus
                         store.Export(exportGen, cli.OutPath);
                     return 0;
                 case "export-vhdx":
-                    if (!TrySnapshot(cli.SnapshotArg, log, out var vhdxGen) || string.IsNullOrEmpty(cli.OutPath))
-                    {
-                        log.Error("--export-vhdx requires --snapshot <gen> --out <path>");
-                        return 1;
-                    }
-                    if (cli.CloneFrom != null)
-                    {
-                        if (cli.CloneFrom.StartsWith("--", StringComparison.Ordinal))
-                        {
-                            log.Error("bare --clone-from refuses (missing <base.vhdx>, got flag: " + cli.CloneFrom + ")");
-                            return 1;
-                        }
-                        using (var store = CreateStore(cfg, log))
-                            ReflinkExport.ExportVhdxFromClone(store, vhdxGen, cli.OutPath, cli.CloneFrom, log);
-                        return 0;
-                    }
-                    using (var store = CreateStore(cfg, log))
-                        store.ExportVhdx(vhdxGen, cli.OutPath);
-                    return 0;
+                    return RunExportVhdx(cfg, cli, log);
                 case "export-vmdk":
                 case "export-ovf":
                 case "export-ova":
@@ -483,7 +474,18 @@ namespace Corpus
                     return RunDeepVerify(cfg, baseDir, deepGen, log);
                 case "mount-snapshot":
                     if (!TrySnapshot(cli.SnapshotArg, log, out var mountGen)) { log.Error("--mount-snapshot requires --snapshot <gen>"); return 1; }
+                    if (cli.Stream)
+                    {
+                        using var dav = StreamWebDavMount.Start(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), mountGen, log, cli.NbdPort);
+                        Console.WriteLine("WebDAV mounted: " + dav.Url + " (Ctrl+C to unmount)");
+                        using var wait = new ManualResetEventSlim(false);
+                        Console.CancelKeyPress += (_, e) => { e.Cancel = true; wait.Set(); };
+                        wait.Wait();
+                        return 0;
+                    }
                     return RunMountSnapshot(cfg, baseDir, mountGen, null, log);
+                case "serve-nbd":
+                    return RunServeNbd(cfg, cli, log);
                 case "list-snapshots":
                     using (var store = CreateStore(cfg, log))
                     {
@@ -513,8 +515,8 @@ namespace Corpus
                 }
                 return RunOvfExportTarget(verb, cli.OutPath, cli.Zstd, cfg.Compression.Level, log,
                     () => store.ExportDiskVmdk(layoutGen, cli.OutPath, cli.SkipRecovery),
-                    () => store.ExportDiskOvf(layoutGen, cli.OutPath, cli.SkipRecovery),
-                    () => store.ExportDiskOva(layoutGen, cli.OutPath, cli.SkipRecovery));
+                    () => store.ExportDiskOvf(layoutGen, cli.OutPath, cli.SkipRecovery, cli.Controller ?? "ahci"),
+                    () => store.ExportDiskOva(layoutGen, cli.OutPath, cli.SkipRecovery, cli.Controller ?? "ahci"));
             }
             if (!TrySnapshot(cli.SnapshotArg, log, out var gen))
             {
@@ -523,8 +525,8 @@ namespace Corpus
             }
             return RunOvfExportTarget(verb, cli.OutPath, cli.Zstd, cfg.Compression.Level, log,
                 () => store.ExportVmdk(gen, cli.OutPath),
-                () => store.ExportOvf(gen, cli.OutPath),
-                () => store.ExportOva(gen, cli.OutPath));
+                () => store.ExportOvf(gen, cli.OutPath, cli.Controller ?? "ahci"),
+                () => store.ExportOva(gen, cli.OutPath, cli.Controller ?? "ahci"));
         }
 
         // Direct storeless --image (--disk <N> | --volume <X:>) --to-vmdk|--to-ovf|--to-ova:
@@ -636,6 +638,64 @@ namespace Corpus
             }
         }
 
+        private static int RunServeNbd(CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            var dbPath = Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db");
+            NbdServer server;
+            if (!string.IsNullOrEmpty(cli.LayoutArg) && TrySnapshot(cli.LayoutArg, log, out var layoutGen))
+                server = NbdServer.StartForLayout(cfg.StorePath, dbPath, layoutGen, log, cli.NbdPort);
+            else if (TrySnapshot(cli.SnapshotArg, log, out var snapGen))
+                server = NbdServer.StartForSnapshot(cfg.StorePath, dbPath, snapGen, log, cli.NbdPort);
+            else
+            {
+                log.Error("--serve-nbd requires --snapshot <gen> or --layout <gen>");
+                return 1;
+            }
+            using (server)
+            {
+                server.Start();
+                Console.WriteLine($"nbd://127.0.0.1:{server.Port} (Ctrl+C to stop)");
+                using var wait = new ManualResetEventSlim(false);
+                Console.CancelKeyPress += (_, e) => { e.Cancel = true; wait.Set(); };
+                wait.Wait();
+            }
+            return 0;
+        }
+
+        private static int RunExportVhdx(CorpusConfig cfg, CliArgs cli, ILogger log)
+        {
+            if (!string.IsNullOrEmpty(cli.LayoutArg))
+            {
+                if (!TrySnapshot(cli.LayoutArg, log, out var layoutGen) || string.IsNullOrEmpty(cli.OutPath))
+                {
+                    log.Error("--export-vhdx --layout requires --layout <gen> --out <path>");
+                    return 1;
+                }
+                using (var store = CreateStore(cfg, log))
+                    store.ExportDiskVhdx(layoutGen, cli.OutPath);
+                return 0;
+            }
+            if (!TrySnapshot(cli.SnapshotArg, log, out var vhdxGen) || string.IsNullOrEmpty(cli.OutPath))
+            {
+                log.Error("--export-vhdx requires --snapshot <gen> (or --layout <gen>) --out <path>");
+                return 1;
+            }
+            if (cli.CloneFrom != null)
+            {
+                if (cli.CloneFrom.StartsWith("--", StringComparison.Ordinal))
+                {
+                    log.Error("bare --clone-from refuses (missing <base.vhdx>, got flag: " + cli.CloneFrom + ")");
+                    return 1;
+                }
+                using (var store = CreateStore(cfg, log))
+                    ReflinkExport.ExportVhdxFromClone(store, vhdxGen, cli.OutPath, cli.CloneFrom, log);
+                return 0;
+            }
+            using (var store = CreateStore(cfg, log))
+                store.ExportVhdx(vhdxGen, cli.OutPath);
+            return 0;
+        }
+
         private static int RunOptimizeToFit(CorpusConfig cfg, CliArgs cli, ILogger log)
         {
             long? budget = null;
@@ -648,7 +708,8 @@ namespace Corpus
                 }
                 budget = b;
             }
-            var optimizer = new StoreOptimizer(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, cfg.Compression.Level, cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level));
+            using var deltaCodec = new ZstdDeltaCodec(cfg.Compression.Level);
+            var optimizer = new StoreOptimizer(cfg.StorePath, Path.Combine(CorpusConfig.StateRoot(cfg), "corpus-chunks.db"), cfg.Retention ?? new CorpusRetentionConfig(), log, cfg.ChunkMib, cfg.Compression.Level, cfg.Encrypt, deltaCodec, cfg.EccOverheadPercent, cfg.WormMode);
             using (StoreLock.Acquire(cfg.StorePath, cli.RetryLockFlag == null ? null : StoreLock.ParseRetryTimeout(cli.RetryLockFlag), log))
                 optimizer.Optimize(budget);
             return 0;
@@ -722,7 +783,8 @@ namespace Corpus
                 cfg.Encrypt, new ZstdDeltaCodec(cfg.Compression.Level),
                 changeAlarmPercent: cfg.ChangeAlarmPercent,
                 chunker: cfg.Chunker,
-                eccOverheadPercent: cfg.EccOverheadPercent);
+                eccOverheadPercent: cfg.EccOverheadPercent,
+                decryptHook: cfg.Decrypt);
             store.WormMode = cfg.WormMode;
             store.Workers = cfg.Workers;
             store.MinFreeBytes = DiskSpaceGuard.GbToBytes(cfg.MinFreeGb);
@@ -849,15 +911,13 @@ namespace Corpus
         // per non-skipped partition + sealed layout sidecar). Volume captures
         // are untouched: --volume with --disk is rejected, never merged.
         private static int RunImageDisk(CorpusConfig cfg, string? diskArg, string? volume, string? name,
-            bool incremental, string? parentArg, bool forceFull, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false)
+            bool incremental, string? parentArg, bool forceFull, List<string> cliExcludes, ILogger log, bool useUnbuffered = true, bool skipIfUnchanged = false, bool differential = false, bool verifyBlocks = false, string? onlyVolumesArg = null, bool skipRecovery = false)
         {
             if (string.IsNullOrEmpty(diskArg) || string.IsNullOrEmpty(name))
             {
                 log.Error("--image --disk requires --disk <N> --name <snapshot>");
                 return 1;
             }
-            if (cliExcludes.Count > 0)
-                log.Warn("--exclude applies to volume captures only, ignored for --disk");
             if (!string.IsNullOrEmpty(volume))
             {
                 log.Error("--volume cannot be combined with --disk (capture a volume or a disk, not both)");
@@ -881,11 +941,20 @@ namespace Corpus
                 Console.Error.WriteLine("--image --disk needs Windows");
                 return 1;
             }
-            DiskImager.CapturePlan = (d, l) => DiskCapture.BuildPlan(d, l, useUnbuffered);
+            IReadOnlySet<string>? onlyVolumes = null;
+            if (!string.IsNullOrWhiteSpace(onlyVolumesArg))
+            {
+                var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var v in onlyVolumesArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    set.Add(v.TrimEnd('\\'));
+                onlyVolumes = set;
+            }
+            DiskImager.CapturePlan = (d, l) => DiskCapture.BuildPlan(d, l, useUnbuffered, strictWriters: cfg.StrictVssWriters, skipRecovery: skipRecovery, onlyVolumes: onlyVolumes);
             using (var store = CreateStore(cfg, log))
             {
+                var exclusions = Store.MergeExclusionNames(cfg.Exclude, cliExcludes);
                 var layout = store.ImageDisk(diskNumber, name,
-                    new DiskImageOptions(Incremental: incremental, ForceFull: forceFull, ParentLayoutGen: parentGen), skipIfUnchanged);
+                    new DiskImageOptions(Incremental: incremental, ForceFull: forceFull, ParentLayoutGen: parentGen, Differential: differential, VerifyBlocks: verifyBlocks, Exclusions: exclusions), skipIfUnchanged);
                 log.Info($"disk image {layout.Generation:D6}-disk{diskNumber}: {layout.Partitions.Count} partitions");
             }
             return 0;
@@ -1563,7 +1632,7 @@ namespace Corpus
         // Item 7 proof verb: boot a VHDX in Hyper-V and poll the heartbeat
         // IC to healthy (first boot takes minutes — the runner polls every
         // 15s to the timeout). No vSwitch: the verify VM stays offline.
-        private static int RunBootVerify(string? vhdx, string? vmName, string? timeoutFlag, string? memoryFlag, ILogger log)
+        private static int RunBootVerify(string? vhdx, string? vmName, string? timeoutFlag, string? memoryFlag, ILogger log, int generation = 0, bool checkFs = true)
         {
             if (string.IsNullOrEmpty(vhdx))
             {
@@ -1595,8 +1664,7 @@ namespace Corpus
                 return 1;
             }
             return BootVerifyOrchestrator.Verify(
-                // Non-null: the IsNullOrEmpty guard above returns early.
-                new BootVerifyOptions(vhdx!, vmName ?? "corpus-bootverify", timeout, memoryMb),
+                new BootVerifyOptions(vhdx!, vmName ?? "corpus-bootverify", timeout, memoryMb, generation, checkFs),
                 new WindowsHyperVRunner(log, timeout, memoryMb), log);
         }
 

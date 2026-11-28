@@ -11,7 +11,7 @@ namespace Corpus
     // FileBlockSource + FakeChangeSource; the real GPT+VSS enumeration is the
     // capture lane's and arrives via the CapturePlan hook (until wired,
     // ImageDisk fails loud — Linux disk verbs exit 1 posture).
-    public sealed record DiskImageOptions(bool Incremental = false, bool ForceFull = false, int ParentLayoutGen = 0);
+    public sealed record DiskImageOptions(bool Incremental = false, bool ForceFull = false, int ParentLayoutGen = 0, bool Differential = false, bool VerifyBlocks = false, IReadOnlyList<string>? Exclusions = null);
 
     // One partition's capture input: layout-derived identity plus a readable
     // source. Source is null exactly when Skipped (MSR: byte range kept in the
@@ -29,7 +29,8 @@ namespace Corpus
         bool Skipped,
         string? SkipReason,
         IBlockSource? Source,
-        IChangeSource? ChangeSource);
+        IChangeSource? ChangeSource,
+        ulong AttributeFlags = 0);
 
     public sealed record DiskCapturePlan(
         string DiskGuid,

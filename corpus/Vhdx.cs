@@ -32,5 +32,26 @@ namespace Corpus
             using var disk = Disk.InitializeDynamic(file, Ownership.None, AlignedCapacity(volumeLength));
             writeContent(disk.Content);
         }
+
+        // Whole-disk bootable dynamic VHDX: synthesizes Protective MBR + Primary GPT
+        // + every captured partition at its recorded offset + Backup GPT.
+        public static void ExportDisk(string vhdxPath, DiskLayout layout, Action<int, Stream> writeSnapshot)
+        {
+            ArgumentNullException.ThrowIfNull(vhdxPath);
+            ArgumentNullException.ThrowIfNull(layout);
+            ArgumentNullException.ThrowIfNull(writeSnapshot);
+            var capacity = AlignedCapacity(layout.DiskSizeBytes);
+            try
+            {
+                using var file = new FileStream(vhdxPath, FileMode.Create, FileAccess.ReadWrite, FileShare.Read, 4 * 1024 * 1024, FileOptions.SequentialScan);
+                using var disk = Disk.InitializeDynamic(file, Ownership.None, capacity);
+                GptWriter.WriteWholeDisk(disk.Content, layout, capacity, writeSnapshot);
+            }
+            catch
+            {
+                try { if (File.Exists(vhdxPath)) File.Delete(vhdxPath); } catch { }
+                throw;
+            }
+        }
     }
 }

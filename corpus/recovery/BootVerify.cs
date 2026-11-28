@@ -15,7 +15,9 @@ namespace Corpus
         string VhdxPath,
         string VmName = "corpus-bootverify",
         int TimeoutSeconds = 300,
-        int StartupMemoryMb = 2048);
+        int StartupMemoryMb = 2048,
+        int Generation = 0,
+        bool CheckFs = true);
 
     public interface IHyperVRunner
     {
@@ -48,24 +50,54 @@ namespace Corpus
                 throw new PlatformNotSupportedException("boot-verify needs Windows (Hyper-V).");
         }
 
-        public string Boot(string vhdxPath, string vmName)
+        public string Boot(string vhdxPath, string vmName) => Boot(vhdxPath, vmName, generation: 0);
+
+        public string Boot(string vhdxPath, string vmName, int generation)
         {
             RequireWindows();
             ArgumentNullException.ThrowIfNull(vhdxPath);
             ArgumentNullException.ThrowIfNull(vmName);
-            _log.Info($"boot-verify: starting {vmName} from {vhdxPath}");
+            var gen = generation is 1 or 2 ? generation : DetectVhdxGeneration(vhdxPath, _log);
+            _log.Info($"boot-verify: starting {vmName} (Gen {gen}) from {vhdxPath}");
             var r = ProcessRunner.RunAsync(
-                BuildBootCommand(vmName, vhdxPath, _startupMemoryMb),
+                BuildBootCommand(vmName, vhdxPath, _startupMemoryMb, gen),
                 Path.GetTempPath(), redirect: true, timeoutMs: _timeoutMs).GetAwaiter().GetResult();
             if (r.TimedOut || r.ExitCode != 0)
+            {
+                try { Cleanup(vmName); } catch { }
                 throw new InvalidDataException($"VM start failed (exit {r.ExitCode}{(r.TimedOut ? ", timed out" : "")}): {Tail(r.Stderr + r.Stdout)}");
+            }
             return vmName;
+        }
+
+        internal static int DetectVhdxGeneration(string vhdxPath, ILogger log)
+        {
+            try
+            {
+                using var disk = new DiscUtils.Vhdx.Disk(vhdxPath, FileAccess.Read);
+                var layout = PartitionTable.ReadFromStream(disk.Content, 0, disk.Capacity, log);
+                return string.Equals(layout.Style, "mbr", StringComparison.OrdinalIgnoreCase) ? 1 : 2;
+            }
+            catch
+            {
+                return 2;
+            }
+        }
+
+        public static void VerifyFilesystem(string vhdxPath, ILogger log)
+        {
+            RequireWindows();
+            var ps = $"$ErrorActionPreference='Stop'; $m=Mount-VHD -Path '{vhdxPath}' -ReadOnly -Passthru; try {{ $d=$m|Get-Disk; $vols=Get-Partition -DiskNumber $d.Number | Get-Volume | Where-Object {{ $_.FileSystem -eq 'NTFS' -and $_.DriveLetter }}; foreach($v in $vols) {{ $dl=$v.DriveLetter+':'; $out=& chkdsk $dl /scan 2>&1; if ($LASTEXITCODE -ne 0) {{ throw ('chkdsk /scan failed on '+$dl+': '+($out -join ' ')) }}; $sys=Join-Path $dl 'Windows\\System32\\config\\SYSTEM'; $krn=Join-Path $dl 'Windows\\System32\\ntoskrnl.exe'; if (Test-Path (Join-Path $dl 'Windows')) {{ if (-not (Test-Path $sys) -or -not (Test-Path $krn)) {{ throw ('critical Windows boot files missing on '+$dl) }} }} }} }} finally {{ Dismount-VHD -Path '{vhdxPath}' }}";
+            log.Info($"boot-verify: pre-boot chkdsk /scan on {vhdxPath}");
+            var r = ProcessRunner.RunAsync($"powershell -NoProfile -Command \"{ps}\"", Path.GetTempPath(), redirect: true, timeoutMs: 300000).GetAwaiter().GetResult();
+            if (r.TimedOut || r.ExitCode != 0)
+                throw new InvalidDataException($"pre-boot filesystem check failed (exit {r.ExitCode}): {Tail(r.Stderr + r.Stdout)}");
         }
 
         // Single-quoted into PowerShell (spaces safe); a raw ' would break
         // out, so the verb rejects quotes in both values before this runs.
-        internal static string BuildBootCommand(string vmName, string vhdxPath, long startupMemoryMb) =>
-            $"powershell -NoProfile -Command \"New-VM -Name '{vmName}' -VHDPath '{vhdxPath}' -Generation 2 -MemoryStartupBytes {startupMemoryMb * 1024L * 1024L} | Out-Null; Start-VM -Name '{vmName}'\"";
+        internal static string BuildBootCommand(string vmName, string vhdxPath, long startupMemoryMb, int generation = 2) =>
+            $"powershell -NoProfile -Command \"New-VM -Name '{vmName}' -VHDPath '{vhdxPath}' -Generation {generation} -MemoryStartupBytes {startupMemoryMb * 1024L * 1024L} | Out-Null; Start-VM -Name '{vmName}'\"";
 
         public string HealthCheck(string vmId)
         {
@@ -185,10 +217,24 @@ namespace Corpus
                 log.Error($"boot-verify: no VHDX at {opts.VhdxPath} (export one first)");
                 return 1;
             }
+            if (opts.CheckFs && OperatingSystem.IsWindows() && runner is WindowsHyperVRunner)
+            {
+                try
+                {
+                    WindowsHyperVRunner.VerifyFilesystem(opts.VhdxPath, log);
+                }
+                catch (Exception ex)
+                {
+                    log.Error("boot-verify: pre-boot filesystem check failed", ex);
+                    return 1;
+                }
+            }
             string vm;
             try
             {
-                vm = runner.Boot(opts.VhdxPath, opts.VmName);
+                vm = runner is WindowsHyperVRunner hv
+                    ? hv.Boot(opts.VhdxPath, opts.VmName, opts.Generation)
+                    : runner.Boot(opts.VhdxPath, opts.VmName);
             }
             catch (Exception ex)
             {

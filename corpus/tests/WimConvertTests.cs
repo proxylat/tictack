@@ -274,8 +274,9 @@ public sealed class WimConvertTests : IDisposable
         var dest = Path.Combine(_dir, "merged.wim");
         var runner = new FakeWimRunner { Backend = WimBackendKind.Dism };
         WimImageOps.MergeSwm(first, dest, runner, new TestLogger());
-        Assert.Single(runner.Calls);
-        var export = runner.Calls[0];
+        Assert.Equal(2, runner.Calls.Count);
+        Assert.StartsWith("/Get-WimInfo", runner.Calls[0], StringComparison.Ordinal);
+        var export = runner.Calls[1];
         Assert.StartsWith("/Export-Image", export, StringComparison.Ordinal);
         Assert.Contains("/SourceImageFile:", export, StringComparison.Ordinal);
         Assert.Contains("/SWMFile:", export, StringComparison.Ordinal);

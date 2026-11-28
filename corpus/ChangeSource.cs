@@ -16,7 +16,12 @@ namespace Corpus
         bool ForceFull = false,
         IChangeSource? ChangeSource = null,
         ILayoutFingerprintProvider? Layout = null,   // item 1-minimal guard seam (null = abstain)
-        IExclusionResolver? Exclusions = null);      // item 4 zero-ranges seam (null = none)
+        IExclusionResolver? Exclusions = null,       // item 4 zero-ranges seam (null = none)
+        bool Differential = false,                   // parent = latest Full (ParentGeneration == 0)
+        bool VerifyBlocks = false,                   // hash all allocated blocks (immune to USN coalescing)
+        string? PartitionKey = null,
+        int? DiskNumber = null,
+        int? PartitionNumber = null);
 
     public sealed record IncrementalPlan(IReadOnlySet<long> DirtyChunks, string NewCursor,
         IReadOnlyList<string>? NewMftDigests = null, int NewMftRecordBytes = 0,
@@ -393,7 +398,8 @@ namespace Corpus
         internal static List<(long StartLcn, long ClusterCount)>? GetDataRuns(SafeFileHandle volume, ulong fileRef, int bytesPerCluster, int bytesPerRecord, IReadOnlyList<(long StartLcn, long ClusterCount)> mftRuns, bool skipSequenceCheck = false)
         {
             var record = ReadFileRecord(volume, fileRef, bytesPerRecord);
-            return ParseRecordExtents(record, fileRef, bytesPerCluster, bytesPerRecord, mftRuns, skipSequenceCheck);
+            return ParseRecordExtents(record, fileRef, bytesPerCluster, bytesPerRecord, mftRuns, skipSequenceCheck,
+                readRecord: r => ReadFileRecord(volume, r, bytesPerRecord));
         }
 
         internal static List<(long StartLcn, long ClusterCount)> GetMftRuns(SafeFileHandle volume, int bytesPerRecord)
@@ -422,7 +428,7 @@ namespace Corpus
             return record;
         }
 
-        internal static List<(long StartLcn, long ClusterCount)>? ParseRecordExtents(byte[] record, ulong fileRef, int bytesPerCluster, int bytesPerRecord, IReadOnlyList<(long StartLcn, long ClusterCount)> mftRuns, bool skipSequenceCheck = false, bool includeRecordCluster = true)
+        internal static List<(long StartLcn, long ClusterCount)>? ParseRecordExtents(byte[] record, ulong fileRef, int bytesPerCluster, int bytesPerRecord, IReadOnlyList<(long StartLcn, long ClusterCount)> mftRuns, bool skipSequenceCheck = false, bool includeRecordCluster = true, Func<ulong, byte[]>? readRecord = null, Func<long, byte[]>? readCluster = null)
         {
             if (record.Length < 48)
                 throw new InvalidDataException("MFT record truncated");
@@ -433,9 +439,15 @@ namespace Corpus
             if ((BitConverter.ToUInt16(record, 0x16) & 1) == 0)
                 return null; // deleted, not yet reused → same skip reasoning
             var extents = new List<(long StartLcn, long ClusterCount)>();
+            var hasAttrList = false;
             foreach (var (off, len) in AttributeSpans(record))
             {
                 var type = BitConverter.ToUInt32(record, off);
+                if (type == 0x20)
+                {
+                    hasAttrList = true;
+                    continue;
+                }
                 // 0x80 with NO name filter: every $DATA stream counts — the
                 // unnamed default stream AND every named ADS (item 2: ADS
                 // captured by construction, not by assumption).
@@ -451,6 +463,12 @@ namespace Corpus
                 if (runOff >= len)
                     throw new InvalidDataException("MFT run offset outside attribute");
                 extents.AddRange(DecodeDataRuns(record.AsSpan(off + runOff, (int)len - runOff)));
+            }
+            if (hasAttrList)
+            {
+                if (readRecord == null)
+                    throw new InvalidDataException("MFT record contains $ATTRIBUTE_LIST (0x20) with no extension reader");
+                extents.AddRange(MftAttributeList.CollectExtents(record, fileRef, bytesPerCluster, readRecord, readCluster, 0x80u, 0xA0u));
             }
             // The file's own record cluster (see class comment). Excluded by
             // the item-4 resolver (shared clusters would wipe neighbors).
@@ -562,7 +580,7 @@ namespace Corpus
             return out_;
         }
 
-        private static List<(int Offset, uint Length)> AttributeSpans(byte[] record)
+        internal static List<(int Offset, uint Length)> AttributeSpans(byte[] record)
         {
             var firstAttr = BitConverter.ToUInt16(record, 0x14);
             var bytesInUse = BitConverter.ToUInt32(record, 0x18);

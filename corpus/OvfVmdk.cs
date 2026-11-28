@@ -70,7 +70,7 @@ namespace Corpus
             return new VmdkExportResult(capacity, vmdk.PopulatedBytes, file.Length, hashStream.FinishHex());
         }
 
-        public static OvfExportResult ExportOvf(string outPath, string vmName, long volumeLength, Action<Stream> writeContent, bool uefi = false)
+        public static OvfExportResult ExportOvf(string outPath, string vmName, long volumeLength, Action<Stream> writeContent, bool uefi = false, string storageController = "ahci")
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(outPath);
             ArgumentNullException.ThrowIfNull(writeContent);
@@ -80,7 +80,7 @@ namespace Corpus
             if (full.EndsWith(".ovf", StringComparison.OrdinalIgnoreCase))
             {
                 dir = Path.GetDirectoryName(full) ?? ".";
-                stem = Path.GetFileNameWithoutExtension(full);
+                stem = SanitizeStem(Path.GetFileNameWithoutExtension(full));
             }
             else
             {
@@ -93,7 +93,7 @@ namespace Corpus
             var mfPath = Path.Combine(dir, stem + ".mf");
 
             var vmdk = ExportVmdk(vmdkPath, volumeLength, writeContent);
-            var ovfXml = BuildOvfXml(stem, Path.GetFileName(vmdkPath), vmdk.CapacityBytes, vmdk.PopulatedBytes, vmdk.FileBytes, uefi);
+            var ovfXml = BuildOvfXml(stem, Path.GetFileName(vmdkPath), vmdk.CapacityBytes, vmdk.PopulatedBytes, vmdk.FileBytes, uefi, storageController);
             var ovfBytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(ovfXml);
             File.WriteAllBytes(ovfPath, ovfBytes);
 
@@ -106,7 +106,7 @@ namespace Corpus
             return new OvfExportResult(ovfPath, vmdkPath, mfPath, vmdk.CapacityBytes, vmdk.PopulatedBytes, vmdk.FileBytes);
         }
 
-        public static OvfExportResult ExportOva(string ovaPath, string vmName, long volumeLength, Action<Stream> writeContent, bool uefi = false)
+        public static OvfExportResult ExportOva(string ovaPath, string vmName, long volumeLength, Action<Stream> writeContent, bool uefi = false, string storageController = "ahci")
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(ovaPath);
             ArgumentNullException.ThrowIfNull(writeContent);
@@ -118,7 +118,7 @@ namespace Corpus
             Directory.CreateDirectory(stage);
             try
             {
-                var ovf = ExportOvf(Path.Combine(stage, stem + ".ovf"), stem, volumeLength, writeContent, uefi);
+                var ovf = ExportOvf(Path.Combine(stage, stem + ".ovf"), stem, volumeLength, writeContent, uefi, storageController);
                 PackOvaArchive(fullOva, ovf.OvfPath, ovf.ManifestPath, ovf.VmdkPath);
                 return ovf;
             }
@@ -165,6 +165,7 @@ namespace Corpus
                         CapturePolicy.ZeroExcludedRanges(buf.AsSpan(0, filled), offset, exclRuns, exclBpc);
                     dest.Write(buf, 0, filled);
                     offset += filled;
+                    if (filled < want) break;
                     index++;
                 }
             }
@@ -317,7 +318,7 @@ namespace Corpus
             return result.Length > 0 ? result : "corpus-disk";
         }
 
-        private static string BuildOvfXml(string vmName, string vmdkFileName, long capacityBytes, long populatedBytes, long vmdkFileBytes, bool uefi)
+        private static string BuildOvfXml(string vmName, string vmdkFileName, long capacityBytes, long populatedBytes, long vmdkFileBytes, bool uefi, string storageController = "ahci")
         {
             var inv = CultureInfo.InvariantCulture;
             var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
@@ -357,14 +358,14 @@ namespace Corpus
                 w.WriteEndElement();
                 w.WriteEndElement();
 
-                WriteVirtualSystem(w, ovfNs, rasdNs, vssdNs, vmwNs, vmName, uefi);
+                WriteVirtualSystem(w, ovfNs, rasdNs, vssdNs, vmwNs, vmName, uefi, storageController);
                 w.WriteEndElement();
                 w.WriteEndDocument();
             }
             return utf8.GetString(ms.ToArray()) + "\n";
         }
 
-        private static void WriteVirtualSystem(XmlWriter w, string ovfNs, string rasdNs, string vssdNs, string vmwNs, string vmName, bool uefi)
+        private static void WriteVirtualSystem(XmlWriter w, string ovfNs, string rasdNs, string vssdNs, string vmwNs, string vmName, bool uefi, string storageController = "ahci")
         {
             w.WriteStartElement("VirtualSystem", ovfNs);
             w.WriteAttributeString("id", ovfNs, vmName);
@@ -388,7 +389,7 @@ namespace Corpus
 
             WriteHardwareItem(w, ovfNs, rasdNs, "2 virtual CPU(s)", "1", "3", virtualQuantity: "2");
             WriteHardwareItem(w, ovfNs, rasdNs, "4096MB of memory", "2", "4", allocationUnits: "byte * 2^20", virtualQuantity: "4096");
-            WriteHardwareItem(w, ovfNs, rasdNs, "SCSI Controller", "3", "6", resourceSubType: "lsilogic");
+            WriteStorageController(w, ovfNs, rasdNs, storageController);
             WriteHardwareItem(w, ovfNs, rasdNs, "Hard Disk 1", "4", "17", hostResource: "ovf:/disk/vmdisk1", parent: "3", addressOnParent: "0");
             if (uefi)
             {
@@ -403,12 +404,32 @@ namespace Corpus
             w.WriteEndElement();
         }
 
+        private static void WriteStorageController(XmlWriter w, string ovfNs, string rasdNs, string controller)
+        {
+            switch (controller.ToLowerInvariant())
+            {
+                case "lsisas":
+                    WriteHardwareItem(w, ovfNs, rasdNs, "SCSI Controller", "3", "6", resourceSubType: "lsilogicsas", address: "0");
+                    break;
+                case "nvme":
+                    WriteHardwareItem(w, ovfNs, rasdNs, "NVMe Controller", "3", "20", resourceSubType: "vmware.nvme.controller", address: "0");
+                    break;
+                case "scsi":
+                    WriteHardwareItem(w, ovfNs, rasdNs, "SCSI Controller", "3", "6", resourceSubType: "lsilogic", address: "0");
+                    break;
+                default: // "ahci" — works in-box on Windows 10/11 across VMware, VirtualBox, and QEMU
+                    WriteHardwareItem(w, ovfNs, rasdNs, "SATA Controller", "3", "20", resourceSubType: "AHCI", address: "0");
+                    break;
+            }
+        }
+
         private static void WriteHardwareItem(
             XmlWriter w, string ovfNs, string rasdNs, string name, string id, string resourceType,
             string? allocationUnits = null, string? virtualQuantity = null, string? resourceSubType = null,
-            string? hostResource = null, string? parent = null, string? addressOnParent = null)
+            string? hostResource = null, string? parent = null, string? addressOnParent = null, string? address = null)
         {
             w.WriteStartElement("Item", ovfNs);
+            if (address != null) w.WriteElementString("Address", rasdNs, address);
             if (addressOnParent != null) w.WriteElementString("AddressOnParent", rasdNs, addressOnParent);
             if (allocationUnits != null) w.WriteElementString("AllocationUnits", rasdNs, allocationUnits);
             w.WriteElementString("ElementName", rasdNs, name);
@@ -828,8 +849,15 @@ namespace Corpus
             ArgumentNullException.ThrowIfNull(dest);
             ArgumentNullException.ThrowIfNull(layout);
             ArgumentNullException.ThrowIfNull(writeSnapshot);
-            var totalSectors = (ulong)(alignedCapacityBytes / Sector);
-            if (totalSectors < 68)
+            var sectorSize = layout.SectorSizeBytes == 4096 ? 4096 : Sector;
+            if (string.Equals(layout.Style, "mbr", StringComparison.OrdinalIgnoreCase))
+            {
+                WriteWholeMbrDisk(dest, layout, sectorSize, writeSnapshot);
+                return;
+            }
+            var arraySectors = (EntryCount * EntrySize) / sectorSize;
+            var totalSectors = (ulong)(alignedCapacityBytes / sectorSize);
+            if (totalSectors < (ulong)(arraySectors * 2 + 4))
                 throw new InvalidDataException($"disk capacity {alignedCapacityBytes} bytes is too small for GPT");
 
             var entries = BuildPartitionArray(layout.Partitions);
@@ -837,8 +865,8 @@ namespace Corpus
             var diskGuid = Guid.TryParse(layout.DiskGuid, out var g) ? g : Guid.NewGuid();
 
             dest.Seek(0, SeekOrigin.Begin);
-            dest.Write(BuildProtectiveMbr(totalSectors));
-            dest.Write(BuildGptHeader(myLba: 1, altLba: totalSectors - 1, entriesLba: 2, totalSectors, diskGuid, entriesCrc));
+            dest.Write(BuildProtectiveMbr(totalSectors, sectorSize));
+            dest.Write(BuildGptHeader(myLba: 1, altLba: totalSectors - 1, entriesLba: 2, totalSectors, diskGuid, entriesCrc, sectorSize, (ulong)arraySectors));
             dest.Write(entries);
 
             var sorted = new List<PartitionRecord>(layout.Partitions);
@@ -851,15 +879,51 @@ namespace Corpus
                 writeSnapshot(part.SnapshotGeneration, dest);
             }
 
-            var backupEntriesLba = totalSectors - 1 - ArraySectors;
-            dest.Seek((long)(backupEntriesLba * Sector), SeekOrigin.Begin);
+            var backupEntriesLba = totalSectors - 1 - (ulong)arraySectors;
+            dest.Seek((long)(backupEntriesLba * (ulong)sectorSize), SeekOrigin.Begin);
             dest.Write(entries);
-            dest.Write(BuildGptHeader(myLba: totalSectors - 1, altLba: 1, entriesLba: backupEntriesLba, totalSectors, diskGuid, entriesCrc));
+            dest.Write(BuildGptHeader(myLba: totalSectors - 1, altLba: 1, entriesLba: backupEntriesLba, totalSectors, diskGuid, entriesCrc, sectorSize, (ulong)arraySectors));
         }
 
-        private static byte[] BuildProtectiveMbr(ulong totalSectors)
+        private static void WriteWholeMbrDisk(Stream dest, DiskLayout layout, int sectorSize, Action<int, Stream> writeSnapshot)
         {
-            var mbr = new byte[Sector];
+            var mbr = new byte[sectorSize];
+            if (uint.TryParse(layout.DiskGuid, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var sig))
+                BinaryPrimitives.WriteUInt32LittleEndian(mbr.AsSpan(440, 4), sig);
+            var slot = 0;
+            foreach (var p in layout.Partitions)
+            {
+                if (slot >= 4) break;
+                var off = 446 + slot * 16;
+                mbr[off] = (byte)(p.AttributeFlags & 0xFF);
+                var ptype = (byte)0x07;
+                if (p.TypeGuid.StartsWith("mbr-0x", StringComparison.OrdinalIgnoreCase)
+                    && byte.TryParse(p.TypeGuid.AsSpan(6), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var parsedType))
+                    ptype = parsedType;
+                else if (string.Equals(p.Filesystem, "fat32", StringComparison.OrdinalIgnoreCase))
+                    ptype = 0x0C;
+                mbr[off + 4] = ptype;
+                BinaryPrimitives.WriteUInt32LittleEndian(mbr.AsSpan(off + 8, 4), (uint)p.FirstLba);
+                BinaryPrimitives.WriteUInt32LittleEndian(mbr.AsSpan(off + 12, 4), (uint)(p.LastLba - p.FirstLba + 1));
+                slot++;
+            }
+            mbr[510] = 0x55;
+            mbr[511] = 0xAA;
+            dest.Seek(0, SeekOrigin.Begin);
+            dest.Write(mbr);
+            var sorted = new List<PartitionRecord>(layout.Partitions);
+            sorted.Sort((a, b) => a.OffsetBytes.CompareTo(b.OffsetBytes));
+            foreach (var part in sorted)
+            {
+                if (part.Skipped || part.SnapshotGeneration <= 0) continue;
+                dest.Seek(part.OffsetBytes, SeekOrigin.Begin);
+                writeSnapshot(part.SnapshotGeneration, dest);
+            }
+        }
+
+        private static byte[] BuildProtectiveMbr(ulong totalSectors, int sectorSize)
+        {
+            var mbr = new byte[sectorSize];
             mbr[446 + 4] = 0xEE; // GPT Protective MBR partition type
             mbr[446 + 1] = 0x00; mbr[446 + 2] = 0x02; mbr[446 + 3] = 0x00;
             mbr[446 + 5] = 0xFF; mbr[446 + 6] = 0xFF; mbr[446 + 7] = 0xFF;
@@ -887,6 +951,7 @@ namespace Corpus
                 uniqueGuid.TryWriteBytes(span.Slice(16, 16));
                 BinaryPrimitives.WriteUInt64LittleEndian(span.Slice(32, 8), (ulong)p.FirstLba);
                 BinaryPrimitives.WriteUInt64LittleEndian(span.Slice(40, 8), (ulong)p.LastLba);
+                BinaryPrimitives.WriteUInt64LittleEndian(span.Slice(48, 8), p.AttributeFlags);
                 if (!string.IsNullOrEmpty(p.Name))
                 {
                     var nameBytes = Encoding.Unicode.GetBytes(p.Name);
@@ -897,16 +962,16 @@ namespace Corpus
             return buf;
         }
 
-        private static byte[] BuildGptHeader(ulong myLba, ulong altLba, ulong entriesLba, ulong totalSectors, Guid diskGuid, uint entriesCrc)
+        private static byte[] BuildGptHeader(ulong myLba, ulong altLba, ulong entriesLba, ulong totalSectors, Guid diskGuid, uint entriesCrc, int sectorSize, ulong arraySectors)
         {
-            var hdr = new byte[Sector];
+            var hdr = new byte[sectorSize];
             Encoding.ASCII.GetBytes("EFI PART", hdr.AsSpan(0, 8));
             BinaryPrimitives.WriteUInt32LittleEndian(hdr.AsSpan(8, 4), 0x00010000u);
             BinaryPrimitives.WriteUInt32LittleEndian(hdr.AsSpan(12, 4), 92u);
             BinaryPrimitives.WriteUInt64LittleEndian(hdr.AsSpan(24, 8), myLba);
             BinaryPrimitives.WriteUInt64LittleEndian(hdr.AsSpan(32, 8), altLba);
-            BinaryPrimitives.WriteUInt64LittleEndian(hdr.AsSpan(40, 8), 34ul);
-            BinaryPrimitives.WriteUInt64LittleEndian(hdr.AsSpan(48, 8), totalSectors - 34ul);
+            BinaryPrimitives.WriteUInt64LittleEndian(hdr.AsSpan(40, 8), 2ul + arraySectors);
+            BinaryPrimitives.WriteUInt64LittleEndian(hdr.AsSpan(48, 8), totalSectors - 2ul - arraySectors);
             diskGuid.TryWriteBytes(hdr.AsSpan(56, 16));
             BinaryPrimitives.WriteUInt64LittleEndian(hdr.AsSpan(72, 8), entriesLba);
             BinaryPrimitives.WriteUInt32LittleEndian(hdr.AsSpan(80, 4), EntryCount);

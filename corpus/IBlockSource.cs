@@ -20,6 +20,13 @@ namespace Corpus
         IReadOnlyList<(long Start, long Count)> GetAllocatedRuns();
     }
 
+    // Signals a clean capture completion to VSS-backed sources even when
+    // sparse holes or incremental seeks skip the tail of the volume.
+    public interface ICompletableBlockSource : IBlockSource
+    {
+        void MarkCompleted();
+    }
+
     public sealed class FileBlockSource : IBlockSource
     {
         private readonly string _path;

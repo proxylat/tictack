@@ -523,11 +523,17 @@ namespace Corpus
             ArgumentException.ThrowIfNullOrWhiteSpace(mountedDir);
             ArgumentException.ThrowIfNullOrWhiteSpace(sourceDir);
             if (maxFiles <= 0) throw new ArgumentOutOfRangeException(nameof(maxFiles));
-            var rels = Directory.EnumerateFiles(mountedDir, "*", SearchOption.AllDirectories)
+            var enumOpts = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.ReparsePoint,
+            };
+            var rels = Directory.EnumerateFiles(mountedDir, "*", enumOpts)
                 .Select(f => System.IO.Path.GetRelativePath(mountedDir, f))
-                .OrderBy(r => r, StringComparer.Ordinal)
                 .Take(maxFiles)
                 .ToList();
+            rels.Sort(StringComparer.Ordinal);
             var problems = new List<string>();
             foreach (var rel in rels)
             {
@@ -876,7 +882,8 @@ namespace Corpus
             if (!SnapshotDirLive(snapshotPath))
                 throw new SingleFileSourceNotFoundException(snapshotPath);
             var target = SingleFileTarget.Resolve(targetArg, "--to-esd", volume, "esd", now);
-            var tempWim = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "corpus-" + Guid.NewGuid().ToString("N") + ".wim");
+            var targetDir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(target)) ?? System.IO.Path.GetTempPath();
+            var tempWim = System.IO.Path.Combine(targetDir, ".corpus-" + Guid.NewGuid().ToString("N") + ".wim");
             var ini = WriteTempIni(CapturePolicy.EffectiveSkip(exclusions));
             try
             {
@@ -885,6 +892,11 @@ namespace Corpus
                 VerifyWim(tempWim, snapshotPath, dism, log, mountSample: true);
                 RunDism(dism, target, $"/Export-Image /SourceImageFile:{ProcessRunner.QuoteArg(tempWim)} /SourceIndex:1 /DestinationImageFile:{ProcessRunner.QuoteArg(target)} /Compress:recovery /CheckIntegrity");
                 VerifyWim(target, snapshotPath, dism, log, mountSample: false);
+            }
+            catch
+            {
+                TryDelete(target);
+                throw;
             }
             finally
             {
@@ -974,7 +986,17 @@ namespace Corpus
         public static bool IsSolidImageInfo(string getWimInfoStdout)
         {
             ArgumentNullException.ThrowIfNull(getWimInfoStdout);
-            return getWimInfoStdout.Contains("solid", StringComparison.OrdinalIgnoreCase);
+            foreach (var raw in getWimInfoStdout.Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.StartsWith("Image File", StringComparison.OrdinalIgnoreCase)
+                    || line.StartsWith("Name", StringComparison.OrdinalIgnoreCase)
+                    || line.StartsWith("Description", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (line.Contains("solid", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
 
         // §12.11 append: a new snapshot as a new image index in an EXISTING

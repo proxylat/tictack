@@ -24,6 +24,7 @@ namespace Corpus
         public string UniqueGuid { get; set; } = "";
         public long FirstLba { get; set; }
         public long LastLba { get; set; }
+        public ulong AttributeFlags { get; set; }
         public long OffsetBytes { get; set; }
         public long LengthBytes { get; set; }
         public string Filesystem { get; set; } = "unknown";

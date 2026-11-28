@@ -354,10 +354,10 @@ namespace Corpus
             var fullParent = Path.GetFullPath(parentPath);
             var parentCapacity = ValidateDiffTargetAndParent(source, target, fullTarget, parentPath, fullParent, dirtyChunks, chunkBytes);
             var record = BuildParentRecord(target, fullParent, parentCapacity, chunkBytes, dirtyChunks);
-            WriteDirtyChunksToChild(source, target, fullParent, parentPath, record.DirtyChunks, chunkBytes);
 
             try
             {
+                WriteDirtyChunksToChild(source, target, fullParent, parentPath, record.DirtyChunks, chunkBytes);
                 WriteSidecar(target, record);
                 VerifyDiff(target, source, log);
             }
@@ -548,8 +548,9 @@ namespace Corpus
             try
             {
                 using var disk = new Disk(parentPath, FileAccess.Read);
-                var sector = (offset / disk.BlockSize) * disk.BlockSize;
-                var buf = new byte[disk.BlockSize];
+                var sectorSize = disk.SectorSize > 0 ? disk.SectorSize : 512;
+                var sector = (offset / sectorSize) * sectorSize;
+                var buf = new byte[sectorSize];
                 disk.Content.Seek(sector, SeekOrigin.Begin);
                 if (ReadExactly(disk.Content, buf, buf.Length) != buf.Length)
                     return null;

@@ -721,7 +721,7 @@ namespace Corpus
                     }
                     var fileRef = ((ulong)BitConverter.ToUInt16(bytes, 0x10) << 48) | (ulong)rec;
                     List<(long StartLcn, long ClusterCount)>? runs;
-                    try { runs = MftExtentReader.ParseRecordExtents(bytes, fileRef, vol.BytesPerCluster, vol.BytesPerRecord, vol.MftRuns); }
+                    try { runs = MftExtentReader.ParseRecordExtents(bytes, fileRef, vol.BytesPerCluster, vol.BytesPerRecord, vol.MftRuns, readRecord: vol.GetRecordBytes); }
                     catch (InvalidDataException ex) { log.Info($"full image (MFT record {rec} unparseable: {ex.Message})"); return false; }
                     if (runs == null) continue;
                     foreach (var c in CapturePolicy.DirtyChunksForRuns(runs, vol.BytesPerCluster, chunkBytes))

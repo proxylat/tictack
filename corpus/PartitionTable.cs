@@ -48,18 +48,28 @@ namespace Corpus
 
         internal static int DetectSectorSize(Stream fs, long diskSizeBytes)
         {
+            // Probe 512B first (guarded: 4Kn raw handles on Windows reject unaligned 512B reads with IOException).
             var probe = new byte[8];
             if (diskSizeBytes >= 512 + 8)
             {
-                fs.Seek(512, SeekOrigin.Begin);
-                if (fs.Read(probe, 0, 8) == 8 && Encoding.ASCII.GetString(probe) == "EFI PART")
-                    return 512;
+                try
+                {
+                    fs.Seek(512, SeekOrigin.Begin);
+                    if (fs.Read(probe, 0, 8) == 8 && Encoding.ASCII.GetString(probe) == "EFI PART")
+                        return 512;
+                }
+                catch (IOException) { }
             }
             if (diskSizeBytes >= 4096 + 8)
             {
-                fs.Seek(4096, SeekOrigin.Begin);
-                if (fs.Read(probe, 0, 8) == 8 && Encoding.ASCII.GetString(probe) == "EFI PART")
-                    return 4096;
+                try
+                {
+                    var aligned = new byte[4096];
+                    fs.Seek(4096, SeekOrigin.Begin);
+                    if (fs.Read(aligned, 0, 4096) >= 8 && Encoding.ASCII.GetString(aligned, 0, 8) == "EFI PART")
+                        return 4096;
+                }
+                catch (IOException) { }
             }
             return SectorSize;
         }
@@ -70,7 +80,8 @@ namespace Corpus
             var mbr = new byte[sectorSize];
             fs.Seek(0, SeekOrigin.Begin);
             fs.ReadExactly(mbr, 0, sectorSize);
-            CheckProtectiveMbr(mbr);
+            if (!HasProtectiveEntry(mbr))
+                return ReadMbrLayout(mbr, diskNumber, diskSizeBytes, sectorSize, log);
 
             var header = new byte[sectorSize];
             fs.Seek(sectorSize, SeekOrigin.Begin);
@@ -108,8 +119,69 @@ namespace Corpus
             };
         }
 
-        // Protective MBR: boot signature + one 0xEE entry. Anything else is
-        // an MBR disk — refused loud, GPT-only in v1.
+        internal static bool HasProtectiveEntry(byte[] sector)
+        {
+            if (sector.Length < SectorSize || sector[510] != 0x55 || sector[511] != 0xAA)
+                throw new InvalidDataException("missing MBR boot signature 0x55AA — not a partitioned disk");
+            for (var i = 0; i < 4; i++)
+            {
+                if (sector[446 + i * 16 + 4] == 0xEE)
+                    return true;
+            }
+            return false;
+        }
+
+        private static DiskLayout ReadMbrLayout(byte[] mbr, int diskNumber, long diskSizeBytes, int sectorSize, ILogger log)
+        {
+            var sig = BitConverter.ToUInt32(mbr, 440);
+            var diskId = sig.ToString("x8", System.Globalization.CultureInfo.InvariantCulture);
+            var parts = new List<PartitionRecord>();
+            for (var i = 0; i < 4; i++)
+            {
+                var off = 446 + i * 16;
+                var partType = mbr[off + 4];
+                if (partType == 0) continue;
+                var status = mbr[off];
+                var startLba = (long)BitConverter.ToUInt32(mbr, off + 8);
+                var countLba = (long)BitConverter.ToUInt32(mbr, off + 12);
+                if (countLba <= 0) continue;
+                var fsName = partType switch
+                {
+                    0x07 => "ntfs",
+                    0x0B or 0x0C => "fat32",
+                    _ => "unknown",
+                };
+                var num = i + 1;
+                parts.Add(new PartitionRecord
+                {
+                    PartitionNumber = num,
+                    Name = $"mbr-p{num}",
+                    TypeGuid = $"mbr-0x{partType:x2}",
+                    UniqueGuid = $"{diskId}-p{num}",
+                    FirstLba = startLba,
+                    LastLba = startLba + countLba - 1,
+                    AttributeFlags = status,
+                    OffsetBytes = startLba * sectorSize,
+                    LengthBytes = countLba * sectorSize,
+                    Filesystem = fsName,
+                    Skipped = false,
+                    PartitionKey = $"disk{diskNumber}p{num}:{diskId}-p{num}",
+                });
+            }
+            log.Info($"disk {diskNumber} mbr-{diskId}: {parts.Count} partitions ({sectorSize}B sectors)");
+            return new DiskLayout
+            {
+                Generation = 0,
+                DiskNumber = diskNumber,
+                DiskGuid = diskId,
+                DiskSizeBytes = diskSizeBytes,
+                SectorSizeBytes = sectorSize,
+                Style = "mbr",
+                Partitions = parts,
+            };
+        }
+
+        // Protective MBR: boot signature + one 0xEE entry.
         internal static void CheckProtectiveMbr(byte[] sector)
         {
             ArgumentNullException.ThrowIfNull(sector);
@@ -167,6 +239,7 @@ namespace Corpus
                 var unique = new Guid(entriesBytes.AsSpan(off + 16, 16));
                 var first = BitConverter.ToInt64(entriesBytes, off + 32);
                 var last = BitConverter.ToInt64(entriesBytes, off + 40);
+                var attrFlags = BitConverter.ToUInt64(entriesBytes, off + 48);
                 if (last < first)
                     throw new InvalidDataException($"partition slot {i + 1}: last LBA {last} precedes first LBA {first}");
                 var name = Encoding.Unicode.GetString(entriesBytes, off + 56, 72).TrimEnd('\0');
@@ -179,6 +252,7 @@ namespace Corpus
                     UniqueGuid = unique.ToString("d"),
                     FirstLba = first,
                     LastLba = last,
+                    AttributeFlags = attrFlags,
                     OffsetBytes = first * sectorSize,
                     LengthBytes = (last - first + 1) * sectorSize,
                     Filesystem = type == EspType ? "fat32" : type == MsrType ? "none" : "unknown",

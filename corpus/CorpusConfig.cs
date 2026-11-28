@@ -77,6 +77,7 @@ namespace Corpus
         // unencrypted. Runs per pack after sealing, never per chunk; a hook
         // failure fails the job loud. Corpus ships zero builtin crypto.
         public string Encrypt { get; set; }
+        public string Decrypt { get; set; } = string.Empty;
         // Service cadence (--service only; manual --gc ignores these):
         // daily GC wall-clock time and landing-optimize interval.
         public string GcDailyAt { get; set; }

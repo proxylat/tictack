@@ -26,6 +26,7 @@ namespace Corpus
         private readonly string? _encryptHook;
         private readonly int _eccOverheadPercent;
         private readonly bool _wormMode;
+        private readonly Action<string>? _onPackSealed;
         private readonly List<(byte[] Digest, long Offset, uint Stored, uint Plain, byte Codec)> _index = new List<(byte[] Digest, long Offset, uint Stored, uint Plain, byte Codec)>();
         private FileStream? _stream;
         private string? _tmpPath;
@@ -34,7 +35,7 @@ namespace Corpus
         private bool _disposed;
         public int SealedPackCount { get; private set; }
 
-        public PackWriter(string packsDir, long maxPackBytes = DefaultMaxPackBytes, string? encryptHook = null, int eccOverheadPercent = 0, bool wormMode = false)
+        public PackWriter(string packsDir, long maxPackBytes = DefaultMaxPackBytes, string? encryptHook = null, int eccOverheadPercent = 0, bool wormMode = false, Action<string>? onPackSealed = null)
         {
             ArgumentNullException.ThrowIfNull(packsDir);
             if (maxPackBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxPackBytes));
@@ -44,6 +45,7 @@ namespace Corpus
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
             _eccOverheadPercent = eccOverheadPercent;
             _wormMode = wormMode;
+            _onPackSealed = onPackSealed;
             Directory.CreateDirectory(_packsDir);
         }
 
@@ -135,15 +137,16 @@ namespace Corpus
             stream.Flush(true);
             stream.Dispose();
             _stream = null;
-            var sealedPath = Path.Combine(_packsDir, _packName!);
-            File.Move(_tmpPath!, sealedPath);
-            AtomicFile.SyncParentDir(sealedPath);
-            // Reset BEFORE the hook: a hook failure must leave a clean writer,
-            // never a half-sealed pack the next Add would corrupt.
+            var sealedName = _packName!;
+            var tmpPath = _tmpPath!;
+            var sealedPath = Path.Combine(_packsDir, sealedName);
+            // Reset BEFORE hook/rename: a failure leaves a clean writer.
             _tmpPath = null;
             _packName = null;
             _index.Clear();
             _currentSize = 0;
+            File.Move(tmpPath, sealedPath);
+            AtomicFile.SyncParentDir(sealedPath);
             if (_encryptHook != null)
                 PackHook.Seal(_encryptHook, sealedPath);
             // Parity covers the final bytes (post-hook ciphertext when
@@ -153,6 +156,7 @@ namespace Corpus
             if (_wormMode)
                 Hardening.SealWormFile(sealedPath);
             SealedPackCount++;
+            _onPackSealed?.Invoke(sealedName);
         }
     }
 

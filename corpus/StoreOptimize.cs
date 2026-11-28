@@ -58,8 +58,10 @@ namespace Corpus
         private readonly int _zstdLevel;
         private readonly string? _encryptHook;
         private readonly IDeltaCodec? _deltaCodec;
+        private readonly int _eccOverheadPercent;
+        private readonly bool _wormMode;
 
-        public StoreOptimizer(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, string? encryptHook = null, IDeltaCodec? deltaCodec = null)
+        public StoreOptimizer(string storeRoot, string dbPath, CorpusRetentionConfig retention, ILogger log, int chunkMib, int zstdLevel, string? encryptHook = null, IDeltaCodec? deltaCodec = null, int eccOverheadPercent = 0, bool wormMode = false)
         {
             ArgumentNullException.ThrowIfNull(storeRoot);
             ArgumentNullException.ThrowIfNull(dbPath);
@@ -77,6 +79,8 @@ namespace Corpus
             _zstdLevel = zstdLevel;
             _encryptHook = string.IsNullOrWhiteSpace(encryptHook) ? null : encryptHook;
             _deltaCodec = deltaCodec;
+            _eccOverheadPercent = eccOverheadPercent;
+            _wormMode = wormMode;
         }
 
         // Test seam: free bytes on the store volume (null = DriveInfo).
@@ -152,12 +156,11 @@ namespace Corpus
         private void PreGcSweep()
         {
             var sweep = new GarbageCollector(_storeRoot, _dbPath,
-                new CorpusRetentionConfig { KeepLast = int.MaxValue }, _log);
+                new CorpusRetentionConfig { KeepLast = int.MaxValue }, _log, _wormMode);
             sweep.Execute(sweep.Plan());
         }
 
-        // Live = union of non-hole digests over ALL manifests (not retention
-        // roots — compact must not strand any surviving snapshot).
+        // Live = union of non-hole digests + delta base digests over ALL manifests.
         private HashSet<string> LiveHexAll()
         {
             var key = ChunkId.EnsureKey(_storeRoot);
@@ -169,6 +172,8 @@ namespace Corpus
                 {
                     if (!entry.IsHole && entry.DigestHex != "")
                         live.Add(entry.DigestHex);
+                    if (!string.IsNullOrEmpty(entry.BaseDigestHex))
+                        live.Add(entry.BaseDigestHex);
                 }
             }
             return live;
@@ -217,7 +222,7 @@ namespace Corpus
                 // nothing reads them (all reads go manifest → index).
                 var moved = new List<ChunkRow>(blobs.Count);
                 var oldLen = new FileInfo(oldPath).Length;
-                using (var writer = new PackWriter(_packsDir, Math.Max(PackWriter.DefaultMaxPackBytes, oldLen), _encryptHook))
+                using (var writer = new PackWriter(_packsDir, Math.Max(PackWriter.DefaultMaxPackBytes, oldLen), _encryptHook, _eccOverheadPercent, _wormMode))
                 {
                     foreach (var (row, blob) in blobs)
                     {
@@ -227,12 +232,11 @@ namespace Corpus
                 }
                 using (var index = new ChunkIndex(_dbPath))
                     index.UpsertBatch(moved);
-                File.Delete(oldPath);
-                // Stale parity must not outlive its pack. The rewritten pack
-                // carries no sidecar (the knob lives on Store, unreachable
-                // here) — its chunks verify from bytes, unprotected, until a
-                // future ECC-on image re-packs them.
-                File.Delete(PackEcc.SidecarPath(oldPath));
+                if (!_wormMode)
+                {
+                    File.Delete(oldPath);
+                    File.Delete(PackEcc.SidecarPath(oldPath));
+                }
             }
         }
 
@@ -305,7 +309,7 @@ namespace Corpus
         // stops at the right generation instead of over-pruning.
         private void PruneToBudget(long budget, List<int> pruned)
         {
-            var probe = new GarbageCollector(_storeRoot, _dbPath, RetentionWith(1), _log).Plan();
+            var probe = new GarbageCollector(_storeRoot, _dbPath, RetentionWith(1), _log, _wormMode).Plan();
             var droppable = ManifestGens(probe.DropManifests);
             foreach (var target in droppable)
             {
@@ -322,7 +326,7 @@ namespace Corpus
                 }
                 if (newer < 1)
                     continue; // target is newest now (retention raced) — the final check reports
-                var gc = new GarbageCollector(_storeRoot, _dbPath, RetentionWith(newer), _log);
+                var gc = new GarbageCollector(_storeRoot, _dbPath, RetentionWith(newer), _log, _wormMode);
                 var plan = gc.Plan();
                 var dropped = ManifestGens(plan.DropManifests);
                 if (dropped.Count != 1 || dropped[0] != target)
@@ -349,7 +353,16 @@ namespace Corpus
         }
 
         private CorpusRetentionConfig RetentionWith(int keepLast) =>
-            new() { KeepLast = keepLast, KeepWithinDays = _retention.KeepWithinDays, Pin = new List<int>(_retention.Pin ?? new List<int>()) };
+            new()
+            {
+                KeepLast = keepLast,
+                KeepWithinDays = _retention.KeepWithinDays,
+                KeepDaily = _retention.KeepDaily,
+                KeepWeekly = _retention.KeepWeekly,
+                KeepMonthly = _retention.KeepMonthly,
+                KeepYearly = _retention.KeepYearly,
+                Pin = new List<int>(_retention.Pin ?? new List<int>()),
+            };
 
         private static List<int> ManifestGens(IEnumerable<string> manifestPaths)
         {
