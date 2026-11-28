@@ -86,8 +86,9 @@ namespace TicTack
                 TimeoutMinutes = EffectiveTimeout(job, defaults),
                 ShowTerminal = EffectiveShowTerminal(job, defaults),
                 Sandbox = job.Sandbox ?? defaults?.Sandbox ?? false,
-                LowPriority = job.LowPriority ?? defaults?.LowPriority ?? ((job.Inherit ?? defaults?.Inherit ?? false) && config.EcoQos),
-                PreventSleep = job.PreventSleep || ((job.Inherit ?? defaults?.Inherit ?? false) && config.PreventSleep),
+                EcoQos = job.EcoQos ?? defaults?.EcoQos ?? ((job.Inherit ?? defaults?.Inherit ?? false) && config.EcoQos),
+                OnAcOnly = job.OnAcOnly ?? defaults?.OnAcOnly ?? false,
+                PreventSleep = job.PreventSleep ?? defaults?.PreventSleep ?? ((job.Inherit ?? defaults?.Inherit ?? false) && config.PreventSleep),
                 NetCheckHost = EffectiveNetCheckHost(job, defaults),
                 NetCheckEnabled = EffectiveNetCheckEnabled(job, defaults),
                 NetCheckSamples = job.NetCheckSamples ?? defaults?.NetCheckSamples ?? 3,
@@ -108,7 +109,7 @@ namespace TicTack
             else
             {
                 WarnInapplicableWatchFields(job, hasEvery ? "interval" : "calendar", log);
-                if (!ParseSchedule(job, entry, defaultMissed, log)) return null;
+                if (!ParseSchedule(job, entry, defaultMissed, defaults, log)) return null;
             }
             return entry;
         }
@@ -199,7 +200,7 @@ namespace TicTack
 
             WarnIfWatchWithoutUsnOrCatchup(job, config, log);
             entry.Kind = JobKind.Watch;
-            ParseExecutionOptions(job, entry, MissedPolicy.Skip, log);
+            ParseExecutionOptions(job, entry, MissedPolicy.Skip, defaults, log);
             return true;
         }
 
@@ -490,7 +491,7 @@ namespace TicTack
         // contradictory or unparseable cadence config. Modifier typos
         // (missed_run/overlap/jitter) warn and fall back instead of killing
         // the job — a misspelled knob must not silence a backup.
-        private static bool ParseSchedule(JobConfig job, JobEntry entry, MissedPolicy defaultMissed, ILogger log)
+        private static bool ParseSchedule(JobConfig job, JobEntry entry, MissedPolicy defaultMissed, JobsDefaultsConfig? defaults, ILogger log)
         {
             var schedule = (job.Schedule ?? "daily").Trim().ToLowerInvariant();
             var hasEvery = !string.IsNullOrWhiteSpace(job.Every);
@@ -536,7 +537,7 @@ namespace TicTack
                 entry.TimeOfDay = ts;
             }
 
-            ParseExecutionOptions(job, entry, defaultMissed, log);
+            ParseExecutionOptions(job, entry, defaultMissed, defaults, log);
 
             return true;
         }
@@ -645,7 +646,7 @@ namespace TicTack
             return true;
         }
 
-        private static void ParseExecutionOptions(JobConfig job, JobEntry entry, MissedPolicy defaultMissed, ILogger log)
+        private static void ParseExecutionOptions(JobConfig job, JobEntry entry, MissedPolicy defaultMissed, JobsDefaultsConfig? defaults, ILogger log)
         {
             if (string.IsNullOrWhiteSpace(job.MissedRun))
                 entry.Missed = defaultMissed;
@@ -659,11 +660,12 @@ namespace TicTack
                 entry.Missed = missed;
             }
 
-            if (string.IsNullOrWhiteSpace(job.Overlap))
+            var overlapSpec = !string.IsNullOrWhiteSpace(job.Overlap) ? job.Overlap : defaults?.Overlap;
+            if (string.IsNullOrWhiteSpace(overlapSpec))
                 entry.Overlap = OverlapPolicy.Skip;
-            else if (!TryParseOverlapPolicy(job.Overlap, out var overlap))
+            else if (!TryParseOverlapPolicy(overlapSpec, out var overlap))
             {
-                log.Warn("Invalid overlap '" + job.Overlap + "' for job '" + job.Name + "' (use skip/queue), using skip");
+                log.Warn("Invalid overlap '" + overlapSpec + "' for job '" + job.Name + "' (use skip/queue), using skip");
                 entry.Overlap = OverlapPolicy.Skip;
             }
             else
@@ -1085,7 +1087,7 @@ namespace TicTack
                 // AC gate sits after the jitter so the reading is closest to
                 // launch. Skipped slots are not stamped: catch-up policies
                 // retry when AC returns, skip policies drop the slot.
-                if (job.Config.OnAcOnly && !IsOnAcPower())
+                if (job.OnAcOnly && !IsOnAcPower())
                 {
                     _log.Info("Job '" + job.Config.Name + "' skipped, running on battery power");
                     return;
@@ -1265,7 +1267,7 @@ namespace TicTack
             var cfg = job.Config;
             var wd = cfg.WorkingDir ?? AppDomain.CurrentDomain.BaseDirectory;
             var timeoutMs = job.TimeoutMinutes * 60000;
-            var low = job.LowPriority;
+            var low = job.EcoQos;
             string Sub(string cmd)
             {
                 var s = job.Kind == JobKind.Watch && !string.IsNullOrEmpty(effectiveWatchPath)
@@ -1537,7 +1539,8 @@ namespace TicTack
             public int DayOfMonth { get; set; }
             public DateTime RunDate { get; set; }
             public TimeSpan Interval { get; set; }
-            public bool LowPriority { get; set; }
+            public bool EcoQos { get; set; }
+            public bool OnAcOnly { get; set; }
             public bool PreventSleep { get; set; }
             public RetryConfig? Retry { get; set; }
             public bool UseVss { get; set; }

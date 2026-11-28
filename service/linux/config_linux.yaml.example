@@ -129,7 +129,7 @@ jobs:
   #   jitter: 15m
   #   pre_command: wake-nas.sh
   #   on_failure: alert.sh
-  #   low_priority: true
+  #   eco_qos: true
   #   on_ac_only: true
   #   prevent_sleep: true
   #   command: /opt/tictack/verify.sh

@@ -384,9 +384,9 @@ namespace TicTack
         public string? OnFailure { get; set; }
         // Laptop trio: idle CPU priority (null = inherit jobs_defaults / eco_qos),
         // skip while on battery, hold a sleep inhibitor for the run.
-        public bool? LowPriority { get; set; }
-        public bool OnAcOnly { get; set; }
-        public bool PreventSleep { get; set; }
+        public bool? EcoQos { get; set; }
+        public bool? OnAcOnly { get; set; }
+        public bool? PreventSleep { get; set; }
         // Null = inherit jobs_defaults.show_terminal (default false).
         public bool? ShowTerminal { get; set; }
         public bool? Sandbox { get; set; }
@@ -441,8 +441,11 @@ namespace TicTack
         public int? SpikeFiles { get; set; }
         public int? SpikeRenames { get; set; }
         public MonitorConfig? Monitor { get; set; }
-        public bool? LowPriority { get; set; }
+        public bool? EcoQos { get; set; }
         public string? MissedRun { get; set; }
+        public string? Overlap { get; set; }
+        public bool? OnAcOnly { get; set; }
+        public bool? PreventSleep { get; set; }
         public int? TimeoutMinutes { get; set; }
         public bool? ShowTerminal { get; set; }
         public bool? Sandbox { get; set; }

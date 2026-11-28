@@ -546,7 +546,7 @@ logging:
     [Fact]
     public void Load_ParsesJobAndRetentionKeys()
     {
-        var yaml = "sources:\n  - path: '/tmp/tt-src'\n    destination: '/tmp/tt-dst'\n    sync:\n      versioning:\n        path: '/tmp/tt-ver'\n        keep_last: 5\n        keep_within: 30d\n        keep_daily: 7\n        keep_weekly: 4\n        keep_monthly: 6\njobs:\n  - name: hourly\n    every: 6h\n    missed_run: skip\n    overlap: queue\n    jitter: 15m\n    pre_command: echo pre\n    post_command: echo post\n    on_failure: echo fail\n    low_priority: true\n    on_ac_only: true\n    prevent_sleep: true\n    command: echo run\n";
+        var yaml = "sources:\n  - path: '/tmp/tt-src'\n    destination: '/tmp/tt-dst'\n    sync:\n      versioning:\n        path: '/tmp/tt-ver'\n        keep_last: 5\n        keep_within: 30d\n        keep_daily: 7\n        keep_weekly: 4\n        keep_monthly: 6\njobs:\n  - name: hourly\n    every: 6h\n    missed_run: skip\n    overlap: queue\n    jitter: 15m\n    pre_command: echo pre\n    post_command: echo post\n    on_failure: echo fail\n    eco_qos: true\n    on_ac_only: true\n    prevent_sleep: true\n    command: echo run\n";
         var path = Path.GetTempFileName();
         try
         {
@@ -567,7 +567,7 @@ logging:
             Assert.Equal("echo pre", job.PreCommand);
             Assert.Equal("echo post", job.PostCommand);
             Assert.Equal("echo fail", job.OnFailure);
-            Assert.True(job.LowPriority == true);
+            Assert.True(job.EcoQos == true);
             Assert.True(job.OnAcOnly);
             Assert.True(job.PreventSleep);
         }

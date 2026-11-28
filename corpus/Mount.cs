@@ -63,8 +63,11 @@ namespace Corpus
                 {
                     var ctx = await _listener.GetContextAsync().ConfigureAwait(false);
                     var rel = Uri.UnescapeDataString(ctx.Request.Url?.AbsolutePath ?? "/").TrimStart('/');
-                    var full = Path.GetFullPath(Path.Combine(_backing.MountPath, rel));
-                    if (!full.StartsWith(Path.GetFullPath(_backing.MountPath), StringComparison.Ordinal))
+                    var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_backing.MountPath));
+                    var rootWithSep = root + Path.DirectorySeparatorChar;
+                    var full = string.IsNullOrEmpty(rel) ? root : Path.GetFullPath(Path.Combine(root, rel));
+                    var inRoot = string.Equals(full, root, StringComparison.Ordinal) || full.StartsWith(rootWithSep, StringComparison.Ordinal);
+                    if (!inRoot || rel.Contains("..", StringComparison.Ordinal) || rel.IndexOf('\0') >= 0)
                     {
                         ctx.Response.StatusCode = 403;
                     }

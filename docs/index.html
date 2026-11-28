@@ -36,19 +36,37 @@
 <div class="layout-grid">
 
 <aside class="sidebar" aria-label="Documentation navigation">
-    <ul class="nav-list">
+    <div class="nav-section">
+      <div class="nav-section-title">Getting Started</div>
+      <ul class="nav-list">
         <li><a class="nav-item" href="#page-overview">Overview</a></li>
-        <li><a class="nav-item" href="#page-requirements">Requirements & constraints</a></li>
+        <li><a class="nav-item" href="#page-requirements">Requirements &amp; constraints</a></li>
         <li><a class="nav-item" href="#page-setup">Quickstart</a></li>
-        <li><a class="nav-item" href="#page-cli">CLI (TicTack)</a></li>
-        <li><a class="nav-item" href="#page-configuration">YAML (TicTack)</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">TicTack (Sync &amp; Jobs)</div>
+      <ul class="nav-list">
+        <li><a class="nav-item" href="#page-cli">CLI</a></li>
+        <li><a class="nav-item" href="#page-configuration">YAML configuration</a></li>
         <li><a class="nav-item" href="#page-remote">Remote sync</a></li>
         <li><a class="nav-item" href="#page-jobs">Jobs &amp; scheduler</a></li>
-        <li><a class="nav-item" href="#page-corpus">Corpus (Architecture)</a></li>
-        <li><a class="nav-item" href="#page-corpus-cli">CLI (Corpus)</a></li>
-        <li><a class="nav-item" href="#page-corpus-yaml">YAML (Corpus)</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">Corpus (System Imaging)</div>
+      <ul class="nav-list">
+        <li><a class="nav-item" href="#page-corpus">Architecture</a></li>
+        <li><a class="nav-item" href="#page-corpus-cli">CLI</a></li>
+        <li><a class="nav-item" href="#page-corpus-yaml">YAML configuration</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">Operations</div>
+      <ul class="nav-list">
         <li><a class="nav-item" href="#page-diagnostics">Diagnostics &amp; profiling</a></li>
-    </ul>
+      </ul>
+    </div>
   </aside>
 
 <main class="article">
@@ -945,7 +963,7 @@
         <tr><td><code>working_dir:</code></td><td>exe dir</td><td>Working directory for the command and its hooks</td></tr>
         <tr><td><code>missed_run:</code></td><td><code>catch_up</code></td><td><code>catch_up</code> fires missed slots at startup | <code>skip</code> drops missed slots (configurable in <code>jobs_defaults:</code>)</td></tr>
         <tr><td><code>run_on_start:</code></td><td><code>false</code></td><td>Run the job immediately once when TicTack starts (useful for <code>watch: true</code> or interval backup jobs that need a startup reconciliation sync; still respects <code>net_check</code> and <code>overlap</code>)</td></tr>
-        <tr><td><code>overlap:</code></td><td><code>skip</code></td><td><code>skip</code> stands down while previous run is active | <code>queue</code> waits and runs once</td></tr>
+        <tr><td><code>overlap:</code></td><td><code>skip</code></td><td><code>skip</code> stands down while previous run is active | <code>queue</code> waits and runs once (also in <code>jobs_defaults:</code>)</td></tr>
         <tr><td><code>jitter:</code></td><td>unset</td><td>Random <code>0..span</code> delay before each fire (e.g. <code>15m</code>) to prevent I/O storms</td></tr>
         <tr><td><code>timeout_minutes:</code></td><td><code>10</code></td><td>Kill command if it exceeds N minutes (falls back to <code>jobs_defaults:</code>, then <code>10</code>)</td></tr>
         <tr><td><code>sandbox:</code></td><td><code>false</code></td><td>Run child process tree inside a Windows JobObject with <code>JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE</code> and <code>JOB_OBJECT_UILIMIT_ALL</code> (also in <code>jobs_defaults:</code>)</td></tr>
@@ -956,7 +974,7 @@
         <tr><td><code>net_check_samples:</code></td><td><code>4</code></td><td>Ping sample count (<code>2..10</code>; also in <code>jobs_defaults:</code>)</td></tr>
         <tr><td><code>net_check_max_ms:</code></td><td><code>250</code></td><td>Max gateway RTT/jitter ceiling in ms (also in <code>jobs_defaults:</code>)</td></tr>
         <tr><td><code>net_check_wait_seconds:</code></td><td><code>60</code></td><td>Retry wait budget in seconds before failing pre-flight (also in <code>jobs_defaults:</code>)</td></tr>
-        <tr><td><code>low_priority:</code></td><td><code>false</code></td><td>Run job with background CPU priority</td></tr>
+        <tr><td><code>eco_qos:</code></td><td><code>false</code></td><td>Run job with background CPU priority</td></tr>
         <tr><td><code>on_ac_only:</code></td><td><code>false</code></td><td>Skip job when running on battery power</td></tr>
         <tr><td><code>prevent_sleep:</code></td><td><code>false</code></td><td>Hold an OS sleep inhibitor while the job runs</td></tr>
         <tr><td><code>pre_command:</code></td><td>unset</td><td>Pre-gate command (non-zero exit skips main job)</td></tr>
@@ -990,14 +1008,14 @@
   <span class="comment"># 2. Deduplicated encrypted repository snapshot via restic</span>
   - <span class="key">name:</span> restic-local-repo
     <span class="key">time:</span> <span class="str">"03:00"</span>
-    <span class="key">low_priority:</span> true
+    <span class="key">eco_qos:</span> true
     <span class="key">command:</span> <span class="str">"restic -r [Backup-Disk]\\ResticRepo backup {source} &amp;&amp; restic -r [Backup-Disk]\\ResticRepo forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 1 --prune"</span>
 
   <span class="comment"># 3. Offsite cloud sync via rclone, gated by passive local network stability check</span>
   - <span class="key">name:</span> rclone-cloud-offload
     <span class="key">time:</span> <span class="str">"04:00"</span>
     <span class="key">net_check:</span> true
-    <span class="key">low_priority:</span> true
+    <span class="key">eco_qos:</span> true
     <span class="key">command:</span> <span class="str">"rclone sync [Backup-Disk]\\ResticRepo s3:my-offsite-bucket/restic --transfers 4"</span></pre>
       </div>
     </div>
@@ -1025,7 +1043,7 @@
         <tr><td><code>spike_bytes_gb:</code></td><td><code>0</code></td><td>Overrides <code>sources[].sync.spike_bytes_gb</code> for <code>ChurnMonitor</code> (also in <code>jobs_defaults:</code>)</td></tr>
         <tr><td><code>spike_files:</code></td><td><code>0</code></td><td>Overrides <code>sources[].sync.spike_files</code> for <code>ChurnMonitor</code> (also in <code>jobs_defaults:</code>)</td></tr>
         <tr><td><code>spike_renames:</code></td><td><code>0</code></td><td>Overrides <code>sources[].sync.spike_renames</code> for <code>ChurnMonitor</code> (also in <code>jobs_defaults:</code>)</td></tr>
-        <tr><td><code>low_priority:</code></td><td><code>false</code></td><td>Overrides <code>eco_qos:</code> when <code>inherit: true</code> (also in <code>jobs_defaults:</code>)</td></tr>
+        <tr><td><code>eco_qos:</code></td><td><code>false</code></td><td>Overrides top-level <code>eco_qos:</code> when <code>inherit: true</code> (also in <code>jobs_defaults:</code>)</td></tr>
         <tr><td><code>prevent_sleep:</code></td><td><code>false</code></td><td>Inherits top-level <code>prevent_sleep:</code> when <code>inherit: true</code></td></tr>
       </table>
     </div>
@@ -1046,7 +1064,7 @@
 │  4. Crash Durability : pending_watch_files in jobs.db (WAL, boot replay)│
 │  5. Safety Guards    : DriveGuard + OnAcOnly + NetCheck + ChurnMonitor  │
 │                        + MinFreeGb + LockHandling/LockWait + VSS Mount  │
-│  6. Execution        : LowPriority (EcoQos) + PreventSleep + Retry      │
+│  6. Execution        : EcoQos + PreventSleep + Retry                    │
 └───────────────────────────────────┬─────────────────────────────────────┘
                                     │ {source}, {files}, {files_abs}
                                     ▼
